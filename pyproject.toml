@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vocalize-cli"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A CLI that turns text, markdown, or piped stdin into speech via the ElevenLabs API, with markdown-table-aware preprocessing."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,9 @@ dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff", "build", "twine"]
 
 [project.scripts]
 vocalize = "vocalize.cli:run"
+
+[tool.hatch.version]
+path = "vocalize/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vocalize"]
