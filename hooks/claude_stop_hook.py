@@ -96,9 +96,14 @@ def main() -> int:
 
     max_chars = os.environ.get("VOCALIZE_MAX_CHARS", str(DEFAULT_MAX_CHARS))
 
+    # Options first, then "--", then the text. Click treats any argv token
+    # starting with "-" as an option, so a reply that opens with a bullet
+    # ("- fixed the parser") or an arrow ("-> next") would otherwise make
+    # vocalize exit 2 with "No such option" and speak nothing. The "--"
+    # end-of-options separator makes the text unambiguously an argument.
     try:
         result = subprocess.run(
-            [vocalize_bin, "speak", text, "--max-chars", max_chars, "--play"],
+            [vocalize_bin, "speak", "--max-chars", max_chars, "--play", "--", text],
             timeout=60,
             check=False,
         )

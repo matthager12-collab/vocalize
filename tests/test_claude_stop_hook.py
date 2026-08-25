@@ -3,6 +3,10 @@ import json
 import subprocess
 
 import claude_stop_hook as hook
+from click.testing import CliRunner
+
+from vocalize.cli import main as vocalize_cli
+from vocalize.exceptions import MissingAPIKeyError
 
 
 def _assistant(content) -> str:
@@ -29,6 +33,9 @@ def _patch_main(monkeypatch, payload, which="/usr/local/bin/vocalize", run=None)
     calls = []
 
     def fake_run(argv, **kwargs):
+        # Pin the timeout: a Stop hook that can hang forever blocks the
+        # session, so this is behaviour, not an implementation detail.
+        assert kwargs.get("timeout") == 60
         calls.append(argv)
         if run is not None:
             return run(argv)
@@ -79,12 +86,17 @@ def test_falls_back_past_tool_use_only_entry(tmp_path):
 
 
 def test_ignores_malformed_json_lines(tmp_path):
+    # The garbage line must sit AFTER the newest assistant entry. The scan
+    # walks reversed(lines) and breaks on the first text it finds, so a
+    # malformed line placed earlier is never parsed and the JSONDecodeError
+    # guard never runs. Trailing is also where it happens for real: a
+    # partially-flushed final line while Claude Code is still writing.
     path = _write_transcript(
         tmp_path,
         [
             _assistant([_text("older answer")]),
-            "{not json at all",
             _assistant([_text("newest answer")]),
+            '{"type": "assistant", "message": {"content": [{"type": "te',
         ],
     )
 
@@ -119,10 +131,11 @@ def test_main_passes_default_max_chars(monkeypatch, tmp_path):
         [
             "/usr/local/bin/vocalize",
             "speak",
-            "hello there",
             "--max-chars",
             "500",
             "--play",
+            "--",
+            "hello there",
         ]
     ]
 
@@ -133,7 +146,58 @@ def test_main_honours_vocalize_max_chars_env(monkeypatch, tmp_path):
     monkeypatch.setenv("VOCALIZE_MAX_CHARS", "120")
 
     assert hook.main() == 0
-    assert calls[0][calls[0].index("--max-chars") + 1] == "120"
+    assert calls == [
+        [
+            "/usr/local/bin/vocalize",
+            "speak",
+            "--max-chars",
+            "120",
+            "--play",
+            "--",
+            "hello there",
+        ]
+    ]
+
+
+def test_main_speaks_dash_led_text(monkeypatch, tmp_path):
+    # A bulleted reply is the single most common shape Claude produces. Without
+    # the "--" separator click reads "- Fixed the parser" as an option and
+    # vocalize exits 2 ("No such option"), so nothing is ever spoken.
+    reply = "- Fixed the parser\n- Added tests"
+    path = _write_transcript(tmp_path, [_assistant([_text(reply)])])
+    calls = _patch_main(monkeypatch, {"transcript_path": path})
+
+    assert hook.main() == 0
+    argv = calls[0]
+    assert argv[-1] == reply
+    assert argv[-2] == "--"
+
+    # And prove it against the real parser rather than our idea of it: the
+    # same argv tail must get PAST argument parsing. Exit code 2 would mean
+    # click rejected the bullet as an unknown option.
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    result = CliRunner().invoke(
+        vocalize_cli,
+        ["speak", "--max-chars", "500", "--no-play", "--", "- Fixed the parser"],
+    )
+
+    assert result.exit_code != 2
+    assert "No such option" not in result.output
+    # Parsing succeeded, so it runs on and fails at the API-key stage instead.
+    assert isinstance(result.exception, MissingAPIKeyError)
+
+
+def test_nonzero_exit_is_logged_to_stderr(monkeypatch, tmp_path, capsys):
+    path = _write_transcript(tmp_path, [_assistant([_text("hello there")])])
+    _patch_main(
+        monkeypatch,
+        {"transcript_path": path},
+        run=lambda argv: subprocess.CompletedProcess(argv, 1),
+    )
+
+    # A failing vocalize must never block the session, but it must be visible.
+    assert hook.main() == 0
+    assert "exited 1" in capsys.readouterr().err
 
 
 def test_main_prefers_vocalize_bin_env(monkeypatch, tmp_path):
