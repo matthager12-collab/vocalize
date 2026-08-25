@@ -42,7 +42,11 @@ def _is_table_start(lines: list[str], i: int) -> bool:
     if i + 1 >= len(lines):
         return False
     header, sep = lines[i], lines[i + 1]
-    return "|" in header and bool(_TABLE_SEPARATOR_RE.match(sep))
+    if "|" not in header or not _TABLE_SEPARATOR_RE.match(sep):
+        return False
+    # Prose containing a stray "|" above a horizontal rule looks like a
+    # header + separator pair, so insist the column counts line up too.
+    return len(_split_table_row(header)) == len(_split_table_row(sep))
 
 
 def _flatten_table(lines: list[str], start: int) -> tuple[str, int]:
@@ -60,16 +64,19 @@ def _flatten_table(lines: list[str], start: int) -> tuple[str, int]:
     if not rows:
         return "", i
 
-    sentences = [f"Table with {len(rows)} rows."]
+    noun = "row" if len(rows) == 1 else "rows"
+    sentences = [f"Table with {len(rows)} {noun}."]
     for row in rows:
-        cells = dict(zip(headers, row))
         label = row[0] if row else ""
         parts = []
-        for header, value in cells.items():
-            if header == headers[0]:
-                continue
+        # Walk by index, not dict(zip(...)): ragged rows and repeated
+        # header names would otherwise lose cells without a word.
+        for idx, value in enumerate(row):
+            if idx == 0:
+                continue  # already spoken as the row's label
             if not value:
                 continue
+            header = headers[idx] if idx < len(headers) else f"column {idx + 1}"
             parts.append(f"{header} is {value}")
         if parts:
             sentences.append(f"For {label}: " + "; ".join(parts) + ".")

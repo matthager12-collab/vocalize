@@ -91,3 +91,61 @@ def test_truncate_for_budget_none_means_unlimited():
     text, truncated = truncate_for_budget(long_text, max_chars=None)
     assert truncated is False
     assert text == long_text
+
+
+def test_prose_line_with_pipe_before_a_horizontal_rule_is_not_a_table():
+    md = "Use the pipe | operator here\n---\nNext paragraph.\n"
+    result = flatten_markdown(md)
+    assert "pipe" in result
+    assert "operator" in result
+    assert "Next paragraph." in result
+
+
+def test_setext_underlined_heading_containing_a_pipe_survives():
+    md = "Shell pipes | and filters\n---\nBody text.\n"
+    result = flatten_markdown(md)
+    assert "Shell pipes" in result
+    assert "and filters" in result
+
+
+def test_row_with_more_cells_than_headers_keeps_the_extra_value():
+    md = (
+        "| Name | Age |\n"
+        "|------|-----|\n"
+        "| Ada  | 34  | London |\n"
+    )
+    result = flatten_markdown(md)
+    assert "column 3 is London" in result
+
+
+def test_row_with_fewer_cells_than_headers_speaks_what_is_present():
+    md = (
+        "| Name | Age | City |\n"
+        "|------|-----|------|\n"
+        "| Ada  | 34  |\n"
+    )
+    result = flatten_markdown(md)
+    assert "For Ada: Age is 34." in result
+    assert "City is" not in result
+
+
+def test_duplicate_header_names_do_not_drop_columns():
+    md = (
+        "| Name | Name |\n"
+        "|------|------|\n"
+        "| Ada  | Lovelace |\n"
+    )
+    result = flatten_markdown(md)
+    assert "Ada" in result
+    assert "Lovelace" in result
+
+
+def test_single_row_table_is_grammatical():
+    md = (
+        "| Quarter | Revenue |\n"
+        "|---------|---------|\n"
+        "| Q1      | 4.2M    |\n"
+    )
+    result = flatten_markdown(md)
+    assert "Table with 1 row." in result
+    assert "1 rows" not in result
