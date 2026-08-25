@@ -8,13 +8,16 @@ access or real API key needed to test the logic in this file.
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 
 from .config import Settings
 from .exceptions import TTSRequestError
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "vocalize"
+
+# The SDK's own default is 240s, far beyond the Stop hook's 60s subprocess
+# timeout — a hung request would otherwise outlive the hook that spawned it.
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 def _cache_key(text: str, settings: Settings) -> str:
@@ -92,4 +95,4 @@ def build_client(api_key: str):
     """
     from elevenlabs.client import ElevenLabs
 
-    return ElevenLabs(api_key=api_key)
+    return ElevenLabs(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS)

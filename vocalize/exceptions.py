@@ -23,3 +23,7 @@ class TTSRequestError(VocalizeError):
 
 class NoAudioPlayerError(VocalizeError):
     """Raised when no supported system audio player can be found."""
+
+
+class AudioPlaybackError(VocalizeError):
+    """Raised when saving or playing audio fails at the OS/subprocess level."""

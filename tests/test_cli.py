@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 import vocalize.cli as cli_module
@@ -100,3 +101,69 @@ def test_voices_command_lists_ids_and_names(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "abc\tRachel" in result.output
     assert "def\tJosh" in result.output
+
+
+def test_speak_file_missing_path_gives_clean_error(tmp_path):
+    missing = tmp_path / "nope.md"
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["speak-file", str(missing)])
+
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "No such file or directory" in result.output
+
+
+def test_speak_file_non_utf8_gives_clean_error(tmp_path):
+    bad_file = tmp_path / "bad.md"
+    bad_file.write_bytes(b"\xff\xfe\x9c")
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["speak-file", str(bad_file)])
+
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, UnicodeDecodeError)
+    assert "UTF-8" in result.output
+    assert str(bad_file) in result.output
+
+
+def test_empty_text_reports_nothing_to_speak_without_a_key(monkeypatch):
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["speak", "", "--no-play"])
+
+    assert result.exit_code != 0
+    from vocalize.exceptions import TTSRequestError
+
+    assert isinstance(result.exception, TTSRequestError)
+    message = str(result.exception).lower()
+    assert "empty" in message
+    assert "api key" not in message
+
+
+def test_run_reports_vocalize_error_and_exits_one(monkeypatch, capsys):
+    from vocalize.exceptions import TTSRequestError
+
+    def raise_error():
+        raise TTSRequestError("boom")
+
+    monkeypatch.setattr(cli_module, "main", raise_error)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_module.run()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "Error: boom" in captured.err
+
+
+def test_default_output_lands_in_cache_dir(monkeypatch, tmp_path):
+    _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["speak", "hello", "--api-key", "fake-key", "--no-play"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "last.mp3").exists()
