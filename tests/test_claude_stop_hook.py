@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 
 import claude_stop_hook as hook
@@ -23,11 +24,14 @@ def _write_transcript(tmp_path, lines) -> str:
     return str(path)
 
 
-def _patch_main(monkeypatch, payload, which="/usr/local/bin/vocalize", run=None):
+def _patch_main(monkeypatch, payload, which="/usr/local/bin/vocalize", run=None, stdin=None):
     """Wire up stdin, PATH lookup and subprocess so main() can't shell out."""
     monkeypatch.delenv("VOCALIZE_MAX_CHARS", raising=False)
     monkeypatch.delenv("VOCALIZE_BIN", raising=False)
-    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(hook.sys, "argv", ["claude_stop_hook.py"])
+    monkeypatch.setattr(
+        hook.sys, "stdin", io.StringIO(json.dumps(payload)) if stdin is None else stdin
+    )
     monkeypatch.setattr(hook.shutil, "which", lambda name: which)
 
     calls = []
@@ -207,6 +211,48 @@ def test_main_prefers_vocalize_bin_env(monkeypatch, tmp_path):
 
     assert hook.main() == 0
     assert calls[0][0] == "/tmp/custom/vocalize"
+
+
+def _fake_projects_dir(tmp_path):
+    """Two sessions' transcripts with distinct mtimes; returns (dir, older, newer)."""
+    projects = tmp_path / "projects"
+    older = projects / "proj-a" / "older.jsonl"
+    newer = projects / "proj-b" / "newer.jsonl"
+    for path, text in ((older, "older session"), (newer, "newest session")):
+        path.parent.mkdir(parents=True)
+        path.write_text(_assistant([_text(text)]) + "\n", encoding="utf-8")
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newer, (2_000_000, 2_000_000))
+    return projects, older, newer
+
+
+def test_find_latest_transcript_picks_the_newest(tmp_path):
+    projects, _older, newer = _fake_projects_dir(tmp_path)
+
+    assert hook._find_latest_transcript(projects) == str(newer)
+
+
+def test_find_latest_transcript_returns_none_when_nothing_to_find(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    assert hook._find_latest_transcript(empty) is None
+    assert hook._find_latest_transcript(tmp_path / "does-not-exist") is None
+
+
+def test_latest_mode_speaks_newest_transcript_without_reading_stdin(monkeypatch, tmp_path):
+    class ExplodingStdin:
+        def read(self, *args):
+            raise AssertionError("--latest must not read stdin")
+
+    projects, _older, _newer = _fake_projects_dir(tmp_path)
+    calls = _patch_main(monkeypatch, {}, stdin=ExplodingStdin())
+    monkeypatch.setattr(hook.sys, "argv", ["claude_stop_hook.py", "--latest"])
+    real_find = hook._find_latest_transcript
+    monkeypatch.setattr(hook, "_find_latest_transcript", lambda: real_find(projects))
+
+    assert hook.main() == 0
+    assert calls[0][-1] == "newest session"
 
 
 def test_subprocess_failure_is_logged_not_raised(monkeypatch, tmp_path, capsys):

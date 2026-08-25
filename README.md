@@ -99,7 +99,18 @@ CLI — so it works identically whether Claude Code is running in a bare
 terminal or inside an IDE's integrated terminal (VS Code, Cursor, etc.),
 since both use the same `~/.claude/settings.json` hook config.
 
-To install it:
+**On-demand mode.** If you'd rather trigger speech yourself than have every
+response spoken, skip the install and run the script with `--latest`. It
+finds your most recent Claude Code response — in any session — and speaks
+that one:
+
+```bash
+python3 hooks/claude_stop_hook.py --latest
+```
+
+Combine it with `VOCALIZE_MAX_CHARS` to control how much gets read.
+
+To install it as an automatic hook instead:
 
 ```bash
 python3 hooks/install_hook.py

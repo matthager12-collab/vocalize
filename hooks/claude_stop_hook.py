@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Claude Code `Stop` hook: speak Claude's last response aloud via vocalize.
+"""Speak Claude's last response aloud via vocalize. Two modes:
 
-Claude Code invokes Stop hooks with a JSON payload on stdin that includes
-`transcript_path` — the path to a JSONL file of the conversation so far.
-This script pulls the most recent assistant text message out of that
+1. As a Claude Code `Stop` hook. Claude Code invokes Stop hooks with a JSON
+   payload on stdin that includes `transcript_path` — the path to a JSONL
+   file of the conversation so far — and every response gets spoken.
+2. On demand, with `--latest`. Nothing is read from stdin; the script finds
+   the most recently written transcript under ~/.claude/projects and speaks
+   that response. Run it when you want speech instead of installing the
+   hook and getting it after every turn.
+
+Either way it pulls the most recent assistant text message out of the
 transcript and pipes it through the `vocalize` CLI (the same one used
 directly from the command line), so there's exactly one code path for
-"turn text into speech" whether you're calling vocalize by hand or Claude
-Code is calling it for you after every response.
+"turn text into speech".
 
 See hooks/install_hook.py to wire this into ~/.claude/settings.json, or
 do it by hand — add to the "Stop" array:
@@ -25,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 # Keep spoken responses short by default — a Stop hook fires after every
 # turn, and a long response would eat the ElevenLabs free-tier quota fast.
@@ -72,13 +78,31 @@ def _extract_last_assistant_text(transcript_path: str) -> str:
     return "\n".join(last_text_parts)
 
 
-def main() -> int:
-    try:
-        payload = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        payload = {}
+def _find_latest_transcript(projects_dir=None) -> str | None:
+    """Most recently modified Claude Code transcript, or None if there are none.
 
-    transcript_path = payload.get("transcript_path")
+    Claude Code stores one directory per project under ~/.claude/projects,
+    each holding <session-id>.jsonl files, so newest mtime is "the session
+    you were just talking to".
+    """
+    base = Path(projects_dir) if projects_dir else Path.home() / ".claude" / "projects"
+    transcripts = list(base.glob("*/*.jsonl"))
+    if not transcripts:
+        return None
+    return str(max(transcripts, key=lambda p: p.stat().st_mtime))
+
+
+def main() -> int:
+    if "--latest" in sys.argv[1:]:
+        # On-demand mode: no hook payload on stdin, so don't read it at all.
+        transcript_path = _find_latest_transcript()
+    else:
+        try:
+            payload = json.load(sys.stdin)
+        except json.JSONDecodeError:
+            payload = {}
+        transcript_path = payload.get("transcript_path")
+
     if not transcript_path:
         return 0  # nothing to do — don't block Claude Code on a hook error
 
