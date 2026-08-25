@@ -1,5 +1,7 @@
 # vocalize
 
+[![CI](https://github.com/matthager12-collab/vocalize/actions/workflows/ci.yml/badge.svg)](https://github.com/matthager12-collab/vocalize/actions/workflows/ci.yml)
+
 A command-line tool that turns text, markdown files, or piped stdin into
 natural-sounding speech using the [ElevenLabs](https://elevenlabs.io) API —
 plus a hook that wires it directly into [Claude Code](https://claude.com/claude-code),
@@ -86,7 +88,7 @@ since both use the same `~/.claude/settings.json` hook config.
 To install it:
 
 ```bash
-python hooks/install_hook.py
+python3 hooks/install_hook.py
 ```
 
 This merges a `Stop` hook entry into `~/.claude/settings.json` (backing up
@@ -94,12 +96,27 @@ the existing file first) rather than overwriting your other hooks. Every
 Claude Code response after that gets spoken aloud automatically. Uninstall
 by removing the `vocalize` entry from the `Stop` array in that file.
 
+By default the hook truncates each response to 500 characters before
+speaking it (`DEFAULT_MAX_CHARS` in `claude_stop_hook.py`) — a Stop hook
+fires after every turn, so a long response would burn through the
+ElevenLabs free-tier quota fast. Override with `VOCALIZE_MAX_CHARS` in the
+environment.
+
+The hook looks up the `vocalize` binary on `PATH`, but Claude Code hooks
+run in Claude Code's own environment, not your interactive shell — if
+`vocalize` was installed into a virtualenv that isn't on that `PATH`, set
+`VOCALIZE_BIN` to the full path (e.g. `/path/to/.venv/bin/vocalize`) to
+point the hook at it directly.
+
 ## Architecture
 
 ```
 vocalize/
+  __init__.py     # package version
+  __main__.py     # python -m vocalize entry point
   preprocess.py   # markdown -> speakable text (pure function, fully unit tested)
   config.py       # API key resolution: --api-key > $ELEVENLABS_API_KEY > .env
+  exceptions.py   # VocalizeError / TTSRequestError
   tts.py          # ElevenLabs API wrapper + disk cache (client is injected, so
                    # it's mockable in tests without hitting the network)
   audio.py        # save to disk + play via the OS's native player
@@ -135,6 +152,16 @@ All tests run offline: the ElevenLabs client is dependency-injected into
 - Table flattening handles standard GFM pipe tables; it doesn't attempt to
   handle merged cells or nested tables (rare enough in practice that it
   wasn't worth the complexity).
+- **Windows playback is untested.** The PowerShell `SoundPlayer` fallback
+  only plays WAV, so the mp3 files this tool generates likely won't play
+  there. Use `--no-play` and open the saved file with whatever's on hand.
+- **The disk cache under `~/.cache/vocalize` grows unbounded.** It's
+  content-addressed (keyed by a hash of text, voice, model, and format),
+  so it's always safe to delete some or all of it — nothing will break,
+  you'll just re-pay for a re-synthesized clip.
+- **`--api-key` on the command line is visible to other local processes**
+  (anything that can run `ps`). Prefer the `ELEVENLABS_API_KEY` environment
+  variable or a `.env` file instead.
 
 ## License
 

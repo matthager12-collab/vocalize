@@ -104,7 +104,7 @@ def main() -> int:
         )
         if result.returncode != 0:
             print(f"vocalize hook: vocalize exited {result.returncode}", file=sys.stderr)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — must not crash the Stop hook
         # A speech failure should never break the coding session, so this
         # still returns 0 — but it's logged to stderr rather than swallowed
         # silently, so a broken hook is diagnosable.

@@ -1,8 +1,7 @@
 import json
 
-import pytest
-
 import install_hook
+import pytest
 
 
 @pytest.fixture

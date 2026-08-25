@@ -62,7 +62,7 @@ def synthesize(
             output_format=settings.output_format,
         )
         audio = b"".join(chunks) if not isinstance(chunks, (bytes, bytearray)) else bytes(chunks)
-    except Exception as exc:  # noqa: BLE001 — surface any SDK error uniformly
+    except Exception as exc:
         raise TTSRequestError(f"ElevenLabs API request failed: {exc}") from exc
 
     if not audio:
@@ -78,7 +78,7 @@ def list_voices(client) -> list[dict]:
     """Return a simplified [{"id": ..., "name": ...}, ...] list of voices."""
     try:
         response = client.voices.search()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise TTSRequestError(f"Could not list voices: {exc}") from exc
 
     voices = getattr(response, "voices", response)

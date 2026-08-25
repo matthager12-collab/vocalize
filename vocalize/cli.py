@@ -14,12 +14,12 @@ from pathlib import Path
 import click
 
 from . import __version__
+from .audio import play as play_audio
+from .audio import save as save_audio
 from .config import DEFAULT_MODEL, DEFAULT_VOICE, Settings, resolve_api_key
 from .exceptions import TTSRequestError, VocalizeError
 from .preprocess import flatten_markdown, truncate_for_budget
 from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
-from .audio import play as play_audio
-from .audio import save as save_audio
 
 
 def _common_options(f):

@@ -7,7 +7,7 @@ name = "vocalize"
 version = "0.1.0"
 description = "A CLI that turns text, markdown, or piped stdin into speech via the ElevenLabs API, with markdown-table-aware preprocessing."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Mat" }]
 dependencies = [
@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dotenv = ["python-dotenv>=1.0"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff"]
 
 [project.scripts]
 vocalize = "vocalize.cli:run"

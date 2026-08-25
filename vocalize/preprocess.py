@@ -31,10 +31,8 @@ _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 
 def _split_table_row(line: str) -> list[str]:
     row = line.strip()
-    if row.startswith("|"):
-        row = row[1:]
-    if row.endswith("|"):
-        row = row[:-1]
+    row = row.removeprefix("|")
+    row = row.removesuffix("|")
     return [cell.strip() for cell in row.split("|")]
 
 
