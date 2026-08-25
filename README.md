@@ -122,6 +122,28 @@ run in Claude Code's own environment, not your interactive shell — if
 `VOCALIZE_BIN` to the full path (e.g. `/path/to/.venv/bin/vocalize`) to
 point the hook at it directly.
 
+## How it's built
+
+Four decisions shaped the design:
+
+- **The markdown flattener is a pure function.** The hardest logic in the
+  project — deciding what a table, list, or code block should *sound* like —
+  takes a string and returns a string. No I/O, no client, no key. That's why
+  it has the deepest test coverage in the repo, including the edge cases
+  that bit during review: prose containing a stray `|`, single-dash GFM
+  separators, ragged rows, duplicate column names.
+- **One code path for humans and hooks.** The Claude Code hook doesn't
+  reimplement synthesis; it shells out to the same `vocalize` CLI you'd
+  type by hand (with an `--` argv guard so a response starting with a
+  bullet isn't parsed as a flag). Anything the hook can do, you can
+  reproduce and debug from your own terminal.
+- **The hook may fail; the session may not.** Every failure path in the
+  Stop hook logs one line to stderr and exits 0. A dead API key or a hung
+  request costs you the audio, never the coding session.
+- **The cache is an optimization, never a failure source.** Synthesis
+  results are content-addressed on disk; an unreadable or unwritable cache
+  degrades to a fresh API call instead of an error.
+
 ## Architecture
 
 ```
