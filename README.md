@@ -28,6 +28,16 @@ API key or network access (see `tests/test_preprocess.py`).
 ## Install
 
 ```bash
+pipx install vocalize-cli
+```
+
+(or `uvx vocalize-cli` for a one-off run without installing anything). The
+package is published on PyPI as `vocalize-cli`; the command it installs is
+still `vocalize`.
+
+For a from-source or dev install:
+
+```bash
 git clone <this-repo>
 cd vocalize
 pip install -e .

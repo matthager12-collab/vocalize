@@ -3,21 +3,37 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vocalize"
+name = "vocalize-cli"
 version = "0.1.0"
 description = "A CLI that turns text, markdown, or piped stdin into speech via the ElevenLabs API, with markdown-table-aware preprocessing."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Mat" }]
+keywords = ["text-to-speech", "elevenlabs", "cli", "claude-code", "markdown"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = [
     "elevenlabs>=1.0.0",
     "click>=8.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/matthager12-collab/vocalize"
+Repository = "https://github.com/matthager12-collab/vocalize"
+
 [project.optional-dependencies]
 dotenv = ["python-dotenv>=1.0"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff", "build", "twine"]
 
 [project.scripts]
 vocalize = "vocalize.cli:run"
