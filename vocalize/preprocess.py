@@ -29,6 +29,11 @@ _BOLD_RE = re.compile(r"(\*\*|__)(.+?)\1")
 _ITALIC_RE = re.compile(r"(\*|_)(.+?)\1")
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 
+# Real Claude Code responses are mostly code blocks. Announcing both ends of
+# every one of them filled the whole spoken budget with bookkeeping, so it's
+# one short mention per block, and consecutive blocks share a single mention.
+_CODE_PLACEHOLDER = "Skipping a code block."
+
 
 def _split_table_row(line: str) -> list[str]:
     row = line.strip()
@@ -101,8 +106,10 @@ def flatten_markdown(text: str) -> str:
     - Tables become short "for X, Y is Z" sentences per row.
     - Headings become their own sentence (so there's a natural pause).
     - Bullet/numbered lists become "First, ... Next, ... Finally, ...".
-    - Fenced code blocks are replaced with a spoken placeholder — reading
-      code character-by-character out loud helps no one.
+    - Fenced code blocks become one short spoken placeholder each, and
+      back-to-back blocks collapse into a single mention — reading code
+      character-by-character out loud helps no one, and neither does
+      announcing six code blocks in a row.
     - Links, images, bold/italic markers, and inline code ticks are
       stripped down to their readable text.
     """
@@ -121,10 +128,10 @@ def flatten_markdown(text: str) -> str:
 
         if _FENCE_RE.match(line):
             in_code_block = not in_code_block
-            if not in_code_block:
-                out.append("End of code block.")
-            else:
-                out.append("Code block:")
+            if in_code_block:
+                last = next((s for s in reversed(out) if s), None)
+                if last != _CODE_PLACEHOLDER:
+                    out.append(_CODE_PLACEHOLDER)
             i += 1
             continue
 

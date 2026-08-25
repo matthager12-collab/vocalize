@@ -62,9 +62,24 @@ def test_code_block_is_replaced_not_read_verbatim():
     md = "Here's the fix:\n\n```python\ndef f():\n    return 1\n```\n\nDone."
     result = flatten_markdown(md)
     assert "def f()" not in result
-    assert "Code block:" in result
-    assert "End of code block." in result
+    assert "Skipping a code block." in result
+    # The closing fence stays silent: announcing both ends of every block ate
+    # the whole spoken budget on a real Claude Code response.
+    assert "End of code block" not in result
     assert "Done." in result
+
+
+def test_consecutive_code_blocks_collapse_to_one_placeholder():
+    md = "```python\na = 1\n```\n\n```python\nb = 2\n```\n"
+    result = flatten_markdown(md)
+    assert result.count("Skipping a code block.") == 1
+
+
+def test_code_blocks_separated_by_prose_each_get_a_placeholder():
+    md = "```python\na = 1\n```\n\nThen run it.\n\n```python\nb = 2\n```\n"
+    result = flatten_markdown(md)
+    assert result.count("Skipping a code block.") == 2
+    assert "Then run it." in result
 
 
 def test_inline_code_ticks_are_stripped():
