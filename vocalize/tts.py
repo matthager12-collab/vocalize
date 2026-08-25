@@ -48,11 +48,14 @@ def synthesize(
 
     cache_path = None
     if cache_dir is not None:
-        key = _cache_key(text, settings)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"{key}.mp3"
-        if cache_path.exists():
-            return cache_path.read_bytes()
+        cache_path = cache_dir / f"{_cache_key(text, settings)}.mp3"
+        # The cache is an optimization, never a failure source: an
+        # unreadable entry is just a miss.
+        try:
+            if cache_path.exists():
+                return cache_path.read_bytes()
+        except OSError:
+            pass
 
     try:
         chunks = client.text_to_speech.convert(
@@ -69,7 +72,13 @@ def synthesize(
         raise TTSRequestError("ElevenLabs API returned no audio data.")
 
     if cache_path is not None:
-        cache_path.write_bytes(audio)
+        # Never discard a paid API response because the cache dir is
+        # read-only — the caller's save path does the real persistence.
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(audio)
+        except OSError:
+            pass
 
     return audio
 

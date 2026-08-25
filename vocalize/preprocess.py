@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import re
 
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+# One dash per column is legal GitHub-flavored markdown ("| - | - |").
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
 _BULLET_RE = re.compile(r"^\s*[-*+]\s+(.*)")
 _NUMBERED_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)")

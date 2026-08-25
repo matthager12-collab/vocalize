@@ -140,6 +140,17 @@ def test_duplicate_header_names_do_not_drop_columns():
     assert "Lovelace" in result
 
 
+def test_single_dash_separator_is_a_table():
+    md = (
+        "| Metric | Q1 |\n"
+        "| - | - |\n"
+        "| Revenue | 4.2m |\n"
+    )
+    result = flatten_markdown(md)
+    assert "For Revenue: Q1 is 4.2m." in result
+    assert "|" not in result
+
+
 def test_single_row_table_is_grammatical():
     md = (
         "| Quarter | Revenue |\n"

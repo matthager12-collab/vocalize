@@ -1,4 +1,5 @@
 import json
+import shlex
 
 import install_hook
 import pytest
@@ -20,6 +21,17 @@ def test_creates_settings_file_when_absent(settings_path):
 
     command = _stop_groups(settings_path)[0]["hooks"][0]["command"]
     assert str(install_hook.HOOK_SCRIPT) in command
+
+
+def test_quotes_a_hook_path_containing_a_space(settings_path, monkeypatch, tmp_path):
+    script = tmp_path / "my checkout" / "claude_stop_hook.py"
+    monkeypatch.setattr(install_hook, "HOOK_SCRIPT", script)
+
+    assert install_hook.main() == 0
+
+    command = _stop_groups(settings_path)[0]["hooks"][0]["command"]
+    assert shlex.quote(str(script)) in command
+    assert shlex.split(command) == ["python3", str(script)]
 
 
 def test_is_idempotent(settings_path, capsys):

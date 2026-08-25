@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -55,6 +56,34 @@ def test_synthesize_uses_cache_on_second_call(tmp_path):
     assert first == second == b"only-once"
     # the underlying API should only have been hit once
     assert len(client.text_to_speech.calls) == 1
+
+
+def test_unreadable_cache_entry_falls_back_to_a_fresh_call(tmp_path):
+    client = FakeClient(chunks=(b"fresh",))
+    settings = Settings(voice_id="v1", model_id="m1")
+
+    synthesize(client, "hi", settings, cache_dir=tmp_path)
+
+    # A directory in the entry's place still reports exists(), but
+    # read_bytes() raises OSError.
+    entry = next(tmp_path.glob("*.mp3"))
+    entry.unlink()
+    entry.mkdir()
+
+    assert synthesize(client, "hi", settings, cache_dir=tmp_path) == b"fresh"
+    assert len(client.text_to_speech.calls) == 2
+
+
+def test_unwritable_cache_dir_still_returns_the_audio(tmp_path, monkeypatch):
+    client = FakeClient(chunks=(b"paid-for",))
+    settings = Settings()
+
+    def deny(*args, **kwargs):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(Path, "mkdir", deny)
+
+    assert synthesize(client, "hi", settings, cache_dir=tmp_path / "nope") == b"paid-for"
 
 
 def test_synthesize_rejects_empty_text(tmp_path):

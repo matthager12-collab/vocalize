@@ -9,6 +9,7 @@ it won't add a duplicate entry if one already points at this hook script.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import sys
 import time
@@ -48,10 +49,11 @@ def main() -> int:
         shutil.copy2(SETTINGS_PATH, backup)
         print(f"Backed up existing settings to {backup}")
 
+    command = f"python3 {shlex.quote(str(HOOK_SCRIPT))}"
     settings.setdefault("hooks", {}).setdefault("Stop", []).append(
         {
             "matcher": "",
-            "hooks": [{"type": "command", "command": f"python3 {HOOK_SCRIPT}"}],
+            "hooks": [{"type": "command", "command": command}],
         }
     )
 

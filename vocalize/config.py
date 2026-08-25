@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from .exceptions import MissingAPIKeyError
 
@@ -24,7 +25,10 @@ def _load_dotenv_if_present() -> None:
         from dotenv import load_dotenv  # type: ignore
     except ImportError:
         return
-    load_dotenv()
+    # Explicit path, not dotenv's default search: bare load_dotenv() walks
+    # up from the install directory, so a console-script install would miss
+    # the user's project .env and could pick up an unrelated one.
+    load_dotenv(dotenv_path=Path.cwd() / ".env")
 
 
 def resolve_api_key(explicit: str | None = None) -> str:
