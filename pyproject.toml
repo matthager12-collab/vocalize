@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
-    "elevenlabs>=1.0.0",
+    "elevenlabs>=2.0",
     "click>=8.1",
 ]
 

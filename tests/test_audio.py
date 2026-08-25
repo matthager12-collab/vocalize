@@ -23,11 +23,17 @@ def test_play_uses_first_available_player(monkeypatch, tmp_path):
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/ffplay" if exe == "ffplay" else None)
     calls = []
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+    call_kwargs = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kwargs: (calls.append(cmd), call_kwargs.append(kwargs))[0],
+    )
 
     play(path)
 
     assert calls == [["ffplay", "-nodisp", "-autoexit", str(path)]]
+    assert call_kwargs[0].get("check") is True
 
 
 def test_play_raises_when_no_player_found(monkeypatch, tmp_path):
@@ -47,7 +53,9 @@ def test_play_wraps_player_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
 
     def fake_run(cmd, **kwargs):
-        raise subprocess.CalledProcessError(1, cmd)
+        if kwargs.get("check"):
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 

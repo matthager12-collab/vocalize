@@ -7,10 +7,16 @@ from vocalize.cli import main
 
 def _patch_tts(monkeypatch, audio=b"fake-mp3-bytes"):
     monkeypatch.setattr(cli_module, "build_client", lambda key: object())
-    monkeypatch.setattr(cli_module, "synthesize", lambda client, text, settings: audio)
+    captured_text = []
+
+    def fake_synthesize(client, text, settings):
+        captured_text.append(text)
+        return audio
+
+    monkeypatch.setattr(cli_module, "synthesize", fake_synthesize)
     played = {}
     monkeypatch.setattr(cli_module, "play_audio", lambda path: played.setdefault("path", path))
-    return played
+    return played, captured_text
 
 
 def test_speak_writes_audio_file(monkeypatch, tmp_path):
@@ -28,7 +34,7 @@ def test_speak_writes_audio_file(monkeypatch, tmp_path):
 
 
 def test_speak_plays_by_default(monkeypatch, tmp_path):
-    played = _patch_tts(monkeypatch)
+    played, _captured_text = _patch_tts(monkeypatch)
     out_file = tmp_path / "out.mp3"
     runner = CliRunner()
 
@@ -56,7 +62,7 @@ def test_speak_file_reads_from_stdin(monkeypatch, tmp_path):
 
 
 def test_speak_file_reads_from_path(monkeypatch, tmp_path):
-    _patch_tts(monkeypatch)
+    _played, captured_text = _patch_tts(monkeypatch)
     src = tmp_path / "notes.md"
     src.write_text("| a | b |\n|---|---|\n| 1 | 2 |\n")
     out_file = tmp_path / "out.mp3"
@@ -69,6 +75,47 @@ def test_speak_file_reads_from_path(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert out_file.exists()
+    assert "Table with 1 row." in captured_text[0]
+    assert "|" not in captured_text[0]
+
+
+def test_raw_flag_skips_flattening(monkeypatch, tmp_path):
+    _played, captured_text = _patch_tts(monkeypatch)
+    src = tmp_path / "notes.md"
+    src.write_text("| a | b |\n|---|---|\n| 1 | 2 |\n")
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "speak-file", str(src), "--api-key", "fake-key",
+            "--output", str(out_file), "--no-play", "--raw",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "| a | b |" in captured_text[0]
+    assert "|---|---|" in captured_text[0]
+
+
+def test_max_chars_truncates_and_notes(monkeypatch, tmp_path):
+    _played, captured_text = _patch_tts(monkeypatch)
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "speak", "hello world, this is a long sentence to truncate",
+            "--api-key", "fake-key", "--output", str(out_file), "--no-play",
+            "--max-chars", "10",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured_text[0]) <= 10 + len("... (truncated)")
+    assert "truncated" in result.output
 
 
 def test_missing_api_key_gives_clean_error(monkeypatch):

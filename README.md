@@ -31,9 +31,9 @@ API key or network access (see `tests/test_preprocess.py`).
 pipx install vocalize-cli
 ```
 
-(or `uvx vocalize-cli` for a one-off run without installing anything). The
-package is published on PyPI as `vocalize-cli`; the command it installs is
-still `vocalize`.
+(or `uvx --from vocalize-cli vocalize` for a one-off run without installing
+anything). The package is published on PyPI as `vocalize-cli`; the command
+it installs is still `vocalize`.
 
 For a from-source or dev install:
 
@@ -86,6 +86,10 @@ by a hash of (text, voice, model, format) — re-running the same command
 twice doesn't burn API quota twice.
 
 ## Claude Code integration
+
+The hook scripts ship in the git repository, not the PyPI package — clone
+the repo to install the hook (it shells out to the `vocalize` command, so a
+pipx-installed CLI plus a cloned repo works fine together).
 
 `hooks/claude_stop_hook.py` is a [Claude Code Stop
 hook](https://docs.claude.com/en/docs/claude-code/hooks): a script Claude
@@ -172,6 +176,8 @@ All tests run offline: the ElevenLabs client is dependency-injected into
 - **`--api-key` on the command line is visible to other local processes**
   (anything that can run `ps`). Prefer the `ELEVENLABS_API_KEY` environment
   variable or a `.env` file instead.
+- `vocalize voices` lists only the first page of results from the
+  ElevenLabs API.
 
 ## License
 
