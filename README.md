@@ -1,0 +1,141 @@
+# vocalize
+
+A command-line tool that turns text, markdown files, or piped stdin into
+natural-sounding speech using the [ElevenLabs](https://elevenlabs.io) API —
+plus a hook that wires it directly into [Claude Code](https://claude.com/claude-code),
+so Claude's responses get read aloud automatically in your terminal or IDE.
+
+## Why this exists
+
+Text-to-speech readers are good at *voices* and bad at *structure*. Point one
+at a markdown report and it reads a table cell-by-cell, left to right, with
+no sense of which row or column you're in — "Q1. 4.2 million. Q2. 5.1
+million" instead of "for Q1, revenue is 4.2 million." Headings, bullet
+lists, and inline code fare the same way: read exactly as typed, syntax and
+all.
+
+`vocalize` fixes the part of that problem that's actually fixable without a
+vision model: a preprocessing pass (`vocalize/preprocess.py`) rewrites
+markdown into short, declarative sentences *before* it ever reaches the TTS
+API — tables become "for X, Y is Z" sentences, bullets become "First, ...
+Second, ...", links keep their text and drop the URL, and fenced code blocks
+are replaced with a spoken placeholder instead of being read character by
+character. It's a text transform, so it's fully unit tested without any
+API key or network access (see `tests/test_preprocess.py`).
+
+## Install
+
+```bash
+git clone <this-repo>
+cd vocalize
+pip install -e .
+```
+
+Get a free ElevenLabs API key at
+[elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)
+(free tier: 10,000 characters/month, API access included, no commercial
+license). Then either:
+
+```bash
+export ELEVENLABS_API_KEY=your-key-here
+```
+
+or copy `.env.example` to `.env` and fill it in (requires the optional
+`python-dotenv` extra: `pip install -e ".[dotenv]"`).
+
+## Usage
+
+```bash
+# Speak a string directly
+vocalize speak "Hello, this is a test."
+
+# Speak a markdown file — tables and formatting get flattened first
+vocalize speak-file report.md
+
+# Pipe anything in
+cat notes.md | vocalize speak-file -
+
+# List available voices and grab an ID
+vocalize voices
+
+# Use a specific voice/model, save without playing
+vocalize speak-file report.md --voice <voice-id> --model eleven_flash_v2_5 \
+  --output out.mp3 --no-play
+
+# Cap how much gets sent (handy for free-tier character budgets)
+vocalize speak-file long-report.md --max-chars 2000
+
+# Skip the markdown flattening entirely
+vocalize speak "raw **markdown** stays raw" --raw
+```
+
+Every synthesis result is cached on disk under `~/.cache/vocalize/`, keyed
+by a hash of (text, voice, model, format) — re-running the same command
+twice doesn't burn API quota twice.
+
+## Claude Code integration
+
+`hooks/claude_stop_hook.py` is a [Claude Code Stop
+hook](https://docs.claude.com/en/docs/claude-code/hooks): a script Claude
+Code runs every time it finishes a response. This one reads the transcript,
+pulls out Claude's last message, and pipes it through the same `vocalize`
+CLI — so it works identically whether Claude Code is running in a bare
+terminal or inside an IDE's integrated terminal (VS Code, Cursor, etc.),
+since both use the same `~/.claude/settings.json` hook config.
+
+To install it:
+
+```bash
+python hooks/install_hook.py
+```
+
+This merges a `Stop` hook entry into `~/.claude/settings.json` (backing up
+the existing file first) rather than overwriting your other hooks. Every
+Claude Code response after that gets spoken aloud automatically. Uninstall
+by removing the `vocalize` entry from the `Stop` array in that file.
+
+## Architecture
+
+```
+vocalize/
+  preprocess.py   # markdown -> speakable text (pure function, fully unit tested)
+  config.py       # API key resolution: --api-key > $ELEVENLABS_API_KEY > .env
+  tts.py          # ElevenLabs API wrapper + disk cache (client is injected, so
+                   # it's mockable in tests without hitting the network)
+  audio.py        # save to disk + play via the OS's native player
+                   # (afplay / mpg123 / ffplay / PowerShell, whichever exists)
+  cli.py          # click-based CLI wiring the above together
+hooks/
+  claude_stop_hook.py  # Claude Code Stop hook -> calls the vocalize CLI
+  install_hook.py      # safely merges the hook into ~/.claude/settings.json
+tests/                  # pytest, all mocked — no API key needed to run these
+```
+
+## Testing
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+All tests run offline: the ElevenLabs client is dependency-injected into
+`tts.py`, so tests pass in a fake client instead of hitting the real API.
+
+## Known limitations
+
+- **Charts and images aren't described.** Flattening markdown tables is a
+  text problem; a rendered chart is an image, and describing it well needs
+  a vision model in the loop, not a text transform. Out of scope for this
+  project, but a natural next step — pipe the image through a
+  vision-capable model first, feed its description into `vocalize` in
+  place of the chart.
+- **Free tier is 10,000 characters/month** — plenty for reading a handful
+  of documents aloud, not for continuous use. `--max-chars` and the disk
+  cache both help stretch it.
+- Table flattening handles standard GFM pipe tables; it doesn't attempt to
+  handle merged cells or nested tables (rare enough in practice that it
+  wasn't worth the complexity).
+
+## License
+
+MIT

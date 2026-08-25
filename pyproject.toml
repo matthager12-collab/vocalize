@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vocalize"
+version = "0.1.0"
+description = "A CLI that turns text, markdown, or piped stdin into speech via the ElevenLabs API, with markdown-table-aware preprocessing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Mat" }]
+dependencies = [
+    "elevenlabs>=1.0.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dotenv = ["python-dotenv>=1.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.scripts]
+vocalize = "vocalize.cli:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vocalize"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
