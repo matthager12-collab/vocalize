@@ -21,6 +21,7 @@ do it by hand — add to the "Stop" array:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -28,8 +29,6 @@ import sys
 # Keep spoken responses short by default — a Stop hook fires after every
 # turn, and a long response would eat the ElevenLabs free-tier quota fast.
 # Override with VOCALIZE_MAX_CHARS in the environment.
-import os
-
 DEFAULT_MAX_CHARS = 500
 
 
@@ -55,9 +54,17 @@ def _extract_last_assistant_text(transcript_path: str) -> str:
 
         message = entry.get("message", {})
         content = message.get("content", [])
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                last_text_parts.append(block["text"])
+        if isinstance(content, str):
+            # Older / alternate transcript shapes store the whole message as
+            # a plain string rather than a list of content blocks.
+            if content:
+                last_text_parts.append(content)
+        else:
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    if text:
+                        last_text_parts.append(text)
 
         if last_text_parts:
             break  # got the most recent assistant turn; stop scanning
@@ -79,7 +86,9 @@ def main() -> int:
     if not text.strip():
         return 0
 
-    vocalize_bin = shutil.which("vocalize")
+    # VOCALIZE_BIN wins over PATH so a venv install still resolves when the
+    # hook runs from Claude Code's environment rather than your own shell.
+    vocalize_bin = os.environ.get("VOCALIZE_BIN") or shutil.which("vocalize")
     if not vocalize_bin:
         # Silently no-op rather than breaking the user's session if the
         # tool isn't installed / not on PATH in this shell.
@@ -88,14 +97,18 @@ def main() -> int:
     max_chars = os.environ.get("VOCALIZE_MAX_CHARS", str(DEFAULT_MAX_CHARS))
 
     try:
-        subprocess.run(
+        result = subprocess.run(
             [vocalize_bin, "speak", text, "--max-chars", max_chars, "--play"],
             timeout=60,
             check=False,
         )
-    except Exception:
-        # A speech failure should never break the coding session.
-        pass
+        if result.returncode != 0:
+            print(f"vocalize hook: vocalize exited {result.returncode}", file=sys.stderr)
+    except Exception as exc:
+        # A speech failure should never break the coding session, so this
+        # still returns 0 — but it's logged to stderr rather than swallowed
+        # silently, so a broken hook is diagnosable.
+        print(f"vocalize hook: speech failed: {exc}", file=sys.stderr)
 
     return 0
 
