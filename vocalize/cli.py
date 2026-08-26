@@ -16,7 +16,7 @@ import click
 from . import __version__
 from .audio import play as play_audio
 from .audio import save as save_audio
-from .config import DEFAULT_MODEL, DEFAULT_VOICE, Settings, resolve_api_key
+from .config import DEFAULT_MODEL, DEFAULT_VOICE, resolve_api_key, resolve_settings
 from .exceptions import TTSRequestError, VocalizeError
 from .preprocess import flatten_markdown, truncate_for_budget
 from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
@@ -24,8 +24,14 @@ from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
 
 def _common_options(f):
     f = click.option("--api-key", default=None, help="ElevenLabs API key (overrides env/.env).")(f)
-    f = click.option("--voice", "voice_id", default=DEFAULT_VOICE, show_default=True, help="Voice ID to use.")(f)
-    f = click.option("--model", "model_id", default=DEFAULT_MODEL, show_default=True, help="ElevenLabs model ID.")(f)
+    # Defaults stay None so a flag can be told apart from "unset" — the
+    # built-in default is applied further down, by resolve_settings.
+    f = click.option("--voice", "voice_id", default=None,
+                      help=f"Voice ID to use (default: {DEFAULT_VOICE}).")(f)
+    f = click.option("--model", "model_id", default=None,
+                      help=f"ElevenLabs model ID (default: {DEFAULT_MODEL}).")(f)
+    f = click.option("--speed", type=float, default=None,
+                      help="Speech speed, 0.7–1.2; 1.0 is normal.")(f)
     f = click.option("-o", "--output", "output_path", type=click.Path(path_type=Path), default=None,
                       help="Save the generated audio to this path (default: "
                       "~/.cache/vocalize/last.mp3, overwritten each run).")(f)
@@ -41,7 +47,7 @@ def main() -> None:
     """Turn text, markdown, or piped stdin into speech via ElevenLabs."""
 
 
-def _run_tts(raw_text: str, *, api_key, voice_id, model_id, output_path, play, raw, max_chars) -> None:
+def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars) -> None:
     text = raw_text if raw else flatten_markdown(raw_text)
     text, truncated = truncate_for_budget(text, max_chars)
     if truncated:
@@ -50,9 +56,9 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, output_path, play, r
     if not text.strip():
         raise TTSRequestError("Nothing to speak: input text is empty.")
 
+    settings = resolve_settings(voice_id=voice_id, model_id=model_id, speed=speed)
     key = resolve_api_key(api_key)
     client = build_client(key)
-    settings = Settings(voice_id=voice_id, model_id=model_id)
 
     click.echo(f"Requesting {len(text)} characters of audio from ElevenLabs...", err=True)
     audio = synthesize(client, text, settings)
@@ -68,22 +74,22 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, output_path, play, r
 @main.command()
 @click.argument("text")
 @_common_options
-def speak(text, api_key, voice_id, model_id, output_path, play, raw, max_chars) -> None:
+def speak(text, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars) -> None:
     """Speak TEXT directly."""
-    _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id,
+    _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars)
 
 
 @main.command("speak-file")
 @click.argument("path", type=click.File("r", encoding="utf-8"))
 @_common_options
-def speak_file(path, api_key, voice_id, model_id, output_path, play, raw, max_chars) -> None:
+def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars) -> None:
     """Speak the contents of PATH (a markdown/text file), or "-" for stdin."""
     try:
         raw_text = path.read()
     except UnicodeDecodeError as exc:
         raise click.FileError(getattr(path, "name", "input"), hint="file is not valid UTF-8 text") from exc
-    _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id,
+    _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars)
 
 

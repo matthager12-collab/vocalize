@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,7 +6,7 @@ import pytest
 
 from vocalize.config import Settings
 from vocalize.exceptions import TTSRequestError
-from vocalize.tts import list_voices, synthesize
+from vocalize.tts import _cache_key, list_voices, synthesize
 
 
 class FakeTTSNamespace:
@@ -109,3 +110,37 @@ def test_list_voices_returns_id_and_name():
     result = list_voices(client)
 
     assert result == [{"id": "abc123", "name": "Rachel"}]
+
+
+def test_speed_is_passed_through_as_voice_settings(tmp_path):
+    client = FakeClient()
+    settings = Settings(voice_id="v1", model_id="m1", speed=1.1)
+
+    synthesize(client, "hi", settings, cache_dir=tmp_path)
+
+    assert client.text_to_speech.calls[0]["voice_settings"].speed == 1.1
+
+
+def test_unset_speed_sends_no_voice_settings_kwarg(tmp_path):
+    client = FakeClient()
+    settings = Settings(voice_id="v1", model_id="m1")
+
+    synthesize(client, "hi", settings, cache_dir=tmp_path)
+
+    assert "voice_settings" not in client.text_to_speech.calls[0]
+
+
+def test_cache_key_differs_by_speed():
+    unset = Settings(voice_id="v1", model_id="m1")
+    faster = Settings(voice_id="v1", model_id="m1", speed=1.1)
+
+    assert _cache_key("hi", unset) != _cache_key("hi", faster)
+
+
+def test_cache_key_is_unchanged_when_speed_is_unset():
+    # Pins the pre-speed payload scheme so caches written by older
+    # versions keep hitting.
+    settings = Settings(voice_id="v1", model_id="m1", output_format="f1")
+    old_payload = f"{settings.voice_id}|{settings.model_id}|{settings.output_format}|hi"
+
+    assert _cache_key("hi", settings) == hashlib.sha256(old_payload.encode("utf-8")).hexdigest()

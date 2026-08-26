@@ -2,8 +2,15 @@ import os
 
 import pytest
 
-from vocalize.config import _load_dotenv_if_present, resolve_api_key
-from vocalize.exceptions import MissingAPIKeyError
+from vocalize.config import (
+    DEFAULT_MODEL,
+    DEFAULT_VOICE,
+    _load_dotenv_if_present,
+    config_path,
+    resolve_api_key,
+    resolve_settings,
+)
+from vocalize.exceptions import ConfigError, MissingAPIKeyError
 
 # Bound at import time on purpose: conftest's autouse fixture replaces the
 # module attribute, so this reference is the only way to reach the real one.
@@ -37,3 +44,124 @@ def test_dotenv_loader_reads_the_env_file_in_the_cwd(monkeypatch, tmp_path):
     real_load_dotenv()
 
     assert os.environ["ELEVENLABS_API_KEY"] == "from-cwd-file"
+
+
+def _isolate(monkeypatch, tmp_path, body=None):
+    """Point the config loader at tmp_path and clear the setting env vars."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
+        monkeypatch.delenv(var, raising=False)
+    path = tmp_path / "vocalize" / "config.toml"
+    if body is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_config_path_honours_xdg_config_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert config_path() == tmp_path / "vocalize" / "config.toml"
+
+
+def test_config_path_falls_back_to_dot_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    assert config_path() == tmp_path / ".config" / "vocalize" / "config.toml"
+
+
+def test_missing_config_file_gives_the_built_in_defaults(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+
+    settings = resolve_settings()
+
+    assert settings.voice_id == DEFAULT_VOICE
+    assert settings.model_id == DEFAULT_MODEL
+    assert settings.speed is None
+
+
+def test_config_file_beats_the_default(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\nspeed = 0.9\n')
+
+    settings = resolve_settings()
+
+    assert settings.voice_id == "file-voice"
+    assert settings.model_id == "file-model"
+    assert settings.speed == 0.9
+
+
+def test_env_var_beats_the_config_file(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\nspeed = 0.9\n')
+    monkeypatch.setenv("VOCALIZE_VOICE", "env-voice")
+    monkeypatch.setenv("VOCALIZE_MODEL", "env-model")
+    monkeypatch.setenv("VOCALIZE_SPEED", "1.1")
+
+    settings = resolve_settings()
+
+    assert settings.voice_id == "env-voice"
+    assert settings.model_id == "env-model"
+    assert settings.speed == 1.1
+
+
+def test_flag_beats_env_var_and_config_file(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\nspeed = 0.9\n')
+    monkeypatch.setenv("VOCALIZE_VOICE", "env-voice")
+    monkeypatch.setenv("VOCALIZE_MODEL", "env-model")
+    monkeypatch.setenv("VOCALIZE_SPEED", "1.1")
+
+    settings = resolve_settings(voice_id="flag-voice", model_id="flag-model", speed=0.8)
+
+    assert settings.voice_id == "flag-voice"
+    assert settings.model_id == "flag-model"
+    assert settings.speed == 0.8
+
+
+def test_unknown_config_key_warns_but_still_loads_the_known_ones(monkeypatch, tmp_path, capsys):
+    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nvoise = "typo"\n')
+
+    settings = resolve_settings()
+
+    assert settings.voice_id == "file-voice"
+    captured = capsys.readouterr()
+    assert "vocalize: unknown config key 'voise'" in captured.err
+    assert captured.err.count("unknown config key") == 1
+
+
+def test_malformed_config_file_gives_a_clean_error(monkeypatch, tmp_path):
+    path = _isolate(monkeypatch, tmp_path, "voice = \n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_settings()
+
+    assert str(path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["fast", "0.2", "5"])
+def test_invalid_speed_from_the_env_var_is_rejected(monkeypatch, tmp_path, value):
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_SPEED", value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_settings()
+
+    assert "VOCALIZE_SPEED" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("literal", ['"fast"', "0.2", "5"])
+def test_invalid_speed_from_the_config_file_is_rejected(monkeypatch, tmp_path, literal):
+    path = _isolate(monkeypatch, tmp_path, f"speed = {literal}\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_settings()
+
+    assert "'speed'" in str(excinfo.value)
+    assert str(path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["fast", 0.2, 5])
+def test_invalid_speed_from_the_flag_is_rejected(monkeypatch, tmp_path, value):
+    _isolate(monkeypatch, tmp_path)
+
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_settings(speed=value)
+
+    assert "--speed" in str(excinfo.value)

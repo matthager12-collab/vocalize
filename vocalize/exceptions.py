@@ -17,6 +17,10 @@ class MissingAPIKeyError(VocalizeError):
         )
 
 
+class ConfigError(VocalizeError):
+    """Raised when the config file or one of its values is invalid."""
+
+
 class TTSRequestError(VocalizeError):
     """Raised when the ElevenLabs API call itself fails."""
 

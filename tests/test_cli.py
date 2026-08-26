@@ -8,15 +8,17 @@ from vocalize.cli import main
 def _patch_tts(monkeypatch, audio=b"fake-mp3-bytes"):
     monkeypatch.setattr(cli_module, "build_client", lambda key: object())
     captured_text = []
+    captured_settings = []
 
     def fake_synthesize(client, text, settings):
         captured_text.append(text)
+        captured_settings.append(settings)
         return audio
 
     monkeypatch.setattr(cli_module, "synthesize", fake_synthesize)
     played = {}
     monkeypatch.setattr(cli_module, "play_audio", lambda path: played.setdefault("path", path))
-    return played, captured_text
+    return played, captured_text, captured_settings
 
 
 def test_speak_writes_audio_file(monkeypatch, tmp_path):
@@ -34,7 +36,7 @@ def test_speak_writes_audio_file(monkeypatch, tmp_path):
 
 
 def test_speak_plays_by_default(monkeypatch, tmp_path):
-    played, _captured_text = _patch_tts(monkeypatch)
+    played, _captured_text, _captured_settings = _patch_tts(monkeypatch)
     out_file = tmp_path / "out.mp3"
     runner = CliRunner()
 
@@ -62,7 +64,7 @@ def test_speak_file_reads_from_stdin(monkeypatch, tmp_path):
 
 
 def test_speak_file_reads_from_path(monkeypatch, tmp_path):
-    _played, captured_text = _patch_tts(monkeypatch)
+    _played, captured_text, _captured_settings = _patch_tts(monkeypatch)
     src = tmp_path / "notes.md"
     src.write_text("| a | b |\n|---|---|\n| 1 | 2 |\n")
     out_file = tmp_path / "out.mp3"
@@ -80,7 +82,7 @@ def test_speak_file_reads_from_path(monkeypatch, tmp_path):
 
 
 def test_raw_flag_skips_flattening(monkeypatch, tmp_path):
-    _played, captured_text = _patch_tts(monkeypatch)
+    _played, captured_text, _captured_settings = _patch_tts(monkeypatch)
     src = tmp_path / "notes.md"
     src.write_text("| a | b |\n|---|---|\n| 1 | 2 |\n")
     out_file = tmp_path / "out.mp3"
@@ -100,7 +102,7 @@ def test_raw_flag_skips_flattening(monkeypatch, tmp_path):
 
 
 def test_max_chars_truncates_and_notes(monkeypatch, tmp_path):
-    _played, captured_text = _patch_tts(monkeypatch)
+    _played, captured_text, _captured_settings = _patch_tts(monkeypatch)
     out_file = tmp_path / "out.mp3"
     runner = CliRunner()
 
@@ -212,3 +214,59 @@ def test_default_output_lands_in_cache_dir(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert (tmp_path / "last.mp3").exists()
+
+
+def _isolate_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-config"))
+    for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_speed_flag_reaches_the_settings(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    _played, _captured_text, captured_settings = _patch_tts(monkeypatch)
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "speak", "hello", "--api-key", "fake-key",
+            "--output", str(out_file), "--no-play", "--speed", "1.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_settings[0].speed == 1.1
+
+
+def test_no_speed_flag_leaves_speed_unset(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    _played, _captured_text, captured_settings = _patch_tts(monkeypatch)
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        ["speak", "hello", "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_settings[0].speed is None
+
+
+def test_invalid_speed_gives_a_clean_error_not_a_traceback(monkeypatch, tmp_path, capsys):
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["vocalize", "speak", "hello", "--api-key", "fake-key", "--no-play", "--speed", "5"],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_module.run()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Error: ")
+    assert "--speed" in captured.err
+    assert "Traceback" not in captured.err

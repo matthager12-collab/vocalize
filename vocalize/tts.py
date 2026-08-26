@@ -22,6 +22,10 @@ REQUEST_TIMEOUT_SECONDS = 30
 
 def _cache_key(text: str, settings: Settings) -> str:
     payload = f"{settings.voice_id}|{settings.model_id}|{settings.output_format}|{text}"
+    # Appended only when speed is set, so an unset speed hashes exactly as
+    # it did before speed existed and older cache entries still hit.
+    if settings.speed is not None:
+        payload += f"|{settings.speed}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -40,8 +44,8 @@ def synthesize(
     shape works, which is what makes this testable with a stub.
 
     Results are cached on disk by a hash of (text, voice, model,
-    format), so re-running the same request — e.g. re-reading the
-    same document twice — doesn't burn API quota twice.
+    format, speed), so re-running the same request — e.g. re-reading
+    the same document twice — doesn't burn API quota twice.
     """
     if not text.strip():
         raise TTSRequestError("Nothing to speak: input text is empty.")
@@ -57,12 +61,21 @@ def synthesize(
         except OSError:
             pass
 
+    convert_kwargs = {}
+    if settings.speed is not None:
+        # Imported here, not at module level, for the same reason as in
+        # build_client: the default path stays usable without the SDK.
+        from elevenlabs import VoiceSettings
+
+        convert_kwargs["voice_settings"] = VoiceSettings(speed=settings.speed)
+
     try:
         chunks = client.text_to_speech.convert(
             text=text,
             voice_id=settings.voice_id,
             model_id=settings.model_id,
             output_format=settings.output_format,
+            **convert_kwargs,
         )
         audio = b"".join(chunks) if not isinstance(chunks, (bytes, bytearray)) else bytes(chunks)
     except Exception as exc:

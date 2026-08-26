@@ -77,13 +77,48 @@ vocalize speak-file report.md --voice <voice-id> --model eleven_flash_v2_5 \
 # Cap how much gets sent (handy for free-tier character budgets)
 vocalize speak-file long-report.md --max-chars 2000
 
+# Slow it down a little
+vocalize speak-file report.md --speed 0.9
+
 # Skip the markdown flattening entirely
 vocalize speak "raw **markdown** stays raw" --raw
 ```
 
 Every synthesis result is cached on disk under `~/.cache/vocalize/`, keyed
-by a hash of (text, voice, model, format) — re-running the same command
-twice doesn't burn API quota twice.
+by a hash of (text, voice, model, format, speed) — re-running the same
+command twice doesn't burn API quota twice.
+
+## Configuration
+
+Each setting is resolved on its own, taking the first source that supplies
+it: CLI flag, then environment variable, then config file, then the
+built-in default.
+
+| Setting | Flag | Env var | Config file key | Default |
+|---|---|---|---|---|
+| Voice ID | `--voice` | `VOCALIZE_VOICE` | `voice` | `21m00Tcm4TlvDq8ikWAM` ("Rachel") |
+| Model ID | `--model` | `VOCALIZE_MODEL` | `model` | `eleven_multilingual_v2` |
+| Speed | `--speed` | `VOCALIZE_SPEED` | `speed` | unset — the API's own 1.0 |
+| Max characters | `--max-chars` | `VOCALIZE_MAX_CHARS` (hook only) | not read from the config file | unset on the CLI; 500 in the hook |
+| Hook binary | — | `VOCALIZE_BIN` | not read from the config file | `vocalize` as found on `PATH` |
+
+The config file is TOML at `$XDG_CONFIG_HOME/vocalize/config.toml`, falling
+back to `~/.config/vocalize/config.toml`. Flat keys, no sections:
+
+```toml
+voice = "21m00Tcm4TlvDq8ikWAM"
+model = "eleven_flash_v2_5"
+speed = 0.95
+```
+
+Not having a config file is normal and silent. A file that isn't valid TOML
+is an error naming the file; a key that isn't recognised is a warning on
+stderr, so a typo doesn't pass unnoticed but doesn't stop the run either.
+`speed` must be a number between 0.7 and 1.2 — anything else is a one-line
+error naming the source it came from.
+
+The API key is separate and never read from this file: use `--api-key`,
+`ELEVENLABS_API_KEY`, or a `.env` file.
 
 ## Claude Code integration
 
@@ -162,7 +197,7 @@ vocalize/
   __init__.py     # package version
   __main__.py     # python -m vocalize entry point
   preprocess.py   # markdown -> speakable text (pure function, fully unit tested)
-  config.py       # API key resolution: --api-key > $ELEVENLABS_API_KEY > .env
+  config.py       # API key resolution + settings: flag > env > config.toml > default
   exceptions.py   # VocalizeError / TTSRequestError
   tts.py          # ElevenLabs API wrapper + disk cache (client is injected, so
                    # it's mockable in tests without hitting the network)
@@ -203,7 +238,8 @@ All tests run offline: the ElevenLabs client is dependency-injected into
   only plays WAV, so the mp3 files this tool generates likely won't play
   there. Use `--no-play` and open the saved file with whatever's on hand.
 - **The disk cache under `~/.cache/vocalize` grows unbounded.** It's
-  content-addressed (keyed by a hash of text, voice, model, and format),
+  content-addressed (keyed by a hash of text, voice, model, format, and
+  speed),
   so it's always safe to delete some or all of it — nothing will break,
   you'll just re-pay for a re-synthesized clip.
 - **`--api-key` on the command line is visible to other local processes**
