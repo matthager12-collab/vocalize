@@ -10,11 +10,16 @@ class MissingAPIKeyError(VocalizeError):
 
     def __init__(self) -> None:
         super().__init__(
-            "No ElevenLabs API key found. Set the ELEVENLABS_API_KEY "
-            "environment variable, add it to a .env file, or pass "
-            "--api-key on the command line. Get a free key at "
-            "https://elevenlabs.io/app/settings/api-keys"
+            "No ElevenLabs API key found. The easiest fix is `vocalize auth "
+            "login`, which stores one in your system keychain. You can also "
+            "set the ELEVENLABS_API_KEY environment variable, add it to a "
+            ".env file, or pass --api-key on the command line. Get a free key "
+            "at https://elevenlabs.io/app/settings/api-keys"
         )
+
+
+class AuthError(VocalizeError):
+    """Raised when the system keychain cannot be read from or written to."""
 
 
 class ConfigError(VocalizeError):

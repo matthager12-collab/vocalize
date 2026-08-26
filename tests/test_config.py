@@ -33,6 +33,19 @@ def test_raises_clear_error_when_nothing_found(monkeypatch):
         resolve_api_key(None)
 
 
+def test_falls_back_to_the_keychain(monkeypatch, fake_keychain):
+    from vocalize import auth
+
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    fake_keychain[(auth.SERVICE, auth.USERNAME)] = "keychain-key"
+
+    assert resolve_api_key(None) == "keychain-key"
+
+    # The keychain is the last tier: anything more local still wins.
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
+    assert resolve_api_key(None) == "env-key"
+
+
 def test_dotenv_loader_reads_the_env_file_in_the_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("ELEVENLABS_API_KEY=from-cwd-file\n", encoding="utf-8")

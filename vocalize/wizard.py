@@ -27,6 +27,7 @@ from pathlib import Path
 import click
 
 from .audio import play, save
+from .auth import login, prompt_for_key, scrub
 from .config import (
     DEFAULT_MODEL,
     SPEED_MAX,
@@ -38,7 +39,7 @@ from .config import (
     resolve_settings,
     validate_speed,
 )
-from .exceptions import ConfigError, VocalizeError
+from .exceptions import ConfigError, MissingAPIKeyError, VocalizeError
 from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
 
 PREVIEW_TEXT = "This is how vocalize will sound."
@@ -215,7 +216,43 @@ def _keep_label(existing: dict, key: str, resolved) -> str:
     return f"{resolved} — not in the file"
 
 
-def _voice_step(ui, current: str, keep: str):
+def _offer_key_setup(ui) -> str | None:
+    """Offer to store an API key when there isn't one yet.
+
+    Without this the wizard just degrades to typing a voice ID by hand,
+    which is a worse first run than being asked one question. Declining
+    keeps that degradation exactly as it was.
+
+    Returns why the attempt failed, or None. The caller carries that into
+    the voice step's note: anything printed on this screen is erased by
+    the next frame's clear, milliseconds later.
+    """
+    try:
+        resolve_api_key()
+    except MissingAPIKeyError:
+        pass
+    else:
+        return None
+
+    _clear(ui)
+    if not _confirm(ui, "No API key found. Set one up now?"):
+        return None
+
+    key = prompt_for_key()
+    if not key:
+        return None
+    try:
+        login(key)
+    except VocalizeError as exc:
+        # login already scrubs, but this is the last stop before a screen.
+        reason = scrub(str(exc), key)
+        # Also to stderr, which outlives the wizard and reaches a log.
+        click.echo(f"vocalize: could not store that key — {reason}", err=True)
+        return reason
+    return None
+
+
+def _voice_step(ui, current: str, keep: str, setup_error: str | None = None):
     rows = [(_KEEP, f"keep current ({keep})")]
     cursor = 0
     notes = []
@@ -229,7 +266,10 @@ def _voice_step(ui, current: str, keep: str):
         # manual entry rather than taking the whole wizard down.
         client = None
         voices = []
-        notes.append(f"No voice list ({exc}) — press m to type a voice ID by hand.")
+        # A failed setup explains this screen far better than the generic
+        # "no key found" it caused, and this note survives the redraws.
+        reason = f"key setup failed: {setup_error}" if setup_error else str(exc)
+        notes.append(f"No voice list ({reason}) — press m to type a voice ID by hand.")
     else:
         notes.append("Previews spend a few characters of your API quota.")
 
@@ -363,6 +403,8 @@ def _walk(ui) -> None:
     for key, value in existing.items():
         _toml_value(key, value)
 
+    setup_error = _offer_key_setup(ui)
+
     try:
         current = resolve_settings()
     except ConfigError as exc:
@@ -379,7 +421,7 @@ def _walk(ui) -> None:
 
     try:
         chosen = {
-            "voice": _voice_step(ui, current.voice_id, keep["voice"]),
+            "voice": _voice_step(ui, current.voice_id, keep["voice"], setup_error),
             "model": _model_step(ui, current.model_id, keep["model"]),
             "speed": _speed_step(ui, current.speed, keep["speed"]),
         }

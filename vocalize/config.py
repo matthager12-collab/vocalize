@@ -5,6 +5,7 @@ API key resolution order (first one found wins):
   2. ELEVENLABS_API_KEY environment variable
   3. A .env file in the current directory (loaded via python-dotenv,
      if it's installed — this is an optional dependency)
+  4. The OS keychain, written by `vocalize auth login`
 
 Voice, model and speed are resolved per setting, in this order:
   CLI flag > environment variable > config file > built-in default
@@ -17,6 +18,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import auth
 from .exceptions import ConfigError, MissingAPIKeyError
 
 DEFAULT_VOICE = "21m00Tcm4TlvDq8ikWAM"  # "Rachel" — a stock ElevenLabs voice
@@ -42,7 +44,10 @@ def _load_dotenv_if_present() -> None:
 
 
 def resolve_api_key(explicit: str | None = None) -> str:
-    """Find an API key from --api-key, the environment, or .env.
+    """Find an API key from --api-key, the environment, .env, or the keychain.
+
+    The keychain comes last on purpose: a project that pins its own key in
+    a .env file must not be overridden by a machine-wide stored one.
 
     Raises MissingAPIKeyError if none is found.
     """
@@ -52,6 +57,10 @@ def resolve_api_key(explicit: str | None = None) -> str:
     _load_dotenv_if_present()
 
     key = os.environ.get("ELEVENLABS_API_KEY")
+    if key:
+        return key
+
+    key = auth.stored_key()
     if key:
         return key
 

@@ -6,10 +6,10 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from vocalize import wizard
+from vocalize import auth, wizard
 from vocalize.cli import main
 from vocalize.config import DEFAULT_MODEL, load_config_file
-from vocalize.exceptions import ConfigError, MissingAPIKeyError
+from vocalize.exceptions import ConfigError, MissingAPIKeyError, TTSRequestError
 
 UP = "\x1b[A"
 DOWN = "\x1b[B"
@@ -64,11 +64,19 @@ def _setup(
     confirm=True,
     api_key="fake-key",
     patch_ui=True,
+    front_door=False,
 ):
     """Point the wizard at a throwaway config file and a scripted keyboard.
 
     patch_ui=True aims the wizard's UI stream at sys.stdout, so capsys sees
     the frames; the tty-seam tests pass False and drive the real factory.
+
+    front_door=False stubs out the "no API key — set one up?" question and
+    fakes resolve_api_key, so these tests only exercise the three steps;
+    the front-door tests pass True and drive the real key resolution.
+
+    `confirm` may be a bool, or a callable taking the prompt's label — the
+    front door and the final write both go through _confirm.
     """
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
@@ -91,15 +99,26 @@ def _setup(
         return answers.pop(0)
 
     monkeypatch.setattr(wizard, "_ask", fake_ask)
-    monkeypatch.setattr(wizard, "_confirm", lambda *args, **kwargs: confirm)
 
-    if api_key is None:
+    confirms = []
+
+    def fake_confirm(ui, label, **kwargs):
+        confirms.append(label)
+        return confirm(label) if callable(confirm) else confirm
+
+    monkeypatch.setattr(wizard, "_confirm", fake_confirm)
+
+    if front_door:
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    elif api_key is None:
+        monkeypatch.setattr(wizard, "_offer_key_setup", lambda ui: None)
 
         def no_key(*args, **kwargs):
             raise MissingAPIKeyError()
 
         monkeypatch.setattr(wizard, "resolve_api_key", no_key)
     else:
+        monkeypatch.setattr(wizard, "_offer_key_setup", lambda ui: None)
         monkeypatch.setattr(wizard, "resolve_api_key", lambda *args, **kwargs: api_key)
 
     client = object()
@@ -119,6 +138,7 @@ def _setup(
 
     return SimpleNamespace(
         keyboard=keyboard,
+        confirms=confirms,
         synth_calls=synth_calls,
         played=played,
         path=tmp_path / "config" / "vocalize" / "config.toml",
@@ -200,6 +220,76 @@ def test_keyless_mode_falls_back_to_manual_entry(monkeypatch, tmp_path, capsys):
         'model = "eleven_flash_v2_5"\n'
         "speed = 0.9\n"
     )
+
+
+def test_a_missing_key_is_offered_a_setup_and_the_new_one_is_used(
+    monkeypatch, tmp_path, capsys, fake_keychain
+):
+    # down to Rachel, up to "keep current" for the model, keep the speed
+    ctx = _setup(monkeypatch, tmp_path, [DOWN, ENTER, UP, ENTER, ENTER], front_door=True)
+    validated = []
+    monkeypatch.setattr("vocalize.auth.validate_key", validated.append)
+    monkeypatch.setattr(wizard, "prompt_for_key", lambda: "typed-key")
+
+    wizard.run_wizard()
+
+    assert "No API key found. Set one up now?" in ctx.confirms
+    assert validated == ["typed-key"]  # validated before it was stored
+    assert fake_keychain[(auth.SERVICE, auth.USERNAME)] == "typed-key"
+    # The stored key is what fetched the list, so there's no degradation note
+    out = capsys.readouterr().out
+    assert "No voice list" not in out
+    assert "abc123  Rachel" in out
+    assert ctx.path.read_text() == 'voice = "abc123"\n'
+
+
+def test_declining_the_key_setup_keeps_the_keyless_degradation(
+    monkeypatch, tmp_path, capsys, fake_keychain
+):
+    def never(*args, **kwargs):
+        raise AssertionError("declining must not ask for a key")
+
+    keys = ["m", DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
+    ctx = _setup(
+        monkeypatch, tmp_path, keys,
+        prompts=["manual-voice"],
+        front_door=True,
+        confirm=lambda label: "Set one up now" not in label,
+    )
+    monkeypatch.setattr(wizard, "prompt_for_key", never)
+
+    wizard.run_wizard()
+
+    assert fake_keychain == {}
+    assert "No voice list" in capsys.readouterr().out
+    assert ctx.path.read_text() == (
+        'voice = "manual-voice"\n'
+        'model = "eleven_flash_v2_5"\n'
+        "speed = 0.9\n"
+    )
+
+
+def test_a_failed_key_setup_names_the_reason_on_the_voice_frame(
+    monkeypatch, tmp_path, capsys, fake_keychain
+):
+    def reject(key):
+        raise TTSRequestError("401 unauthorized")
+
+    # m types a voice by hand, up to "keep current" for the model, keep speed
+    ctx = _setup(monkeypatch, tmp_path, ["m", UP, ENTER, ENTER],
+                 prompts=["manual-voice"], front_door=True)
+    monkeypatch.setattr(wizard, "prompt_for_key", lambda: "typed-key")
+    monkeypatch.setattr("vocalize.auth.validate_key", reject)
+
+    wizard.run_wizard()
+
+    captured = capsys.readouterr()
+    # The stderr line is erased from the screen by the next frame's clear,
+    # so the reason has to survive on the frame itself.
+    assert "No voice list (key setup failed: 401 unauthorized)" in captured.out
+    assert "could not store that key — 401 unauthorized" in captured.err
+    assert fake_keychain == {}
+    assert ctx.path.read_text() == 'voice = "manual-voice"\n'
 
 
 def test_non_tty_stdin_is_a_clean_error(monkeypatch, tmp_path):

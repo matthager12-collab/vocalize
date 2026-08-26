@@ -5,6 +5,7 @@
     cat notes.md | vocalize speak-file - --play
     vocalize voices
     vocalize config
+    vocalize auth login
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import click
 from . import __version__
 from .audio import play as play_audio
 from .audio import save as save_audio
+from .auth import delete_key, key_source, login, masked, probe_keychain, prompt_for_key
 from .config import DEFAULT_MODEL, DEFAULT_VOICE, resolve_api_key, resolve_settings
 from .exceptions import TTSRequestError, VocalizeError
 from .preprocess import flatten_markdown, truncate_for_budget
@@ -109,6 +111,58 @@ def voices(api_key) -> None:
 def config_cmd() -> None:
     """Interactive setup: pick voice, model, and speed."""
     run_wizard()
+
+
+@main.group()
+def auth() -> None:
+    """Store, inspect, or remove the ElevenLabs API key."""
+
+
+@auth.command("login")
+@click.option("--stdin", "from_stdin", is_flag=True,
+              help="Read the key from stdin instead of prompting, for piping from a secret manager.")
+def auth_login(from_stdin) -> None:
+    """Validate an API key and save it in the system keychain."""
+    key = sys.stdin.readline().strip() if from_stdin else prompt_for_key()
+    if not key:
+        raise click.ClickException("No API key given — nothing was stored.")
+    try:
+        click.echo(login(key))
+    except VocalizeError as exc:
+        # Raised before anything is written, so a rejected key leaves
+        # whatever was already stored untouched.
+        raise click.ClickException(str(exc)) from exc
+
+
+@auth.command("status")
+def auth_status() -> None:
+    """Report where the API key comes from, without revealing it."""
+    source = key_source(None)
+    if source != "not found":
+        click.echo(f"API key source: {source}")
+        click.echo(f"Key: {masked(resolve_api_key())}")
+        return
+
+    # key_source flattens an unreadable keychain into "not found" so that
+    # resolution never crashes. A status command must not repeat that lie.
+    status, reason = probe_keychain()
+    if status == "error":
+        click.echo(f"API key source: keychain unavailable ({reason})")
+        click.echo("Unlock your keychain and try again, or run `vocalize auth login`.")
+        return
+    click.echo("API key source: not found")
+    click.echo("Run `vocalize auth login` to store one in your system keychain.")
+
+
+@auth.command("logout")
+def auth_logout() -> None:
+    """Remove the stored API key from the system keychain."""
+    try:
+        delete_key()
+    except VocalizeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    # delete_key reads the entry back, so this line is a fact, not a hope.
+    click.echo("Removed the stored API key from the system keychain.")
 
 
 def run() -> None:
