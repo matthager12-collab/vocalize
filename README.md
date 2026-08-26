@@ -224,6 +224,36 @@ run in Claude Code's own environment, not your interactive shell — if
 `VOCALIZE_BIN` to the full path (e.g. `/path/to/.venv/bin/vocalize`) to
 point the hook at it directly.
 
+### Speaking files, artifacts, and more
+
+Two primitives cover almost everything: `vocalize speak-file <path>` speaks
+any local file (markdown flattened first), and the hook's `--latest` mode
+speaks the most recent Claude Code response. Anything Claude itself has to
+fetch — a claude.ai artifact, for instance — has to be fetched *by Claude*
+(the CLI has no session), summarized, and piped in:
+
+```bash
+printf '%s' "the summary text" | vocalize speak-file -
+```
+
+If you wire this into a slash command of your own, treat it as a security
+surface, because **every character you speak is sent to ElevenLabs**. The
+guard principles that matter, in order:
+
+1. Resolve paths (`realpath`, expand `~`, casefold) and check an
+   **allow-list** of speakable directories — symlinks and `../` defeat
+   string matching on the raw argument.
+2. Hard-refuse secret-shaped files (`.env*`, keys, credentials) and your
+   sensitive directories; confirm before speaking anything else unusual.
+3. Summarize long or fetched content in an **isolated subagent** that
+   returns only the summary — content you fetched can carry instructions
+   aimed at your session.
+4. Pipe summaries over stdin (as above) — no temp files, nothing in argv.
+5. Confirm before any read that will spend real quota; a free tier is
+   10,000 characters a month.
+6. Remember the disk cache: everything spoken leaves an mp3 under
+   `~/.cache/vocalize/`.
+
 ## How it's built
 
 Four decisions shaped the design:
