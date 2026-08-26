@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.0
+
+### Added
+
+- `vocalize usage` — ElevenLabs quota and local cache at a glance.
+
 ## 0.3.0
 
 ### Added

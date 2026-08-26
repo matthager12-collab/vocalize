@@ -4,6 +4,7 @@
     vocalize speak-file report.md --play
     cat notes.md | vocalize speak-file - --play
     vocalize voices
+    vocalize usage
     vocalize config
     vocalize auth login
 """
@@ -11,6 +12,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -22,7 +24,7 @@ from .auth import delete_key, key_source, login, masked, probe_keychain, prompt_
 from .config import DEFAULT_MODEL, DEFAULT_VOICE, resolve_api_key, resolve_settings
 from .exceptions import TTSRequestError, VocalizeError
 from .preprocess import flatten_markdown, truncate_for_budget
-from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
+from .tts import DEFAULT_CACHE_DIR, build_client, get_usage, list_voices, synthesize
 from .wizard import run_wizard
 
 
@@ -105,6 +107,47 @@ def voices(api_key) -> None:
     client = build_client(key)
     for v in list_voices(client):
         click.echo(f"{v['id']}\t{v['name']}")
+
+
+def _human_readable_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+@main.command()
+@click.option("--api-key", default=None)
+def usage(api_key) -> None:
+    """Show ElevenLabs quota usage and local cache stats."""
+    key = resolve_api_key(api_key)
+    client = build_client(key)
+    stats = get_usage(client)
+
+    used, limit = stats["used"], stats["limit"]
+    percent = (used / limit * 100) if limit else 0.0
+    remaining = max(limit - used, 0)
+
+    click.echo(f"Tier: {stats['tier']}")
+    click.echo(f"Used: {used:,} / {limit:,} characters ({percent:.1f}%)")
+    click.echo(f"Remaining: {remaining:,} characters")
+    if stats["resets_at"] is not None:
+        # UTC-aware, then converted to the system's local zone explicitly —
+        # a bare fromtimestamp() is implicitly local, which ruff (DTZ006)
+        # flags as ambiguous.
+        local_reset = datetime.fromtimestamp(stats["resets_at"], tz=timezone.utc).astimezone()
+        click.echo(f"Resets: {local_reset.strftime('%Y-%m-%d')}")
+
+    click.echo("")
+    # Local cache stats are pure filesystem lookups — no API call, no quota.
+    cache_files = list(DEFAULT_CACHE_DIR.glob("*.mp3")) if DEFAULT_CACHE_DIR.is_dir() else []
+    if not cache_files:
+        click.echo("Local cache: cache empty")
+    else:
+        total_bytes = sum(f.stat().st_size for f in cache_files)
+        click.echo(f"Local cache: {len(cache_files)} files, {_human_readable_size(total_bytes)}")
 
 
 @main.command("config")

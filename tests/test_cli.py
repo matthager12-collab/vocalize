@@ -255,6 +255,51 @@ def test_no_speed_flag_leaves_speed_unset(monkeypatch, tmp_path):
     assert captured_settings[0].speed is None
 
 
+def test_usage_command_prints_tier_used_limit_and_percent(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
+    monkeypatch.setattr(
+        cli_module,
+        "get_usage",
+        lambda client: {"tier": "creator", "used": 12345, "limit": 100000, "resets_at": None},
+    )
+    # Empty tmp_path also covers the "cache empty" branch.
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["usage", "--api-key", "fake-key"])
+
+    assert result.exit_code == 0, result.output
+    assert "creator" in result.output
+    assert "12,345" in result.output
+    assert "100,000" in result.output
+    assert "12.3%" in result.output
+    assert "cache empty" in result.output
+
+
+def test_usage_command_reports_local_cache_file_count(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    reset_unix = 1735689600
+    expected_date = datetime.fromtimestamp(reset_unix, tz=timezone.utc).astimezone().strftime("%Y-%m-%d")
+    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
+    monkeypatch.setattr(
+        cli_module,
+        "get_usage",
+        lambda client: {"tier": "free", "used": 0, "limit": 10000, "resets_at": reset_unix},
+    )
+    (tmp_path / "a.mp3").write_bytes(b"x" * 1000)
+    (tmp_path / "b.mp3").write_bytes(b"y" * 2000)
+    (tmp_path / "not-audio.txt").write_bytes(b"ignore me")
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["usage", "--api-key", "fake-key"])
+
+    assert result.exit_code == 0, result.output
+    assert "2 files" in result.output
+    assert expected_date in result.output
+
+
 def test_invalid_speed_gives_a_clean_error_not_a_traceback(monkeypatch, tmp_path, capsys):
     _isolate_config(monkeypatch, tmp_path)
     monkeypatch.setattr(

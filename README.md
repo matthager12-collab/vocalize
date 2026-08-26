@@ -105,6 +105,9 @@ cat notes.md | vocalize speak-file -
 # List available voices and grab an ID
 vocalize voices
 
+# Check your quota and cache
+vocalize usage
+
 # Use a specific voice/model, save without playing
 vocalize speak-file report.md --voice <voice-id> --model eleven_flash_v2_5 \
   --output out.mp3 --no-play

@@ -6,7 +6,7 @@ import pytest
 
 from vocalize.config import Settings
 from vocalize.exceptions import TTSRequestError
-from vocalize.tts import _cache_key, list_voices, synthesize
+from vocalize.tts import _cache_key, get_usage, list_voices, synthesize
 
 
 class FakeTTSNamespace:
@@ -28,6 +28,26 @@ class FakeVoicesNamespace:
 
     def search(self):
         return SimpleNamespace(voices=self._voices)
+
+
+class FakeUserNamespace:
+    def __init__(self, tier="free", used=1000, limit=10000, resets_at=1700000000, raise_error=None):
+        self._tier = tier
+        self._used = used
+        self._limit = limit
+        self._resets_at = resets_at
+        self._raise_error = raise_error
+        self.subscription = SimpleNamespace(get=self._get)
+
+    def _get(self):
+        if self._raise_error:
+            raise self._raise_error
+        return SimpleNamespace(
+            tier=self._tier,
+            character_count=self._used,
+            character_limit=self._limit,
+            next_character_count_reset_unix=self._resets_at,
+        )
 
 
 class FakeClient:
@@ -144,3 +164,28 @@ def test_cache_key_is_unchanged_when_speed_is_unset():
     old_payload = f"{settings.voice_id}|{settings.model_id}|{settings.output_format}|hi"
 
     assert _cache_key("hi", settings) == hashlib.sha256(old_payload.encode("utf-8")).hexdigest()
+
+
+def test_get_usage_returns_tier_used_limit_and_reset():
+    client = SimpleNamespace(
+        user=FakeUserNamespace(tier="creator", used=4200, limit=100000, resets_at=1735689600)
+    )
+
+    result = get_usage(client)
+
+    assert result == {"tier": "creator", "used": 4200, "limit": 100000, "resets_at": 1735689600}
+
+
+def test_get_usage_passes_through_a_missing_reset_time():
+    client = SimpleNamespace(user=FakeUserNamespace(resets_at=None))
+
+    result = get_usage(client)
+
+    assert result["resets_at"] is None
+
+
+def test_get_usage_wraps_sdk_errors():
+    client = SimpleNamespace(user=FakeUserNamespace(raise_error=RuntimeError("unauthorized")))
+
+    with pytest.raises(TTSRequestError, match="unauthorized"):
+        get_usage(client)

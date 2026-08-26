@@ -110,6 +110,25 @@ def list_voices(client) -> list[dict]:
     ]
 
 
+def get_usage(client) -> dict:
+    """Return ElevenLabs subscription usage: tier, used, limit, resets_at.
+
+    `resets_at` is the unix timestamp of the next character-count reset,
+    or None on tiers that don't report one. This call costs no quota.
+    """
+    try:
+        subscription = client.user.subscription.get()
+    except Exception as exc:
+        raise TTSRequestError(f"Could not fetch usage: {exc}") from exc
+
+    return {
+        "tier": subscription.tier,
+        "used": subscription.character_count,
+        "limit": subscription.character_limit,
+        "resets_at": subscription.next_character_count_reset_unix,
+    }
+
+
 def build_client(api_key: str):
     """Construct the real ElevenLabs SDK client. Imported lazily so the
     rest of the package (and its tests) don't require the `elevenlabs`
