@@ -1,3 +1,4 @@
+import io
 import sys
 from types import SimpleNamespace
 
@@ -27,6 +28,17 @@ class FakeStdin:
         return self._tty
 
 
+class FakeTTY(io.StringIO):
+    """A /dev/tty stand-in that stays readable after the wizard closes it."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed_by_wizard = False
+
+    def close(self):
+        self.closed_by_wizard = True
+
+
 class Keyboard:
     """A scripted keyboard: each getchar() call returns the next key."""
 
@@ -42,8 +54,22 @@ class Keyboard:
         return key
 
 
-def _setup(monkeypatch, tmp_path, keys, *, voices=None, prompts=(), confirm=True, api_key="fake-key"):
-    """Point the wizard at a throwaway config file and a scripted keyboard."""
+def _setup(
+    monkeypatch,
+    tmp_path,
+    keys,
+    *,
+    voices=None,
+    prompts=(),
+    confirm=True,
+    api_key="fake-key",
+    patch_ui=True,
+):
+    """Point the wizard at a throwaway config file and a scripted keyboard.
+
+    patch_ui=True aims the wizard's UI stream at sys.stdout, so capsys sees
+    the frames; the tty-seam tests pass False and drive the real factory.
+    """
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
         monkeypatch.delenv(var, raising=False)
@@ -51,19 +77,21 @@ def _setup(monkeypatch, tmp_path, keys, *, voices=None, prompts=(), confirm=True
     monkeypatch.setenv("LINES", "40")
 
     monkeypatch.setattr(sys, "stdin", FakeStdin(tty=True))
-    monkeypatch.setattr(click, "clear", lambda: None)
+    if patch_ui:
+        # Resolved lazily: sys.stdout is whatever capsys has installed.
+        monkeypatch.setattr(wizard, "_open_ui_stream", lambda: (sys.stdout, False))
     keyboard = Keyboard(keys)
     monkeypatch.setattr(click, "getchar", keyboard)
 
     answers = list(prompts)
 
-    def fake_prompt(text, **kwargs):
+    def fake_ask(ui, label, **kwargs):
         if not answers:
-            raise AssertionError(f"unexpected prompt: {text}")
+            raise AssertionError(f"unexpected prompt: {label}")
         return answers.pop(0)
 
-    monkeypatch.setattr(click, "prompt", fake_prompt)
-    monkeypatch.setattr(click, "confirm", lambda *args, **kwargs: confirm)
+    monkeypatch.setattr(wizard, "_ask", fake_ask)
+    monkeypatch.setattr(wizard, "_confirm", lambda *args, **kwargs: confirm)
 
     if api_key is None:
 
@@ -280,6 +308,64 @@ def test_keep_current_names_the_file_value_not_the_env_var(monkeypatch, tmp_path
     assert "keep current (from-the-env)" not in out
     assert "voice → unchanged (from-the-file)" in out
     assert ctx.path.read_text() == 'voice = "from-the-file"\n'
+
+
+def _piped(monkeypatch):
+    """stdout relayed down a pipe (`op run`), with /dev/tty still openable."""
+    tty = FakeTTY()
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(wizard, "_open_tty", lambda: tty)
+    assert not sys.stdout.isatty()
+    return tty
+
+
+def test_piped_stdout_paints_to_dev_tty(monkeypatch, tmp_path):
+    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
+    ctx = _setup(monkeypatch, tmp_path, keys, patch_ui=False)
+    tty = _piped(monkeypatch)
+
+    wizard.run_wizard()  # not refused: the keyboard and /dev/tty are both there
+
+    painted = tty.getvalue()
+    assert "\x1b[2J\x1b[H" in painted  # our own clear; click.clear() would no-op
+    assert "Step 1 of 3 — Voice" in painted
+    assert "Step 2 of 3 — Model" in painted
+    assert "Step 3 of 3 — Speed" in painted
+    assert wizard.VOICE_HOTKEYS in painted
+    assert "About to write:" in painted
+    # None of it went down the pipe, and the stream we opened got closed
+    assert "Step 1 of 3 — Voice" not in sys.stdout.getvalue()
+    assert tty.closed_by_wizard
+    assert ctx.path.read_text() == (
+        'voice = "abc123"\n'
+        'model = "eleven_flash_v2_5"\n'
+        "speed = 0.9\n"
+    )
+
+
+def test_headless_still_refused(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(sys, "stdin", FakeStdin(tty=False))
+    opened = []
+    monkeypatch.setattr(wizard, "_open_tty", lambda: opened.append(True))
+
+    with pytest.raises(ConfigError, match="interactive terminal"):
+        wizard.run_wizard()
+
+    assert opened == []  # a dead stdin is decided on its own, before any tty
+    assert not (tmp_path / "config" / "vocalize" / "config.toml").exists()
+
+
+def test_confirmation_line_reaches_stdout_too(monkeypatch, tmp_path):
+    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
+    ctx = _setup(monkeypatch, tmp_path, keys, patch_ui=False)
+    tty = _piped(monkeypatch)
+
+    wizard.run_wizard()
+
+    assert f"Wrote {ctx.path}" in tty.getvalue()
+    # Wrappers and logs only capture stdout, so the outcome has to land there
+    assert sys.stdout.getvalue().strip() == f"Wrote {ctx.path}"
 
 
 def test_the_current_voice_starts_under_the_cursor(monkeypatch, tmp_path, capsys):

@@ -4,6 +4,13 @@ Three steps — voice, model, speed — each a keyboard-driven list rendered
 with click.echo and driven by click.getchar(). click is already a
 dependency, so this needs no curses, prompt_toolkit, or anything else.
 
+Every frame is painted on the controlling terminal rather than on
+stdout. Wrappers that relay a child's output — `op run`, the documented
+way this project injects its API key — leave sys.stdout non-tty while
+the keyboard still works, which makes click.clear() a no-op and lets the
+relay's writes land in the middle of a raw-mode read. Painting at
+/dev/tty sidesteps both.
+
 This module owns the *interaction* only. Every default, bound, and
 validation rule still comes from vocalize.config, and the voice list and
 previews go through the same tts/audio functions the rest of the CLI
@@ -61,15 +68,61 @@ _CHROME_LINES = 8
 _KEEP = object()
 _UNSET = object()
 
+_NO_TERMINAL = (
+    "The config wizard needs an interactive terminal. "
+    "Run `vocalize config` in a terminal, not from a pipe or a script."
+)
+
 
 class _Cancelled(Exception):
     """Raised inside a step on q, Escape, or EOF."""
 
 
-def _render(title: str, rows: list, cursor: int, legend: str, notes: list) -> None:
-    click.clear()
-    click.echo(title)
-    click.echo()
+def _open_tty():
+    """The controlling terminal as a writable stream, or None."""
+    try:
+        return open("/dev/tty", "w", encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _open_ui_stream():
+    """Where to paint the wizard: (stream, did_we_open_it).
+
+    Returns (None, False) when there's no terminal to paint on at all.
+    """
+    stdout = sys.stdout
+    if stdout is not None and stdout.isatty():
+        return stdout, False
+    tty = _open_tty()
+    return (tty, True) if tty is not None else (None, False)
+
+
+def _clear(ui) -> None:
+    # click.clear() only ever writes to stdout, and no-ops when stdout
+    # isn't a tty — which is the whole case this wizard has to survive.
+    ui.write("\x1b[2J\x1b[H")
+    ui.flush()
+
+
+def _ask(ui, label: str) -> str:
+    """Read one typed line. The tty driver echoes the typing itself."""
+    click.echo(f"{label}: ", file=ui, nl=False)
+    try:
+        return input()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def _confirm(ui, label: str) -> bool:
+    """Default no: an empty answer, or an EOF, must not write the file."""
+    return _ask(ui, f"{label} [y/N]").strip().lower() in ("y", "yes")
+
+
+def _render(ui, title: str, rows: list, cursor: int, legend: str, notes: list) -> None:
+    _clear(ui)
+    click.echo(title, file=ui)
+    click.echo(file=ui)
 
     # A full ElevenLabs voice list is longer than an 80x24 terminal, so the
     # list is windowed onto the cursor rather than echoed whole — otherwise
@@ -79,21 +132,21 @@ def _render(title: str, rows: list, cursor: int, legend: str, notes: list) -> No
     end = min(start + height, len(rows))
 
     if start > 0:
-        click.echo("  …")
+        click.echo("  …", file=ui)
     for index in range(start, end):
-        click.echo(f"{'>' if index == cursor else ' '} {rows[index][1]}")
+        click.echo(f"{'>' if index == cursor else ' '} {rows[index][1]}", file=ui)
     if end < len(rows):
-        click.echo("  …")
+        click.echo("  …", file=ui)
 
-    click.echo()
+    click.echo(file=ui)
     if notes:
         for note in notes:
-            click.echo(note)
-        click.echo()
-    click.echo(legend)
+            click.echo(note, file=ui)
+        click.echo(file=ui)
+    click.echo(legend, file=ui)
 
 
-def _select(title, rows, cursor, *, legend=HOTKEYS, notes=(), manual=None, preview=None):
+def _select(ui, title, rows, cursor, *, legend=HOTKEYS, notes=(), manual=None, preview=None):
     """Run one step of the wizard and return the chosen row value.
 
     `manual` and `preview` are callables for the m and p hotkeys; either
@@ -103,7 +156,7 @@ def _select(title, rows, cursor, *, legend=HOTKEYS, notes=(), manual=None, previ
     status = None
 
     while True:
-        _render(title, rows, cursor, legend, notes + ([status] if status else []))
+        _render(ui, title, rows, cursor, legend, notes + ([status] if status else []))
         key = click.getchar()
 
         # An empty read means EOF (a closed pty). It matches no key set, so
@@ -126,22 +179,21 @@ def _select(title, rows, cursor, *, legend=HOTKEYS, notes=(), manual=None, previ
             status = preview(rows[cursor][0])
 
 
-def _manual_text(label: str) -> str | None:
+def _manual_text(ui, label: str) -> str | None:
     """Type a value by hand. An empty answer means 'never mind'."""
-    value = click.prompt(label, default="", show_default=False).strip()
-    return value or None
+    return _ask(ui, label).strip() or None
 
 
-def _manual_speed() -> float | None:
+def _manual_speed(ui) -> float | None:
     """Type a speed by hand, re-asking until it passes the config check."""
     while True:
-        raw = click.prompt(f"Speed ({SPEED_MIN}–{SPEED_MAX})", default="", show_default=False).strip()
+        raw = _ask(ui, f"Speed ({SPEED_MIN}–{SPEED_MAX})").strip()
         if not raw:
             return None
         try:
             return validate_speed(raw, "manual entry")
         except ConfigError as exc:
-            click.echo(str(exc))
+            click.echo(str(exc), file=ui)
 
 
 def _speed_choices() -> list[float]:
@@ -163,7 +215,7 @@ def _keep_label(existing: dict, key: str, resolved) -> str:
     return f"{resolved} — not in the file"
 
 
-def _voice_step(current: str, keep: str):
+def _voice_step(ui, current: str, keep: str):
     rows = [(_KEEP, f"keep current ({keep})")]
     cursor = 0
     notes = []
@@ -194,7 +246,7 @@ def _voice_step(current: str, keep: str):
             return "Preview needs an API key."
         # Synthesis and playback both block; say so, or the frozen frame
         # reads as a hang.
-        click.echo(f"Previewing {voice_id}…")
+        click.echo(f"Previewing {voice_id}…", file=ui)
         try:
             play(save(synthesize(client, PREVIEW_TEXT, Settings(voice_id=voice_id)), PREVIEW_PATH))
         except VocalizeError as exc:
@@ -202,17 +254,18 @@ def _voice_step(current: str, keep: str):
         return f"Previewed {voice_id}."
 
     return _select(
+        ui,
         "Step 1 of 3 — Voice",
         rows,
         cursor,
         legend=VOICE_HOTKEYS,
         notes=notes,
-        manual=lambda: _manual_text("Voice ID"),
+        manual=lambda: _manual_text(ui, "Voice ID"),
         preview=preview,
     )
 
 
-def _model_step(current: str, keep: str):
+def _model_step(ui, current: str, keep: str):
     rows = [(_KEEP, f"keep current ({keep})")]
     cursor = 0
 
@@ -224,14 +277,15 @@ def _model_step(current: str, keep: str):
         rows.append((model_id, label))
 
     return _select(
+        ui,
         "Step 2 of 3 — Model",
         rows,
         cursor,
-        manual=lambda: _manual_text("Model ID"),
+        manual=lambda: _manual_text(ui, "Model ID"),
     )
 
 
-def _speed_step(current: float | None, keep: str):
+def _speed_step(ui, current: float | None, keep: str):
     rows = [(_KEEP, f"keep current ({keep})"), (_UNSET, "unset (API default)")]
     cursor = 0
 
@@ -242,7 +296,7 @@ def _speed_step(current: float | None, keep: str):
             cursor = len(rows)
         rows.append((value, label))
 
-    return _select("Step 3 of 3 — Speed", rows, cursor, manual=_manual_speed)
+    return _select(ui, "Step 3 of 3 — Speed", rows, cursor, manual=lambda: _manual_speed(ui))
 
 
 def _toml_value(key: str, value) -> str:
@@ -287,11 +341,21 @@ def run_wizard() -> None:
     """Walk through voice, model and speed, then write the config file."""
     stdin = sys.stdin
     if stdin is None or not stdin.isatty():
-        raise ConfigError(
-            "The config wizard needs an interactive terminal. "
-            "Run `vocalize config` in a terminal, not from a pipe or a script."
-        )
+        raise ConfigError(_NO_TERMINAL)
 
+    # The keyboard is only half of it — there also has to be somewhere to
+    # paint. A relayed stdout is fine as long as /dev/tty opens.
+    ui, opened = _open_ui_stream()
+    if ui is None:
+        raise ConfigError(_NO_TERMINAL)
+    try:
+        _walk(ui)
+    finally:
+        if opened:
+            ui.close()
+
+
+def _walk(ui) -> None:
     path = config_path()
     existing = load_config_file()
     # Dry-run the serialiser before asking any questions: fail fast rather
@@ -315,12 +379,12 @@ def run_wizard() -> None:
 
     try:
         chosen = {
-            "voice": _voice_step(current.voice_id, keep["voice"]),
-            "model": _model_step(current.model_id, keep["model"]),
-            "speed": _speed_step(current.speed, keep["speed"]),
+            "voice": _voice_step(ui, current.voice_id, keep["voice"]),
+            "model": _model_step(ui, current.model_id, keep["model"]),
+            "speed": _speed_step(ui, current.speed, keep["speed"]),
         }
     except _Cancelled:
-        click.echo("Cancelled — nothing changed.")
+        click.echo("Cancelled — nothing changed.", file=ui)
         return
 
     data = dict(existing)  # unknown keys ride through untouched
@@ -332,20 +396,24 @@ def run_wizard() -> None:
         else:
             data[key] = value
 
-    click.clear()
-    click.echo("About to write:")
-    click.echo()
+    _clear(ui)
+    click.echo("About to write:", file=ui)
+    click.echo(file=ui)
     for key, value in chosen.items():
-        click.echo(f"  {key:<5} → {_summary_value(value, keep[key])}")
-    click.echo()
-    click.echo(f"File: {path}")
-    click.echo()
+        click.echo(f"  {key:<5} → {_summary_value(value, keep[key])}", file=ui)
+    click.echo(file=ui)
+    click.echo(f"File: {path}", file=ui)
+    click.echo(file=ui)
 
-    if not click.confirm("Write these settings?", default=False):
-        click.echo("Cancelled — nothing changed.")
+    if not _confirm(ui, "Write these settings?"):
+        click.echo("Cancelled — nothing changed.", file=ui)
         return
 
     text = _write_config(path, data)
-    click.echo(f"Wrote {path}")
-    click.echo()
-    click.echo(text.rstrip("\n") or "(empty — every setting is back to its default)")
+    click.echo(f"Wrote {path}", file=ui)
+    if ui is not sys.stdout:
+        # The outcome line is the one thing a wrapper or a log should still
+        # see when the UI went to the terminal instead of down the pipe.
+        click.echo(f"Wrote {path}", file=sys.stdout)
+    click.echo(file=ui)
+    click.echo(text.rstrip("\n") or "(empty — every setting is back to its default)", file=ui)

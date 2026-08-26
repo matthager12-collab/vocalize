@@ -100,7 +100,8 @@ the highlighted one), model, and speed — shows you a summary, and writes the
 config file below. Unrecognised top-level keys already in that file are
 carried through; comments and layout are not preserved. A file containing a
 TOML table or array is left alone entirely, with a message saying to edit it
-by hand.
+by hand. The wizard paints on the controlling terminal rather than on stdout,
+so it still works under output-capturing wrappers like `op run`.
 
 ```bash
 vocalize config
