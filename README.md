@@ -7,6 +7,25 @@ natural-sounding speech using the [ElevenLabs](https://elevenlabs.io) API —
 plus a hook that wires it directly into [Claude Code](https://claude.com/claude-code),
 so Claude's responses get read aloud automatically in your terminal or IDE.
 
+## Quickstart
+
+```bash
+pipx install vocalize-cli
+```
+
+```bash
+vocalize config
+```
+
+Walks you through your API key, a voice, and a speed, and saves it all.
+
+```bash
+vocalize speak "hello"
+```
+
+To set up just the key, skip the wizard and run `vocalize auth login` — it
+stores the key in your OS keychain.
+
 ## Why this exists
 
 Text-to-speech readers are good at *voices* and bad at *structure*. Point one
@@ -46,7 +65,23 @@ pip install -e .
 Get a free ElevenLabs API key at
 [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)
 (free tier: 10,000 characters/month, API access included, no commercial
-license). Then either:
+license). Then, recommended, store it in your OS keychain:
+
+```bash
+vocalize auth login
+```
+
+This prompts for the key (input hidden), validates it against the
+ElevenLabs API, and stores it via your OS's own keychain (macOS Keychain,
+Windows Credential Locker, Linux Secret Service) — no plaintext file to
+manage. Piping it in from a secret manager works too:
+
+```bash
+op read op://vault/elevenlabs/key | vocalize auth login --stdin
+```
+
+An environment variable or `.env` file work as well, and take priority over
+the keychain if both are set:
 
 ```bash
 export ELEVENLABS_API_KEY=your-key-here
@@ -113,6 +148,7 @@ writing anything.
 
 | Setting | Flag | Env var | Config file key | Default |
 |---|---|---|---|---|
+| API key | `--api-key` | `ELEVENLABS_API_KEY` | not read from the config file | stored via `vocalize auth` |
 | Voice ID | `--voice` | `VOCALIZE_VOICE` | `voice` | `21m00Tcm4TlvDq8ikWAM` ("Rachel") |
 | Model ID | `--model` | `VOCALIZE_MODEL` | `model` | `eleven_multilingual_v2` |
 | Speed | `--speed` | `VOCALIZE_SPEED` | `speed` | unset — the API's own 1.0 |
@@ -134,8 +170,11 @@ stderr, so a typo doesn't pass unnoticed but doesn't stop the run either.
 `speed` must be a number between 0.7 and 1.2 — anything else is a one-line
 error naming the source it came from.
 
-The API key is separate and never read from this file: use `--api-key`,
-`ELEVENLABS_API_KEY`, or a `.env` file.
+The API key is separate and never read from this file. It resolves in its
+own order: `--api-key` flag, then `ELEVENLABS_API_KEY`, then a `.env` file
+in the current directory, then the OS keychain. `vocalize auth login` sets
+up the keychain entry; `vocalize auth status` shows which of those sources
+is currently supplying the key.
 
 ## Claude Code integration
 
@@ -260,8 +299,8 @@ All tests run offline: the ElevenLabs client is dependency-injected into
   so it's always safe to delete some or all of it — nothing will break,
   you'll just re-pay for a re-synthesized clip.
 - **`--api-key` on the command line is visible to other local processes**
-  (anything that can run `ps`). Prefer the `ELEVENLABS_API_KEY` environment
-  variable or a `.env` file instead.
+  (anything that can run `ps`). Prefer `vocalize auth login`, the
+  `ELEVENLABS_API_KEY` environment variable, or a `.env` file instead.
 - `vocalize voices` lists only the first page of results from the
   ElevenLabs API.
 
