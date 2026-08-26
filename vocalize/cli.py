@@ -4,6 +4,7 @@
     vocalize speak-file report.md --play
     cat notes.md | vocalize speak-file - --play
     vocalize voices
+    vocalize config
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from .config import DEFAULT_MODEL, DEFAULT_VOICE, resolve_api_key, resolve_setti
 from .exceptions import TTSRequestError, VocalizeError
 from .preprocess import flatten_markdown, truncate_for_budget
 from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
+from .wizard import run_wizard
 
 
 def _common_options(f):
@@ -101,6 +103,12 @@ def voices(api_key) -> None:
     client = build_client(key)
     for v in list_voices(client):
         click.echo(f"{v['id']}\t{v['name']}")
+
+
+@main.command("config")
+def config_cmd() -> None:
+    """Interactive setup: pick voice, model, and speed."""
+    run_wizard()
 
 
 def run() -> None:

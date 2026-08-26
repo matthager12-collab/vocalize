@@ -109,6 +109,14 @@ def _coerce_speed(value, source: str) -> float:
     return speed
 
 
+def validate_speed(value, source: str) -> float:
+    """Public front door to the speed check, for callers outside this module.
+
+    Same bounds and same message as every other speed the CLI resolves.
+    """
+    return _coerce_speed(value, source)
+
+
 def _first(*values):
     for value in values:
         if value is not None:

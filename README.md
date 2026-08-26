@@ -94,6 +94,22 @@ Each setting is resolved on its own, taking the first source that supplies
 it: CLI flag, then environment variable, then config file, then the
 built-in default.
 
+There's an interactive way to set the file up, if you'd rather not write
+TOML by hand. It walks through three lists — voice (with a live preview of
+the highlighted one), model, and speed — shows you a summary, and writes the
+config file below. Unrecognised top-level keys already in that file are
+carried through; comments and layout are not preserved. A file containing a
+TOML table or array is left alone entirely, with a message saying to edit it
+by hand.
+
+```bash
+vocalize config
+```
+
+Hotkeys: `↑`/`↓` or `k`/`j` move, `Enter` selects, `p` previews the
+highlighted voice, `m` types a value by hand, `q` or `Esc` cancels without
+writing anything.
+
 | Setting | Flag | Env var | Config file key | Default |
 |---|---|---|---|---|
 | Voice ID | `--voice` | `VOCALIZE_VOICE` | `voice` | `21m00Tcm4TlvDq8ikWAM` ("Rachel") |
