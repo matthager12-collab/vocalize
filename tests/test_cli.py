@@ -120,6 +120,59 @@ def test_max_chars_truncates_and_notes(monkeypatch, tmp_path):
     assert "truncated" in result.output
 
 
+def test_short_input_makes_one_convert_call_with_unchanged_message(monkeypatch, tmp_path):
+    _played, captured_text, _captured_settings = _patch_tts(monkeypatch)
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        ["speak", "hello world", "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Exactly one convert call, and the message is the pre-chunking wording
+    # — a single-chunk run must be byte-identical to before chunking existed.
+    assert captured_text == ["hello world"]
+    assert "Requesting 11 characters of audio from ElevenLabs..." in result.output
+    assert "Long input" not in result.output
+    assert "Requesting chunk" not in result.output
+
+
+def test_long_input_splits_into_chunks_and_concatenates_audio(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
+    calls = []
+
+    def fake_synthesize(client, text, settings):
+        calls.append(text)
+        # Distinct, order-dependent bytes per call, so concatenation order
+        # in the saved file is actually being checked, not just its length.
+        return f"[chunk {len(calls)}: {text}]".encode()
+
+    monkeypatch.setattr(cli_module, "synthesize", fake_synthesize)
+    monkeypatch.setattr(cli_module, "play_audio", lambda path: None)
+
+    text = "First sentence here. " * 20
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "speak", text, "--api-key", "fake-key",
+            "--output", str(out_file), "--no-play", "--chunk-chars", "50",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) > 1
+    expected = b"".join(f"[chunk {i}: {c}]".encode() for i, c in enumerate(calls, start=1))
+    assert out_file.read_bytes() == expected
+    assert f"Long input: splitting into {len(calls)} chunks." in result.output
+    assert f"Requesting chunk 1/{len(calls)}" in result.output
+    assert all(len(c) <= 50 for c in calls)
+
+
 def test_missing_api_key_gives_clean_error(monkeypatch):
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     monkeypatch.setattr(cli_module, "build_client", lambda key: object())

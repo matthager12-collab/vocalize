@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.5.0 - 2026-08-31
+
+### Added
+
+- Chunked synthesis: input longer than the `eleven_multilingual_v2` model's
+  10,000-character per-request cap is now split into chunks — preferring
+  paragraph, then sentence, then word boundaries — synthesized sequentially,
+  and concatenated into one audio file, instead of failing outright. Each
+  chunk still goes through the existing disk cache individually, so a
+  partially-cached long document only pays for the chunks it's missing.
+- `--chunk-chars` flag to control the split size (default: 9,500).
+
 ## 0.4.0
 
 ### Added

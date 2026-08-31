@@ -23,7 +23,12 @@ from .audio import save as save_audio
 from .auth import delete_key, key_source, login, masked, probe_keychain, prompt_for_key
 from .config import DEFAULT_MODEL, DEFAULT_VOICE, resolve_api_key, resolve_settings
 from .exceptions import TTSRequestError, VocalizeError
-from .preprocess import flatten_markdown, truncate_for_budget
+from .preprocess import (
+    DEFAULT_CHUNK_CHARS,
+    flatten_markdown,
+    split_for_synthesis,
+    truncate_for_budget,
+)
 from .tts import DEFAULT_CACHE_DIR, build_client, get_usage, list_voices, synthesize
 from .wizard import run_wizard
 
@@ -44,6 +49,10 @@ def _common_options(f):
     f = click.option("--play/--no-play", default=True, help="Play the audio after generating it.")(f)
     f = click.option("--raw", is_flag=True, help="Skip markdown flattening; speak the text verbatim.")(f)
     f = click.option("--max-chars", type=int, default=None, help="Truncate input to this many characters first.")(f)
+    f = click.option("--chunk-chars", type=click.IntRange(min=1), default=None,
+                      help="Split long input into chunks of at most this many characters before sending "
+                      f"each to ElevenLabs (default: {DEFAULT_CHUNK_CHARS}; the eleven_multilingual_v2 "
+                      "model caps a single request at 10,000 characters).")(f)
     return f
 
 
@@ -53,7 +62,8 @@ def main() -> None:
     """Turn text, markdown, or piped stdin into speech via ElevenLabs."""
 
 
-def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars) -> None:
+def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
+             chunk_chars) -> None:
     text = raw_text if raw else flatten_markdown(raw_text)
     text, truncated = truncate_for_budget(text, max_chars)
     if truncated:
@@ -66,8 +76,18 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
     key = resolve_api_key(api_key)
     client = build_client(key)
 
-    click.echo(f"Requesting {len(text)} characters of audio from ElevenLabs...", err=True)
-    audio = synthesize(client, text, settings)
+    chunks = split_for_synthesis(text, chunk_chars or DEFAULT_CHUNK_CHARS)
+    if len(chunks) == 1:
+        click.echo(f"Requesting {len(text)} characters of audio from ElevenLabs...", err=True)
+        audio = synthesize(client, text, settings)
+    else:
+        n = len(chunks)
+        click.echo(f"Long input: splitting into {n} chunks.", err=True)
+        parts = []
+        for i, chunk in enumerate(chunks, start=1):
+            click.echo(f"Requesting chunk {i}/{n} ({len(chunk)} characters) from ElevenLabs...", err=True)
+            parts.append(synthesize(client, chunk, settings))
+        audio = b"".join(parts)
 
     dest = output_path or (DEFAULT_CACHE_DIR / "last.mp3")
     save_audio(audio, dest)
@@ -80,23 +100,23 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
 @main.command()
 @click.argument("text")
 @_common_options
-def speak(text, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars) -> None:
+def speak(text, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars, chunk_chars) -> None:
     """Speak TEXT directly."""
     _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
-              output_path=output_path, play=play, raw=raw, max_chars=max_chars)
+              output_path=output_path, play=play, raw=raw, max_chars=max_chars, chunk_chars=chunk_chars)
 
 
 @main.command("speak-file")
 @click.argument("path", type=click.File("r", encoding="utf-8"))
 @_common_options
-def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars) -> None:
+def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars, chunk_chars) -> None:
     """Speak the contents of PATH (a markdown/text file), or "-" for stdin."""
     try:
         raw_text = path.read()
     except UnicodeDecodeError as exc:
         raise click.FileError(getattr(path, "name", "input"), hint="file is not valid UTF-8 text") from exc
     _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
-              output_path=output_path, play=play, raw=raw, max_chars=max_chars)
+              output_path=output_path, play=play, raw=raw, max_chars=max_chars, chunk_chars=chunk_chars)
 
 
 @main.command()

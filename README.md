@@ -126,6 +126,11 @@ Every synthesis result is cached on disk under `~/.cache/vocalize/`, keyed
 by a hash of (text, voice, model, format, speed) — re-running the same
 command twice doesn't burn API quota twice.
 
+Long inputs are also split automatically — at paragraph boundaries where
+possible, then sentences, then words — into requests no bigger than
+`--chunk-chars` (default 9500), so a long read no longer fails the API's
+own per-request cap.
+
 ## Configuration
 
 Each setting is resolved on its own, taking the first source that supplies
@@ -233,11 +238,21 @@ Two primitives cover almost everything: `vocalize speak-file <path>` speaks
 any local file (markdown flattened first), and the hook's `--latest` mode
 speaks the most recent Claude Code response. Anything Claude itself has to
 fetch — a claude.ai artifact, for instance — has to be fetched *by Claude*
-(the CLI has no session), summarized, and piped in:
+(the CLI has no session), summarized, written to a file, and spoken from
+the file:
 
 ```bash
-printf '%s' "the summary text" | vocalize speak-file -
+vocalize speak-file /path/to/summary.txt
 ```
+
+Never interpolate the summary into the command line itself — see guard 4.
+
+**Web pages.** The CLI has no URL support, by design — it can't fetch
+anything. For a URL, Claude fetches the page itself, in an isolated
+subagent with a locked-down tool set, and produces either a short spoken
+digest or a verbatim extract of the core content. That text comes back to
+the main session the same way any other summary does: written to a file
+and passed to `speak-file`.
 
 If you wire this into a slash command of your own, treat it as a security
 surface, because **every character you speak is sent to ElevenLabs**. The
@@ -251,11 +266,20 @@ guard principles that matter, in order:
 3. Summarize long or fetched content in an **isolated subagent** that
    returns only the summary — content you fetched can carry instructions
    aimed at your session.
-4. Pipe summaries over stdin (as above) — no temp files, nothing in argv.
+4. Pass summaries as a file path (as above) — never build the shell
+   command by interpolating model-written text into a quoted string. A
+   summary a model wrote can contain `$(...)`, and the shell will run it;
+   `printf '%s' "<summary>"` is exactly that bug.
 5. Confirm before any read that will spend real quota; a free tier is
    10,000 characters a month.
 6. Remember the disk cache: everything spoken leaves an mp3 under
    `~/.cache/vocalize/`.
+7. Fetching is a second egress. Fetch only the URL the user typed — a page
+   can carry text telling its reader to fetch another URL, with data
+   smuggled out in the query string.
+8. Refuse non-public hosts. `localhost` and `169.254.169.254` are
+   reachable from your machine and nowhere else; parse the URL with the
+   `ipaddress` module rather than pattern-matching the string.
 
 ## How it's built
 
@@ -313,10 +337,11 @@ All tests run offline: the ElevenLabs client is dependency-injected into
 
 - **Charts and images aren't described.** Flattening markdown tables is a
   text problem; a rendered chart is an image, and describing it well needs
-  a vision model in the loop, not a text transform. Out of scope for this
-  project, but a natural next step — pipe the image through a
-  vision-capable model first, feed its description into `vocalize` in
-  place of the chart.
+  a vision model in the loop, not a text transform. That's out of scope for
+  the CLI itself, but the next step now lives outside it, where it belongs:
+  the `/speak` command's web-page mode renders a page in a browser, hands it
+  to a vision-capable subagent, and the diagram description comes back as
+  plain text — same as any other content this tool speaks.
 - **Free tier is 10,000 characters/month** — plenty for reading a handful
   of documents aloud, not for continuous use. `--max-chars` and the disk
   cache both help stretch it.

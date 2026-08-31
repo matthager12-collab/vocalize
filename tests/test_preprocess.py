@@ -1,4 +1,10 @@
-from vocalize.preprocess import flatten_markdown, truncate_for_budget
+import re
+
+from vocalize.preprocess import (
+    flatten_markdown,
+    split_for_synthesis,
+    truncate_for_budget,
+)
 
 
 def test_flattens_simple_table_into_per_row_sentences():
@@ -175,3 +181,87 @@ def test_single_row_table_is_grammatical():
     result = flatten_markdown(md)
     assert "Table with 1 row." in result
     assert "1 rows" not in result
+
+
+def test_split_for_synthesis_short_text_is_returned_unchanged():
+    text = "  short text with padding  "
+    assert split_for_synthesis(text, max_chars=1000) == [text]
+
+
+def test_split_for_synthesis_exact_limit_is_not_split():
+    text = "x" * 50
+    assert split_for_synthesis(text, max_chars=50) == [text]
+
+
+def test_split_for_synthesis_prefers_paragraph_over_mid_sentence_cuts():
+    para1 = "Alpha bravo charlie delta echo foxtrot golf hotel."
+    para2 = "India juliet kilo lima mike november oscar papa."
+    text = f"{para1}\n\n{para2}"
+    assert len(para1) <= 60
+    assert len(para2) <= 60
+    assert len(text) > 60  # forces a split; only the paragraph gap should be used
+
+    chunks = split_for_synthesis(text, max_chars=60)
+
+    assert chunks == [para1, para2]
+    # A mid-sentence cut would end a chunk without terminal punctuation.
+    for chunk in chunks:
+        assert chunk[-1] in ".!?"
+
+
+def test_split_for_synthesis_long_mixed_input_stays_within_limit():
+    paragraphs = [
+        "First paragraph. It has two sentences.",
+        (
+            "Second paragraph is a fair bit longer than the first one, "
+            "with several clauses strung together to pad it out some more."
+        ),
+        "Third short one.",
+        "A" * 40,  # a single unbroken run, shorter than max_chars on its own
+    ]
+    text = "\n\n".join(paragraphs)
+
+    chunks = split_for_synthesis(text, max_chars=30)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk == chunk.strip()
+        assert chunk != ""
+        assert len(chunk) <= 30
+
+
+def test_split_for_synthesis_preserves_all_content():
+    text = (
+        "# Heading\n\n"
+        "First paragraph with a couple of sentences. Here is the second one.\n\n"
+        "Second paragraph, longer, rambling on for a while about nothing "
+        "in particular just to pad out the length a bit further still.\n\n"
+        "- bullet one\n- bullet two\n- bullet three\n"
+    )
+    chunks = split_for_synthesis(text, max_chars=40)
+
+    rejoined = re.sub(r"\s+", " ", " ".join(chunks)).strip()
+    normalized_input = re.sub(r"\s+", " ", text).strip()
+    assert rejoined == normalized_input
+
+
+def test_split_for_synthesis_never_merges_hard_slices_into_neighbours():
+    token = "x" * 50
+    text = f"see {token} end."
+
+    chunks = split_for_synthesis(text, max_chars=20)
+
+    # The over-long token's slices stay standalone chunks, in order, and
+    # concatenate directly back into the token — no invented word breaks.
+    assert chunks == ["see", "x" * 20, "x" * 20, "x" * 10, "end."]
+    assert "".join(chunks[1:4]) == token
+
+
+def test_split_for_synthesis_hard_slices_a_single_unbroken_run():
+    text = "x" * 25000  # no spaces anywhere — nothing but a hard slice can break this up
+
+    chunks = split_for_synthesis(text, max_chars=9500)
+
+    assert len(chunks) == 3
+    assert all(0 < len(chunk) <= 9500 for chunk in chunks)
+    assert "".join(chunks) == text

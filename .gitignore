@@ -11,3 +11,4 @@ dist/
 venv/
 *.mp3
 *.wav
+.claude/
