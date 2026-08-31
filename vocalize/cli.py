@@ -21,7 +21,15 @@ from . import __version__
 from .audio import play as play_audio
 from .audio import save as save_audio
 from .auth import delete_key, key_source, login, masked, probe_keychain, prompt_for_key
-from .config import DEFAULT_MODEL, DEFAULT_VOICE, resolve_api_key, resolve_settings
+from .config import (
+    DEFAULT_MODEL,
+    DEFAULT_VOICE,
+    OVERFLOW_MODES,
+    load_config_file,
+    resolve_api_key,
+    resolve_overflow,
+    resolve_settings,
+)
 from .exceptions import TTSRequestError, VocalizeError
 from .preprocess import (
     DEFAULT_CHUNK_CHARS,
@@ -53,6 +61,12 @@ def _common_options(f):
                       help="Split long input into chunks of at most this many characters before sending "
                       f"each to ElevenLabs (default: {DEFAULT_CHUNK_CHARS}; the eleven_multilingual_v2 "
                       "model caps a single request at 10,000 characters).")(f)
+    f = click.option("--overflow", type=click.Choice(OVERFLOW_MODES), default=None,
+                      help="What to do when input exceeds the cap: truncate it (the default), "
+                      "ask first, or never truncate.")(f)
+    f = click.option("--default-max-chars", type=click.IntRange(min=1), default=None,
+                      help="Fallback cap used only when no --max-chars, VOCALIZE_MAX_CHARS, or "
+                      "config file value sets one. For wrapper scripts; most users want --max-chars.")(f)
     return f
 
 
@@ -62,17 +76,59 @@ def main() -> None:
     """Turn text, markdown, or piped stdin into speech via ElevenLabs."""
 
 
+def _ask_to_truncate(input_chars: int, cap: int) -> bool | None:
+    """Ask on the controlling terminal whether to truncate. None = no terminal.
+
+    The prompt uses /dev/tty, not stdin/stdout: stdin may be the very text
+    being spoken (`speak-file -`) and stdout may be piped — the same
+    reasoning as the config wizard.
+    """
+    try:
+        with open("/dev/tty", "r", encoding="utf-8") as tty_in, \
+             open("/dev/tty", "w", encoding="utf-8") as tty_out:
+            tty_out.write(
+                f"Input is {input_chars:,} characters; the cap is {cap:,}. "
+                f"Truncate to {cap:,}? [Y/n] "
+            )
+            tty_out.flush()
+            answer = tty_in.readline()
+    except OSError:
+        return None
+    if not answer:  # EOF — no human on the other end after all
+        return None
+    return answer.strip().lower() not in ("n", "no")
+
+
 def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
-             chunk_chars) -> None:
+             chunk_chars, overflow, default_max_chars) -> None:
     text = raw_text if raw else flatten_markdown(raw_text)
-    text, truncated = truncate_for_budget(text, max_chars)
+
+    # Parsed once here and shared by both resolvers, so a config-file typo
+    # warns once per run, not once per resolver.
+    file_config = load_config_file()
+
+    mode, cap = resolve_overflow(overflow, max_chars, default_max_chars, file_config=file_config)
+    if mode == "never":
+        cap = None
+    elif mode == "ask" and cap is not None and len(text) > cap:
+        answer = _ask_to_truncate(len(text), cap)
+        if answer is None:
+            click.echo(
+                f"Note: overflow is 'ask' but there is no terminal to ask on; "
+                f"truncating to {cap} characters instead.", err=True,
+            )
+        elif answer is False:
+            cap = None
+
+    text, truncated = truncate_for_budget(text, cap)
     if truncated:
-        click.echo(f"Note: input truncated to {max_chars} characters.", err=True)
+        click.echo(f"Note: input truncated to {cap} characters.", err=True)
 
     if not text.strip():
         raise TTSRequestError("Nothing to speak: input text is empty.")
 
-    settings = resolve_settings(voice_id=voice_id, model_id=model_id, speed=speed)
+    settings = resolve_settings(voice_id=voice_id, model_id=model_id, speed=speed,
+                                file_config=file_config)
     key = resolve_api_key(api_key)
     client = build_client(key)
 
@@ -100,23 +156,27 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
 @main.command()
 @click.argument("text")
 @_common_options
-def speak(text, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars, chunk_chars) -> None:
+def speak(text, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
+          chunk_chars, overflow, default_max_chars) -> None:
     """Speak TEXT directly."""
     _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
-              output_path=output_path, play=play, raw=raw, max_chars=max_chars, chunk_chars=chunk_chars)
+              output_path=output_path, play=play, raw=raw, max_chars=max_chars,
+              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars)
 
 
 @main.command("speak-file")
 @click.argument("path", type=click.File("r", encoding="utf-8"))
 @_common_options
-def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars, chunk_chars) -> None:
+def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
+               chunk_chars, overflow, default_max_chars) -> None:
     """Speak the contents of PATH (a markdown/text file), or "-" for stdin."""
     try:
         raw_text = path.read()
     except UnicodeDecodeError as exc:
         raise click.FileError(getattr(path, "name", "input"), hint="file is not valid UTF-8 text") from exc
     _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
-              output_path=output_path, play=play, raw=raw, max_chars=max_chars, chunk_chars=chunk_chars)
+              output_path=output_path, play=play, raw=raw, max_chars=max_chars,
+              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars)
 
 
 @main.command()

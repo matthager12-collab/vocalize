@@ -36,16 +36,29 @@ def _patch_main(monkeypatch, payload, which="/usr/local/bin/vocalize", run=None,
 
     calls = []
 
-    def fake_run(argv, **kwargs):
-        # Pin the timeout: a Stop hook that can hang forever blocks the
-        # session, so this is behaviour, not an implementation detail.
-        assert kwargs.get("timeout") == 60
-        calls.append(argv)
-        if run is not None:
-            return run(argv)
-        return subprocess.CompletedProcess(argv, 0)
+    class _FakeProc:
+        pid = 4242
 
-    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+        def __init__(self, argv):
+            self._argv = argv
+
+        def wait(self, timeout=None):
+            # Pin the timeout: a Stop hook that can hang forever blocks the
+            # session, so this is behaviour, not an implementation detail. It
+            # scales with the text being spoken (argv[-1], after the "--").
+            assert timeout == hook._speech_timeout(self._argv[-1])
+            if run is not None:
+                return run(self._argv).returncode
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        # The new session is behaviour too: it is what makes overflow "ask"
+        # degrade (no controlling tty) and what the timeout path kills.
+        assert kwargs.get("start_new_session") is True
+        calls.append(argv)
+        return _FakeProc(argv)
+
+    monkeypatch.setattr(hook.subprocess, "Popen", fake_popen)
     return calls
 
 
@@ -135,7 +148,7 @@ def test_main_passes_default_max_chars(monkeypatch, tmp_path):
         [
             "/usr/local/bin/vocalize",
             "speak",
-            "--max-chars",
+            "--default-max-chars",
             "500",
             "--play",
             "--",
@@ -144,23 +157,57 @@ def test_main_passes_default_max_chars(monkeypatch, tmp_path):
     ]
 
 
-def test_main_honours_vocalize_max_chars_env(monkeypatch, tmp_path):
+def test_env_max_chars_is_left_for_the_cli_to_resolve(monkeypatch, tmp_path):
+    # The hook must not translate VOCALIZE_MAX_CHARS into --max-chars: the
+    # CLI reads the (inherited) environment itself, and a --max-chars flag
+    # here would wrongly outrank the user's config-file precedence.
     path = _write_transcript(tmp_path, [_assistant([_text("hello there")])])
     calls = _patch_main(monkeypatch, {"transcript_path": path})
     monkeypatch.setenv("VOCALIZE_MAX_CHARS", "120")
 
     assert hook.main() == 0
-    assert calls == [
-        [
-            "/usr/local/bin/vocalize",
-            "speak",
-            "--max-chars",
-            "120",
-            "--play",
-            "--",
-            "hello there",
-        ]
-    ]
+    assert len(calls) == 1
+    assert "--max-chars" not in calls[0]
+    assert "120" not in calls[0]
+    assert calls[0][2:4] == ["--default-max-chars", "500"]
+
+
+def test_speech_timeout_scales_with_text_and_is_capped():
+    assert hook._speech_timeout("") == 60
+    assert hook._speech_timeout("x" * 1200) == 60 + 100
+    # 12,000 chars would want 1,060s; the ceiling wins.
+    assert hook._speech_timeout("x" * 12000) == 900
+
+
+def test_timeout_kills_the_whole_process_group(monkeypatch, tmp_path, capsys):
+    path = _write_transcript(tmp_path, [_assistant([_text("hello there")])])
+    _patch_main(monkeypatch, {"transcript_path": path})
+
+    class _HangingProc:
+        pid = 4242
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(cmd="vocalize", timeout=timeout)
+            return -9  # the post-kill reap
+
+    proc = _HangingProc()
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda argv, **kwargs: proc)
+    killed = {}
+    monkeypatch.setattr(
+        hook.os, "killpg", lambda pgid, sig: killed.update(pgid=pgid, sig=sig)
+    )
+
+    assert hook.main() == 0
+    # The whole group dies — vocalize AND the afplay child it spawned —
+    # and the hook still exits 0 so the session is never blocked.
+    assert killed == {"pgid": 4242, "sig": hook.signal.SIGKILL}
+    assert proc.waits == 2
+    assert "timed out" in capsys.readouterr().err
 
 
 def test_main_speaks_dash_led_text(monkeypatch, tmp_path):

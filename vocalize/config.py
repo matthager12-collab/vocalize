@@ -29,7 +29,10 @@ DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
-KNOWN_CONFIG_KEYS = ("voice", "model", "speed")
+KNOWN_CONFIG_KEYS = ("voice", "model", "speed", "max_chars", "overflow")
+
+# What to do when input is longer than the resolved character cap.
+OVERFLOW_MODES = ("truncate", "ask", "never")
 
 
 def _load_dotenv_if_present() -> None:
@@ -126,6 +129,72 @@ def validate_speed(value, source: str) -> float:
     return _coerce_speed(value, source)
 
 
+def _coerce_overflow(value, source: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in OVERFLOW_MODES:
+        raise ConfigError(
+            f"Invalid overflow mode {value!r} from {source}: "
+            f"expected one of: {', '.join(OVERFLOW_MODES)}."
+        )
+    return mode
+
+
+def _coerce_max_chars(value, source: str) -> int:
+    try:
+        chars = int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"Invalid max_chars {value!r} from {source}: expected a positive integer."
+        ) from None
+    if chars <= 0:
+        raise ConfigError(f"Invalid max_chars {chars} from {source}: must be positive.")
+    return chars
+
+
+def resolve_overflow(
+    overflow: str | None = None,
+    max_chars: int | None = None,
+    default_max_chars: int | None = None,
+    file_config: dict | None = None,
+) -> tuple[str, int | None]:
+    """Resolve the overflow mode and the character cap it applies to.
+
+    Both follow the same order as every other setting:
+    flag > env var > config file > default.
+
+    `default_max_chars` sits below all three — it's a fallback for wrapper
+    scripts (the Stop hook) that want a protective cap when the user has
+    configured nothing, without overriding anything the user did set.
+    A cap of None means no cap. Pass `file_config` (from load_config_file)
+    when the caller also resolves other settings, so the file is parsed —
+    and its unknown-key warnings printed — once, not per resolver.
+    """
+    if file_config is None:
+        file_config = load_config_file()
+
+    mode = "truncate"
+    for value, source in (
+        (overflow, "--overflow"),
+        (os.environ.get("VOCALIZE_OVERFLOW"), "VOCALIZE_OVERFLOW"),
+        (file_config.get("overflow"), f"'overflow' in {config_path()}"),
+    ):
+        if value is not None:
+            mode = _coerce_overflow(value, source)
+            break
+
+    cap = default_max_chars
+    for value, source in (
+        (max_chars, "--max-chars"),
+        (os.environ.get("VOCALIZE_MAX_CHARS"), "VOCALIZE_MAX_CHARS"),
+        (file_config.get("max_chars"), f"'max_chars' in {config_path()}"),
+    ):
+        if value is not None:
+            cap = _coerce_max_chars(value, source)
+            break
+
+    return mode, cap
+
+
 def _first(*values):
     for value in values:
         if value is not None:
@@ -145,9 +214,11 @@ def resolve_settings(
     voice_id: str | None = None,
     model_id: str | None = None,
     speed: float | None = None,
+    file_config: dict | None = None,
 ) -> Settings:
     """Build Settings from flag > env var > config file > built-in default."""
-    file_config = load_config_file()
+    if file_config is None:
+        file_config = load_config_file()
 
     resolved_speed = None
     for value, source in (

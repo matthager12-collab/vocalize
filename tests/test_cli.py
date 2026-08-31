@@ -1,3 +1,6 @@
+import builtins
+import io
+
 import pytest
 from click.testing import CliRunner
 
@@ -368,3 +371,225 @@ def test_invalid_speed_gives_a_clean_error_not_a_traceback(monkeypatch, tmp_path
     assert captured.err.startswith("Error: ")
     assert "--speed" in captured.err
     assert "Traceback" not in captured.err
+
+
+# --- overflow behaviour ------------------------------------------------------
+
+
+def _isolate_overflow_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    for var in ("VOCALIZE_OVERFLOW", "VOCALIZE_MAX_CHARS"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _speak_long(monkeypatch, tmp_path, extra_args, text="word " * 100):
+    _played, captured_text, _settings = _patch_tts(monkeypatch)
+    out_file = tmp_path / "out.mp3"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["speak", text, "--api-key", "fake-key", "--output", str(out_file), "--no-play",
+         *extra_args],
+    )
+    return result, captured_text
+
+
+def test_overflow_never_ignores_the_cap(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "never"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    assert len(captured[0]) > 50
+    assert "truncated" not in result.output
+
+
+def test_overflow_truncate_is_the_default(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    result, captured = _speak_long(monkeypatch, tmp_path, ["--max-chars", "50"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert "truncated to 50" in result.output
+
+
+def test_overflow_ask_without_a_terminal_degrades_to_truncate(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", lambda n, cap: None)
+
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert "no terminal to ask on" in result.output
+
+
+def test_overflow_ask_speaks_everything_on_a_no(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    asked = {}
+    monkeypatch.setattr(
+        cli_module, "_ask_to_truncate",
+        lambda n, cap: asked.update(chars=n, cap=cap) or False,
+    )
+
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) > 50
+    assert asked["cap"] == 50
+    assert asked["chars"] == len(captured[0])
+
+
+def test_overflow_ask_truncates_on_a_yes(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", lambda n, cap: True)
+
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 50 + len("... (truncated)")
+
+
+def test_overflow_ask_under_the_cap_never_prompts(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+
+    def boom(n, cap):
+        raise AssertionError("prompted even though input fits the cap")
+
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", boom)
+    result, _captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "5000", "--overflow", "ask"]
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_default_max_chars_caps_when_nothing_else_is_set(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    result, captured = _speak_long(monkeypatch, tmp_path, ["--default-max-chars", "50"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert "truncated to 50" in result.output
+
+
+def test_env_var_beats_default_max_chars(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_MAX_CHARS", "80")
+    result, captured = _speak_long(monkeypatch, tmp_path, ["--default-max-chars", "50"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 80 + len("... (truncated)")
+    assert "truncated to 80" in result.output
+
+
+def test_env_overflow_never_reaches_the_cli(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_OVERFLOW", "never")
+    result, captured = _speak_long(monkeypatch, tmp_path, ["--max-chars", "50"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) > 50
+
+
+def test_invalid_overflow_flag_is_rejected_at_the_flag_layer(monkeypatch, tmp_path):
+    # The flag is a case-sensitive click Choice, unlike the case-insensitive
+    # env/config coercion — "Never" must fail loudly, not silently truncate.
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    result, captured = _speak_long(monkeypatch, tmp_path, ["--overflow", "Never"])
+
+    assert result.exit_code == 2
+    assert "--overflow" in result.output
+    assert captured == []
+
+
+def test_config_file_overflow_and_max_chars_reach_the_cli(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    cfg = tmp_path / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('max_chars = 60\noverflow = "truncate"\n', encoding="utf-8")
+
+    result, captured = _speak_long(monkeypatch, tmp_path, [])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 60 + len("... (truncated)")
+    assert "truncated to 60" in result.output
+
+
+def test_unknown_config_key_warns_once_per_run(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    cfg = tmp_path / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('bogus = "x"\n', encoding="utf-8")
+
+    result, _captured = _speak_long(monkeypatch, tmp_path, [])
+
+    assert result.exit_code == 0, result.output
+    # Both resolvers share one parse; a typo'd key must not warn twice.
+    assert result.output.count("unknown config key") == 1
+
+
+def _fake_tty(monkeypatch, reply):
+    """Route /dev/tty opens to in-memory streams; everything else is real."""
+    real_open = builtins.open
+
+    class _KeepValue(io.StringIO):
+        final_value = ""
+
+        def close(self):
+            self.final_value = self.getvalue()
+            super().close()
+
+    written = _KeepValue()
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if path == "/dev/tty":
+            return io.StringIO(reply) if "r" in mode else written
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    return written
+
+
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        ("n\n", False),
+        ("no\n", False),
+        ("No\n", False),
+        ("  N  \n", False),
+        ("y\n", True),
+        ("\n", True),  # bare Enter takes the [Y/n] default
+        ("nope\n", True),  # only n/no decline; anything else truncates
+    ],
+)
+def test_ask_to_truncate_parses_real_tty_answers(monkeypatch, reply, expected):
+    written = _fake_tty(monkeypatch, reply)
+    assert cli_module._ask_to_truncate(5000, 100) is expected
+    assert "5,000" in written.final_value
+    assert "[Y/n]" in written.final_value
+
+
+def test_ask_to_truncate_returns_none_on_tty_eof(monkeypatch):
+    _fake_tty(monkeypatch, "")
+    assert cli_module._ask_to_truncate(5000, 100) is None
+
+
+def test_ask_to_truncate_returns_none_without_a_tty(monkeypatch):
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/dev/tty":
+            raise OSError("no controlling terminal")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert cli_module._ask_to_truncate(5000, 100) is None

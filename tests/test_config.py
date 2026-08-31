@@ -8,6 +8,7 @@ from vocalize.config import (
     _load_dotenv_if_present,
     config_path,
     resolve_api_key,
+    resolve_overflow,
     resolve_settings,
 )
 from vocalize.exceptions import ConfigError, MissingAPIKeyError
@@ -178,3 +179,71 @@ def test_invalid_speed_from_the_flag_is_rejected(monkeypatch, tmp_path, value):
         resolve_settings(speed=value)
 
     assert "--speed" in str(excinfo.value)
+
+
+# --- overflow mode and cap resolution ---------------------------------------
+
+
+def _isolate_overflow(monkeypatch, tmp_path, body=None):
+    """Same as _isolate, for the overflow/max_chars env vars."""
+    path = _isolate(monkeypatch, tmp_path, body)
+    for var in ("VOCALIZE_OVERFLOW", "VOCALIZE_MAX_CHARS"):
+        monkeypatch.delenv(var, raising=False)
+    return path
+
+
+def test_overflow_defaults_to_truncate_with_no_cap(monkeypatch, tmp_path):
+    _isolate_overflow(monkeypatch, tmp_path)
+    assert resolve_overflow() == ("truncate", None)
+
+
+def test_overflow_flag_beats_env_beats_file(monkeypatch, tmp_path):
+    _isolate_overflow(monkeypatch, tmp_path, 'overflow = "never"\nmax_chars = 300\n')
+    assert resolve_overflow() == ("never", 300)
+
+    monkeypatch.setenv("VOCALIZE_OVERFLOW", "ask")
+    monkeypatch.setenv("VOCALIZE_MAX_CHARS", "200")
+    assert resolve_overflow() == ("ask", 200)
+
+    assert resolve_overflow(overflow="truncate", max_chars=100) == ("truncate", 100)
+
+
+def test_default_max_chars_sits_below_every_real_source(monkeypatch, tmp_path):
+    _isolate_overflow(monkeypatch, tmp_path)
+    assert resolve_overflow(default_max_chars=500) == ("truncate", 500)
+
+    monkeypatch.setenv("VOCALIZE_MAX_CHARS", "200")
+    assert resolve_overflow(default_max_chars=500) == ("truncate", 200)
+
+
+def test_config_file_max_chars_beats_the_caller_default(monkeypatch, tmp_path):
+    _isolate_overflow(monkeypatch, tmp_path, "max_chars = 300\n")
+    assert resolve_overflow(default_max_chars=500) == ("truncate", 300)
+
+
+@pytest.mark.parametrize("value", ["shout", "", "truncate please"])
+def test_invalid_overflow_mode_is_rejected_with_its_source(monkeypatch, tmp_path, value):
+    _isolate_overflow(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_OVERFLOW", value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_overflow()
+
+    assert "VOCALIZE_OVERFLOW" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["lots", "0", "-5"])
+def test_invalid_max_chars_is_rejected_with_its_source(monkeypatch, tmp_path, value):
+    _isolate_overflow(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_MAX_CHARS", value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_overflow()
+
+    assert "VOCALIZE_MAX_CHARS" in str(excinfo.value)
+
+
+def test_overflow_mode_is_case_insensitive(monkeypatch, tmp_path):
+    _isolate_overflow(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_OVERFLOW", "Never")
+    assert resolve_overflow() == ("never", None)

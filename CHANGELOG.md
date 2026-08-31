@@ -14,6 +14,28 @@ All notable changes to this project are documented here. Format follows
   chunk still goes through the existing disk cache individually, so a
   partially-cached long document only pays for the chunks it's missing.
 - `--chunk-chars` flag to control the split size (default: 9,500).
+- Configurable overflow behaviour: a new `overflow` setting (`truncate` |
+  `ask` | `never`) decides what happens when input exceeds the character
+  cap. `ask` prompts on the controlling terminal and degrades to
+  `truncate` with a note when there is none. Resolved like every other
+  setting: `--overflow` > `VOCALIZE_OVERFLOW` > config file > `truncate`.
+- `max_chars` can now come from the environment (`VOCALIZE_MAX_CHARS`) and
+  the config file, not just the `--max-chars` flag.
+- `--default-max-chars`: a fallback cap that sits below flag, env, and
+  config file — for wrapper scripts that want a protective default
+  without overriding the user's own settings.
+
+### Changed
+
+- The Stop hook no longer reads `VOCALIZE_MAX_CHARS` itself; it passes
+  `--default-max-chars 500` and lets the CLI resolve the user's real
+  settings. Its subprocess timeout now scales with the text length
+  (60s base, ~12 chars/s, 900s ceiling) instead of killing any clip
+  longer than a minute; on timeout the whole process group is killed,
+  so the `afplay` child can't keep playing as an orphan.
+- The Stop hook launches `vocalize` in its own session (no controlling
+  terminal), so an inherited `overflow = "ask"` degrades to truncate
+  there instead of blocking on a prompt nobody sees.
 
 ## 0.4.0
 

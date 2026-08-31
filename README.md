@@ -160,7 +160,8 @@ writing anything.
 | Voice ID | `--voice` | `VOCALIZE_VOICE` | `voice` | `21m00Tcm4TlvDq8ikWAM` ("Rachel") |
 | Model ID | `--model` | `VOCALIZE_MODEL` | `model` | `eleven_multilingual_v2` |
 | Speed | `--speed` | `VOCALIZE_SPEED` | `speed` | unset — the API's own 1.0 |
-| Max characters | `--max-chars` | `VOCALIZE_MAX_CHARS` (hook only) | not read from the config file | unset on the CLI; 500 in the hook |
+| Max characters | `--max-chars` | `VOCALIZE_MAX_CHARS` | `max_chars` | unset on the CLI; the hook supplies a 500 fallback |
+| Overflow mode | `--overflow` | `VOCALIZE_OVERFLOW` | `overflow` | `truncate` |
 | Hook binary | — | `VOCALIZE_BIN` | not read from the config file | `vocalize` as found on `PATH` |
 
 The config file is TOML at `$XDG_CONFIG_HOME/vocalize/config.toml`, falling
@@ -170,7 +171,19 @@ back to `~/.config/vocalize/config.toml`. Flat keys, no sections:
 voice = "21m00Tcm4TlvDq8ikWAM"
 model = "eleven_flash_v2_5"
 speed = 0.95
+max_chars = 1000
+overflow = "ask"
 ```
+
+`overflow` decides what happens when input is longer than the resolved
+`max_chars` cap: `truncate` (the default) cuts it at the cap, `ask` prompts
+on the controlling terminal first — and degrades to `truncate` with a note
+when there is no terminal to ask on (the Stop hook runs vocalize detached
+from the terminal precisely so this always happens there; pipes and scripts
+usually have no terminal either) — and `never` speaks the whole thing
+regardless. With no cap set anywhere there is no overflow, so the mode
+never fires. Hook-triggered speech still lives under the hook's 15-minute
+watchdog described below, whatever the mode.
 
 Not having a config file is normal and silent. A file that isn't valid TOML
 is an error naming the file; a key that isn't recognised is a warning on
@@ -220,11 +233,21 @@ the existing file first) rather than overwriting your other hooks. Every
 Claude Code response after that gets spoken aloud automatically. Uninstall
 by removing the `vocalize` entry from the `Stop` array in that file.
 
-By default the hook truncates each response to 500 characters before
-speaking it (`DEFAULT_MAX_CHARS` in `claude_stop_hook.py`) — a Stop hook
-fires after every turn, so a long response would burn through the
-ElevenLabs free-tier quota fast. Override with `VOCALIZE_MAX_CHARS` in the
-environment.
+By default the hook caps each response at 500 characters before speaking
+it — a Stop hook fires after every turn, so a long response would burn
+through the ElevenLabs free-tier quota fast. That 500 is only a fallback
+(`--default-max-chars`, supplied by the hook): a `VOCALIZE_MAX_CHARS` env
+var, a `max_chars` in the config file, or an `overflow` mode of `never`
+all override it, resolved by `vocalize` itself with the usual precedence.
+
+The hook launches `vocalize` in its own session, detached from the
+terminal, so an `overflow` of `ask` degrades to truncate there instead of
+writing a Y/n prompt into the middle of a session nobody is watching. Its
+subprocess timeout scales with the length of the text being spoken (about
+twelve characters a second, plus a minute of headroom), capped at a hard
+15-minute ceiling as a watchdog against hung processes — a read that
+would outlast the ceiling is stopped there, and the whole process group
+is killed so no orphaned audio keeps playing.
 
 The hook looks up the `vocalize` binary on `PATH`, but Claude Code hooks
 run in Claude Code's own environment, not your interactive shell — if

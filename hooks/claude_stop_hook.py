@@ -28,14 +28,31 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 # Keep spoken responses short by default — a Stop hook fires after every
 # turn, and a long response would eat the ElevenLabs free-tier quota fast.
-# Override with VOCALIZE_MAX_CHARS in the environment.
+# Passed as vocalize's --default-max-chars, which sits BELOW the user's own
+# settings: a --max-chars flag, VOCALIZE_MAX_CHARS in the environment, or
+# max_chars in the config file all override it (vocalize resolves those
+# itself — this hook deliberately doesn't).
 DEFAULT_MAX_CHARS = 500
+
+# Playback runs inside the vocalize subprocess and speech is roughly 12
+# characters a second, so a fixed timeout kills long clips mid-play. Scale
+# with the text instead; the ceiling still stops a hung process from
+# outliving the session. Truncation (if any) happens inside vocalize, so
+# the untruncated length is an upper bound, never too tight.
+TIMEOUT_BASE_SECONDS = 60
+TIMEOUT_CEILING_SECONDS = 900
+CHARS_PER_SECOND = 12
+
+
+def _speech_timeout(text: str) -> int:
+    return min(TIMEOUT_CEILING_SECONDS, TIMEOUT_BASE_SECONDS + len(text) // CHARS_PER_SECOND)
 
 
 def _extract_last_assistant_text(transcript_path: str) -> str:
@@ -118,21 +135,34 @@ def main() -> int:
         # tool isn't installed / not on PATH in this shell.
         return 0
 
-    max_chars = os.environ.get("VOCALIZE_MAX_CHARS", str(DEFAULT_MAX_CHARS))
-
     # Options first, then "--", then the text. Click treats any argv token
     # starting with "-" as an option, so a reply that opens with a bullet
     # ("- fixed the parser") or an arrow ("-> next") would otherwise make
     # vocalize exit 2 with "No such option" and speak nothing. The "--"
     # end-of-options separator makes the text unambiguously an argument.
+    #
+    # start_new_session detaches vocalize from the controlling terminal, on
+    # purpose, for two reasons: (1) overflow "ask" then finds no /dev/tty
+    # and degrades to truncate instead of writing a Y/n prompt into the
+    # middle of a Claude Code session that nobody knows to answer; (2) the
+    # new process group lets the timeout path kill vocalize AND the afplay
+    # child it spawned — subprocess.run's own timeout kills only the direct
+    # child and leaves the audio playing.
+    argv = [vocalize_bin, "speak", "--default-max-chars", str(DEFAULT_MAX_CHARS),
+            "--play", "--", text]
+    timeout = _speech_timeout(text)
     try:
-        result = subprocess.run(
-            [vocalize_bin, "speak", "--max-chars", max_chars, "--play", "--", text],
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0:
-            print(f"vocalize hook: vocalize exited {result.returncode}", file=sys.stderr)
+        proc = subprocess.Popen(argv, start_new_session=True)
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)  # pgid == pid: it leads the new session
+            proc.wait()
+            print(f"vocalize hook: speech timed out after {timeout}s; "
+                  "killed the process group", file=sys.stderr)
+            return 0
+        if returncode != 0:
+            print(f"vocalize hook: vocalize exited {returncode}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — must not crash the Stop hook
         # A speech failure should never break the coding session, so this
         # still returns 0 — but it's logged to stderr rather than swallowed
