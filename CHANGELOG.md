@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.5.0 - 2026-08-31
 
 ### Added
 
@@ -14,11 +14,6 @@ All notable changes to this project are documented here. Format follows
   touched — and a SIGTERM'd playback counts as a clean exit for the
   speak command that started it. Overlapping plays keep the newest
   record: the survivor is what stop stops.
-
-## 0.5.0 - 2026-08-31
-
-### Added
-
 - Chunked synthesis: input longer than the `eleven_multilingual_v2` model's
   10,000-character per-request cap is now split into chunks — preferring
   paragraph, then sentence, then word boundaries — synthesized sequentially,
