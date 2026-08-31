@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `vocalize settings` — prints the resolved settings, one key=value per
+  line, so wrapper scripts (like the /speak slash command) can read the
+  effective `overflow` and `max_chars` instead of hardcoding them.
+- `--print-length` on the Stop hook: prints the response's character count
+  instead of speaking, so a wrapper can decide to ask about truncation
+  interactively before any audio is spent.
+
 ## 0.5.0 - 2026-08-31
 
 ### Added

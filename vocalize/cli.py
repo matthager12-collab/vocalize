@@ -4,6 +4,7 @@
     vocalize speak-file report.md --play
     cat notes.md | vocalize speak-file - --play
     vocalize stop
+    vocalize settings
     vocalize voices
     vocalize usage
     vocalize config
@@ -179,6 +180,24 @@ def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw,
     _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
               chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars)
+
+
+@main.command()
+def settings() -> None:
+    """Print the resolved settings, env and config precedence applied.
+
+    One key=value per line, made for wrapper scripts (the /speak slash
+    command reads overflow and max_chars from here) — no API call, no key
+    needed.
+    """
+    file_config = load_config_file()
+    resolved = resolve_settings(file_config=file_config)
+    mode, cap = resolve_overflow(file_config=file_config)
+    click.echo(f"voice={resolved.voice_id}")
+    click.echo(f"model={resolved.model_id}")
+    click.echo(f"speed={resolved.speed if resolved.speed is not None else 'unset'}")
+    click.echo(f"max_chars={cap if cap is not None else 'unset'}")
+    click.echo(f"overflow={mode}")
 
 
 @main.command()

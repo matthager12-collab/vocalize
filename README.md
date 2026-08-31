@@ -191,6 +191,10 @@ regardless. With no cap set anywhere there is no overflow, so the mode
 never fires. Hook-triggered speech still lives under the hook's 15-minute
 watchdog described below, whatever the mode.
 
+`vocalize settings` prints the resolved values (one `key=value` per
+line, env and config applied) — handy for wrapper scripts and for checking
+which source won.
+
 Not having a config file is normal and silent. A file that isn't valid TOML
 is an error naming the file; a key that isn't recognised is a warning on
 stderr, so a typo doesn't pass unnoticed but doesn't stop the run either.

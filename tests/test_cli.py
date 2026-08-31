@@ -583,6 +583,34 @@ def test_ask_to_truncate_returns_none_on_tty_eof(monkeypatch):
     assert cli_module._ask_to_truncate(5000, 100) is None
 
 
+def test_settings_prints_resolved_config_values(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = tmp_path / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('max_chars = 1000\noverflow = "ask"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "max_chars=1000" in result.output
+    assert "overflow=ask" in result.output
+
+
+def test_settings_prints_defaults_when_nothing_is_configured(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
+        monkeypatch.delenv(var, raising=False)
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "max_chars=unset" in result.output
+    assert "overflow=truncate" in result.output
+    assert "speed=unset" in result.output
+
+
 def test_stop_command_reports_a_stopped_player(monkeypatch):
     monkeypatch.setattr(cli_module, "stop_playback", lambda: True)
     result = CliRunner().invoke(main, ["stop"])

@@ -172,6 +172,26 @@ def test_env_max_chars_is_left_for_the_cli_to_resolve(monkeypatch, tmp_path):
     assert calls[0][2:4] == ["--default-max-chars", "500"]
 
 
+def test_print_length_reports_count_without_speaking(monkeypatch, tmp_path, capsys):
+    path = _write_transcript(tmp_path, [_assistant([_text("hello there")])])
+    calls = _patch_main(monkeypatch, {"transcript_path": path})
+    monkeypatch.setattr(hook.sys, "argv", ["claude_stop_hook.py", "--print-length"])
+
+    assert hook.main() == 0
+    assert capsys.readouterr().out.strip() == "11"
+    assert calls == []  # nothing was spoken
+
+
+def test_print_length_reports_zero_for_an_empty_response(monkeypatch, tmp_path, capsys):
+    path = _write_transcript(tmp_path, ['{"type":"user"}'])
+    calls = _patch_main(monkeypatch, {"transcript_path": path})
+    monkeypatch.setattr(hook.sys, "argv", ["claude_stop_hook.py", "--print-length"])
+
+    assert hook.main() == 0
+    assert capsys.readouterr().out.strip() == "0"
+    assert calls == []
+
+
 def test_speech_timeout_scales_with_text_and_is_capped():
     assert hook._speech_timeout("") == 60
     assert hook._speech_timeout("x" * 1200) == 60 + 100

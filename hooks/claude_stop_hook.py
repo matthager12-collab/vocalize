@@ -9,6 +9,10 @@
    that response. Run it when you want speech instead of installing the
    hook and getting it after every turn.
 
+Add `--print-length` to either mode to print the response's character
+count instead of speaking — for wrappers deciding whether to ask about
+truncation before committing to audio.
+
 Either way it pulls the most recent assistant text message out of the
 transcript and pipes it through the `vocalize` CLI (the same one used
 directly from the command line), so there's exactly one code path for
@@ -125,6 +129,15 @@ def main() -> int:
 
     text = _extract_last_assistant_text(transcript_path)
     if not text.strip():
+        if "--print-length" in sys.argv[1:]:
+            print(0)
+        return 0
+
+    if "--print-length" in sys.argv[1:]:
+        # Report the response's size without speaking — the /speak command
+        # uses this to decide whether to ask about truncation in-app. Raw
+        # (pre-flattening) length: close enough for an ask threshold.
+        print(len(text))
         return 0
 
     # VOCALIZE_BIN wins over PATH so a venv install still resolves when the
