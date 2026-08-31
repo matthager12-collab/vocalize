@@ -583,6 +583,20 @@ def test_ask_to_truncate_returns_none_on_tty_eof(monkeypatch):
     assert cli_module._ask_to_truncate(5000, 100) is None
 
 
+def test_stop_command_reports_a_stopped_player(monkeypatch):
+    monkeypatch.setattr(cli_module, "stop_playback", lambda: True)
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert "Stopped playback." in result.output
+
+
+def test_stop_command_reports_nothing_playing(monkeypatch):
+    monkeypatch.setattr(cli_module, "stop_playback", lambda: False)
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert "Nothing is playing." in result.output
+
+
 def test_ask_to_truncate_returns_none_without_a_tty(monkeypatch):
     real_open = builtins.open
 

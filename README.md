@@ -126,6 +126,12 @@ Every synthesis result is cached on disk under `~/.cache/vocalize/`, keyed
 by a hash of (text, voice, model, format, speed) — re-running the same
 command twice doesn't burn API quota twice.
 
+`vocalize stop` (from any terminal) stops playback immediately — the
+player's identity (process ID plus launch timestamp) is tracked in
+`~/.cache/vocalize/play.pid`, and stop refuses to touch a process that no
+longer matches the full record — a recycled PID is never killed. A
+stopped read exits cleanly; the mp3 stays cached.
+
 Long inputs are also split automatically — at paragraph boundaries where
 possible, then sentences, then words — into requests no bigger than
 `--chunk-chars` (default 9500), so a long read no longer fails the API's

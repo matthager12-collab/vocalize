@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `vocalize stop` — stops in-progress playback from any terminal. play()
+  now records the player's PID in `~/.cache/vocalize/play.pid` while audio
+  runs; stop kills it only when the PID, its recorded launch timestamp,
+  and a known player name all still match — a recycled PID is never
+  touched — and a SIGTERM'd playback counts as a clean exit for the
+  speak command that started it. Overlapping plays keep the newest
+  record: the survivor is what stop stops.
+
 ## 0.5.0 - 2026-08-31
 
 ### Added

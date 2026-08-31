@@ -3,6 +3,7 @@
     vocalize speak "some text" --play
     vocalize speak-file report.md --play
     cat notes.md | vocalize speak-file - --play
+    vocalize stop
     vocalize voices
     vocalize usage
     vocalize config
@@ -20,6 +21,7 @@ import click
 from . import __version__
 from .audio import play as play_audio
 from .audio import save as save_audio
+from .audio import stop_playback
 from .auth import delete_key, key_source, login, masked, probe_keychain, prompt_for_key
 from .config import (
     DEFAULT_MODEL,
@@ -177,6 +179,15 @@ def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw,
     _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
               chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars)
+
+
+@main.command()
+def stop() -> None:
+    """Stop any audio vocalize is currently playing."""
+    if stop_playback():
+        click.echo("Stopped playback.")
+    else:
+        click.echo("Nothing is playing.")
 
 
 @main.command()
