@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.7.0 - 2026-08-31
+
+### Added
+
+- `vocalize clip` — speaks the macOS clipboard (pbpaste). Stops any
+  current playback first, refuses an empty clipboard, and refuses
+  credential-shaped content: a single high-entropy token, or one starting
+  with a known secret prefix (sk-, pypi-, ghp\_, op://, eyJ, …), is never
+  echoed or sent to ElevenLabs. `--allow-secret` bypasses the guard.
+- `--ask-dialog` on speak/speak-file/clip — when overflow is `ask` and no
+  terminal is attached, ask via a native macOS dialog (Truncate / Speak
+  all / Cancel, 30 s timeout defaulting to Truncate) instead of silently
+  truncating. Off by default; the Claude Code Stop hook never uses it.
+- macOS Quick Actions: "Speak with Vocalize" (highlight text in any app →
+  right-click → Services, or a keyboard shortcut) and "Stop Vocalize".
+  Install with `python3 hooks/install_quick_action.py`; the checked-in
+  bundles live in `hooks/quick_actions/`.
+
 ## 0.6.0 - 2026-08-31
 
 ### Added

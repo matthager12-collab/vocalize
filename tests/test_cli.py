@@ -1,5 +1,6 @@
 import builtins
 import io
+import subprocess
 
 import pytest
 from click.testing import CliRunner
@@ -635,3 +636,241 @@ def test_ask_to_truncate_returns_none_without_a_tty(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert cli_module._ask_to_truncate(5000, 100) is None
+
+
+# --- the credential guard behind `vocalize clip` ---------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "sk-abcdefetc",
+        "pypi-AgEIcHlwaS5vcmc",
+        "ghp_16charsofpadding",
+        "github_pat_11ABCDE",
+        "op://Employee/Example/some-item",  # the op:// prefix
+        "eyJhbGciOiJIUzI1NiJ9",
+        "xoxb-1234-abcd",
+        "AKIAIOSFODNN7EXAMPLE",
+        "glpat-xxxxxxxxxxxxxxxxxxxx",
+        # No known prefix, but shaped like a generated key: long, one token,
+        # letters+digits, high entropy.
+        "aB3dE9fG1hJ4kL7mN0pQ2rS5",
+    ],
+)
+def test_credential_guard_refuses_secret_shaped_tokens(token):
+    assert cli_module._looks_like_credential(token) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a plain sentence someone actually wants read aloud",
+        "hello",  # short single word
+        "supercalifragilistic",  # long but letters-only
+        "12345678901234567890123",  # digits-only (a phone number)
+        "a1a1a1a1a1a1a1a1a1a1a1a1",  # mixed but low entropy
+        "https://example.com/reports/x1y2z3w4v5u6t7s8",  # a URL
+        "",
+        "   \n  ",
+    ],
+)
+def test_credential_guard_allows_ordinary_text(text):
+    assert cli_module._looks_like_credential(text) is False
+
+
+# --- vocalize clip ----------------------------------------------------------
+
+
+def test_clip_speaks_the_clipboard(monkeypatch, tmp_path):
+    _played, captured_text, _settings = _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "copied words to speak")
+    out_file = tmp_path / "out.mp3"
+
+    result = CliRunner().invoke(
+        main, ["clip", "--api-key", "fake-key", "--output", str(out_file), "--no-play"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_text == ["copied words to speak"]
+
+
+def test_clip_stops_current_playback_first(monkeypatch, tmp_path):
+    _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "new content")
+    stopped = {}
+    monkeypatch.setattr(cli_module, "stop_playback", lambda: stopped.setdefault("hit", True))
+    out_file = tmp_path / "out.mp3"
+
+    result = CliRunner().invoke(
+        main, ["clip", "--api-key", "fake-key", "--output", str(out_file)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert stopped == {"hit": True}
+
+
+def test_clip_does_not_stop_playback_with_no_play(monkeypatch, tmp_path):
+    _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "new content")
+
+    def boom():
+        raise AssertionError("stop_playback called for a --no-play run")
+
+    monkeypatch.setattr(cli_module, "stop_playback", boom)
+    out_file = tmp_path / "out.mp3"
+
+    result = CliRunner().invoke(
+        main, ["clip", "--api-key", "fake-key", "--output", str(out_file), "--no-play"]
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_clip_refuses_an_empty_clipboard(monkeypatch):
+    _played, captured_text, _settings = _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "   \n ")
+
+    result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, cli_module.TTSRequestError)
+    assert captured_text == []
+
+
+def test_clip_refuses_a_credential_without_echoing_it(monkeypatch):
+    _played, captured_text, _settings = _patch_tts(monkeypatch)
+    secret = "sk-supersecretvalue123456"
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: secret)
+
+    result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
+
+    assert result.exit_code != 0
+    assert "Refusing to speak" in result.output
+    # The whole point: nothing secret in the transcript, nothing to the API.
+    assert secret not in result.output
+    assert "supersecret" not in result.output
+    assert captured_text == []
+
+
+def test_clip_allow_secret_bypasses_the_guard(monkeypatch, tmp_path):
+    _played, captured_text, _settings = _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "sk-fine-really")
+    out_file = tmp_path / "out.mp3"
+
+    result = CliRunner().invoke(
+        main,
+        ["clip", "--allow-secret", "--api-key", "fake-key",
+         "--output", str(out_file), "--no-play"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_text == ["sk-fine-really"]
+
+
+# --- the --ask-dialog fallback ----------------------------------------------
+
+
+def _fake_osascript(monkeypatch, returncode=0, stdout="", raise_exc=None):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if raise_exc is not None:
+            raise raise_exc
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    return calls
+
+
+def test_dialog_truncate_button_maps_to_truncate(monkeypatch):
+    calls = _fake_osascript(monkeypatch, stdout="button returned:Truncate, gave up:false")
+    assert cli_module._ask_to_truncate_dialog(5000, 100) == "truncate"
+    assert calls[0][0] == "osascript"
+    # Only vocalize's own integers reach the AppleScript source.
+    assert "5,000" in calls[0][2]
+    assert "100" in calls[0][2]
+
+
+def test_dialog_speak_all_button_maps_to_all(monkeypatch):
+    _fake_osascript(monkeypatch, stdout="button returned:Speak all, gave up:false")
+    assert cli_module._ask_to_truncate_dialog(5000, 100) == "all"
+
+
+def test_dialog_cancel_maps_to_cancel(monkeypatch):
+    # Cancel/Esc raises AppleScript error -128, surfacing as a non-zero exit.
+    _fake_osascript(monkeypatch, returncode=1)
+    assert cli_module._ask_to_truncate_dialog(5000, 100) == "cancel"
+
+
+def test_dialog_timeout_takes_the_default_truncate(monkeypatch):
+    # A given-up dialog exits 0 with an EMPTY button name — the real macOS
+    # output is "button returned:, gave up:true" (verified live). The
+    # not-"Speak all" fallback must map that to truncate.
+    _fake_osascript(monkeypatch, stdout="button returned:, gave up:true")
+    assert cli_module._ask_to_truncate_dialog(5000, 100) == "truncate"
+
+
+def test_dialog_subprocess_failure_fails_closed(monkeypatch):
+    _fake_osascript(monkeypatch, raise_exc=OSError("no osascript"))
+    assert cli_module._ask_to_truncate_dialog(5000, 100) == "cancel"
+
+
+def test_ask_dialog_speak_all_skips_the_cap(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", lambda n, cap: None)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate_dialog", lambda n, cap: "all")
+
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask", "--ask-dialog"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) > 50
+
+
+def test_ask_dialog_truncate_applies_the_cap(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", lambda n, cap: None)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate_dialog", lambda n, cap: "truncate")
+
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask", "--ask-dialog"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured[0]) <= 50 + len("... (truncated)")
+
+
+def test_ask_dialog_cancel_speaks_nothing(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", lambda n, cap: None)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate_dialog", lambda n, cap: "cancel")
+
+    result, captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask", "--ask-dialog"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == []
+    assert "cancelled" in result.output
+
+
+def test_no_dialog_without_the_flag(monkeypatch, tmp_path):
+    # The Stop hook's silent degrade depends on this: overflow "ask" with no
+    # tty and no --ask-dialog must never pop a dialog.
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "_ask_to_truncate", lambda n, cap: None)
+
+    def boom(n, cap):
+        raise AssertionError("dialog fired without --ask-dialog")
+
+    monkeypatch.setattr(cli_module, "_ask_to_truncate_dialog", boom)
+
+    result, _captured = _speak_long(
+        monkeypatch, tmp_path, ["--max-chars", "50", "--overflow", "ask"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "no terminal to ask on" in result.output

@@ -30,6 +30,10 @@ class TTSRequestError(VocalizeError):
     """Raised when the ElevenLabs API call itself fails."""
 
 
+class ClipboardError(VocalizeError):
+    """Raised when the system clipboard cannot be read."""
+
+
 class NoAudioPlayerError(VocalizeError):
     """Raised when no supported system audio player can be found."""
 

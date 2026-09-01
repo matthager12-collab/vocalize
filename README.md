@@ -102,6 +102,9 @@ vocalize speak-file report.md
 # Pipe anything in
 cat notes.md | vocalize speak-file -
 
+# Speak whatever is on the macOS clipboard
+vocalize clip
+
 # List available voices and grab an ID
 vocalize voices
 
@@ -136,6 +139,14 @@ Long inputs are also split automatically — at paragraph boundaries where
 possible, then sentences, then words — into requests no bigger than
 `--chunk-chars` (default 9500), so a long read no longer fails the API's
 own per-request cap.
+
+`vocalize clip` stops any current playback first, then speaks the
+clipboard. It refuses content shaped like a secret — a single
+high-entropy token, or one starting with a known credential prefix
+(`sk-`, `pypi-`, `ghp_`, `op://`, `eyJ`, …) — without echoing it anywhere;
+`--allow-secret` bypasses the guard when you're sure. This is a
+habit-breaking guard for text copied out of a password manager, not a
+full secret scanner.
 
 ## Configuration
 
@@ -206,6 +217,35 @@ own order: `--api-key` flag, then `ELEVENLABS_API_KEY`, then a `.env` file
 in the current directory, then the OS keychain. `vocalize auth login` sets
 up the keychain entry; `vocalize auth status` shows which of those sources
 is currently supplying the key.
+
+## macOS Quick Actions (highlight → speak)
+
+Two Services let you use vocalize from any app without a terminal:
+
+- **Speak with Vocalize** — highlight text anywhere, right-click →
+  Services → Speak with Vocalize. It stops whatever was already playing
+  and reads the selection. If the selection is over your cap and your
+  overflow mode is `ask`, a native dialog asks Truncate / Speak all /
+  Cancel (that's the `--ask-dialog` flag at work).
+- **Stop Vocalize** — appears in every app's application menu → Services;
+  silences playback from anywhere.
+
+Install both:
+
+```bash
+python3 hooks/install_quick_action.py
+```
+
+This copies the bundles from `hooks/quick_actions/` into
+`~/Library/Services/` with this machine's absolute `vocalize` path baked
+in, then refreshes the Services registry. To trigger them from the
+keyboard, assign shortcuts under System Settings → Keyboard → Keyboard
+Shortcuts → Services → Text.
+
+Some Electron apps (Claude Code desktop among them) don't expose the
+Services menu for text selected in their own window. There, copy the
+selection and use `/speak clip` (or `vocalize clip` in a terminal)
+instead.
 
 ## Claude Code integration
 

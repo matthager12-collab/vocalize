@@ -3,6 +3,7 @@
     vocalize speak "some text" --play
     vocalize speak-file report.md --play
     cat notes.md | vocalize speak-file - --play
+    vocalize clip
     vocalize stop
     vocalize settings
     vocalize voices
@@ -13,7 +14,10 @@
 
 from __future__ import annotations
 
+import math
+import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +28,7 @@ from .audio import play as play_audio
 from .audio import save as save_audio
 from .audio import stop_playback
 from .auth import delete_key, key_source, login, masked, probe_keychain, prompt_for_key
+from .clipboard import read_clipboard
 from .config import (
     DEFAULT_MODEL,
     DEFAULT_VOICE,
@@ -70,6 +75,10 @@ def _common_options(f):
     f = click.option("--default-max-chars", type=click.IntRange(min=1), default=None,
                       help="Fallback cap used only when no --max-chars, VOCALIZE_MAX_CHARS, or "
                       "config file value sets one. For wrapper scripts; most users want --max-chars.")(f)
+    f = click.option("--ask-dialog", is_flag=True, default=False,
+                      help="When overflow is 'ask' and there is no terminal, ask via a macOS "
+                      "dialog instead of degrading to truncate. For GUI launchers like the "
+                      "Quick Action; never used by the Claude Code Stop hook.")(f)
     return f
 
 
@@ -102,8 +111,90 @@ def _ask_to_truncate(input_chars: int, cap: int) -> bool | None:
     return answer.strip().lower() not in ("n", "no")
 
 
+_DIALOG_TIMEOUT_SECONDS = 30
+
+
+def _ask_to_truncate_dialog(input_chars: int, cap: int) -> str:
+    """Ask via a macOS dialog when there is no /dev/tty.
+
+    Returns "truncate", "all", or "cancel". Only reached under --ask-dialog
+    (the Quick Action); the Stop hook keeps its silent degrade. The dialog
+    text contains only integers vocalize computed — never spoken content —
+    so nothing user- or attacker-controlled is interpolated into the
+    AppleScript source.
+    """
+    script = (
+        f'display dialog "Input is {input_chars:,} characters; the cap is {cap:,}. '
+        f'What should vocalize do?" with title "vocalize" '
+        f'buttons {{"Cancel", "Speak all", "Truncate"}} '
+        f'default button "Truncate" cancel button "Cancel" '
+        f'giving up after {_DIALOG_TIMEOUT_SECONDS}'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=_DIALOG_TIMEOUT_SECONDS + 10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "cancel"  # can't confirm intent → speak nothing
+    if result.returncode != 0:
+        return "cancel"  # Cancel / Esc raises AppleScript error -128
+    if "Speak all" in result.stdout:
+        return "all"
+    # Explicit Truncate click, or the "giving up after" timeout — a
+    # given-up dialog exits 0 with an EMPTY button name, so anything that
+    # isn't "Speak all" must resolve to truncate, never to speaking more.
+    return "truncate"
+
+
+_CREDENTIAL_PREFIXES = (
+    "sk-", "sk_live_", "sk_test_", "pk_live_", "pk_test_", "rk_live_",
+    "pypi-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+    "op://", "eyJ", "xoxb-", "xoxp-", "xoxa-", "xoxc-", "AKIA", "ASIA",
+    "AIza", "glpat-", "npm_", "shpat_", "shpss_", "sq0atp-", "sq0csp-",
+)
+_CREDENTIAL_MIN_LENGTH = 20
+_CREDENTIAL_CHARSET = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=_.-"
+)
+_CREDENTIAL_ENTROPY_THRESHOLD = 3.5  # bits per character
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
+
+
+def _looks_like_credential(text: str) -> bool:
+    """Guard against speaking a secret copied from a password manager.
+
+    Refuses a SINGLE whitespace-free token that starts with a known secret
+    prefix, or that is long, token-charset only, mixes letters and digits,
+    and is high-entropy — the shape of a generated key, not of a word,
+    sentence, or URL. It exists to interrupt habit, not to be an airtight
+    scanner, so it never inspects multi-word text at all.
+    """
+    stripped = text.strip()
+    if not stripped or any(ch.isspace() for ch in stripped):
+        return False
+    if stripped.startswith(_CREDENTIAL_PREFIXES):
+        return True
+    if len(stripped) < _CREDENTIAL_MIN_LENGTH:
+        return False
+    if "://" in stripped:
+        return False  # a bare URL; op:// already matched as a prefix
+    if not set(stripped) <= _CREDENTIAL_CHARSET:
+        return False
+    if not (any(c.isalpha() for c in stripped) and any(c.isdigit() for c in stripped)):
+        return False
+    return _shannon_entropy(stripped) >= _CREDENTIAL_ENTROPY_THRESHOLD
+
+
 def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
-             chunk_chars, overflow, default_max_chars) -> None:
+             chunk_chars, overflow, default_max_chars, ask_dialog=False) -> None:
     text = raw_text if raw else flatten_markdown(raw_text)
 
     # Parsed once here and shared by both resolvers, so a config-file typo
@@ -115,6 +206,12 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
         cap = None
     elif mode == "ask" and cap is not None and len(text) > cap:
         answer = _ask_to_truncate(len(text), cap)
+        if answer is None and ask_dialog:
+            outcome = _ask_to_truncate_dialog(len(text), cap)
+            if outcome == "cancel":
+                click.echo("Note: cancelled at the truncation prompt; nothing spoken.", err=True)
+                return
+            answer = outcome == "truncate"
         if answer is None:
             click.echo(
                 f"Note: overflow is 'ask' but there is no terminal to ask on; "
@@ -160,18 +257,19 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
 @click.argument("text")
 @_common_options
 def speak(text, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
-          chunk_chars, overflow, default_max_chars) -> None:
+          chunk_chars, overflow, default_max_chars, ask_dialog) -> None:
     """Speak TEXT directly."""
     _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
-              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars)
+              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars,
+              ask_dialog=ask_dialog)
 
 
 @main.command("speak-file")
 @click.argument("path", type=click.File("r", encoding="utf-8"))
 @_common_options
 def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
-               chunk_chars, overflow, default_max_chars) -> None:
+               chunk_chars, overflow, default_max_chars, ask_dialog) -> None:
     """Speak the contents of PATH (a markdown/text file), or "-" for stdin."""
     try:
         raw_text = path.read()
@@ -179,7 +277,34 @@ def speak_file(path, api_key, voice_id, model_id, speed, output_path, play, raw,
         raise click.FileError(getattr(path, "name", "input"), hint="file is not valid UTF-8 text") from exc
     _run_tts(raw_text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
-              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars)
+              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars,
+              ask_dialog=ask_dialog)
+
+
+@main.command()
+@click.option("--allow-secret", is_flag=True,
+              help="Bypass the credential-shaped-clipboard guard. Only when you are "
+              "certain the clipboard is not a secret.")
+@_common_options
+def clip(allow_secret, api_key, voice_id, model_id, speed, output_path, play, raw, max_chars,
+         chunk_chars, overflow, default_max_chars, ask_dialog) -> None:
+    """Speak the current macOS clipboard contents."""
+    text = read_clipboard()
+    if not text.strip():
+        raise TTSRequestError("Clipboard is empty; nothing to speak.")
+    if not allow_secret and _looks_like_credential(text):
+        # Deliberately does not echo any part of the clipboard.
+        raise click.ClickException(
+            "Refusing to speak: the clipboard looks like a secret or credential "
+            "(a single high-entropy token). It was not shown or sent anywhere. "
+            "If you are sure it is safe, re-run with --allow-secret."
+        )
+    if play:
+        stop_playback()  # fresh content replaces whatever is mid-playback
+    _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
+              output_path=output_path, play=play, raw=raw, max_chars=max_chars,
+              chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars,
+              ask_dialog=ask_dialog)
 
 
 @main.command()
