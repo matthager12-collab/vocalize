@@ -191,8 +191,9 @@ def truncate_for_budget(text: str, max_chars: int | None) -> tuple[str, bool]:
     """
     if max_chars is None or len(text) <= max_chars:
         return text, False
-    cut = text[:max_chars].rsplit(" ", 1)[0]
-    return cut + "... (truncated)", True
+    # No spoken marker: this text is read aloud, and a literal "(truncated)"
+    # gets spoken as a word. Callers surface truncation on stderr instead.
+    return text[:max_chars].rsplit(" ", 1)[0], True
 
 
 # The eleven_multilingual_v2 model caps a single request at 10,000

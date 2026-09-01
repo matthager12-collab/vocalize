@@ -107,6 +107,14 @@ def test_truncate_for_budget_cuts_on_word_boundary():
     assert not text.startswith("one two thre")
 
 
+def test_truncate_for_budget_leaves_no_spoken_marker():
+    # The result is read aloud; a literal "(truncated)" would be spoken.
+    text, truncated = truncate_for_budget("one two three four five", max_chars=13)
+    assert truncated is True
+    assert "truncated" not in text
+    assert "(" not in text
+
+
 def test_truncate_for_budget_none_means_unlimited():
     long_text = "word " * 10000
     text, truncated = truncate_for_budget(long_text, max_chars=None)

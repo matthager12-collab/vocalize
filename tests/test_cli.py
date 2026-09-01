@@ -120,7 +120,7 @@ def test_max_chars_truncates_and_notes(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert len(captured_text[0]) <= 10 + len("... (truncated)")
+    assert len(captured_text[0]) <= 10
     assert "truncated" in result.output
 
 
@@ -412,7 +412,7 @@ def test_overflow_truncate_is_the_default(monkeypatch, tmp_path):
     result, captured = _speak_long(monkeypatch, tmp_path, ["--max-chars", "50"])
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert len(captured[0]) <= 50
     assert "truncated to 50" in result.output
 
 
@@ -425,7 +425,7 @@ def test_overflow_ask_without_a_terminal_degrades_to_truncate(monkeypatch, tmp_p
     )
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert len(captured[0]) <= 50
     assert "no terminal to ask on" in result.output
 
 
@@ -456,7 +456,7 @@ def test_overflow_ask_truncates_on_a_yes(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert len(captured[0]) <= 50
 
 
 def test_overflow_ask_under_the_cap_never_prompts(monkeypatch, tmp_path):
@@ -478,7 +478,7 @@ def test_default_max_chars_caps_when_nothing_else_is_set(monkeypatch, tmp_path):
     result, captured = _speak_long(monkeypatch, tmp_path, ["--default-max-chars", "50"])
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert len(captured[0]) <= 50
     assert "truncated to 50" in result.output
 
 
@@ -488,7 +488,7 @@ def test_env_var_beats_default_max_chars(monkeypatch, tmp_path):
     result, captured = _speak_long(monkeypatch, tmp_path, ["--default-max-chars", "50"])
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 80 + len("... (truncated)")
+    assert len(captured[0]) <= 80
     assert "truncated to 80" in result.output
 
 
@@ -521,7 +521,7 @@ def test_config_file_overflow_and_max_chars_reach_the_cli(monkeypatch, tmp_path)
     result, captured = _speak_long(monkeypatch, tmp_path, [])
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 60 + len("... (truncated)")
+    assert len(captured[0]) <= 60
     assert "truncated to 60" in result.output
 
 
@@ -840,7 +840,7 @@ def test_ask_dialog_truncate_applies_the_cap(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert len(captured[0]) <= 50 + len("... (truncated)")
+    assert len(captured[0]) <= 50
 
 
 def test_ask_dialog_cancel_speaks_nothing(monkeypatch, tmp_path):

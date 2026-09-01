@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.8.1 - 2026-09-01
+
+### Fixed
+
+- Truncated speech no longer reads the words "dot dot dot truncated" aloud.
+  The `... (truncated)` marker was being appended to the text sent to
+  ElevenLabs and spoken; it's gone from the audio now. The CLI still prints
+  a "Note: input truncated to N characters." line to stderr.
+
 ## 0.8.0 - 2026-08-31
 
 ### Added
