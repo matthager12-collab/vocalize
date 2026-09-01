@@ -9,6 +9,7 @@ overwrites the same two bundles.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -23,9 +24,12 @@ BUNDLE_NAMES = (
     "Speak Latest Plan.workflow",
 )
 PLACEHOLDER = "__VOCALIZE_BIN__"
+CLAUDE_PLACEHOLDER = "__CLAUDE_BIN__"
+CLAUDE_EXTRA_PATH_PLACEHOLDER = "__CLAUDE_EXTRA_PATH__"
+HELPER_PLACEHOLDER = "__HELPER__"
 PBS = "/System/Library/CoreServices/pbs"
 
-# The path lands inside BIN="..." in the Quick Action's zsh script. These
+# Baked values land inside "..." in the Quick Action's zsh script. These
 # characters could escape those quotes, so refuse rather than try to quote.
 _UNSAFE_PATH_CHARS = set('"\\`$')
 
@@ -45,7 +49,35 @@ def _resolve_vocalize_bin() -> Path:
     sys.exit(1)
 
 
-def _install_one(name: str, bin_path: str) -> None:
+def _resolve_helper() -> Path:
+    helper = Path(__file__).resolve().parent / "speak_options.py"
+    if not helper.is_file():
+        print(f"Could not find the picker helper at {helper}.", file=sys.stderr)
+        sys.exit(1)
+    return helper
+
+
+def _resolve_claude() -> tuple[str, str]:
+    """Return (claude_path, extra_PATH). Empty strings when claude is absent.
+
+    claude.exe may need `node` resolved via PATH even when invoked by its
+    absolute path, and a bare Services environment has neither on PATH, so
+    bake claude's and node's directories for the helper to prepend.
+    """
+    found = shutil.which("claude")
+    if not found:
+        return "", ""
+    claude_path = Path(found).resolve()
+    dirs = [str(claude_path.parent)]
+    node = shutil.which("node")
+    if node:
+        node_dir = str(Path(node).resolve().parent)
+        if node_dir not in dirs:
+            dirs.append(node_dir)
+    return str(claude_path), os.pathsep.join(dirs)
+
+
+def _install_one(name: str, substitutions: dict) -> None:
     src = TEMPLATES_DIR / name
     dest = SERVICES_DIR / name
     if dest.exists():
@@ -54,31 +86,48 @@ def _install_one(name: str, bin_path: str) -> None:
 
     wflow = dest / "Contents" / "Resources" / "document.wflow"
     text = wflow.read_text(encoding="utf-8")
-    wflow.write_text(text.replace(PLACEHOLDER, xml_escape(bin_path)), encoding="utf-8")
+    for placeholder, value in substitutions.items():
+        text = text.replace(placeholder, xml_escape(value))
+    wflow.write_text(text, encoding="utf-8")
 
 
 def main() -> int:
     bin_path = str(_resolve_vocalize_bin())
-    if _UNSAFE_PATH_CHARS & set(bin_path):
-        print(
-            f"Refusing to install: the resolved vocalize path contains characters "
-            f"that would break the Quick Action script: {bin_path!r}",
-            file=sys.stderr,
-        )
-        return 1
+    helper_path = str(_resolve_helper())
+    claude_path, claude_extra_path = _resolve_claude()
+
+    substitutions = {
+        PLACEHOLDER: bin_path,
+        HELPER_PLACEHOLDER: helper_path,
+        CLAUDE_PLACEHOLDER: claude_path,
+        CLAUDE_EXTRA_PATH_PLACEHOLDER: claude_extra_path,
+    }
+    for value in substitutions.values():
+        if _UNSAFE_PATH_CHARS & set(value):
+            print(
+                f"Refusing to install: a resolved path contains characters that "
+                f"would break the Quick Action script: {value!r}",
+                file=sys.stderr,
+            )
+            return 1
 
     SERVICES_DIR.mkdir(parents=True, exist_ok=True)
     for name in BUNDLE_NAMES:
-        _install_one(name, bin_path)
+        _install_one(name, substitutions)
         print(f"Installed {name} -> {SERVICES_DIR / name}")
 
     # Nudge the Services registry so the new entries appear without a logout.
     subprocess.run([PBS, "-update"], check=False)
 
     print(f"\nUsing vocalize at: {bin_path}")
+    if claude_path:
+        print(f"Summaries via claude at: {claude_path}")
+    else:
+        print("claude not found; Quick Actions will offer speak-all / truncate only.")
     print('Highlight text in any app, then right-click -> Services -> "Speak with Vocalize".')
     print("Keyboard shortcuts: System Settings -> Keyboard -> Keyboard Shortcuts -> Services.")
     print("If the actions don't appear, re-open the Services submenu once, or log out and in.")
+    print("Run this installer from a normal terminal (its PATH is what gets baked in).")
     return 0
 
 

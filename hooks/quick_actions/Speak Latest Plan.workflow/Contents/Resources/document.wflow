@@ -71,7 +71,10 @@ if [[ -z "$PLAN" ]]; then
   exit 0
 fi
 "$BIN" stop &gt;/dev/null 2&gt;&amp;1
-exec "$BIN" speak-file "$PLAN" --play --ask-dialog</string>
+export VOCALIZE_BIN="$BIN"
+export CLAUDE_BIN="__CLAUDE_BIN__"
+export CLAUDE_EXTRA_PATH="__CLAUDE_EXTRA_PATH__"
+exec /usr/bin/python3 "__HELPER__" &lt; "$PLAN"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<false/>
 					<key>inputMethod</key>

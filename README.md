@@ -225,8 +225,12 @@ Two Services let you use vocalize from any app without a terminal:
 - **Speak with Vocalize** — highlight text anywhere, right-click →
   Services → Speak with Vocalize. It stops whatever was already playing
   and reads the selection. If the selection is over your cap and your
-  overflow mode is `ask`, a native dialog asks Truncate / Speak all /
-  Cancel (that's the `--ask-dialog` flag at work).
+  overflow mode is `ask`, a picker offers **Speak all**, three summary
+  depths (**light** ~25s, **medium** ~1 min, **detailed** ~2.5 min), or
+  **Truncate**. Summaries are produced by `claude -p --model haiku` (with
+  tools denied) — picking one has a few seconds of silent cold-start
+  before audio begins. If no `claude` binary was found when you ran the
+  installer, the picker simply omits the three summary depths.
 - **Stop Vocalize** — appears in every app's application menu → Services;
   silences playback from anywhere.
 - **Speak Latest Plan** — reads the newest Claude Code plan file
@@ -241,10 +245,12 @@ python3 hooks/install_quick_action.py
 ```
 
 This copies the bundles from `hooks/quick_actions/` into
-`~/Library/Services/` with this machine's absolute `vocalize` path baked
-in, then refreshes the Services registry. To trigger them from the
-keyboard, assign shortcuts under System Settings → Keyboard → Keyboard
-Shortcuts → Services → Text.
+`~/Library/Services/` with this machine's absolute `vocalize`, `claude`,
+and helper paths baked in, then refreshes the Services registry. Run it
+from a normal terminal — its PATH is what gets captured. To trigger the
+actions from the keyboard, assign shortcuts under System Settings →
+Keyboard → Keyboard Shortcuts → Services (Stop Vocalize is worth a
+shortcut of its own so you can silence a read from anywhere).
 
 Some Electron apps (Claude Code desktop among them) don't expose the
 Services menu for text selected in their own window. There, copy the

@@ -59,15 +59,18 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string># Selected text arrives on stdin. The only interpolated value is the
-# vocalize path, baked in by hooks/install_quick_action.py.
+					<string># Selected text arrives on stdin. Interpolated values (vocalize/claude
+# paths, helper location) are baked in by hooks/install_quick_action.py.
 BIN="__VOCALIZE_BIN__"
 if [[ ! -x "$BIN" ]]; then
   /usr/bin/osascript -e 'display notification "vocalize not found — re-run hooks/install_quick_action.py" with title "Vocalize"'
   exit 1
 fi
 "$BIN" stop &gt;/dev/null 2&gt;&amp;1
-exec "$BIN" speak-file - --play --ask-dialog</string>
+export VOCALIZE_BIN="$BIN"
+export CLAUDE_BIN="__CLAUDE_BIN__"
+export CLAUDE_EXTRA_PATH="__CLAUDE_EXTRA_PATH__"
+exec /usr/bin/python3 "__HELPER__"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<false/>
 					<key>inputMethod</key>
