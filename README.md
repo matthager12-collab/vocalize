@@ -229,6 +229,10 @@ Two Services let you use vocalize from any app without a terminal:
   Cancel (that's the `--ask-dialog` flag at work).
 - **Stop Vocalize** — appears in every app's application menu → Services;
   silences playback from anywhere.
+- **Speak Latest Plan** — reads the newest Claude Code plan file
+  (`~/.claude/plans/`) aloud on demand. Made for the plan-approval moment:
+  the proposal card is up, you press your shortcut, hear the plan, then
+  accept or reject. Nothing reads unless you trigger it.
 
 Install both:
 

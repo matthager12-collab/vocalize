@@ -17,7 +17,11 @@ from xml.sax.saxutils import escape as xml_escape
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "quick_actions"
 SERVICES_DIR = Path.home() / "Library" / "Services"
-BUNDLE_NAMES = ("Speak with Vocalize.workflow", "Stop Vocalize.workflow")
+BUNDLE_NAMES = (
+    "Speak with Vocalize.workflow",
+    "Stop Vocalize.workflow",
+    "Speak Latest Plan.workflow",
+)
 PLACEHOLDER = "__VOCALIZE_BIN__"
 PBS = "/System/Library/CoreServices/pbs"
 

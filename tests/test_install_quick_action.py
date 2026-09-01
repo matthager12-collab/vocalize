@@ -156,3 +156,16 @@ def test_checked_in_stop_bundle_takes_no_stdin():
     # inputMethod 1 = as-arguments: a no-input service must not wait on stdin.
     assert params["inputMethod"] == 1
     assert " stop" in params["COMMAND_STRING"]
+
+
+def test_checked_in_plan_bundle_speaks_newest_plan_on_demand():
+    doc = _real_wflow("Speak Latest Plan.workflow")
+    params = doc["actions"][0]["action"]["ActionParameters"]
+    script = params["COMMAND_STRING"]
+    # No-input service (inputMethod 1), reads the newest plan file, asks
+    # via dialog when over the cap, and quotes the resolved path.
+    assert params["inputMethod"] == 1
+    assert '.claude/plans"/*.md' in script
+    assert "--ask-dialog" in script
+    assert 'speak-file "$PLAN"' in script
+    assert install_quick_action.PLACEHOLDER in script

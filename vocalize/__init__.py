@@ -7,4 +7,4 @@ formatting into something that actually sounds good spoken aloud
 which is close to useless).
 """
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"

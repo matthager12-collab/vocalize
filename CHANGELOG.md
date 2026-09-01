@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.7.1 - 2026-08-31
+
+### Added
+
+- "Speak Latest Plan" Quick Action — a no-input Service that speaks the
+  newest plan under `~/.claude/plans/` on demand (dialog-asks when over
+  the cap). For hearing a Claude Code plan proposal before accepting it;
+  installed by the same `hooks/install_quick_action.py`.
+
 ## 0.7.0 - 2026-08-31
 
 ### Added
