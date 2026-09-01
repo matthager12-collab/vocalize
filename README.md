@@ -123,6 +123,15 @@ vocalize speak-file report.md --speed 0.9
 
 # Skip the markdown flattening entirely
 vocalize speak "raw **markdown** stays raw" --raw
+
+# Speak through one specific provider, no fallback
+vocalize speak "Test" --provider google
+
+# See (or set) the order providers are tried in
+vocalize chain
+
+# Set up the offline, opt-in local voice (downloads ~354 MB once)
+vocalize local install
 ```
 
 Every synthesis result is cached on disk under `~/.cache/vocalize/`, keyed
@@ -179,18 +188,44 @@ writing anything.
 | Speed | `--speed` | `VOCALIZE_SPEED` | `speed` | unset — the API's own 1.0 |
 | Max characters | `--max-chars` | `VOCALIZE_MAX_CHARS` | `max_chars` | unset on the CLI; the hook supplies a 500 fallback |
 | Overflow mode | `--overflow` | `VOCALIZE_OVERFLOW` | `overflow` | `truncate` |
+| Provider chain | `--provider` (forces one, no fallback) | `VOCALIZE_CHAIN` (comma-separated) | `chain` (array) | `["elevenlabs", "say"]` |
 | Hook binary | — | `VOCALIZE_BIN` | not read from the config file | `vocalize` as found on `PATH` |
+
+`--voice`/`--model`/`--speed` and their `VOCALIZE_*` env vars only ever apply
+to the **primary** provider — the first in the chain, or the one `--provider`
+forces. Every other link reads only its own `[providers.<name>]` table and
+its own built-in defaults; see
+[Providers and fallback](#providers-and-fallback) below.
 
 The config file is TOML at `$XDG_CONFIG_HOME/vocalize/config.toml`, falling
 back to `~/.config/vocalize/config.toml`. Flat keys, no sections:
 
 ```toml
+chain = ["elevenlabs", "google", "say"]
+
+# Flat keys = ElevenLabs, unchanged since before there was a chain.
 voice = "21m00Tcm4TlvDq8ikWAM"
 model = "eleven_flash_v2_5"
 speed = 0.95
 max_chars = 1000
 overflow = "ask"
+
+[providers.google]
+voice = "en-US-Neural2-F"
+language = "en-US"
+monthly_chars = 1000000
+
+[providers.say]
+voice = "Samantha"
+
+[providers.kokoro]
+voice = "af_heart"
 ```
+
+Every other provider gets its own `[providers.<name>]` table. The keys it
+can hold: `voice`, `model`, `engine` (an alias for `model` — Polly's field is
+called that), `speed`, `language`, `region`, `profile`, and `monthly_chars`.
+A key outside that set warns on stderr rather than failing the run.
 
 `overflow` decides what happens when input is longer than the resolved
 `max_chars` cap: `truncate` (the default) cuts it at the cap, `ask` prompts
@@ -217,6 +252,134 @@ own order: `--api-key` flag, then `ELEVENLABS_API_KEY`, then a `.env` file
 in the current directory, then the OS keychain. `vocalize auth login` sets
 up the keychain entry; `vocalize auth status` shows which of those sources
 is currently supplying the key.
+
+## Providers and fallback
+
+vocalize tries providers in order — a **chain** — until one speaks. The
+default is `elevenlabs, say`: ElevenLabs behaves exactly as before, and a
+failure now degrades to the always-free `say` instead of erroring out.
+
+| Provider | Credentials | Config table | Per-request cap | Free tier | What `check` needs |
+|---|---|---|---|---|---|
+| `elevenlabs` | keychain / env / `.env` / `--api-key` | `[providers.elevenlabs]` or the flat legacy keys | 9,500 chars | 10,000 chars/month | an API key |
+| `openai` | keychain / env / `.env` | `[providers.openai]` | 4,000 chars | none — prepaid credit only, ~$15/million chars | an API key |
+| `google` | keychain / env / `.env` | `[providers.google]` | 4,500 chars (also a 4,900-byte hard cap) | ~4M Standard or ~1M Neural2/WaveNet chars/month, then bills | an API key |
+| `polly` | your normal AWS credentials (env, `~/.aws/credentials`, a profile, or a role) — vocalize stores none of it | `[providers.polly]` | 2,900 chars | Standard 5M/month ongoing; Neural 1M/month for 12 months, then $4–$16/million | `boto3` installed + AWS credentials discoverable |
+| `say` | none | `[providers.say]` | none (one call, any length) | free, offline | macOS with the `say` binary |
+| `kokoro` | none | `[providers.kokoro]` | 400 chars per streamed piece | free, offline, one-time ~354 MB download | `uv` + `vocalize local install` done |
+
+**Fallback rules**, decided by typed errors, not string-matching:
+
+- **Unavailable / auth / transient** errors (missing key, bad credentials, a
+  5xx or rate limit) skip straight to the next provider in the chain.
+- **Quota** errors do the same, but also mark that provider exhausted in the
+  local ledger for the rest of the calendar month — see
+  [Budgets and the usage ledger](#budgets-and-the-usage-ledger).
+- **Content** errors — a bad voice name, text longer than the API actually
+  accepts — **stop the chain immediately**, loudly, naming the bad config
+  key. A silent misconfiguration would be the worse bug to ship.
+- Anything else (a bug in vocalize itself) is never treated as "try the next
+  one" — it propagates as a real error.
+- Once Kokoro's streaming playback has started, a later failure can't fall
+  through to another provider either — you can't un-hear the first half of
+  a read.
+
+You'll see the handoff on stderr as it happens:
+
+```
+openai: out of credit — trying google
+google: local budget reached (1,004,233/1,000,000 chars this month) — trying polly
+Spoke via say (fallback).
+```
+
+If every provider fails, the error lists each one's reason, plus a hint to
+add `say` to the chain if it's missing.
+
+`--provider` is the opt-out: it forces exactly one provider with no
+fallback at all, same as vocalize behaved before it had a chain.
+
+**A chain is multi-vendor egress.** `elevenlabs, google, say` can, on a bad
+day, send the same text to both ElevenLabs and Google before `say` finally
+speaks it — every attempt that reaches a provider's `synthesize` call is a
+real request to that vendor. `say` and `kokoro` are the exception: they
+never send text off the machine.
+
+Amazon Polly needs the optional extra:
+
+```bash
+pip install "vocalize-cli[polly]"
+```
+
+For the click-by-click setup of each provider — where to go, what to click,
+the one command that stores the credential, the one command that proves it
+works — see [docs/provider-credentials.md](docs/provider-credentials.md).
+
+## Budgets and the usage ledger
+
+Cloud providers don't stop at their free tier — they bill past it. vocalize
+can't see your vendor invoice, so it keeps its own local estimate instead
+and stops using a provider once you say where the line is.
+
+Set `monthly_chars` under that provider's `[providers.<name>]` table:
+
+```toml
+[providers.google]
+monthly_chars = 1000000
+```
+
+Usage is tracked in `~/.cache/vocalize/usage.json`, one entry per provider
+per calendar month, decided by your machine's local time. A provider that
+comes back with a real quota error from the vendor is remembered as
+exhausted for the rest of that month — no further requests to it, even if
+you raise `monthly_chars` in between; only the new month clears it.
+
+`vocalize usage` prints every provider's tally against its budget (or
+"unlimited" with no `monthly_chars` set), flags any that are exhausted, then
+ElevenLabs's own remote quota (skipped gracefully, not a failure, when no
+key is configured), then local disk-cache stats.
+
+The ledger is per-machine and an estimate, not a bill: a cached (repeat)
+request costs nothing and isn't counted, and usage from a different machine
+never shows up here. Google's own limits and billing are byte-based, not
+character-based, so vocalize counts Google's usage in UTF-8 bytes too — the
+same text can cost a different amount against Google's cap than everyone
+else's.
+
+## Local providers
+
+Two providers never leave the machine.
+
+**`say`** is built in — macOS only, no setup, no network, no quota. Output
+is `.m4a`, not `.mp3`. It uses whichever voices `say -v ?` lists on your
+Mac; set one with `[providers.say] voice = "Samantha"`.
+
+**Kokoro** is opt-in. `pip install vocalize-cli` brings none of it — no
+model weights, no extra runtime — until you ask for it:
+
+```bash
+vocalize local install
+```
+
+This prints exactly what it's about to download before asking to confirm:
+`kokoro-v1.0.onnx` (326 MB) and `voices-v1.0.bin` (28 MB) from a pinned
+GitHub release, into `~/.cache/vocalize/models/kokoro/`, plus about 230 MB
+more that `uv` fetches into its own cache (Python 3.12 and the `kokoro-onnx`
+runtime). Every file is checked against a pinned sha256 before it's kept —
+a mismatch deletes it and refuses rather than installing anything
+unverified. The runtime runs under `uv run --python 3.12`, entirely apart
+from vocalize's own environment, so installing Kokoro never touches or
+upgrades the Python vocalize itself runs in. `vocalize local status`
+reports what's present, missing, or unverified.
+
+Use it for one read with `--provider kokoro`, or add it to your chain in
+`config.toml`.
+
+Long text streams: it's broken into ~400-character pieces, and playback
+starts after the first one is ready — roughly 20–25 seconds of speech —
+instead of waiting for the whole thing to render. Measured on this Mac
+(M3): about 5x faster than real time, peaking around 870 MB of RAM while
+rendering. `vocalize stop`, run from any terminal, halts a Kokoro read
+mid-sentence the same as any other provider.
 
 ## macOS Quick Actions (highlight → speak)
 
@@ -270,6 +433,10 @@ pulls out Claude's last message, and pipes it through the same `vocalize`
 CLI — so it works identically whether Claude Code is running in a bare
 terminal or inside an IDE's integrated terminal (VS Code, Cursor, etc.),
 since both use the same `~/.claude/settings.json` hook config.
+
+Whatever speaks a response is whichever provider your chain resolves to —
+`vocalize settings` now prints a `chain=` line alongside `overflow=` and
+`max_chars=`, which is how a wrapper script like `/speak` can check it.
 
 **On-demand mode.** If you'd rather trigger speech yourself than have every
 response spoken, skip the install and run the script with `--latest`. It
@@ -338,8 +505,9 @@ the main session the same way any other summary does: written to a file
 and passed to `speak-file`.
 
 If you wire this into a slash command of your own, treat it as a security
-surface, because **every character you speak is sent to ElevenLabs**. The
-guard principles that matter, in order:
+surface, because **every character you speak is sent to whichever provider
+in your chain ends up speaking it** — unless that provider is `say` or
+`kokoro`. The guard principles that matter, in order:
 
 1. Resolve paths (`realpath`, expand `~`, casefold) and check an
    **allow-list** of speakable directories — symlinks and `../` defeat
@@ -394,9 +562,14 @@ vocalize/
   __main__.py     # python -m vocalize entry point
   preprocess.py   # markdown -> speakable text (pure function, fully unit tested)
   config.py       # API key resolution + settings: flag > env > config.toml > default
-  exceptions.py   # VocalizeError / TTSRequestError
-  tts.py          # ElevenLabs API wrapper + disk cache (client is injected, so
+  exceptions.py   # VocalizeError / TTSRequestError / typed ProviderError family
+  tts.py          # ElevenLabs API wrapper (client is injected, so
                    # it's mockable in tests without hitting the network)
+  cache.py        # disk cache: cache_key/get/put, shared by every provider
+  chain.py        # tries each provider in the chain in turn until one speaks
+  ledger.py       # ~/.cache/vocalize/usage.json — local monthly budget tracking
+  providers/      # elevenlabs.py, openai.py, google.py, polly.py, say.py, kokoro.py
+  local/          # Kokoro's opt-in download/verify + the uv-run worker script
   audio.py        # save to disk + play via the OS's native player
                    # (afplay / mpg123 / ffplay / PowerShell, whichever exists)
   cli.py          # click-based CLI wiring the above together
@@ -444,6 +617,29 @@ All tests run offline: the ElevenLabs client is dependency-injected into
   `ELEVENLABS_API_KEY` environment variable, or a `.env` file instead.
 - `vocalize voices` lists only the first page of results from the
   ElevenLabs API.
+- **A chain is multi-vendor egress.** A fallback chain can send the same
+  text to more than one cloud vendor before one of them succeeds — see
+  [Providers and fallback](#providers-and-fallback).
+- **The usage ledger is local and an estimate, not a bill.** It doesn't see
+  what your vendor actually charges, doesn't know about usage from another
+  machine, and a cached (repeat) request isn't counted at all.
+- **Polly ignores `--speed`.** Its rate control needs SSML, which this
+  release doesn't wrap plain text into; `[providers.polly]` has no speed
+  knob yet.
+- **Joined MP3 chunks are a byte concatenation, not a re-encode.** Most
+  players handle it fine, but the frame boundary between chunks can
+  occasionally produce an audible click.
+- **`vocalize config`'s wizard only sets up ElevenLabs.** Configure the rest
+  of the chain with `vocalize chain` or by hand-editing `config.toml`.
+- **Kokoro needs `uv`**, and its shipped pack carries 54 voices across nine
+  languages but is phonemized for `en-us` unless you set `language` under
+  `[providers.kokoro]` to match a non-English voice; it's opt-in for a
+  reason — see [Local providers](#local-providers).
+- **A locked or first-use macOS keychain blocks silently.** Reading a stored
+  key can raise a macOS permission dialog ("python wants to use your
+  confidential information"); until you click Always Allow, every command
+  that needs that key waits. Click it once per Python binary, or supply the
+  key through its environment variable instead.
 
 ## License
 

@@ -8,11 +8,13 @@ clear message if none is found.
 
 from __future__ import annotations
 
+import io
 import os
 import platform
 import shutil
 import signal
 import subprocess
+import wave
 from pathlib import Path
 
 from .exceptions import AudioPlaybackError, NoAudioPlayerError
@@ -61,12 +63,13 @@ def _clear_own_record(pid: int) -> None:
         pass
 
 
-def _run_tracked(cmd: list[str]) -> None:
+def _run_tracked(cmd: list[str]) -> int:
     """Run the player with its identity on disk, so `vocalize stop` can
     kill it: PID on line one, ps launch timestamp on line two.
 
     A SIGTERM exit is treated as success: that is `vocalize stop` doing its
-    job, not the player failing.
+    job, not the player failing. The returncode is handed back so a caller
+    playing a sequence can tell that stop apart from a clean finish.
     """
     proc = subprocess.Popen(cmd)
     try:
@@ -80,6 +83,7 @@ def _run_tracked(cmd: list[str]) -> None:
         _clear_own_record(proc.pid)
     if returncode not in (0, -signal.SIGTERM):
         raise subprocess.CalledProcessError(returncode, cmd)
+    return returncode
 
 
 def _is_known_player(pid: int) -> bool:
@@ -136,7 +140,12 @@ def save(audio: bytes, path: Path) -> Path:
     return path
 
 
-def play(path: Path) -> None:
+def play(path: Path) -> int:
+    """Play one file, blocking until it ends. Returns the player's exit code.
+
+    `-signal.SIGTERM` means `vocalize stop` ended it; 0 means it played to
+    the end.
+    """
     system = platform.system()
 
     if system == "Windows":
@@ -150,28 +159,88 @@ def play(path: Path) -> None:
             f"(New-Object Media.SoundPlayer '{path_str}').PlaySync();",
         ]
         try:
-            _run_tracked(cmd)
+            return _run_tracked(cmd)
         except (subprocess.CalledProcessError, OSError) as exc:
             raise AudioPlaybackError(
                 f"powershell failed to play the audio: {exc}. "
                 f"The file is still saved at {path} — open it manually."
             ) from exc
-        return
 
     for candidate in _CANDIDATES.get(system, []):
         exe = candidate[0]
         if shutil.which(exe):
             try:
-                _run_tracked([*candidate, str(path)])
+                return _run_tracked([*candidate, str(path)])
             except (subprocess.CalledProcessError, OSError) as exc:
                 raise AudioPlaybackError(
                     f"{exe} failed to play the audio: {exc}. "
                     f"The file is still saved at {path} — open it manually."
                 ) from exc
-            return
 
     raise NoAudioPlayerError(
         f"No supported audio player found for {system}. "
         f"Install one of: {', '.join(c[0] for c in _CANDIDATES.get(system, []))} "
         f"— or open the saved file manually: {path}"
+    )
+
+
+def play_sequence(paths, *, stop_check=None) -> bool:
+    """Play each path in order. False as soon as the user stopped one.
+
+    Each piece goes through play(), so the PID file always names the
+    player that is running right now and `vocalize stop` keeps working
+    unchanged. A piece killed by SIGTERM is the user stopping the read:
+    the rest of the sequence is abandoned rather than played on.
+    """
+    for path in paths:
+        if stop_check is not None and stop_check():
+            return False
+        if play(path) == -signal.SIGTERM:
+            return False
+    return True
+
+
+def stitch_wav(parts: list[bytes]) -> bytes:
+    """One WAV out of several: same params, frames appended.
+
+    Raw byte-concatenation would leave a header mid-file, so the frames
+    are re-wrapped with stdlib `wave` instead.
+    """
+    frames: list[bytes] = []
+    params = None
+    for part in parts:
+        try:
+            with wave.open(io.BytesIO(part), "rb") as reader:
+                if params is None:
+                    params = reader.getparams()
+                elif reader.getparams()[:3] != params[:3]:
+                    raise AudioPlaybackError(
+                        "Cannot join WAV pieces recorded with different "
+                        "channels, sample width or frame rate."
+                    )
+                frames.append(reader.readframes(reader.getnframes()))
+        except wave.Error as exc:
+            raise AudioPlaybackError(f"Could not join WAV audio: {exc}") from exc
+
+    if params is None:
+        return b""
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(b"".join(frames))
+    return out.getvalue()
+
+
+def join_audio(parts: list[bytes], ext: str) -> bytes:
+    """Join one provider's chunks into the single file the caller saves."""
+    if len(parts) == 1:
+        return parts[0]
+    if ext == "wav":
+        return stitch_wav(parts)
+    if ext == "mp3":
+        return b"".join(parts)  # frame-concatenated MP3 plays fine
+    raise AudioPlaybackError(
+        f"{ext} audio cannot be chunked: that provider has to answer in one "
+        f"piece. Raise --chunk-chars, or pick a provider that returns MP3."
     )

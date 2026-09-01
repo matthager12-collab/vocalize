@@ -331,3 +331,84 @@ def test_cli_logout_does_not_claim_a_denied_removal(fake_keychain):
     assert "STILL stored" in result.output
     assert "rotate the key" in result.output
     assert fake_keychain[ENTRY] == SECRET
+
+
+# --- per-provider keychain slots ---------------------------------------------
+
+
+@pytest.mark.parametrize("provider", ["elevenlabs", "openai", "google"])
+def test_store_read_delete_round_trip_per_provider(fake_keychain, provider):
+    entry = (auth.SERVICE, auth.PROVIDER_USERNAMES[provider])
+
+    assert auth.stored_key(provider) is None
+
+    auth.store_key(SECRET, provider)
+
+    assert fake_keychain[entry] == SECRET
+    assert auth.stored_key(provider) == SECRET
+
+    auth.delete_key(provider)
+
+    assert entry not in fake_keychain
+    assert auth.stored_key(provider) is None
+
+
+def test_logout_of_openai_leaves_elevenlabs_untouched(fake_keychain):
+    auth.store_key(SECRET, "elevenlabs")
+    auth.store_key("openai-secret-key-1234567890", "openai")
+
+    auth.delete_key("openai")
+
+    assert auth.stored_key("elevenlabs") == SECRET
+    assert auth.stored_key("openai") is None
+
+
+@pytest.mark.parametrize(
+    "provider, env_var", [("openai", "OPENAI_API_KEY"), ("google", "GOOGLE_API_KEY")]
+)
+def test_key_source_per_provider_env_var(monkeypatch, provider, env_var):
+    monkeypatch.setenv(env_var, "provider-env-key")
+
+    assert auth.key_source(None, provider) == "environment"
+
+
+def test_validate_key_dispatches_to_the_provider_module(monkeypatch):
+    seen = []
+
+    class _Stub:
+        def validate(self, key):
+            seen.append(key)
+
+    monkeypatch.setattr("vocalize.providers.get", lambda name: _Stub())
+
+    auth.validate_key("provider-key", "openai")
+
+    assert seen == ["provider-key"]
+
+
+# --- polly_credential_status --------------------------------------------------
+
+
+def test_polly_credential_status_reports_environment(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shh")
+
+    assert auth.polly_credential_status("default") == "environment"
+
+
+def test_polly_credential_status_reports_the_credentials_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    creds = tmp_path / "credentials"
+    creds.write_text("[work]\naws_access_key_id = x\naws_secret_access_key = y\n")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(creds))
+
+    assert auth.polly_credential_status("work") == "~/.aws/credentials [work]"
+
+
+def test_polly_credential_status_reports_not_configured(monkeypatch, tmp_path):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "missing"))
+
+    assert auth.polly_credential_status("default") == "not configured"

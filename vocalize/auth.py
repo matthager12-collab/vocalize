@@ -9,6 +9,10 @@ discovery is slow enough to notice on a `vocalize speak` that already had
 a key in the environment, and routing every call through one seam gives
 the tests a single place to swap in an in-memory store so they never
 touch the developer's real keychain.
+
+This is also the dependency-free leaf that owns the provider *names*:
+providers import them from here, never the other way round, so nothing
+here may import vocalize.providers at module level.
 """
 
 from __future__ import annotations
@@ -19,8 +23,37 @@ import click
 
 from .exceptions import AuthError, VocalizeError
 
+PROVIDER_NAMES = ("elevenlabs", "openai", "google", "polly", "say", "kokoro")
+
+PROVIDER_LABELS = {
+    "elevenlabs": "ElevenLabs",
+    "openai": "OpenAI",
+    "google": "Google Cloud",
+    "polly": "Amazon Polly",
+    "say": "macOS say",
+    "kokoro": "Kokoro (local)",
+}
+
+# Only providers authenticated by a single API key appear here. Polly uses
+# boto3's own credential chain; say and kokoro need no credentials at all.
+PROVIDER_ENV_VARS = {
+    "elevenlabs": "ELEVENLABS_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+}
+
+PROVIDER_USERNAMES = {
+    "elevenlabs": "elevenlabs-api-key",
+    "openai": "openai-api-key",
+    "google": "google-api-key",
+}
+
+DEFAULT_PROVIDER = "elevenlabs"
+
 SERVICE = "vocalize"
-USERNAME = "elevenlabs-api-key"
+# Kept as module constants because the CLI, the wizard and the tests all
+# name them; the values are the ElevenLabs slot, unchanged since 0.1.
+USERNAME = PROVIDER_USERNAMES[DEFAULT_PROVIDER]
 
 WHERE = f"the system keychain ({SERVICE}/{USERNAME})"
 
@@ -29,6 +62,19 @@ _DELETE_DENIED = (
     "STILL stored; unlock the keychain or remove it manually, and rotate the "
     "key if you were revoking a leak."
 )
+
+
+def _username(provider: str) -> str:
+    """The keychain entry name for `provider`, or an error if it has none."""
+    try:
+        return PROVIDER_USERNAMES[provider]
+    except KeyError:
+        label = PROVIDER_LABELS.get(provider, provider)
+        raise AuthError(f"{label} does not use a stored API key.") from None
+
+
+def _where(provider: str) -> str:
+    return f"the system keychain ({SERVICE}/{_username(provider)})"
 
 
 def _backend():
@@ -60,15 +106,15 @@ def _short_reason(exc: BaseException) -> str:
     return text.splitlines()[0] if text else type(exc).__name__
 
 
-def store_key(key: str) -> None:
+def store_key(key: str, provider: str = DEFAULT_PROVIDER) -> None:
     """Save the API key in the OS keychain."""
     try:
-        _backend().set_password(SERVICE, USERNAME, key)
+        _backend().set_password(SERVICE, _username(provider), key)
     except _errors() as exc:
-        raise AuthError(f"Could not write to {WHERE}: {exc}") from exc
+        raise AuthError(f"Could not write to {_where(provider)}: {exc}") from exc
 
 
-def probe_keychain() -> tuple[str, str | None]:
+def probe_keychain(provider: str = DEFAULT_PROVIDER) -> tuple[str, str | None]:
     """("ok", key-or-None), or ("error", short reason).
 
     The honest sibling of stored_key(). Anything that *reports* on the
@@ -76,23 +122,23 @@ def probe_keychain() -> tuple[str, str | None]:
     a distinction stored_key() deliberately flattens into None.
     """
     try:
-        return "ok", (_backend().get_password(SERVICE, USERNAME) or None)
+        return "ok", (_backend().get_password(SERVICE, _username(provider)) or None)
     except _errors() as exc:
         return "error", _short_reason(exc)
 
 
-def stored_key() -> str | None:
+def stored_key(provider: str = DEFAULT_PROVIDER) -> str | None:
     """The key held in the OS keychain, or None.
 
     None also covers a backend that failed outright: resolving a key must
     never blow up because the keychain is locked or missing, when a flag
     or an env var may well have supplied one anyway.
     """
-    status, value = probe_keychain()
+    status, value = probe_keychain(provider)
     return value if status == "ok" else None
 
 
-def delete_key() -> None:
+def delete_key(provider: str = DEFAULT_PROVIDER) -> None:
     """Forget the stored key. A missing entry is not an error.
 
     The exception alone cannot be trusted here: keyring's macOS backend
@@ -104,13 +150,13 @@ def delete_key() -> None:
     from keyring.errors import PasswordDeleteError
 
     try:
-        _backend().delete_password(SERVICE, USERNAME)
+        _backend().delete_password(SERVICE, _username(provider))
     except PasswordDeleteError:
         pass  # might mean "already gone", might mean "refused" — read back
     except _errors() as exc:
-        raise AuthError(f"Could not delete from {WHERE}: {exc}") from exc
+        raise AuthError(f"Could not delete from {_where(provider)}: {exc}") from exc
 
-    status, value = probe_keychain()
+    status, value = probe_keychain(provider)
     if status == "ok" and value is not None:
         raise AuthError(_DELETE_DENIED)
     if status == "error":
@@ -122,8 +168,8 @@ def delete_key() -> None:
         )
 
 
-def key_source(explicit: str | None = None) -> str:
-    """Where resolve_api_key would get its key, without revealing the key.
+def key_source(explicit: str | None = None, provider: str = DEFAULT_PROVIDER) -> str:
+    """Where resolve_provider_key would get its key, without revealing it.
 
     One of: "flag", "environment", ".env file", "keychain", "not found".
     """
@@ -133,14 +179,16 @@ def key_source(explicit: str | None = None) -> str:
     # Imported at call time, not module scope: config imports this module.
     from .config import _load_dotenv_if_present
 
-    if os.environ.get("ELEVENLABS_API_KEY"):
-        return "environment"
+    env_var = PROVIDER_ENV_VARS.get(provider)
+    if env_var:
+        if os.environ.get(env_var):
+            return "environment"
 
-    _load_dotenv_if_present()
-    if os.environ.get("ELEVENLABS_API_KEY"):
-        return ".env file"
+        _load_dotenv_if_present()
+        if os.environ.get(env_var):
+            return ".env file"
 
-    if stored_key():
+    if provider in PROVIDER_USERNAMES and stored_key(provider):
         return "keychain"
     return "not found"
 
@@ -179,24 +227,54 @@ def _check_shape(key: str) -> None:
         )
 
 
-def validate_key(key: str) -> None:
+def validate_key(key: str, provider: str = DEFAULT_PROVIDER) -> None:
     """Check a key against the API. Raises VocalizeError when it doesn't work."""
-    from .tts import build_client, list_voices
+    if provider == "elevenlabs":
+        from .tts import build_client, list_voices
 
-    list_voices(build_client(key))
+        list_voices(build_client(key))
+        return
+
+    if provider in PROVIDER_USERNAMES:
+        # Lazy: importing a provider module pulls in its HTTP layer.
+        from . import providers
+
+        providers.get(provider).validate(key)
+        return
+
+    label = PROVIDER_LABELS.get(provider, provider)
+    raise AuthError(f"{label} does not use a stored API key.")
 
 
-def prompt_for_key() -> str:
+def polly_credential_status(profile: str = "default") -> str:
+    """Where Polly's credentials would come from, for `auth status`.
+
+    Offline only, mirroring providers.polly.check()'s own three checks (env,
+    ~/.aws/credentials, profile) without ever constructing a boto3 Session —
+    a status command must not touch the network any more than check() does.
+    """
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return "environment"
+
+    from . import providers  # lazy: this module must not import providers eagerly
+
+    if providers.get("polly")._profile_in_credentials_file(profile):
+        return f"~/.aws/credentials [{profile}]"
+    return "not configured"
+
+
+def prompt_for_key(provider: str = DEFAULT_PROVIDER) -> str:
     """Ask for a key without echoing it.
 
     click's hidden prompt is getpass, which reads and writes /dev/tty
     directly — so this works unchanged inside the wizard, which paints
     there rather than on a possibly-relayed stdout.
     """
-    return click.prompt("ElevenLabs API key", hide_input=True, show_default=False).strip()
+    label = PROVIDER_LABELS.get(provider, provider)
+    return click.prompt(f"{label} API key", hide_input=True, show_default=False).strip()
 
 
-def login(key: str) -> str:
+def login(key: str, provider: str = DEFAULT_PROVIDER) -> str:
     """Check the shape, validate against the API, then store. Returns where.
 
     Validation comes first and nothing is written when it fails: a key
@@ -208,8 +286,14 @@ def login(key: str) -> str:
     """
     _check_shape(key)
     try:
-        validate_key(key)
-        store_key(key)
+        # The ElevenLabs path keeps its one-argument call on purpose: the
+        # wizard and the tests replace this seam with a single-parameter
+        # stand-in, and a second positional would break them.
+        if provider == DEFAULT_PROVIDER:
+            validate_key(key)
+        else:
+            validate_key(key, provider)
+        store_key(key, provider)
     except VocalizeError as exc:
         raise AuthError(scrub(str(exc), key)) from None
-    return f"Stored the API key in {WHERE}."
+    return f"Stored the API key in {_where(provider)}."

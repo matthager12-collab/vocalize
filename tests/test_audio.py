@@ -272,3 +272,104 @@ def test_save_wraps_permission_error(monkeypatch, tmp_path):
 
     with pytest.raises(AudioPlaybackError):
         save(b"x", tmp_path / "out.mp3")
+
+
+# --- play_sequence -----------------------------------------------------------
+
+
+def test_play_sequence_plays_every_piece_in_order(monkeypatch, tmp_path):
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    calls = _patch_player(monkeypatch, tmp_path)
+    pieces = [tmp_path / "1.wav", tmp_path / "2.wav", tmp_path / "3.wav"]
+
+    assert audio_module.play_sequence(pieces) is True
+    assert calls == [["afplay", str(p)] for p in pieces]
+
+
+def test_play_sequence_stops_at_the_piece_the_user_stopped(monkeypatch, tmp_path):
+    # `vocalize stop` kills the piece that is playing; the rest of the
+    # document must not carry on without it.
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    calls = _patch_player(monkeypatch, tmp_path, returncode=-signal.SIGTERM)
+    pieces = [tmp_path / "1.wav", tmp_path / "2.wav", tmp_path / "3.wav"]
+
+    assert audio_module.play_sequence(pieces) is False
+    assert len(calls) == 1
+
+
+def test_play_sequence_asks_stop_check_before_each_piece(monkeypatch, tmp_path):
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    calls = _patch_player(monkeypatch, tmp_path)
+    answers = [False, True]
+
+    result = audio_module.play_sequence(
+        [tmp_path / "1.wav", tmp_path / "2.wav"], stop_check=lambda: answers.pop(0)
+    )
+
+    assert result is False
+    assert len(calls) == 1  # the second piece was never started
+
+
+# --- stitching -----------------------------------------------------------
+
+
+def _wav(frames: int, *, channels=1, width=2, rate=24000) -> bytes:
+    import io
+    import wave
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(width)
+        writer.setframerate(rate)
+        writer.writeframes(b"\x00" * width * channels * frames)
+    return out.getvalue()
+
+
+def _params(data: bytes):
+    import io
+    import wave
+
+    with wave.open(io.BytesIO(data), "rb") as reader:
+        return reader.getparams()
+
+
+def test_stitch_wav_appends_frames_and_keeps_the_params(tmp_path):
+    joined = audio_module.stitch_wav([_wav(100), _wav(250), _wav(7)])
+
+    assert _params(joined).nframes == 357
+    assert _params(joined)[:3] == _params(_wav(100))[:3]
+    # One header, not three: raw concatenation would be longer than this.
+    assert len(joined) < len(_wav(100)) + len(_wav(250)) + len(_wav(7))
+
+
+def test_stitch_wav_refuses_mismatched_pieces():
+    with pytest.raises(AudioPlaybackError, match="different"):
+        audio_module.stitch_wav([_wav(10), _wav(10, rate=48000)])
+
+
+def test_stitch_wav_refuses_something_that_is_not_a_wav():
+    with pytest.raises(AudioPlaybackError, match="Could not join"):
+        audio_module.stitch_wav([_wav(10), b"not audio at all"])
+
+
+def test_join_audio_concatenates_mp3_frames():
+    assert audio_module.join_audio([b"aaa", b"bbb"], "mp3") == b"aaabbb"
+
+
+def test_join_audio_stitches_wav():
+    joined = audio_module.join_audio([_wav(10), _wav(20)], "wav")
+
+    assert _params(joined).nframes == 30
+
+
+def test_join_audio_refuses_to_stitch_two_m4a_pieces():
+    with pytest.raises(AudioPlaybackError, match="cannot be chunked"):
+        audio_module.join_audio([b"piece one", b"piece two"], "m4a")
+
+
+def test_join_audio_passes_a_single_m4a_piece_straight_through():
+    assert audio_module.join_audio([b"the only piece"], "m4a") == b"the only piece"

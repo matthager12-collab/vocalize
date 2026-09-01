@@ -295,7 +295,7 @@ def _voice_step(ui, current: str, keep: str, setup_error: str | None = None):
 
     return _select(
         ui,
-        "Step 1 of 3 — Voice",
+        "Step 1 of 3 — Voice (ElevenLabs)",
         rows,
         cursor,
         legend=VOICE_HOTKEYS,
@@ -318,7 +318,7 @@ def _model_step(ui, current: str, keep: str):
 
     return _select(
         ui,
-        "Step 2 of 3 — Model",
+        "Step 2 of 3 — Model (ElevenLabs)",
         rows,
         cursor,
         manual=lambda: _manual_text(ui, "Model ID"),
@@ -336,29 +336,109 @@ def _speed_step(ui, current: float | None, keep: str):
             cursor = len(rows)
         rows.append((value, label))
 
-    return _select(ui, "Step 3 of 3 — Speed", rows, cursor, manual=lambda: _manual_speed(ui))
+    return _select(
+        ui, "Step 3 of 3 — Speed (ElevenLabs)", rows, cursor, manual=lambda: _manual_speed(ui)
+    )
+
+
+_TOML_STRING_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _escape_toml_string(text: str) -> str:
+    """Escape `text` for a TOML basic string — every control char, not just \\ and ".
+
+    A raw newline, tab, or other C0/DEL byte inside an unescaped basic
+    string makes the file unparseable (or parses fine but truncates the
+    value at the control character); tomllib rejects a literal control
+    byte outright. Named escapes where TOML defines one, \\uXXXX otherwise.
+    """
+    out = []
+    for ch in text:
+        escape = _TOML_STRING_ESCAPES.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _toml_value(key: str, value) -> str:
-    """Render one scalar as TOML. The config file is flat scalars only."""
-    if isinstance(value, (dict, list)):
-        # str() would quietly turn a table or array into a Python-repr
-        # string and destroy it on write. Refuse instead.
-        kind = "table" if isinstance(value, dict) else "array"
+    """Render one scalar, or a flat list of scalars, as TOML.
+
+    A list of scalars (e.g. `chain = ["elevenlabs", "say"]`) renders
+    element-by-element through this same function. Anything with a table
+    or array nested inside it — and any bare table — is refused: str()
+    would quietly turn it into a Python-repr string and destroy it on
+    write, so this raises instead and points at hand-editing the file.
+    """
+    if isinstance(value, list):
+        if any(isinstance(item, (dict, list)) for item in value):
+            raise ConfigError(
+                f"The config file has a list under {key!r} containing a table or "
+                f"nested array. The wizard only manages flat keys, so it will not "
+                f"rewrite this file — edit that file by hand."
+            )
+        return "[" + ", ".join(_toml_value(key, item) for item in value) + "]"
+    if isinstance(value, dict):
         raise ConfigError(
-            f"The config file has a {kind} under {key!r}. The wizard only manages "
+            f"The config file has a table under {key!r}. The wizard only manages "
             f"flat keys, so it will not rewrite this file — edit that file by hand."
         )
     if isinstance(value, bool):  # bool before int — bool is an int subclass
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return repr(value)
-    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    text = _escape_toml_string(str(value))
     return f'"{text}"'
 
 
+def _render_config_text(data: dict) -> str:
+    """Render `data` as TOML: flat keys first, then any `[providers.*]` tables.
+
+    Pure — no filesystem access — so `_walk`'s pre-flight dry run can call
+    it purely to raise early, and `_write_config` can call it for the text
+    it actually writes; the two can never disagree.
+
+    Flat keys first isn't a style choice: TOML parses a bare `key = value`
+    that appears after a `[section]` header as belonging to that section,
+    so root keys have to come before every table or a re-read would nest
+    them somewhere they don't belong.
+    """
+    lines = [f"{key} = {_toml_value(key, value)}" for key, value in data.items() if key != "providers"]
+
+    providers = data.get("providers")
+    if providers is not None:
+        if not isinstance(providers, dict):
+            raise ConfigError(
+                "The config file has a non-table value under 'providers'. The "
+                "wizard only manages [providers.*] tables — edit that file by hand."
+            )
+        for name, table in providers.items():
+            if not isinstance(table, dict):
+                raise ConfigError(
+                    f"The config file has a non-table value under providers.{name!r}. "
+                    f"The wizard only manages [providers.*] tables of flat keys — "
+                    f"edit that file by hand."
+                )
+            lines.append("")
+            lines.append(f"[providers.{name}]")
+            lines.extend(f"{pkey} = {_toml_value(pkey, pvalue)}" for pkey, pvalue in table.items())
+
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def _write_config(path: Path, data: dict) -> str:
-    text = "".join(f"{key} = {_toml_value(key, value)}\n" for key, value in data.items())
+    text = _render_config_text(data)
     tmp = path.with_suffix(".toml.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,8 +480,7 @@ def _walk(ui) -> None:
     existing = load_config_file()
     # Dry-run the serialiser before asking any questions: fail fast rather
     # than walking someone through three steps we can't write at the end.
-    for key, value in existing.items():
-        _toml_value(key, value)
+    _render_config_text(existing)
 
     setup_error = _offer_key_setup(ui)
 
@@ -430,6 +509,13 @@ def _walk(ui) -> None:
         return
 
     data = dict(existing)  # unknown keys ride through untouched
+    # A [providers.elevenlabs] table outranks these legacy top-level keys
+    # when resolving settings, so a stale table entry would silently
+    # shadow whatever the wizard just picked. Strip the same key from the
+    # table so the wizard's choice is the one that actually applies.
+    providers = dict(data.get("providers") or {})
+    elevenlabs_table = dict(providers.get("elevenlabs") or {})
+    shadowed = []
     for key, value in chosen.items():
         if value is _KEEP:
             continue
@@ -437,12 +523,30 @@ def _walk(ui) -> None:
             data.pop(key, None)
         else:
             data[key] = value
+        if key in elevenlabs_table:
+            del elevenlabs_table[key]
+            shadowed.append(key)
+
+    if shadowed:
+        if elevenlabs_table:
+            providers["elevenlabs"] = elevenlabs_table
+        else:
+            providers.pop("elevenlabs", None)
+        if providers:
+            data["providers"] = providers
+        else:
+            data.pop("providers", None)
 
     _clear(ui)
     click.echo("About to write:", file=ui)
     click.echo(file=ui)
     for key, value in chosen.items():
         click.echo(f"  {key:<5} → {_summary_value(value, keep[key])}", file=ui)
+    for key in shadowed:
+        click.echo(
+            f"[providers.elevenlabs] {key} removed — the wizard's choice now applies",
+            file=ui,
+        )
     click.echo(file=ui)
     click.echo(f"File: {path}", file=ui)
     click.echo(file=ui)

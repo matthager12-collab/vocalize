@@ -43,6 +43,17 @@ class _FakeKeyring:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_ledger(monkeypatch, tmp_path):
+    """Keep every test off the real usage ledger at ~/.cache/vocalize.
+
+    Autouse for the same reason as fake_keychain: a real usage.json on the
+    developer's machine could satisfy or skew a status()/record() call and
+    quietly turn a test green (or exhausted) for the wrong reason.
+    """
+    monkeypatch.setattr("vocalize.ledger.DEFAULT_CACHE_DIR", tmp_path)
+
+
+@pytest.fixture(autouse=True)
 def fake_keychain(monkeypatch):
     """Keep every test off the real OS keychain.
 

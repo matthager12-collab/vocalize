@@ -1,25 +1,44 @@
 import builtins
 import io
 import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 import vocalize.cli as cli_module
 from vocalize.cli import main
+from vocalize.config import resolve_provider_settings
 
 
-def _patch_tts(monkeypatch, audio=b"fake-mp3-bytes"):
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
+def _patch_tts(monkeypatch, audio=b"fake-mp3-bytes", calls=None, echo_lines=()):
+    """Replace the provider chain with a fake that records what it was asked.
+
+    The seam moved from tts.synthesize to chain.run when the chain landed;
+    the captured text and settings are the same two things the assertions
+    below have always looked at. Pass `calls` to also collect the keyword
+    arguments each chain_run call received.
+    """
     captured_text = []
     captured_settings = []
 
-    def fake_synthesize(client, text, settings):
+    def fake_chain_run(text, **kwargs):
         captured_text.append(text)
-        captured_settings.append(settings)
-        return audio
+        if calls is not None:
+            calls.append(kwargs)
+        overrides = dict(kwargs.get("overrides") or {})
+        overrides.pop("api_key", None)
+        captured_settings.append(
+            resolve_provider_settings(
+                kwargs["chain"][0], kwargs["file_config"], primary=True, **overrides
+            )
+        )
+        for line in echo_lines:
+            kwargs["echo"](line)
+        return audio, kwargs["chain"][0], "mp3"
 
-    monkeypatch.setattr(cli_module, "synthesize", fake_synthesize)
+    monkeypatch.setattr(cli_module, "chain_run", fake_chain_run)
     played = {}
     monkeypatch.setattr(cli_module, "play_audio", lambda path: played.setdefault("path", path))
     return played, captured_text, captured_settings
@@ -124,8 +143,13 @@ def test_max_chars_truncates_and_notes(monkeypatch, tmp_path):
     assert "truncated" in result.output
 
 
-def test_short_input_makes_one_convert_call_with_unchanged_message(monkeypatch, tmp_path):
-    _played, captured_text, _captured_settings = _patch_tts(monkeypatch)
+def test_short_input_makes_one_chain_call_and_relays_its_progress(monkeypatch, tmp_path):
+    # The per-chunk wording now comes from chain.run (tested in
+    # test_chain.py); what the CLI owes is one call with the whole text and
+    # every chain message relayed to stderr.
+    _played, captured_text, _captured_settings = _patch_tts(
+        monkeypatch, echo_lines=["Requesting 11 characters from elevenlabs..."]
+    )
     out_file = tmp_path / "out.mp3"
     runner = CliRunner()
 
@@ -135,60 +159,47 @@ def test_short_input_makes_one_convert_call_with_unchanged_message(monkeypatch, 
     )
 
     assert result.exit_code == 0, result.output
-    # Exactly one convert call, and the message is the pre-chunking wording
-    # — a single-chunk run must be byte-identical to before chunking existed.
     assert captured_text == ["hello world"]
-    assert "Requesting 11 characters of audio from ElevenLabs..." in result.output
+    assert "Requesting 11 characters from elevenlabs..." in result.output
     assert "Long input" not in result.output
-    assert "Requesting chunk" not in result.output
 
 
-def test_long_input_splits_into_chunks_and_concatenates_audio(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
+def test_chunk_chars_flag_reaches_the_chain(monkeypatch, tmp_path):
+    # Splitting itself is the chain's job now (test_chain.py); the CLI's
+    # part is handing the flag over unchanged, None included.
     calls = []
-
-    def fake_synthesize(client, text, settings):
-        calls.append(text)
-        # Distinct, order-dependent bytes per call, so concatenation order
-        # in the saved file is actually being checked, not just its length.
-        return f"[chunk {len(calls)}: {text}]".encode()
-
-    monkeypatch.setattr(cli_module, "synthesize", fake_synthesize)
-    monkeypatch.setattr(cli_module, "play_audio", lambda path: None)
-
-    text = "First sentence here. " * 20
+    _patch_tts(monkeypatch, calls=calls)
     out_file = tmp_path / "out.mp3"
     runner = CliRunner()
 
     result = runner.invoke(
         main,
         [
-            "speak", text, "--api-key", "fake-key",
+            "speak", "some words", "--api-key", "fake-key",
             "--output", str(out_file), "--no-play", "--chunk-chars", "50",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert len(calls) > 1
-    expected = b"".join(f"[chunk {i}: {c}]".encode() for i, c in enumerate(calls, start=1))
-    assert out_file.read_bytes() == expected
-    assert f"Long input: splitting into {len(calls)} chunks." in result.output
-    assert f"Requesting chunk 1/{len(calls)}" in result.output
-    assert all(len(c) <= 50 for c in calls)
+    assert calls[0]["chunk_chars"] == 50
 
 
-def test_missing_api_key_gives_clean_error(monkeypatch):
+def test_missing_api_key_gives_clean_error(monkeypatch, tmp_path):
+    # Forced to ElevenLabs, a missing key has nowhere to fall back to: the
+    # chain's all-failed error still has to name the fix.
+    _isolate_config(monkeypatch, tmp_path)
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
-    monkeypatch.setattr(cli_module, "synthesize", lambda client, text, settings: b"x")
     runner = CliRunner()
 
-    result = runner.invoke(main, ["speak", "hello", "--no-play"])
+    result = runner.invoke(
+        main, ["speak", "hello", "--no-play", "--provider", "elevenlabs"]
+    )
 
     assert result.exit_code != 0
-    from vocalize.exceptions import MissingAPIKeyError
+    from vocalize.exceptions import TTSRequestError
 
-    assert isinstance(result.exception, MissingAPIKeyError)
+    assert isinstance(result.exception, TTSRequestError)
+    assert "No ElevenLabs API key found" in str(result.exception)
 
 
 def test_voices_command_lists_ids_and_names(monkeypatch):
@@ -874,3 +885,617 @@ def test_no_dialog_without_the_flag(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "no terminal to ask on" in result.output
+
+
+# --- the provider chain -----------------------------------------------------
+
+
+def test_provider_flag_forces_a_single_provider_chain(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main,
+        ["speak", "hello", "--provider", "google", "--output", str(tmp_path / "out.mp3"),
+         "--no-play"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["chain"] == ["google"]
+
+
+def test_no_provider_flag_leaves_the_configured_chain_alone(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--output", str(tmp_path / "out.mp3"), "--no-play"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["chain"] == ["elevenlabs", "say"]
+
+
+def test_api_key_with_another_provider_is_a_usage_error(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--api-key", "sk-secret", "--provider", "openai", "--no-play"]
+    )
+
+    assert result.exit_code == 2
+    assert "--api-key only applies to ElevenLabs" in result.output
+    assert "vocalize auth login --provider openai" in result.output
+    # Refused before anything was synthesized, and the key is not echoed.
+    assert calls == []
+    assert "sk-secret" not in result.output
+
+
+def test_an_unknown_provider_is_rejected_at_the_flag_layer(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    _patch_tts(monkeypatch)
+
+    result = CliRunner().invoke(main, ["speak", "hello", "--provider", "nope", "--no-play"])
+
+    assert result.exit_code == 2
+    assert "--provider" in result.output
+
+
+def test_clip_takes_the_provider_flag_too(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "copied words")
+
+    result = CliRunner().invoke(
+        main, ["clip", "--provider", "say", "--output", str(tmp_path / "out.mp3"), "--no-play"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["chain"] == ["say"]
+
+
+def test_the_output_extension_follows_the_provider_that_answered(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(cli_module, "play_audio", lambda path: None)
+    monkeypatch.setattr(
+        cli_module, "chain_run", lambda text, **kwargs: (b"m4a-bytes", "say", "m4a")
+    )
+
+    result = CliRunner().invoke(main, ["speak", "hello", "--no-play"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "last.m4a").read_bytes() == b"m4a-bytes"
+
+
+def test_a_stopped_read_exits_cleanly(monkeypatch, tmp_path):
+    from vocalize.exceptions import PlaybackStopped
+
+    def stopped(text, **kwargs):
+        raise PlaybackStopped("Playback stopped.")
+
+    monkeypatch.setattr(cli_module, "chain_run", stopped)
+    monkeypatch.setattr(cli_module, "play_audio", lambda path: None)
+    monkeypatch.setattr(cli_module, "play_sequence", lambda paths, **kwargs: True)
+
+    result = CliRunner().invoke(main, ["speak", "hello", "--output", str(tmp_path / "out.mp3")])
+
+    assert result.exit_code == 0, result.output
+    assert "Stopped." in result.output
+    assert not (tmp_path / "out.mp3").exists()
+
+
+def _patch_streaming(monkeypatch, tmp_path, pieces=("one", "two", "three")):
+    """A chain_run that streams `pieces` the way a STREAMING provider does."""
+    played = []
+    monkeypatch.setattr(cli_module, "play_audio", lambda path: played.append(("whole", path)))
+
+    def fake_play_sequence(paths, **kwargs):
+        played.extend(("piece", Path(p).read_bytes()) for p in paths)
+        return True
+
+    monkeypatch.setattr(cli_module, "play_sequence", fake_play_sequence)
+
+    def fake_chain_run(text, **kwargs):
+        source = tmp_path / "chain-tmp"
+        source.mkdir(exist_ok=True)
+        for index, piece in enumerate(pieces, start=1):
+            path = source / f"{index}.wav"
+            path.write_bytes(piece.encode())
+            kwargs["on_chunk"](path)
+        return b"".join(p.encode() for p in pieces), "kokoro", "wav"
+
+    monkeypatch.setattr(cli_module, "chain_run", fake_chain_run)
+    return played
+
+
+def test_streaming_plays_each_piece_once_and_never_replays_the_whole_file(
+    monkeypatch, tmp_path
+):
+    played = _patch_streaming(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--output", str(tmp_path / "out.wav")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert played == [("piece", b"one"), ("piece", b"two"), ("piece", b"three")]
+    assert (tmp_path / "out.wav").read_bytes() == b"onetwothree"
+
+
+def test_a_streamed_piece_survives_the_chains_temporary_directory(monkeypatch, tmp_path):
+    # The chain deletes its temp dir the moment run() returns, while the
+    # last piece is usually still playing — the CLI has to own its copy.
+    monkeypatch.setattr(cli_module, "play_sequence", lambda paths, **kwargs: True)
+    player = cli_module._StreamPlayer(tmp_path)
+
+    with tempfile.TemporaryDirectory() as source:
+        piece = Path(source) / "1.wav"
+        piece.write_bytes(b"piece")
+        assert player.on_chunk(piece) is True
+
+    player.close()
+
+    assert (tmp_path / "1.wav").read_bytes() == b"piece"
+
+
+def test_a_player_that_blows_up_is_reported_instead_of_hanging(monkeypatch, tmp_path):
+    # A failing player used to be fatal in the worst way: the thread died,
+    # and the render loop blocked forever on the next handover.
+    from vocalize.exceptions import AudioPlaybackError
+
+    def boom(paths, **kwargs):
+        raise AudioPlaybackError("afplay failed to play the audio")
+
+    monkeypatch.setattr(cli_module, "play_sequence", boom)
+    monkeypatch.setattr(cli_module, "play_audio", lambda path: None)
+
+    def fake_chain_run(text, **kwargs):
+        source = tmp_path / "chain-tmp"
+        source.mkdir(exist_ok=True)
+        rendered = b""
+        for index in range(1, 4):
+            path = source / f"{index}.wav"
+            path.write_bytes(b"piece")
+            rendered += b"piece"
+            if kwargs["on_chunk"](path) is False:
+                from vocalize.exceptions import PlaybackStopped
+
+                # What the real chain does: the stop carries everything
+                # rendered up to it.
+                raise PlaybackStopped("Playback stopped.", rendered, "wav")
+        return b"pieces", "kokoro", "wav"
+
+    monkeypatch.setattr(cli_module, "chain_run", fake_chain_run)
+
+    result = CliRunner().invoke(main, ["speak", "hello", "--output", str(tmp_path / "out.wav")])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, AudioPlaybackError)
+    assert "afplay failed" in str(result.exception)
+    # Only playback broke. The audio was rendered and paid for, so it is
+    # on disk rather than thrown away with the exception.
+    # (how many pieces rendered before the player thread reported in is a
+    # race; that anything was saved at all is the point.)
+    assert (tmp_path / "out.wav").read_bytes().startswith(b"piece")
+    assert "Saved audio to" in result.stderr
+
+
+def test_forcing_a_provider_tells_the_chain_fallback_is_off(monkeypatch, tmp_path):
+    # chain.run needs this to stop advising a fallback the flag disabled.
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--provider", "say", "--no-play",
+               "--output", str(tmp_path / "out.mp3")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["forced"] is True
+
+
+def test_without_the_flag_the_chain_is_not_told_it_was_forced(monkeypatch, tmp_path):
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--api-key", "k", "--no-play",
+               "--output", str(tmp_path / "out.mp3")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["forced"] is False
+
+
+def test_no_play_never_streams(monkeypatch, tmp_path):
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--output", str(tmp_path / "out.mp3"), "--no-play"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["on_chunk"] is None
+
+
+# --- per-provider `auth login` -----------------------------------------------
+
+
+def test_auth_login_stores_a_key_for_openai(fake_keychain, monkeypatch):
+    import vocalize.auth as auth_module
+
+    class _Stub:
+        def validate(self, key):
+            pass
+
+    monkeypatch.setattr("vocalize.providers.get", lambda name: _Stub())
+
+    result = CliRunner().invoke(
+        main,
+        ["auth", "login", "--provider", "openai", "--stdin"],
+        input="sk-openaikeyabc1234567\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_keychain[(auth_module.SERVICE, "openai-api-key")] == "sk-openaikeyabc1234567"
+    assert "openai-api-key" in result.output
+    assert "sk-openaikeyabc1234567" not in result.output
+
+
+def test_auth_login_refuses_polly(fake_keychain):
+    result = CliRunner().invoke(main, ["auth", "login", "--provider", "polly"])
+
+    assert result.exit_code == 1
+    assert "Polly uses your AWS credentials" in result.output
+    assert "vocalize auth status --provider polly" in result.output
+
+
+@pytest.mark.parametrize("provider", ["say", "kokoro"])
+def test_auth_login_refuses_local_providers(fake_keychain, provider):
+    result = CliRunner().invoke(main, ["auth", "login", "--provider", provider])
+
+    assert result.exit_code == 1
+    assert "is local and needs no credentials" in result.output
+
+
+# --- per-provider `auth status` ----------------------------------------------
+
+
+def test_auth_status_no_flag_lists_other_chain_providers(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+
+    result = CliRunner().invoke(main, ["auth", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "say: local, no credentials" in result.output
+
+
+def test_auth_status_provider_google_environment(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "g-key")
+
+    result = CliRunner().invoke(main, ["auth", "status", "--provider", "google"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "google: environment"
+
+
+def test_auth_status_provider_openai_not_configured(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = CliRunner().invoke(main, ["auth", "status", "--provider", "openai"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "openai: not configured"
+
+
+def test_auth_status_provider_admits_an_unreadable_keychain(monkeypatch):
+    # key_source flattens "could not look" into "not found"; the status
+    # line used to repeat that as "not configured" and send the user off
+    # to store a key they may already have.
+    class _Broken:
+        def get_password(self, service, username):
+            raise RuntimeError("no recommended backend")
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("vocalize.auth._backend", lambda: _Broken())
+
+    result = CliRunner().invoke(main, ["auth", "status", "--provider", "openai"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "openai: keychain unavailable (no recommended backend)"
+
+
+def test_auth_status_provider_openai_keychain_is_masked(fake_keychain, monkeypatch):
+    import vocalize.auth as auth_module
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    fake_keychain[(auth_module.SERVICE, "openai-api-key")] = "sk-abcxyz1234567890"
+
+    result = CliRunner().invoke(main, ["auth", "status", "--provider", "openai"])
+
+    assert result.exit_code == 0, result.output
+    assert "openai: keychain (sk-a…)" in result.output
+    assert "sk-abcxyz1234567890" not in result.output
+
+
+def test_auth_status_provider_polly(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shh")
+
+    result = CliRunner().invoke(main, ["auth", "status", "--provider", "polly"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "polly: environment"
+
+
+def test_auth_status_provider_say_and_kokoro(monkeypatch):
+    result_say = CliRunner().invoke(main, ["auth", "status", "--provider", "say"])
+    result_kokoro = CliRunner().invoke(main, ["auth", "status", "--provider", "kokoro"])
+
+    assert result_say.output.strip() == "say: local, no credentials"
+    assert result_kokoro.output.strip() == "kokoro: local provider (see: vocalize local status)"
+
+
+# --- `voices --provider` -----------------------------------------------------
+
+
+def test_voices_provider_google_dispatches_to_the_provider_module(monkeypatch):
+    class _Stub:
+        def list_voices(self):
+            return [{"id": "en-US-Neural2-F", "name": "Neural2 F (en-US)"}]
+
+    monkeypatch.setattr(cli_module.providers, "get", lambda name: _Stub())
+
+    result = CliRunner().invoke(main, ["voices", "--provider", "google"])
+
+    assert result.exit_code == 0, result.output
+    assert "en-US-Neural2-F\tNeural2 F (en-US)" in result.output
+
+
+def test_voices_api_key_with_another_provider_is_a_usage_error(monkeypatch):
+    result = CliRunner().invoke(main, ["voices", "--api-key", "x", "--provider", "openai"])
+
+    assert result.exit_code == 2
+    assert "--api-key only applies to ElevenLabs" in result.output
+
+
+def test_voices_kokoro_lists_the_manifest_ids_without_the_runtime(monkeypatch):
+    # The voice list is static (manifest), so it works before `local install`
+    # and never spawns the worker.
+    monkeypatch.setattr(
+        cli_module.subprocess, "Popen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("worker spawned")),
+    )
+    result = CliRunner().invoke(main, ["voices", "--provider", "kokoro"])
+
+    assert result.exit_code == 0, result.output
+    assert "af_heart\taf_heart" in result.output
+    assert len(result.output.strip().splitlines()) == 54
+
+
+# --- `usage` ------------------------------------------------------------------
+
+
+def test_usage_table_shows_budget_and_marks_exhausted(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
+    monkeypatch.setattr(
+        cli_module,
+        "get_usage",
+        lambda client: {"tier": "free", "used": 0, "limit": 10000, "resets_at": None},
+    )
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    cfg = tmp_path / "cfg" / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("[providers.google]\nmonthly_chars = 1000\n", encoding="utf-8")
+
+    from vocalize import ledger
+
+    ledger.record("google", 1200)
+
+    result = CliRunner().invoke(main, ["usage", "--api-key", "fake-key"])
+
+    assert result.exit_code == 0, result.output
+    assert "google: 1,200 / 1,000 bytes (120.0%) EXHAUSTED" in result.output
+    assert "elevenlabs: 0 characters (no monthly_chars set — unlimited)" in result.output
+
+
+def test_usage_marks_an_exhausted_provider_without_a_budget(monkeypatch, tmp_path):
+    # The common case: no monthly_chars set. A provider a real quota error
+    # marked exhausted was invisible on this line.
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty"))
+
+    from vocalize import ledger
+
+    ledger.mark_exhausted("elevenlabs")
+
+    result = CliRunner().invoke(main, ["usage"])
+
+    assert result.exit_code == 0, result.output
+    assert "elevenlabs: 0 characters (no monthly_chars set — unlimited) EXHAUSTED" in result.output
+    assert "google: 0 bytes (no monthly_chars set — unlimited)\n" in result.output
+
+
+def test_usage_without_a_key_skips_the_elevenlabs_block(monkeypatch, tmp_path):
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty"))
+
+    result = CliRunner().invoke(main, ["usage"])
+
+    assert result.exit_code == 0, result.output
+    assert "ElevenLabs remote quota: no key configured, skipped." in result.output
+
+
+# --- `local install` resume ---------------------------------------------------
+
+
+def test_local_install_never_re_downloads_a_verified_file(monkeypatch, tmp_path):
+    # A partial install leaves one good file on disk; re-running it used to
+    # re-fetch all 326 MB regardless.
+    from vocalize.local import install as install_module
+    from vocalize.local import kokoro_manifest as manifest
+    from vocalize.providers import kokoro as kokoro_provider
+
+    monkeypatch.setattr(manifest, "MODEL_DIR", tmp_path / "models")
+    monkeypatch.setattr(kokoro_provider, "uv_path", lambda: "/usr/local/bin/uv")
+    monkeypatch.setattr(install_module, "selftest", lambda uv, **kw: "ok")
+
+    done, missing = manifest.FILES[0], manifest.FILES[1]
+    monkeypatch.setattr(
+        install_module, "file_is_verified",
+        lambda entry, model_dir=None: entry["name"] == done["name"],
+    )
+
+    requested = []
+
+    def fake_download(url, dest, size, sha256, progress=None):
+        requested.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"downloaded")
+        return dest
+
+    monkeypatch.setattr(install_module, "download_file", fake_download)
+
+    result = CliRunner().invoke(main, ["local", "install", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert requested == [missing["url"]]
+    assert done["url"] not in requested
+    assert f"{done['name']}: already verified, skipping" in result.output
+
+
+def test_local_install_still_downloads_a_file_that_fails_verification(monkeypatch, tmp_path):
+    # The skip must never become "a file is on disk, so trust it": a
+    # corrupted or tampered file has to be fetched again, not adopted.
+    import hashlib
+
+    from vocalize.local import install as install_module
+    from vocalize.local import kokoro_manifest as manifest
+    from vocalize.providers import kokoro as kokoro_provider
+
+    payloads = [b"real-model-bytes", b"real-voice-bytes"]
+    files = [
+        {
+            "name": entry["name"],
+            "url": entry["url"],
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        for entry, payload in zip(manifest.FILES, payloads)
+    ]
+    model_dir = tmp_path / "models"
+    monkeypatch.setattr(manifest, "FILES", files)
+    monkeypatch.setattr(manifest, "MODEL_DIR", model_dir)
+    monkeypatch.setattr(kokoro_provider, "uv_path", lambda: "/usr/local/bin/uv")
+    monkeypatch.setattr(install_module, "selftest", lambda uv, **kw: "ok")
+
+    # Right name, right size, wrong bytes — the shape a tampered or
+    # truncated-then-padded file has.
+    model_dir.mkdir(parents=True)
+    (model_dir / files[0]["name"]).write_bytes(b"evil-model-bytes")
+
+    requested = []
+
+    def fake_download(url, dest, size, sha256, progress=None):
+        requested.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(payloads[[f["url"] for f in files].index(url)])
+        return dest
+
+    monkeypatch.setattr(install_module, "download_file", fake_download)
+
+    result = CliRunner().invoke(main, ["local", "install", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert requested == [files[0]["url"], files[1]["url"]]
+    assert "already verified, skipping" not in result.output
+
+
+# --- `settings` chain= line ---------------------------------------------------
+
+
+def test_settings_prints_the_resolved_chain(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "chain=elevenlabs,say" in result.output
+
+
+# --- `vocalize chain` ---------------------------------------------------------
+
+
+def test_chain_show_prints_order_and_source(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+
+    result = CliRunner().invoke(main, ["chain"])
+
+    assert result.exit_code == 0, result.output
+    assert "chain=elevenlabs,say" in result.output
+    assert "source=default" in result.output
+
+
+def test_chain_write_preserves_other_keys_and_tables(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text(
+        'voice = "abc"\n\n[providers.google]\nvoice = "en-US-Neural2-F"\nmonthly_chars = 500\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(main, ["chain", "google", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert "chain=google,say" in result.output
+    assert f"wrote {cfg_path}" in result.output
+
+    text = cfg_path.read_text()
+    assert 'chain = ["google", "say"]' in text
+    assert 'voice = "abc"' in text
+    assert "[providers.google]" in text
+    assert "monthly_chars = 500" in text
+
+
+def test_chain_creates_the_file_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    assert not cfg_path.exists()
+
+    result = CliRunner().invoke(main, ["chain", "polly", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert cfg_path.exists()
+    assert 'chain = ["polly", "say"]' in cfg_path.read_text()
+
+
+def test_chain_rejects_an_unknown_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    result = CliRunner().invoke(main, ["chain", "nope"])
+
+    assert result.exit_code == 2
+    assert "Unknown provider" in result.output
+    assert "elevenlabs" in result.output
+
+
+def test_chain_rejects_a_duplicate_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    result = CliRunner().invoke(main, ["chain", "say", "say"])
+
+    assert result.exit_code == 2
+    assert "Duplicate" in result.output

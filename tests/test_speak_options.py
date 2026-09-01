@@ -121,6 +121,15 @@ def test_settings_nonzero_exit_falls_back(monkeypatch, rec):
     assert rec.speak_calls()  # still spoke via fallback
 
 
+def test_settings_tolerates_a_chain_line(rec):
+    # The chain=... line settings gained is additive; the parser only ever
+    # looks for overflow=/max_chars= prefixes, so an unrecognized line must
+    # not change the parsed (mode, cap).
+    rec.settings = _Result(0, "overflow=ask\nmax_chars=1000\nchain=elevenlabs,say\n")
+
+    assert speak_options._read_settings("/opt/vocalize") == ("ask", 1000)
+
+
 def test_settings_missing_overflow_line_falls_back(monkeypatch, rec):
     rec.settings = _Result(0, "max_chars=1000\n")
     _run(monkeypatch, rec, "x" * 5000)

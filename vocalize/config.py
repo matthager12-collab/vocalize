@@ -29,10 +29,26 @@ DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
-KNOWN_CONFIG_KEYS = ("voice", "model", "speed", "max_chars", "overflow")
+KNOWN_CONFIG_KEYS = ("voice", "model", "speed", "max_chars", "overflow", "chain", "providers")
+
+# Keys allowed inside a [providers.<name>] table.
+KNOWN_PROVIDER_KEYS = (
+    "voice",
+    "model",
+    "engine",
+    "language",
+    "region",
+    "profile",
+    "monthly_chars",
+    "speed",
+)
 
 # What to do when input is longer than the resolved character cap.
 OVERFLOW_MODES = ("truncate", "ask", "never")
+
+# chain = ["elevenlabs", "say"]: ElevenLabs today, degrading to the always-
+# free `say` on failure instead of erroring.
+DEFAULT_CHAIN = ("elevenlabs", "say")
 
 
 def _load_dotenv_if_present() -> None:
@@ -46,11 +62,15 @@ def _load_dotenv_if_present() -> None:
     load_dotenv(dotenv_path=Path.cwd() / ".env")
 
 
-def resolve_api_key(explicit: str | None = None) -> str:
-    """Find an API key from --api-key, the environment, .env, or the keychain.
+def resolve_provider_key(provider: str, explicit: str | None = None) -> str:
+    """Find `provider`'s API key: flag, env var, .env, then the keychain.
 
     The keychain comes last on purpose: a project that pins its own key in
     a .env file must not be overridden by a machine-wide stored one.
+
+    Providers with no key slot at all (Polly authenticates through boto3,
+    `say` needs nothing) fall straight through to MissingAPIKeyError,
+    whose message names the right command for the provider.
 
     Raises MissingAPIKeyError if none is found.
     """
@@ -59,15 +79,23 @@ def resolve_api_key(explicit: str | None = None) -> str:
 
     _load_dotenv_if_present()
 
-    key = os.environ.get("ELEVENLABS_API_KEY")
-    if key:
-        return key
+    env_var = auth.PROVIDER_ENV_VARS.get(provider)
+    if env_var:
+        key = os.environ.get(env_var)
+        if key:
+            return key
 
-    key = auth.stored_key()
-    if key:
-        return key
+    if provider in auth.PROVIDER_USERNAMES:
+        key = auth.stored_key(provider)
+        if key:
+            return key
 
-    raise MissingAPIKeyError()
+    raise MissingAPIKeyError(provider)
+
+
+def resolve_api_key(explicit: str | None = None) -> str:
+    """The ElevenLabs key. Kept as the name every existing caller uses."""
+    return resolve_provider_key("elevenlabs", explicit)
 
 
 def config_path() -> Path:
@@ -103,7 +131,63 @@ def load_config_file() -> dict:
         if key not in KNOWN_CONFIG_KEYS:
             print(f"vocalize: unknown config key {key!r} in {path}", file=sys.stderr)
 
+    if "chain" in data:
+        _validate_chain(data["chain"], path)
+    if "providers" in data:
+        _validate_providers_table(data["providers"], path)
+
     return data
+
+
+def _validate_provider_name(name: str, source: str) -> None:
+    if name not in auth.PROVIDER_NAMES:
+        raise ConfigError(
+            f"Unknown provider {name!r} in {source}. Known: {', '.join(auth.PROVIDER_NAMES)}"
+        )
+
+
+def _validate_chain(value, path: Path) -> None:
+    if not isinstance(value, list) or not all(isinstance(name, str) and name for name in value):
+        raise ConfigError("config key 'chain' must be a list of provider names")
+    if not value:
+        raise ConfigError("config key 'chain' must list at least one provider")
+
+    source = f"'chain' in {path}"
+    seen: set[str] = set()
+    for name in value:
+        _validate_provider_name(name, source)
+        if name in seen:
+            raise ConfigError(f"Duplicate provider {name!r} in {source}.")
+        seen.add(name)
+
+
+def _validate_monthly_chars(value, provider_name: str, path: Path) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(
+            f"Invalid monthly_chars {value!r} for provider {provider_name!r} in {path}: "
+            f"expected a non-negative integer."
+        )
+
+
+def _validate_providers_table(value, path: Path) -> None:
+    if not isinstance(value, dict) or not all(isinstance(table, dict) for table in value.values()):
+        raise ConfigError("config key 'providers' must be a table of provider tables")
+
+    for name, table in value.items():
+        if name not in auth.PROVIDER_NAMES:
+            print(
+                f"vocalize: unknown provider {name!r} under 'providers' in {path}. "
+                f"Known: {', '.join(auth.PROVIDER_NAMES)}",
+                file=sys.stderr,
+            )
+        for key, val in table.items():
+            if key not in KNOWN_PROVIDER_KEYS:
+                print(
+                    f"vocalize: unknown config key {key!r} in [providers.{name}] in {path}",
+                    file=sys.stderr,
+                )
+            if key == "monthly_chars":
+                _validate_monthly_chars(val, name, path)
 
 
 def _coerce_speed(value, source: str) -> float:
@@ -195,6 +279,76 @@ def resolve_overflow(
     return mode, cap
 
 
+def resolve_chain(provider: str | None = None, file_config: dict | None = None) -> list[str]:
+    """The provider chain to try, in order: flag > env > config file > default.
+
+    `--provider` forces a single-provider, no-fallback chain — it always
+    wins and short-circuits every other source. `say` is never appended
+    automatically to an explicit chain; the all-providers-failed error is
+    what tells the user it was missing.
+    """
+    if file_config is None:
+        file_config = load_config_file()
+
+    if provider is not None:
+        _validate_provider_name(provider, "--provider")
+        return [provider]
+
+    env_value = os.environ.get("VOCALIZE_CHAIN")
+    if env_value is not None and env_value.strip():
+        names: list[str] = []
+        seen: set[str] = set()
+        for raw in env_value.split(","):
+            name = raw.strip()
+            if not name:
+                continue
+            _validate_provider_name(name, "VOCALIZE_CHAIN")
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+        if not names:
+            raise ConfigError(
+                "VOCALIZE_CHAIN is empty after parsing — set at least one provider name."
+            )
+        return names
+
+    file_chain = file_config.get("chain")
+    if file_chain:
+        return list(file_chain)  # already validated in load_config_file
+
+    return list(DEFAULT_CHAIN)
+
+
+def chain_source(provider: str | None = None, file_config: dict | None = None) -> str:
+    """Which precedence tier resolve_chain would draw its answer from.
+
+    For the `vocalize chain` setter to report, e.g., "chain (from config
+    file): elevenlabs, say".
+    """
+    if file_config is None:
+        file_config = load_config_file()
+
+    if provider is not None:
+        return "flag"
+    if (os.environ.get("VOCALIZE_CHAIN") or "").strip():
+        return "environment"
+    if file_config.get("chain"):
+        return "config file"
+    return "default"
+
+
+def provider_table(name: str, file_config: dict | None = None) -> dict:
+    """The `[providers.<name>]` table, or {} when there isn't one."""
+    if file_config is None:
+        file_config = load_config_file()
+    return (file_config.get("providers") or {}).get(name) or {}
+
+
+def budget_for(name: str, file_config: dict | None = None) -> int | None:
+    """The provider's local monthly character budget, or None for unlimited."""
+    return provider_table(name, file_config).get("monthly_chars") or None
+
+
 def _first(*values):
     for value in values:
         if value is not None:
@@ -208,6 +362,79 @@ class Settings:
     model_id: str = DEFAULT_MODEL
     output_format: str = DEFAULT_OUTPUT_FORMAT
     speed: float | None = None
+    # Everything below is provider-chain territory and defaults to today's
+    # single-provider behavior, so existing construction sites are unchanged.
+    provider: str = auth.DEFAULT_PROVIDER
+    language: str | None = None
+    region: str | None = None
+    profile: str | None = None
+
+
+def resolve_provider_settings(
+    name: str,
+    file_config: dict | None = None,
+    *,
+    voice_id: str | None = None,
+    model_id: str | None = None,
+    speed: float | None = None,
+    primary: bool = True,
+) -> Settings:
+    """Build one chain link's Settings.
+
+    Per-key precedence: flag > VOCALIZE_VOICE/MODEL/SPEED env > this
+    provider's `[providers.<name>]` table > (ElevenLabs only) the legacy
+    top-level voice/model/speed keys > the provider module's own DEFAULTS.
+
+    Flags and VOCALIZE_* env vars are the primary provider's alone —
+    `primary=False` (every non-first chain link) ignores them and reads
+    only its own table and defaults, same as the plan's "no shared knobs
+    down the chain" rule.
+    """
+    if file_config is None:
+        file_config = load_config_file()
+
+    from . import providers  # lazy: avoids a config<->providers import cycle
+
+    table = provider_table(name, file_config)
+    defaults = providers.get(name).DEFAULTS
+    legacy = name == "elevenlabs"
+
+    resolved_voice = _first(
+        voice_id if primary else None,
+        os.environ.get("VOCALIZE_VOICE") if primary else None,
+        table.get("voice"),
+        file_config.get("voice") if legacy else None,
+        defaults.get("voice"),
+    )
+
+    resolved_model = _first(
+        model_id if primary else None,
+        os.environ.get("VOCALIZE_MODEL") if primary else None,
+        _first(table.get("model"), table.get("engine")),
+        file_config.get("model") if legacy else None,
+        _first(defaults.get("model"), defaults.get("engine")),
+    )
+
+    resolved_speed = None
+    for value, source in (
+        (speed if primary else None, "--speed"),
+        (os.environ.get("VOCALIZE_SPEED") if primary else None, "VOCALIZE_SPEED"),
+        (table.get("speed"), f"'speed' in [providers.{name}] in {config_path()}"),
+        (file_config.get("speed") if legacy else None, f"'speed' in {config_path()}"),
+    ):
+        if value is not None:
+            resolved_speed = _coerce_speed(value, source)
+            break
+
+    return Settings(
+        voice_id=resolved_voice,
+        model_id=resolved_model,
+        speed=resolved_speed,
+        provider=name,
+        language=_first(table.get("language"), defaults.get("language")),
+        region=table.get("region"),
+        profile=table.get("profile"),
+    )
 
 
 def resolve_settings(
@@ -216,22 +443,16 @@ def resolve_settings(
     speed: float | None = None,
     file_config: dict | None = None,
 ) -> Settings:
-    """Build Settings from flag > env var > config file > built-in default."""
-    if file_config is None:
-        file_config = load_config_file()
+    """Build Settings from flag > env var > config file > built-in default.
 
-    resolved_speed = None
-    for value, source in (
-        (speed, "--speed"),
-        (os.environ.get("VOCALIZE_SPEED"), "VOCALIZE_SPEED"),
-        (file_config.get("speed"), f"'speed' in {config_path()}"),
-    ):
-        if value is not None:
-            resolved_speed = _coerce_speed(value, source)
-            break
-
-    return Settings(
-        voice_id=_first(voice_id, os.environ.get("VOCALIZE_VOICE"), file_config.get("voice"), DEFAULT_VOICE),
-        model_id=_first(model_id, os.environ.get("VOCALIZE_MODEL"), file_config.get("model"), DEFAULT_MODEL),
-        speed=resolved_speed,
+    The ElevenLabs case of resolve_provider_settings, kept under its own
+    name because every existing caller passes voice/model/speed here.
+    """
+    return resolve_provider_settings(
+        "elevenlabs",
+        file_config,
+        voice_id=voice_id,
+        model_id=model_id,
+        speed=speed,
+        primary=True,
     )

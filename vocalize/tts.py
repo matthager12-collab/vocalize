@@ -7,11 +7,11 @@ access or real API key needed to test the logic in this file.
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
+from . import cache
 from .config import Settings
-from .exceptions import TTSRequestError
+from .exceptions import ProviderTransientError, TTSRequestError
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "vocalize"
 
@@ -20,13 +20,8 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "vocalize"
 REQUEST_TIMEOUT_SECONDS = 30
 
 
-def _cache_key(text: str, settings: Settings) -> str:
-    payload = f"{settings.voice_id}|{settings.model_id}|{settings.output_format}|{text}"
-    # Appended only when speed is set, so an unset speed hashes exactly as
-    # it did before speed existed and older cache entries still hit.
-    if settings.speed is not None:
-        payload += f"|{settings.speed}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+# The cache moved to cache.py; this alias keeps the old import path working.
+_cache_key = cache.cache_key
 
 
 def synthesize(
@@ -46,20 +41,15 @@ def synthesize(
     Results are cached on disk by a hash of (text, voice, model,
     format, speed), so re-running the same request — e.g. re-reading
     the same document twice — doesn't burn API quota twice.
+    `cache_dir=None` turns caching off, for callers that own it
+    themselves.
     """
     if not text.strip():
         raise TTSRequestError("Nothing to speak: input text is empty.")
 
-    cache_path = None
-    if cache_dir is not None:
-        cache_path = cache_dir / f"{_cache_key(text, settings)}.mp3"
-        # The cache is an optimization, never a failure source: an
-        # unreadable entry is just a miss.
-        try:
-            if cache_path.exists():
-                return cache_path.read_bytes()
-        except OSError:
-            pass
+    cached = cache.get(text, settings, cache_dir, "mp3")
+    if cached is not None:
+        return cached
 
     convert_kwargs = {}
     if settings.speed is not None:
@@ -79,19 +69,19 @@ def synthesize(
         )
         audio = b"".join(chunks) if not isinstance(chunks, (bytes, bytearray)) else bytes(chunks)
     except Exception as exc:
-        raise TTSRequestError(f"ElevenLabs API request failed: {exc}") from exc
+        # Imported here, not at module level: providers.elevenlabs imports
+        # this module. classify re-raises our own bugs (TypeError and
+        # friends) untouched rather than dressing them as API failures.
+        from .providers.elevenlabs import classify
+
+        raise classify(exc) from exc
 
     if not audio:
-        raise TTSRequestError("ElevenLabs API returned no audio data.")
+        # Transient, not bare: an empty 200 is a wobble the next provider
+        # in the chain can cover, and a bare TTSRequestError aborts the run.
+        raise ProviderTransientError("elevenlabs", "returned no audio")
 
-    if cache_path is not None:
-        # Never discard a paid API response because the cache dir is
-        # read-only — the caller's save path does the real persistence.
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(audio)
-        except OSError:
-            pass
+    cache.put(text, settings, audio, cache_dir, "mp3")
 
     return audio
 

@@ -12,3 +12,4 @@ venv/
 *.mp3
 *.wav
 .claude/
+uv.lock

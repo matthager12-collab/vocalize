@@ -3,6 +3,66 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.0 - 2026-09-01
+
+### Added
+
+- Multi-provider text-to-speech with a fallback chain. Alongside ElevenLabs,
+  vocalize can now speak through OpenAI, Google Cloud Text-to-Speech, Amazon
+  Polly, macOS `say`, and a new local Kokoro provider — tried in order until
+  one succeeds. Default chain when nothing is configured: `elevenlabs, say`.
+- `--provider` on `speak`/`speak-file`/`clip` forces a single provider and
+  turns fallback off. `vocalize chain` shows the resolved order and its
+  source (flag/env/config/default), or writes a new one to `config.toml`
+  (`vocalize chain google polly say`) with every other key and table
+  preserved.
+- A local monthly character budget per cloud provider (`monthly_chars` under
+  `[providers.<name>]`), tracked in `~/.cache/vocalize/usage.json`. A
+  provider that returns a real quota error from the vendor is remembered as
+  exhausted for the rest of the calendar month. `vocalize usage` now reports
+  every provider's tally against its budget alongside the existing
+  ElevenLabs remote quota.
+- Per-provider `vocalize auth login|status|logout --provider <name>` and
+  `vocalize voices --provider <name>`.
+- `vocalize local install` and `vocalize local status` — opt-in setup for
+  Kokoro, an offline local voice. Nothing is downloaded until you run
+  `install`: it prints exactly what it will fetch (sizes, source URLs,
+  destination), verifies every file against a pinned sha256, and runs the
+  model under its own `uv`-managed Python 3.12 so vocalize's own environment
+  never changes. `pip install vocalize-cli` pulls in none of it.
+- Streaming playback for Kokoro: long text renders in ~400-character pieces
+  and starts playing after the first one instead of waiting for the whole
+  read to finish. `vocalize stop` works mid-read same as any other provider.
+- New optional extra `pip install "vocalize-cli[polly]"` for Amazon Polly
+  (boto3, lazy-imported — nothing else pays for it).
+- New `docs/provider-credentials.md`: click-by-click setup for OpenAI,
+  Google, Polly, and Kokoro.
+
+### Changed
+
+- The default output file is now `~/.cache/vocalize/last.<ext>` (`.mp3`,
+  `.m4a`, or `.wav` depending on which provider spoke), not always `.mp3`.
+- `vocalize usage` no longer fails outright when no ElevenLabs key is
+  configured — it prints "no key configured, skipped" for that section and
+  still shows every provider's local budget line and the cache stats.
+- Request progress on stderr now names the provider that's speaking
+  (`Requesting 340 characters from google...`) instead of always saying
+  ElevenLabs, and a fallback that succeeds says so (`Spoke via say
+  (fallback).`).
+- `vocalize config`'s wizard step labels are now suffixed `(ElevenLabs)` —
+  the wizard still only sets up ElevenLabs; use `vocalize chain` or hand-edit
+  `config.toml` for the rest of the chain.
+- `vocalize settings` gains one additive line: `chain=elevenlabs,say`.
+
+### Security
+
+- Every provider's API key stays out of URLs, argv, logs, and error
+  messages — headers, the OS keychain, or environment variables only.
+- Kokoro's model downloads are pinned by URL, size, and sha256; a mismatch
+  deletes the file and refuses rather than installing anything unverified.
+- Text reaches every local worker (`say`, Kokoro) through a file or stdin,
+  never as a command-line argument or environment variable.
+
 ## 0.8.1 - 2026-09-01
 
 ### Fixed

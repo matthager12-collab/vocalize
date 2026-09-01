@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vocalize.config import Settings
-from vocalize.exceptions import TTSRequestError
+from vocalize.exceptions import ProviderTransientError, TTSRequestError
 from vocalize.tts import _cache_key, get_usage, list_voices, synthesize
 
 
@@ -113,6 +113,16 @@ def test_synthesize_rejects_empty_text(tmp_path):
 
     with pytest.raises(TTSRequestError, match="empty"):
         synthesize(client, "   ", settings, cache_dir=tmp_path)
+
+
+def test_an_empty_body_is_transient_so_the_chain_can_fall_through(tmp_path):
+    # A 200 with no bytes is a wobble, not a verdict: as a bare
+    # TTSRequestError it aborted the whole run instead of moving on.
+    client = FakeClient(chunks=())
+    settings = Settings()
+
+    with pytest.raises(ProviderTransientError, match="returned no audio"):
+        synthesize(client, "hello", settings, cache_dir=tmp_path)
 
 
 def test_synthesize_wraps_sdk_errors(tmp_path):

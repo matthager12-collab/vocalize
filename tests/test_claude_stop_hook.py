@@ -7,7 +7,7 @@ import claude_stop_hook as hook
 from click.testing import CliRunner
 
 from vocalize.cli import main as vocalize_cli
-from vocalize.exceptions import MissingAPIKeyError
+from vocalize.exceptions import TTSRequestError
 
 
 def _assistant(content) -> str:
@@ -247,15 +247,19 @@ def test_main_speaks_dash_led_text(monkeypatch, tmp_path):
     # same argv tail must get PAST argument parsing. Exit code 2 would mean
     # click rejected the bullet as an unknown option.
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    # --provider pins the chain to ElevenLabs so the run stops at the key
+    # stage instead of falling through to `say` and speaking for real.
     result = CliRunner().invoke(
         vocalize_cli,
-        ["speak", "--max-chars", "500", "--no-play", "--", "- Fixed the parser"],
+        ["speak", "--max-chars", "500", "--no-play", "--provider", "elevenlabs",
+         "--", "- Fixed the parser"],
     )
 
     assert result.exit_code != 2
     assert "No such option" not in result.output
     # Parsing succeeded, so it runs on and fails at the API-key stage instead.
-    assert isinstance(result.exception, MissingAPIKeyError)
+    assert isinstance(result.exception, TTSRequestError)
+    assert "No ElevenLabs API key found" in str(result.exception)
 
 
 def test_nonzero_exit_is_logged_to_stderr(monkeypatch, tmp_path, capsys):

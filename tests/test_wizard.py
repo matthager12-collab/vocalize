@@ -8,7 +8,7 @@ from click.testing import CliRunner
 
 from vocalize import auth, wizard
 from vocalize.cli import main
-from vocalize.config import DEFAULT_MODEL, load_config_file
+from vocalize.config import DEFAULT_MODEL, load_config_file, resolve_settings
 from vocalize.exceptions import ConfigError, MissingAPIKeyError, TTSRequestError
 
 UP = "\x1b[A"
@@ -348,6 +348,44 @@ def test_quotes_and_backslashes_in_a_manual_value_round_trip(monkeypatch, tmp_pa
     assert load_config_file()["voice"] == weird
 
 
+def test_control_characters_in_a_manual_value_round_trip(monkeypatch, tmp_path):
+    weird = "Bad\nNews"
+    ctx = _setup(monkeypatch, tmp_path, ["m", UP, ENTER, ENTER], prompts=[weird])
+
+    wizard.run_wizard()
+
+    assert ctx.path.read_text() == 'voice = "Bad\\nNews"\n'
+    assert load_config_file()["voice"] == weird
+
+
+def test_wizards_choice_removes_the_shadowing_provider_table_key(monkeypatch, tmp_path, capsys):
+    # voice: down to abc123; model: up to "keep current"; speed: keep current
+    ctx = _setup(monkeypatch, tmp_path, [DOWN, ENTER, UP, ENTER, ENTER])
+    ctx.path.parent.mkdir(parents=True)
+    ctx.path.write_text(
+        'voice = "old-voice"\n'
+        "\n[providers.elevenlabs]\n"
+        'voice = "table-voice"\n'
+        "monthly_chars = 1000000\n"
+    )
+
+    wizard.run_wizard()
+
+    assert ctx.path.read_text() == (
+        'voice = "abc123"\n'
+        "\n[providers.elevenlabs]\n"
+        "monthly_chars = 1000000\n"
+    )
+    data = load_config_file()
+    assert "voice" not in data["providers"]["elevenlabs"]
+    assert data["providers"]["elevenlabs"]["monthly_chars"] == 1000000
+    assert resolve_settings().voice_id == "abc123"
+    assert (
+        "[providers.elevenlabs] voice removed — the wizard's choice now applies"
+        in capsys.readouterr().out
+    )
+
+
 def test_a_table_in_the_config_file_is_refused_not_flattened(monkeypatch, tmp_path):
     ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
     ctx.path.parent.mkdir(parents=True)
@@ -456,6 +494,114 @@ def test_confirmation_line_reaches_stdout_too(monkeypatch, tmp_path):
     assert f"Wrote {ctx.path}" in tty.getvalue()
     # Wrappers and logs only capture stdout, so the outcome has to land there
     assert sys.stdout.getvalue().strip() == f"Wrote {ctx.path}"
+
+
+def test_chain_array_round_trips_byte_for_byte(monkeypatch, tmp_path):
+    # keep voice, up to "keep current" for the model, keep speed
+    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, ENTER])
+    ctx.path.parent.mkdir(parents=True)
+    original = 'chain = ["elevenlabs", "google"]\n'
+    ctx.path.write_text(original)
+
+    wizard.run_wizard()
+
+    assert ctx.path.read_text() == original
+
+
+def test_providers_table_round_trips_with_blank_line_and_key_order(monkeypatch, tmp_path):
+    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, ENTER])
+    ctx.path.parent.mkdir(parents=True)
+    original = (
+        "\n[providers.polly]\n"
+        'region = "us-east-1"\n'
+        'profile = "default"\n'
+        "monthly_chars = 1000000\n"
+    )
+    ctx.path.write_text(original)
+
+    wizard.run_wizard()
+
+    assert ctx.path.read_text() == original
+
+
+def test_render_config_text_puts_flat_keys_before_provider_tables():
+    # providers listed first in the dict on purpose: the renderer must not
+    # just echo insertion order — flat keys always come first, because a
+    # bare key after a [section] header would parse into that section.
+    data = {
+        "providers": {
+            "google": {"language": "en-US", "monthly_chars": 1000000},
+            "say": {"voice": "Samantha"},
+        },
+        "voice": "keep-me",
+        "chain": ["elevenlabs", "google", "say"],
+    }
+
+    text = wizard._render_config_text(data)
+
+    assert text == (
+        'voice = "keep-me"\n'
+        'chain = ["elevenlabs", "google", "say"]\n'
+        "\n[providers.google]\n"
+        'language = "en-US"\n'
+        "monthly_chars = 1000000\n"
+        "\n[providers.say]\n"
+        'voice = "Samantha"\n'
+    )
+
+
+def test_nested_table_inside_a_provider_is_refused_not_flattened(monkeypatch, tmp_path):
+    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
+    ctx.path.parent.mkdir(parents=True)
+    original = '[providers.google]\nlanguage = "en-US"\n\n[providers.google.extra]\nx = 1\n'
+    ctx.path.write_text(original)
+
+    with pytest.raises(ConfigError, match="edit that file by hand"):
+        wizard.run_wizard()
+
+    assert ctx.path.read_text() == original
+
+
+def test_an_extras_table_is_still_refused_alongside_chain_and_providers(monkeypatch, tmp_path):
+    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
+    ctx.path.parent.mkdir(parents=True)
+    original = (
+        'chain = ["elevenlabs", "say"]\n\n'
+        '[providers.google]\nlanguage = "en-US"\n\n'
+        "[extras]\nx = 1\n"
+    )
+    ctx.path.write_text(original)
+
+    with pytest.raises(ConfigError, match="edit that file by hand"):
+        wizard.run_wizard()
+
+    assert ctx.path.read_text() == original
+
+
+def test_a_list_containing_a_table_is_refused(monkeypatch, tmp_path):
+    # an arbitrary key, not "chain" — that one has its own dedicated
+    # provider-name validation in config.py and raises before this does
+    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
+    ctx.path.parent.mkdir(parents=True)
+    original = 'tags = [{name = "x"}]\n'
+    ctx.path.write_text(original)
+
+    with pytest.raises(ConfigError, match="edit that file by hand"):
+        wizard.run_wizard()
+
+    assert ctx.path.read_text() == original
+
+
+def test_step_titles_are_labelled_elevenlabs(monkeypatch, tmp_path, capsys):
+    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
+    _setup(monkeypatch, tmp_path, keys)
+
+    wizard.run_wizard()
+
+    out = capsys.readouterr().out
+    assert "Step 1 of 3 — Voice (ElevenLabs)" in out
+    assert "Step 2 of 3 — Model (ElevenLabs)" in out
+    assert "Step 3 of 3 — Speed (ElevenLabs)" in out
 
 
 def test_the_current_voice_starts_under_the_cursor(monkeypatch, tmp_path, capsys):
