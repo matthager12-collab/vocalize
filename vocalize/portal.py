@@ -100,6 +100,22 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _same_secret(offered: str, secret: str) -> bool:
+    """Constant-time compare that survives a non-ASCII offer.
+
+    `secrets.compare_digest` refuses two `str` arguments unless both are
+    ASCII and raises `TypeError` — and the offered half is attacker
+    input: a header value http.server decoded as latin-1, or a JSON
+    string that may hold anything including a lone surrogate. Raising
+    there would mean no response and no security headers at all, so both
+    sides are compared as UTF-8 bytes instead, which keeps the
+    constant-time property and answers 401 like any other bad secret.
+    """
+    return secrets.compare_digest(
+        offered.encode("utf-8", "surrogatepass"), secret.encode("utf-8", "surrogatepass")
+    )
+
+
 # --- state ------------------------------------------------------------
 
 
@@ -176,7 +192,7 @@ class PortalState:
             elif _now() > self.code_expires_at:
                 self.code = None
                 failure = "this code has expired"
-            elif secrets.compare_digest(code, self.code):
+            elif _same_secret(code, self.code):
                 self.code = None
                 self.last_seen = _now()
                 return self.token, ""
@@ -193,7 +209,7 @@ class PortalState:
     def token_matches(self, offered: str | None) -> bool:
         if not offered:
             return False
-        return secrets.compare_digest(offered, self.token)
+        return _same_secret(offered, self.token)
 
 
 # --- bounded probes ---------------------------------------------------
@@ -519,7 +535,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(length) if length else b""
-        self._respond(*route(method, self.path, self.headers, body, state=state))
+        try:
+            answer = route(method, self.path, self.headers, body, state=state)
+        except Exception:  # noqa: BLE001 — never drop a connection over a route bug
+            # A route that raises would otherwise reach socketserver, which
+            # closes the socket with no status line and no security headers
+            # and prints a traceback. The message is fixed: an exception's
+            # text here can carry configuration or credential material.
+            answer = _json(500, {"error": "the portal hit an internal error"})
+        self._respond(*answer)
 
     def do_GET(self):
         self._handle("GET")
@@ -541,6 +565,28 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self._handle("OPTIONS")
+
+
+class _Server(ThreadingHTTPServer):
+    """The portal's server: silent, and never joined at close."""
+
+    # Handler threads are daemons and keep-alive connections outlive the
+    # request, so joining them at close would block on an idle browser tab
+    # rather than shut anything down.
+    daemon_threads = True
+    block_on_close = False
+
+    portal_state: PortalState
+
+    def handle_error(self, request, client_address):
+        """Say nothing.
+
+        socketserver's default prints the traceback — which names install
+        paths and can carry request material — to stderr, which is the one
+        thing `log_message` was overridden to prevent. `_handle` already
+        turns a route failure into a 500; what reaches here is a broken or
+        timed-out connection, and there is nothing to say about it.
+        """
 
 
 @dataclass
@@ -605,12 +651,7 @@ def serve(
         readiness_timeout=readiness_timeout,
         idle_timeout=idle_timeout,
     )
-    httpd = ThreadingHTTPServer((BIND_HOST, port), _Handler)
-    httpd.daemon_threads = True
-    # Handler threads are daemons and keep-alive connections outlive the
-    # request, so joining them at close would block on an idle browser
-    # tab rather than shut anything down.
-    httpd.block_on_close = False
+    httpd = _Server((BIND_HOST, port), _Handler)
     state.port = httpd.server_address[1]
     httpd.portal_state = state
 

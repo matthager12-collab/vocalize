@@ -333,6 +333,40 @@ def test_the_valid_token_opens_the_api():
     assert _authed_get(state, "/api/ping")[0] == 200
 
 
+# --- secrets that are not ASCII ---------------------------------------
+#
+# `secrets.compare_digest` raises TypeError on a non-ASCII str, and both
+# halves of the auth surface compare attacker-supplied text: a header
+# http.server decodes as latin-1, and a JSON string that can hold a lone
+# surrogate. A raise there is not a 401 — it is no response at all.
+
+
+@pytest.mark.parametrize("offered", ("café", "\xff", "\ud800", "🔑"))
+def test_a_non_ascii_token_header_is_refused_with_the_full_header_set(offered):
+    state = _state()
+    status, headers, _ = _get(state, "/api/ping", **{TOKEN_HEADER: offered})
+    assert status == 401
+    for name, value in portal.SECURITY_HEADERS.items():
+        assert headers.get(name) == value
+
+
+@pytest.mark.parametrize("offered", ("café", "\ud800", "🔑"))
+def test_a_non_ascii_code_is_refused_and_counts_toward_the_lockout(offered):
+    state = _state()
+    status, headers, body = _post(state, "/api/session", {"code": offered})
+    assert status == 401
+    assert json.loads(body)["error"] == "wrong code"
+    assert state.failed_codes == 1
+    assert headers["Content-Security-Policy"] == portal.SECURITY_HEADERS["Content-Security-Policy"]
+
+
+def test_a_non_ascii_secret_is_never_taken_for_the_real_one():
+    state = _state()
+    state.token = "café"
+    assert _get(state, "/api/ping", **{TOKEN_HEADER: "cafe"})[0] == 401
+    assert _get(state, "/api/ping", **{TOKEN_HEADER: "café"})[0] == 200
+
+
 # --- static assets ----------------------------------------------------
 
 
@@ -750,6 +784,40 @@ def test_the_handler_logs_nothing(running_portal, capsys):
     captured = capsys.readouterr()
     assert "leaky" not in captured.err
     assert "leaky" not in captured.out
+
+
+def test_a_failing_route_answers_500_with_the_security_headers(
+    running_portal, monkeypatch, capsys
+):
+    """A route that raises must not drop the connection.
+
+    A hand-corrupted `usage.json` is enough to make `ledger.all_status()`
+    raise inside `/api/state`. Without a boundary the client gets zero
+    bytes — no status line, so none of the security headers — and
+    socketserver prints a traceback naming install paths to stderr, which
+    is the one thing `log_message` exists to prevent.
+    """
+
+    def boom():
+        raise AttributeError("no attribute 'get' on the corrupt month entry")
+
+    monkeypatch.setattr("vocalize.ledger.all_status", boom)
+    started = running_portal
+    conn = _connect(started)
+    conn.request("GET", "/api/state", headers={TOKEN_HEADER: started.state.token})
+    response = conn.getresponse()
+    body = response.read()
+    conn.close()
+
+    assert response.status == 500
+    for name, value in portal.SECURITY_HEADERS.items():
+        assert response.getheader(name) == value
+    assert b"AttributeError" not in body
+    assert b"corrupt month entry" not in body
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
 
 
 def test_the_idle_watchdog_closes_the_portal():
