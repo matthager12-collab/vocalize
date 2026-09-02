@@ -54,6 +54,13 @@ from .exceptions import VocalizeError
 BIND_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 64 * 1024
+# A connection that opens and then goes quiet must not pin a handler
+# thread for the life of the process: this is a ThreadingHTTPServer, one
+# unbounded daemon thread per connection, and a declared body that never
+# arrives would block `rfile.read` with no deadline at all. Comfortably
+# above the page's ping interval, so a keep-alive connection between two
+# pings is never dropped under it.
+HANDLER_TIMEOUT_SECONDS = 30.0
 CODE_TTL_SECONDS = 60.0
 MAX_CODE_ATTEMPTS = 5
 PING_INTERVAL_SECONDS = 15.0
@@ -484,6 +491,10 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "vocalize"
     sys_version = ""
+    # StreamRequestHandler.setup() applies this with settimeout(), and
+    # handle_one_request already treats a timed-out read as a closed
+    # connection.
+    timeout = HANDLER_TIMEOUT_SECONDS
 
     def log_message(self, format, *args):
         """Log nothing.
@@ -532,11 +543,21 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) > 1:
+            # Two lengths is the classic smuggling shape: whichever copy
+            # this server picks, something in front of it may pick the
+            # other. Refused with the connection, because the bytes we
+            # would not read are the next request's line to anything that
+            # kept talking on it.
+            self._respond(*_json(400, {"error": "bad Content-Length"}), close=True)
+            return
+
         # Strictly decimal, not int()'s idea of a number: it accepts
         # "5_0", unicode digits and surrounding space, and a length the
         # server reads differently from the way anything in front of it
         # would is the seed of a request-smuggling bug.
-        raw_length = self.headers.get("Content-Length")
+        raw_length = lengths[0] if lengths else None
         if raw_length is not None and not _DECIMAL.fullmatch(raw_length):
             self._respond(*_json(400, {"error": "bad Content-Length"}), close=True)
             return

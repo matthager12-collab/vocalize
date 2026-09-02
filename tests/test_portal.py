@@ -910,3 +910,54 @@ def test_the_handler_refuses_a_non_decimal_content_length(running_portal):
     response.read()
     assert response.status == 400
     conn.close()
+
+
+def test_the_handler_refuses_two_content_length_headers(running_portal):
+    """The sibling of the check above: `.get()` would take the first copy,
+    something in front of this server could take the second, and the bytes
+    left unread are the next request line on the same connection."""
+    started = running_portal
+    body = json.dumps({"code": started.state.code}).encode()
+    raw = _raw(
+        started,
+        b"POST /api/session HTTP/1.1\r\n"
+        + f"Host: {portal.BIND_HOST}:{started.port}\r\n".encode()
+        + b"Content-Type: application/json\r\n"
+        + b"Content-Length: 0\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body,
+    )
+    assert " 400 " in _head_of(raw)
+    # And the smuggled exchange never happened.
+    assert started.state.code is not None
+
+
+@pytest.mark.parametrize(
+    ("label", "sent"),
+    (
+        ("no request line at all", b""),
+        (
+            "a declared body that never arrives",
+            b"POST /api/session HTTP/1.1\r\nContent-Length: 65536\r\n\r\n",
+        ),
+    ),
+)
+def test_a_stalled_connection_is_dropped_instead_of_pinning_a_thread(
+    running_portal, monkeypatch, label, sent
+):
+    """One thread per connection, unbounded and daemon: without a socket
+    timeout a few thousand of these would be a local denial of service,
+    and they arrive before any Host or token check."""
+    # Pin the shipped default first — the monkeypatch below only makes the
+    # same rule quick enough to assert on.
+    assert portal._Handler.timeout == portal.HANDLER_TIMEOUT_SECONDS
+    assert 0 < portal.HANDLER_TIMEOUT_SECONDS <= 60
+    monkeypatch.setattr(portal._Handler, "timeout", 0.2)
+    started = running_portal
+    sock = socket.create_connection((portal.BIND_HOST, started.port), timeout=5)
+    try:
+        if sent:
+            sock.sendall(sent)
+        assert sock.recv(4096) == b"", f"{label}: the connection is still open"
+    finally:
+        sock.close()
