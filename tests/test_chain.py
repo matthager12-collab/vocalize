@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import io
 import wave
+from pathlib import Path
 
 import pytest
 
+from vocalize import audio as audio_module
 from vocalize import cache, chain, ledger
 from vocalize.config import Settings
 from vocalize.exceptions import (
@@ -680,3 +682,64 @@ def test_streamed_pieces_are_gone_once_the_run_returns(registry):
     _run(registry, text="First sentence here. Second sentence here.", on_chunk=on_chunk)
 
     assert paths and not any(p.exists() for p in paths)
+
+
+# --- what a stop leaves behind for a resume (DEC-003) ------------------
+
+
+def _played(path, elapsed=1.5):
+    """Pretend the CLI's player was killed while playing `path`."""
+    audio_module._record_stop(Path(path), elapsed, True)
+
+
+def test_an_interrupted_read_carries_the_text_nobody_heard(registry):
+    # The CLI hands pieces over one ahead of the one playing, so the piece
+    # that comes back False is not the piece the stop landed in. The read
+    # continues after the piece the *player* had open — the one saved with
+    # the record and replayed from its offset.
+    registry["kokoro"] = FakeProvider("kokoro", ext="wav", max_chars=25, streaming=True)
+    text = ("First sentence here. Second sentence here. Third one here. "
+            "Fourth sentence here. Fifth sentence here.")
+    chunks = chain._chunks_for(registry["kokoro"], text, None)
+    assert len(chunks) == 5
+
+    def on_chunk(path):
+        if path.name == "3.wav":
+            _played("vocalize-play/3.wav")  # a name, never opened
+        return path.name != "5.wav"
+
+    with pytest.raises(PlaybackStopped) as excinfo:
+        _run(registry, text=text, on_chunk=on_chunk)
+
+    assert excinfo.value.remaining_text == " ".join(chunks[3:])
+    assert excinfo.value.provider == "kokoro"
+
+
+def test_an_interrupted_read_falls_back_to_the_piece_it_was_handed(registry):
+    # No usable piece name means the stop came from somewhere other than a
+    # killed player (a broken one, say). Nothing after the handover was
+    # heard either, so that piece is where the text resumes.
+    registry["kokoro"] = FakeProvider("kokoro", ext="wav", max_chars=25, streaming=True)
+    text = "First sentence here. Second sentence here. Third one here."
+    chunks = chain._chunks_for(registry["kokoro"], text, None)
+    _seen, on_chunk = _collect(results=[True, False])
+
+    with pytest.raises(PlaybackStopped) as excinfo:
+        _run(registry, text=text, on_chunk=on_chunk)
+
+    assert excinfo.value.remaining_text == " ".join(chunks[1:])
+
+
+def test_a_stop_from_another_read_never_decides_where_this_one_resumes(registry):
+    # last_stop() is per process, and a piece number out of this read's
+    # range is not this read's piece.
+    registry["kokoro"] = FakeProvider("kokoro", ext="wav", max_chars=25, streaming=True)
+    text = "First sentence here. Second sentence here. Third one here."
+    chunks = chain._chunks_for(registry["kokoro"], text, None)
+    _played("vocalize-play/97.wav")  # a name, never opened
+    _seen, on_chunk = _collect(results=[True, False])
+
+    with pytest.raises(PlaybackStopped) as excinfo:
+        _run(registry, text=text, on_chunk=on_chunk)
+
+    assert excinfo.value.remaining_text == " ".join(chunks[1:])

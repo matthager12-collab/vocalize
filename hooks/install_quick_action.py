@@ -22,6 +22,7 @@ BUNDLE_NAMES = (
     "Speak with Vocalize.workflow",
     "Stop Vocalize.workflow",
     "Speak Latest Plan.workflow",
+    "Dictate with Vocalize.workflow",
 )
 PLACEHOLDER = "__VOCALIZE_BIN__"
 CLAUDE_PLACEHOLDER = "__CLAUDE_BIN__"

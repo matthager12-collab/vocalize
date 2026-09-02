@@ -557,3 +557,156 @@ def test_resolve_provider_settings_sets_the_provider_field(monkeypatch, tmp_path
     _isolate(monkeypatch, tmp_path)
     settings = resolve_provider_settings("say")
     assert settings.provider == "say"
+
+
+# --- the [stt] table (T-42, DEC-006) ----------------------------------
+#
+# Every value here ends up as one argv entry in a subprocess — the
+# recorder's --device, the whisper worker's --model and --language — so
+# each is checked before it can get that far, and each check has a test
+# that proves it can refuse.
+
+
+def _load_stt(monkeypatch, tmp_path, body):
+    from vocalize.config import load_config_file
+
+    _isolate(monkeypatch, tmp_path, body)
+    return load_config_file()
+
+
+def test_stt_table_loads_with_valid_values(monkeypatch, tmp_path):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(
+        monkeypatch, tmp_path,
+        '[stt]\nmodel = "base.en"\nlanguage = "en"\ncleanup = true\n'
+        'max_seconds = 30\ninput_device = "Built-in Microphone"\n',
+    )
+
+    resolved = resolve_stt(data)
+    assert resolved["model"] == "base.en"
+    assert resolved["cleanup"] is True
+    assert resolved["max_seconds"] == 30
+    assert resolved["input_device"] == "Built-in Microphone"
+    # Untouched keys still come from the defaults.
+    assert resolved["sounds"] is True
+    assert resolved["paste"] is False
+
+
+def test_stt_defaults_apply_with_no_table_at_all(monkeypatch, tmp_path):
+    from vocalize.config import STT_DEFAULTS, resolve_stt
+
+    assert resolve_stt(_load_stt(monkeypatch, tmp_path, "")) == STT_DEFAULTS
+
+
+def test_an_unknown_stt_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, '[stt]\nmodel = "base.en"\nmodle = "typo"\n')
+
+    assert resolve_stt(data)["model"] == "base.en"
+    assert "unknown config key 'modle' in [stt]" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "model",
+    ['"tiny.en"', '"../../etc/passwd"', '"--serve"', '"small.en\\u0007"', "12"],
+)
+def test_an_stt_model_off_the_allowlist_is_refused(monkeypatch, tmp_path, model):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\nmodel = {model}\n")
+
+    assert "stt.model" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("language", ['"klingon"', '"--foo"', '"en; rm -rf /"', "7"])
+def test_an_stt_language_off_the_allowlist_is_refused(monkeypatch, tmp_path, language):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\nlanguage = {language}\n")
+
+    assert "stt.language" in str(excinfo.value)
+
+
+def test_an_english_only_stt_model_with_another_language_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, '[stt]\nmodel = "small.en"\nlanguage = "fr"\n')
+
+    assert "English-only" in str(excinfo.value)
+
+
+def test_the_english_only_stt_rule_also_catches_the_default_model(monkeypatch, tmp_path):
+    # No model line at all: the default is small.en, which is still .en.
+    with pytest.raises(ConfigError):
+        _load_stt(monkeypatch, tmp_path, '[stt]\nlanguage = "de"\n')
+
+
+def test_a_multilingual_stt_model_accepts_another_language(monkeypatch, tmp_path):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(
+        monkeypatch, tmp_path, '[stt]\nmodel = "large-v3-turbo-q5_0"\nlanguage = "fr"\n'
+    )
+    assert resolve_stt(data)["language"] == "fr"
+
+
+@pytest.mark.parametrize("value", ["0", '"abc"', "601", "-1", "12.5", "true"])
+def test_an_out_of_range_stt_max_seconds_is_refused(monkeypatch, tmp_path, value):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\nmax_seconds = {value}\n")
+
+    assert "stt.max_seconds" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["1", "600", "120"])
+def test_stt_max_seconds_at_the_edges_is_accepted(monkeypatch, tmp_path, value):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, f"[stt]\nmax_seconds = {value}\n")
+    assert resolve_stt(data)["max_seconds"] == int(value)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '"--foo"',                 # flag-shaped: would become a recorder option
+        '"a\\nb"',                 # control character: a newline in a device name
+        '"mic\\u001b[31m"',        # an escape sequence a terminal would obey
+        '"' + "x" * 129 + '"',     # over the length cap
+        "42",                      # not a string at all
+    ],
+)
+def test_a_bad_shaped_stt_input_device_is_refused(monkeypatch, tmp_path, literal):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\ninput_device = {literal}\n")
+
+    assert "stt.input_device" in str(excinfo.value)
+
+
+def test_an_empty_stt_input_device_is_the_system_default(monkeypatch, tmp_path):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, '[stt]\ninput_device = ""\n')
+    assert resolve_stt(data)["input_device"] == ""
+
+
+@pytest.mark.parametrize("key", ["cleanup", "paste", "sounds"])
+def test_a_non_boolean_stt_flag_is_refused(monkeypatch, tmp_path, key):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f'[stt]\n{key} = "yes"\n')
+
+    assert f"stt.{key}" in str(excinfo.value)
+
+
+def test_an_stt_value_that_is_not_a_table_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, 'stt = "small.en"\n')
+
+    assert "'stt'" in str(excinfo.value)
+
+
+def test_resolve_stt_revalidates_a_hand_built_dict():
+    """The portal and any other caller hand this a dict it never read."""
+    from vocalize.config import resolve_stt
+
+    with pytest.raises(ConfigError):
+        resolve_stt({"stt": {"model": "--serve"}})

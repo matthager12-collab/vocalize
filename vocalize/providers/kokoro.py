@@ -20,7 +20,6 @@ from __future__ import annotations
 import atexit
 import json
 import queue
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -34,6 +33,7 @@ from ..exceptions import (
 )
 from ..local import install as install_module
 from ..local import kokoro_manifest as manifest
+from ..local import uv_path  # re-exported: `provider.uv_path()` stays public API
 
 NAME = "kokoro"
 AUDIO_EXT = "wav"
@@ -48,20 +48,10 @@ DEFAULTS = {"voice": manifest.DEFAULT_VOICE, "language": manifest.DEFAULT_LANGUA
 SESSION_SEAM = subprocess.Popen
 
 _UV_DOCS = "https://docs.astral.sh/uv/"
-_INSTALL_HINT = "run: vocalize local install"
 
 # 400 characters take about 5 seconds to render on an M3. The timeout is
 # for a wedged worker, not a slow one.
 _REQUEST_TIMEOUT = 300
-
-
-def uv_path() -> str | None:
-    """uv's executable, or None. PATH first, then its default install spot."""
-    found = shutil.which("uv")
-    if found:
-        return found
-    fallback = Path.home() / ".local" / "bin" / "uv"
-    return str(fallback) if fallback.is_file() else None
 
 
 def installed(model_dir: Path | None = None) -> tuple[bool, str]:
@@ -71,34 +61,12 @@ def installed(model_dir: Path | None = None) -> tuple[bool, str]:
     left behind by a verified install must match the manifest's version
     and hashes. Sizes are checked, hashes are not re-computed — hashing
     326 MB per run would cost more than the synthesis.
+
+    Delegates to install.py's generalized checker with Kokoro's own
+    manifest and default install hint, so the message text is identical
+    to before this was shared with Whisper's installer.
     """
-    base = manifest.MODEL_DIR if model_dir is None else model_dir
-
-    for entry in manifest.FILES:
-        path = base / entry["name"]
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return False, f"not installed — {_INSTALL_HINT}"
-        if size != entry["size"]:
-            return False, (
-                f"{entry['name']} is the wrong size — reinstall with: "
-                f"vocalize local install"
-            )
-
-    stamp = install_module.read_stamp(base)
-    if stamp is None:
-        return False, f"not verified — {_INSTALL_HINT}"
-    if stamp.get("manifest_version") != manifest.MANIFEST_VERSION:
-        return False, f"installed by an older vocalize — {_INSTALL_HINT}"
-
-    recorded = stamp.get("files") or {}
-    for entry in manifest.FILES:
-        seen = recorded.get(entry["name"]) or {}
-        if (seen.get("sha256"), seen.get("size")) != (entry["sha256"], entry["size"]):
-            return False, f"{entry['name']} does not match this release — {_INSTALL_HINT}"
-
-    return True, ""
+    return install_module.installed(manifest, model_dir)
 
 
 def _voice(settings: Settings | None) -> str:

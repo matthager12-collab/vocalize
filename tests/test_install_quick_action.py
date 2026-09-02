@@ -262,3 +262,84 @@ def test_checked_in_plan_bundle_redirects_plan_into_helper():
     assert '.claude/plans"/*.md' in script
     assert 'exec /usr/bin/python3 "__HELPER__" < "$PLAN"' in script
     assert install_quick_action.PLACEHOLDER in script
+
+
+# --- the dictation Quick Action (T-44) --------------------------------
+
+
+DICTATE_BUNDLE = "Dictate with Vocalize.workflow"
+
+
+def _real_info(name):
+    path = install_quick_action.TEMPLATES_DIR / name / "Contents" / "Info.plist"
+    with path.open("rb") as fh:
+        return plistlib.load(fh)
+
+
+def test_the_dictate_bundle_is_installed_with_the_others(install_env):
+    services, fake_bin, _helper, _claude, _pbs = install_env
+
+    assert install_quick_action.main() == 0
+
+    wflow = services / DICTATE_BUNDLE / "Contents" / "Resources" / "document.wflow"
+    assert wflow.is_file()
+    text = wflow.read_text(encoding="utf-8")
+    assert install_quick_action.PLACEHOLDER not in text
+    assert str(fake_bin) in text
+
+
+def test_the_dictate_bundle_takes_no_input_at_all():
+    """A keyboard shortcut has no selection to hand over.
+
+    A service that declares NSSendTypes is offered only when something is
+    selected, and one whose action reads stdin waits forever when nothing
+    arrives — either would make the hotkey do nothing at all.
+    """
+    info = _real_info(DICTATE_BUNDLE)
+    service = info["NSServices"][0]
+    assert "NSSendTypes" not in service
+    assert "NSReturnTypes" not in service
+
+    doc = _real_wflow(DICTATE_BUNDLE)
+    params = doc["actions"][0]["action"]["ActionParameters"]
+    assert params["inputMethod"] == 1  # as arguments, never stdin
+    assert doc["workflowMetaData"]["serviceProcessesInput"] == 0
+    assert doc["workflowMetaData"]["serviceInputTypeIdentifier"] == "com.apple.Automator.nothing"
+
+
+def test_the_dictate_bundle_has_its_own_identity():
+    info = _real_info(DICTATE_BUNDLE)
+
+    assert info["CFBundleIdentifier"] == "cards.arda.vocalize.dictate"
+    assert info["NSServices"][0]["NSMenuItem"]["default"] == "Dictate with Vocalize"
+
+
+def test_the_dictate_bundle_does_not_reuse_the_stop_bundles_uuids():
+    """Two services sharing an action UUID confuse the Services registry."""
+    dictate_action = _real_wflow(DICTATE_BUNDLE)["actions"][0]["action"]
+    stop_action = _real_wflow("Stop Vocalize.workflow")["actions"][0]["action"]
+
+    assert dictate_action["UUID"] != stop_action["UUID"]
+    assert dictate_action["InputUUID"] != stop_action["InputUUID"]
+
+
+def test_the_dictate_bundle_execs_dictate_and_exports_the_claude_environment():
+    script = _real_wflow(DICTATE_BUNDLE)["actions"][0]["action"]["ActionParameters"][
+        "COMMAND_STRING"
+    ]
+
+    assert 'exec "$BIN" dictate' in script
+    assert 'export CLAUDE_BIN="__CLAUDE_BIN__"' in script
+    assert 'export CLAUDE_EXTRA_PATH="__CLAUDE_EXTRA_PATH__"' in script
+    assert install_quick_action.PLACEHOLDER in script
+
+
+def test_the_dictate_bundle_never_passes_text_on_its_command_line():
+    """Nothing spoken or dictated may become a Quick Action argument."""
+    script = _real_wflow(DICTATE_BUNDLE)["actions"][0]["action"]["ActionParameters"][
+        "COMMAND_STRING"
+    ]
+
+    assert "$@" not in script
+    assert "$1" not in script
+    assert "$*" not in script

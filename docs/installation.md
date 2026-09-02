@@ -4,8 +4,13 @@ This is the full installation guide, written after a complete from-scratch
 install on a real machine (macOS, 2026-09-01). Every command in the main flow
 was actually executed during that install; anything not exercised is labeled
 **untested**. It supersedes the scattered install notes in the README by
-treating the system as what it actually is: **five layers that install
-separately**.
+treating the system as what it actually is: **six layers that install
+separately**. Layer 5 (dictation) was added for 0.10.0 (2026-09-02), after
+the original from-scratch narrative below — its command-level behavior
+(config resolution, `--check`/`--list-devices` exit codes, `--wav`) was
+verified the same way as the rest of this doc; the live microphone grant and
+a real hotkey press need the owner physically present, the same ceiling
+described in [What still can't be automated](#what-still-cant-be-automated).
 
 | Layer | What you get | Installed by | Scope |
 |---|---|---|---|
@@ -14,9 +19,10 @@ separately**.
 | 2. `/speak` | slash command / skill inside Claude Code | **not shipped yet** — create by hand (below) | user-global |
 | 3. Stop hook | every Claude Code response auto-spoken | `hooks/install_hook.py` (repo) | user-global, new sessions |
 | 4. Quick Actions | right-click → Services, hotkey-able | `hooks/install_quick_action.py` (repo) | user-global + 2 GUI steps |
+| 5. Dictation | hotkey → speech-to-text → clipboard | `vocalize local install --stt` + layer 4's installer | user-global + 1 GUI step (hotkey) + 1 permission prompt |
 
 The single most common confusion: **the PyPI package ships layer 0 only.**
-Layers 3–4 live in the git repo, and layer 2 currently ships nowhere — the
+Layers 3–5 live in the git repo, and layer 2 currently ships nowhere — the
 README references `/speak`, but no artifact creates it. If you installed via
 pipx and wonder where `/speak` is: that's why.
 
@@ -168,10 +174,12 @@ Otherwise, plainly:
 python3 ~/code/vocalize/hooks/install_quick_action.py
 ```
 
-Installs three workflows into `~/Library/Services/` and refreshes the
+Installs four workflows into `~/Library/Services/` and refreshes the
 registry: **Speak with Vocalize** (selected text), **Stop Vocalize**,
 **Speak Latest Plan** (newest `~/.claude/plans/` file — made for the
-plan-approval moment).
+plan-approval moment), and **Dictate with Vocalize** (the dictation
+hotkey — see [Layer 5](#layer-5--dictation-speech-to-text) below; it needs
+no input and shows no window).
 
 Known rot: even with the pre-check, `.resolve()` follows symlinks, so
 `claude` bakes to a **version-pinned Caskroom path** (e.g.
@@ -183,8 +191,11 @@ command, idempotent — re-run it after upgrades.
 ### The two steps no script can do (GUI-only, by design)
 
 1. **Hotkeys:** System Settings → Keyboard → Keyboard Shortcuts →
-   **Services** → assign shortcuts to the three actions. Give **Stop
-   Vocalize** its own shortcut — it's your mute button from anywhere.
+   **Services** → assign shortcuts to the four actions (Dictate with
+   Vocalize is under the **Text** category there — the other three are
+   under **General**). Give **Stop Vocalize** its own shortcut — it's your
+   mute button from anywhere; Dictate with Vocalize needs one too, since a
+   Service with no shortcut can only be triggered by name from the menu.
    Scripting this via `defaults write pbs` is off-limits territory (system
    settings) and fragile besides — don't automate it. You *can* verify it:
    `defaults read pbs NSServicesStatus` shows a `key_equivalent` per
@@ -199,6 +210,65 @@ text and use `/speak clip`.
 
 ---
 
+## Layer 5 — Dictation (speech to text)
+
+The reverse direction: a hotkey records your voice and transcribes it
+on-device with whisper.cpp, then puts the transcript on the clipboard.
+Full detail lives in [docs/dictation.md](./dictation.md); this is the
+install-layer summary in the same shape as layers 0–4.
+
+```bash
+vocalize local install --stt
+```
+
+Downloads one whisper.cpp model (~465 MB for the default `small.en`),
+verifies it against a pinned sha256, compiles and ad-hoc signs the
+**Vocalize Recorder** bundle (the thing that actually holds the microphone
+permission — `xcrun swiftc`, a few seconds, not a download), then warms the
+runtime — paying whisper.cpp's one-time Metal shader compile here rather
+than during a real dictation.
+
+This layer depends on layer 4's installer for the "Dictate with Vocalize"
+Quick Action and its hotkey — install both, in either order; each is a
+no-op if the other isn't done yet, but you need both before ⌃⌥⌘D (or
+whatever shortcut you assign) actually does anything.
+
+**Sequence:**
+
+1. `vocalize local install --stt` (this layer's model + recorder + runtime)
+2. `python3 hooks/install_quick_action.py` (layer 4, if not already run —
+   installs the Dictate Quick Action bundle alongside the other three)
+3. Assign a shortcut: System Settings → Keyboard → Keyboard Shortcuts →
+   Services → Text → **Dictate with Vocalize**
+4. Press it once. macOS prompts for microphone access naming **"Vocalize
+   Recorder"** — this is the first-use permission prompt this doc's ceiling
+   section already names as GUI-only; approve it. The press waits while the
+   dialog is up (nothing is recording yet) and starts recording, with its
+   Tink, the moment you click Allow.
+5. Verify: `vocalize listen --check` — exit 0 means ready; any other exit
+   names the next step (see [docs/dictation.md § Troubleshooting](./dictation.md#troubleshooting)
+   for the full table).
+
+**Known rot, same shape as layer 4's:** Vocalize Recorder's microphone
+permission is tied to its ad-hoc code signature. A vocalize upgrade that
+changes `vocalize/recorder/VocalizeRecorder.swift` forces a rebuild, which
+changes that signature and silently revokes the grant — `local install
+--stt` prints a re-grant warning when this happens, and it's worth
+believing rather than assuming last install's grant still holds.
+
+**Command-level behavior verified in a scratch environment** (not this
+doc's real-machine narrative, since dictation postdates it): `vocalize
+listen --check`, `--list-devices`, `--wav` on a synthesized clip, `status`,
+`settings`, and `resume` with nothing to resume all produce the messages
+and exit codes documented here and in docs/dictation.md. **Not verified by
+this pass, and owner-present work per this project's own release process:**
+the real microphone grant dialog, a real-voice dictation through the actual
+hotkey, and `vocalize stop` racing a live dictation — TCC prompts and a
+physical key press can't be scripted, the same ceiling as layer 4's GUI
+steps.
+
+---
+
 ## Post-install verification checklist
 
 All verifiable from a shell (run each; every one was exercised on the
@@ -209,10 +279,11 @@ vocalize settings                       # chain + resolved config
 vocalize local status                   # "Kokoro is ready."
 echo test | vocalize speak-file -       # audible, names the provider used
 python3 -c "import json;print(json.load(open('$HOME/.claude/settings.json'))['hooks']['Stop'])"
-ls ~/Library/Services/                  # three .workflow bundles
+ls ~/Library/Services/                  # four .workflow bundles
 ls ~/.claude/skills/speak/SKILL.md      # /speak exists
 VOCALIZE_MAX_CHARS=150 python3 ~/code/vocalize/hooks/claude_stop_hook.py --latest
 defaults read pbs NSServicesStatus      # hotkeys assigned? (GUI step)
+vocalize listen --check                 # dictation: model + recorder + microphone + device
 ```
 
 Not verifiable from a shell: first-use TCC prompts, and whether audio is

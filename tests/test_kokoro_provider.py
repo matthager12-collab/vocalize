@@ -14,6 +14,7 @@ import wave
 
 import pytest
 
+from vocalize import local
 from vocalize.config import Settings
 from vocalize.exceptions import (
     ProviderContentError,
@@ -164,13 +165,16 @@ def model_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def with_uv(monkeypatch):
-    monkeypatch.setattr(kokoro.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    # uv_path() lives in vocalize.local now (shared with Whisper); kokoro.py
+    # only re-exports the name, so the real `shutil` it calls through is
+    # vocalize.local's, not kokoro's own.
+    monkeypatch.setattr(local.shutil, "which", lambda name: f"/usr/local/bin/{name}")
     return "/usr/local/bin/uv"
 
 
 @pytest.fixture
 def no_uv(monkeypatch, tmp_path):
-    monkeypatch.setattr(kokoro.shutil, "which", lambda name: None)
+    monkeypatch.setattr(local.shutil, "which", lambda name: None)
     # Path.home() reads $HOME, so this empties the ~/.local/bin fallback too.
     monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
 

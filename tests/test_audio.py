@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -432,3 +433,299 @@ def test_playback_slot_is_a_noop_without_fcntl(monkeypatch):
     with audio_module._playback_slot():
         pass
     assert not audio_module._LOCK_FILE.exists()
+
+
+# --- the interrupt marker and last_stop (DEC-003) ------------------------
+
+
+def _marker(*, pid=4242, age=0.0) -> Path:
+    """A stop marker as stop_playback(remember=True) would have left it."""
+    path = audio_module._INTERRUPT_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{pid}\n{time.time() - age}\n", encoding="utf-8")
+    return path
+
+
+def _claim(*, remembered=True, age=0.0) -> Path:
+    """The silence order every stop leaves behind (DEC-013)."""
+    path = audio_module._STOP_CLAIM_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{time.time() - age}\n{int(remembered)}\n", encoding="utf-8")
+    return path
+
+
+def test_a_remembered_stop_writes_the_interrupt_marker_before_it_signals(monkeypatch, tmp_path):
+    # Before, not after: the player can exit — and go looking for this
+    # marker — in the microseconds after the signal lands.
+    _seed_record(monkeypatch, tmp_path)
+    seen = {}
+    monkeypatch.setattr(
+        os, "kill",
+        lambda pid, sig: seen.update(marker=audio_module._INTERRUPT_FILE.read_text()),
+    )
+
+    assert stop_playback(remember=True) is True
+
+    assert seen["marker"].splitlines()[0] == "4242"
+
+
+def test_a_plain_stop_leaves_no_interrupt_marker(monkeypatch, tmp_path):
+    _seed_record(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    assert stop_playback() is True
+
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def test_the_interrupt_marker_is_private(monkeypatch, tmp_path):
+    _seed_record(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    stop_playback(remember=True)
+
+    mode = audio_module._INTERRUPT_FILE.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_an_interrupt_marker_is_never_written_through_a_symlink(monkeypatch, tmp_path):
+    # The path is guessable, so anything running as the user can plant a
+    # symlink there and have this truncate whatever it points at.
+    target = tmp_path / "someone-elses-file"
+    target.write_text("keep me")
+    audio_module._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    audio_module._INTERRUPT_FILE.symlink_to(target)
+    _seed_record(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    assert stop_playback(remember=True) is True
+
+    assert target.read_text() == "keep me"
+
+
+def test_an_interrupt_marker_is_dropped_when_the_stop_hit_nothing(monkeypatch, tmp_path):
+    # The player was already gone. Leaving the marker would let the *next*
+    # read believe it had been asked to remember itself.
+    _seed_record(monkeypatch, tmp_path)
+
+    def gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", gone)
+
+    assert stop_playback(remember=True) is False
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def _stopped_play(monkeypatch, tmp_path, *, on_wait=None):
+    """Play one file through a player that exits by SIGTERM."""
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    _patch_player(monkeypatch, tmp_path, returncode=-signal.SIGTERM, on_wait=on_wait)
+    path = tmp_path / "3.wav"
+    path.write_bytes(b"piece three")
+    return play(path), path
+
+
+def test_a_stopped_player_remembers_the_file_and_the_interrupt_request(monkeypatch, tmp_path):
+    returncode, path = _stopped_play(
+        monkeypatch, tmp_path, on_wait=lambda: (_marker(), time.sleep(0.05)),
+    )
+
+    assert returncode == -signal.SIGTERM
+    stop = audio_module.last_stop()
+    assert stop.path == path
+    assert stop.remembered is True
+    assert 0.05 <= stop.elapsed_seconds < 5
+    # Consumed by the thread that ran the player, not left for the next one.
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def test_a_stopped_player_without_an_interrupt_request_is_not_remembered(monkeypatch, tmp_path):
+    # `vocalize stop` on a plain read: stopped, but nothing to resume.
+    _stopped_play(monkeypatch, tmp_path)
+
+    stop = audio_module.last_stop()
+    assert stop.path is not None
+    assert stop.remembered is False
+
+
+def test_a_fresh_interrupt_marker_naming_another_player_is_left_alone(monkeypatch, tmp_path):
+    _stopped_play(monkeypatch, tmp_path, on_wait=lambda: _marker(pid=9999))
+
+    assert audio_module.last_stop().remembered is False
+    assert audio_module._INTERRUPT_FILE.read_text().splitlines()[0] == "9999"
+
+
+def test_an_interrupt_marker_older_than_the_window_is_removed_but_never_used(monkeypatch, tmp_path):
+    _stopped_play(
+        monkeypatch, tmp_path,
+        on_wait=lambda: _marker(age=audio_module.INTERRUPT_WINDOW + 1),
+    )
+
+    assert audio_module.last_stop().remembered is False
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def test_a_malformed_interrupt_marker_is_never_acted_on(monkeypatch, tmp_path):
+    def garbage():
+        audio_module._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        audio_module._INTERRUPT_FILE.write_text("../../etc/passwd\n")
+
+    _stopped_play(monkeypatch, tmp_path, on_wait=garbage)
+
+    assert audio_module.last_stop().remembered is False
+    assert audio_module._INTERRUPT_FILE.exists()  # not ours to delete
+
+
+def test_a_player_that_finished_consumes_no_interrupt_marker(monkeypatch, tmp_path):
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    _patch_player(monkeypatch, tmp_path, on_wait=_marker)
+
+    play(tmp_path / "whole.mp3")
+
+    assert audio_module.last_stop() == audio_module.LastStop()
+    # A read that ended on its own consumes nothing: the marker belongs to
+    # whichever player the stopper actually named.
+    assert audio_module._INTERRUPT_FILE.exists()
+
+
+def test_an_interrupt_marker_is_never_read_through_a_symlink(monkeypatch, tmp_path):
+    # The mirror of the write side. A symlink planted at the guessable path
+    # could otherwise fabricate a stop for a read nobody interrupted — any
+    # file whose first two lines read as a PID and a timestamp will do.
+    target = tmp_path / "someone-elses-file"
+    target.write_text(f"4242\n{time.time()}\n")
+    audio_module._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    audio_module._INTERRUPT_FILE.symlink_to(target)
+
+    assert audio_module.take_interrupt_request(4242) is False
+
+    assert target.exists()  # and it was not consumed either
+
+
+def test_a_stale_interrupt_marker_naming_another_player_is_swept(tmp_path):
+    # Nobody is coming for it: the player it names was SIGKILLed before it
+    # could look. Leaving it on disk for ever is the deviation T-46's
+    # acceptance criterion rules out.
+    _marker(pid=9999, age=audio_module.INTERRUPT_WINDOW + 1)
+
+    assert audio_module.take_interrupt_request(4242) is False
+
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def test_a_remembered_stop_with_nothing_playing_still_leaves_a_marker(monkeypatch, tmp_path):
+    # The gap between two streamed pieces: the read is alive, no player is,
+    # and the stop has no process to name. Without this marker the next
+    # piece plays straight into the open microphone.
+    monkeypatch.setattr(audio_module, "_PID_FILE", tmp_path / "play.pid")
+
+    assert stop_playback(remember=True) is False
+
+    assert audio_module._INTERRUPT_FILE.read_text().splitlines()[0] == "0"
+
+
+def test_an_interrupt_in_the_gap_is_taken_by_the_piece_about_to_play(tmp_path):
+    piece = tmp_path / "4.wav"
+    _marker(pid=0)
+    _claim()
+
+    assert audio_module.take_gap_stop(piece, since=time.time() - 60) is True
+
+    stop = audio_module.last_stop()
+    assert (stop.path, stop.elapsed_seconds, stop.remembered) == (piece, 0.0, True)
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def test_an_interrupt_from_before_the_read_is_never_taken_in_the_gap(tmp_path):
+    # A dictation that stopped nothing at all leaves this behind. A read
+    # started afterwards must not take it as its own and stop itself.
+    _marker(pid=0)
+    _claim()
+
+    assert audio_module.take_gap_stop(tmp_path / "1.wav", since=time.time() + 1) is False
+
+    assert audio_module.last_stop() == audio_module.LastStop()
+    assert audio_module._INTERRUPT_FILE.exists()  # still fresh, still someone's
+
+
+def test_a_gap_interrupt_marker_past_the_window_is_swept_by_the_next_read(tmp_path):
+    _marker(pid=0, age=audio_module.INTERRUPT_WINDOW + 1)
+    _claim(age=audio_module.INTERRUPT_WINDOW + 1)
+
+    assert audio_module.take_gap_stop(tmp_path / "1.wav", since=time.time()) is False
+
+    assert not audio_module._INTERRUPT_FILE.exists()
+
+
+def test_an_unclaimed_interrupt_marker_says_the_stop_found_no_player(tmp_path):
+    started = time.time() - 5
+    _marker(pid=0)
+
+    assert audio_module.stop_found_no_player(started) is True
+
+    # Consumed by a read, or naming a player that took it: something was
+    # stopped, and its record may still be seconds away.
+    audio_module._INTERRUPT_FILE.unlink()
+    assert audio_module.stop_found_no_player(started) is False
+    _marker(pid=4242)
+    assert audio_module.stop_found_no_player(started) is False
+
+
+# --- a stop reaches every read in flight (DEC-013) --------------------
+
+
+def test_a_plain_stop_in_the_gap_still_stops_the_read(tmp_path):
+    """`vocalize stop` between two streamed pieces must stop the read.
+
+    Only a `remember=True` stop ever wrote a marker, so a plain stop in
+    the gap was ignored entirely and the queued piece played on.
+    """
+    _claim(remembered=False)
+
+    assert audio_module.take_gap_stop(tmp_path / "2.wav", since=time.time() - 60) is True
+
+    # Stopped, but nothing to resume: a plain stop records no read.
+    assert audio_module.last_stop().remembered is False
+
+
+def test_a_stop_reaches_the_read_queued_behind_the_one_it_killed(tmp_path):
+    """Read A's player is killed; read B is next on the playback lock.
+
+    B starts the instant that lock frees — into the microphone the stop
+    was opening. The marker names A's player, so B takes no record, but it
+    must still stop.
+    """
+    _marker(pid=4242)  # the record baton belongs to read A's player
+    _claim()
+
+    assert audio_module.take_gap_stop(tmp_path / "1.wav", since=time.time() - 60) is True
+
+    assert audio_module.last_stop().remembered is False  # A's record, not B's
+    assert audio_module._INTERRUPT_FILE.exists()  # left for A's player thread
+
+
+def test_a_read_started_after_the_stop_silences_itself_on_nothing(tmp_path):
+    _claim()
+
+    assert audio_module.take_gap_stop(tmp_path / "1.wav", since=time.time() + 1) is False
+
+    assert audio_module.last_stop() == audio_module.LastStop()
+
+
+def test_a_stop_claim_past_the_window_stops_nothing(tmp_path):
+    _claim(age=audio_module.INTERRUPT_WINDOW + 1)
+
+    assert audio_module.take_gap_stop(tmp_path / "1.wav", since=0.0) is False
+
+
+def test_every_stop_leaves_the_silence_order_behind(monkeypatch, tmp_path):
+    monkeypatch.setattr(audio_module, "_PID_FILE", tmp_path / "play.pid")
+
+    assert stop_playback() is False  # nothing was playing
+
+    claim = audio_module._read_stop_claim()
+    assert claim is not None
+    assert claim[1] is False  # a plain stop still records no read

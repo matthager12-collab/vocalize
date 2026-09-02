@@ -119,6 +119,43 @@ def _chunks_for(provider, text: str, chunk_chars: int | None) -> list[str]:
     return chunks
 
 
+# The chunk texts of the last streamed run in this process, for
+# `unheard_text` to answer from after the run has returned. Per process and
+# main-thread only, like the run that fills it.
+_last_chunks: list[str] = []
+
+
+def unheard_text(ext: str, *, handed: int | None = None) -> str:
+    """The text of the last streamed run's chunks nobody heard (DEC-003).
+
+    The piece that came back False was never played — the player is
+    already stopped by then — but it is not the piece the stop landed in:
+    the CLI hands pieces over one ahead of the one playing, so by the time
+    a stop is reported back, one or two rendered pieces have gone by
+    unheard. When every piece was handed over before the stop — a read
+    whose audio is all cached renders far faster than it plays — nothing
+    is reported back at all, and `handed` is None.
+
+    `audio.last_stop()` names the piece the player actually had open, as
+    `<n>.<ext>` in the CLI's own copy of it. That piece is saved with the
+    record and replayed from its offset, so the text carries on *after*
+    it: everything from `n + 1` on. Only the fallback — no usable name,
+    which means the stop came from somewhere other than a killed player —
+    starts at the piece `handed` names.
+    """
+    stopped = audio_module.last_stop()
+    if stopped.path is not None and stopped.path.name.endswith(f".{ext}"):
+        try:
+            played = int(stopped.path.name[: -len(ext) - 1])
+        except ValueError:
+            played = 0
+        if 1 <= played <= len(_last_chunks):
+            return " ".join(_last_chunks[played:])
+    if handed is None:
+        return ""  # nothing to place it against: resume the saved piece alone
+    return " ".join(_last_chunks[handed - 1:])
+
+
 def _speak(
     name, provider, settings, text, *, chunk_chars, cache_dir, echo, on_chunk, call_kwargs
 ):
@@ -136,6 +173,9 @@ def _speak(
         echo(f"Long input: splitting into {total} chunks.")
 
     streaming = on_chunk is not None and getattr(provider, "STREAMING", False)
+    if streaming:
+        global _last_chunks
+        _last_chunks = chunks  # what `unheard_text` answers from, stop or no stop
     parts: list[bytes] = []
     started = False
     # 0700 by default, and the text only ever reaches it as audio.
@@ -175,7 +215,9 @@ def _speak(
                     # Everything rendered so far travels with the stop: the
                     # CLI saves it when the stop came from a broken player.
                     raise PlaybackStopped(
-                        "Playback stopped.", audio_module.join_audio(parts, ext), ext
+                        "Playback stopped.", audio_module.join_audio(parts, ext), ext,
+                        remaining_text=unheard_text(ext, handed=index),
+                        provider=name,
                     )
 
         return audio_module.join_audio(parts, ext)

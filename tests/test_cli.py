@@ -1,13 +1,23 @@
 import builtins
 import io
+import json
+import os
+import platform
+import shutil
+import signal
 import subprocess
 import tempfile
+import time
+import wave
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from click.testing import CliRunner
 
+import vocalize.audio as audio_module
 import vocalize.cli as cli_module
+from vocalize import interrupted
 from vocalize.cli import main
 from vocalize.config import resolve_provider_settings
 
@@ -608,6 +618,22 @@ def test_settings_prints_resolved_config_values(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert "max_chars=1000" in result.output
     assert "overflow=ask" in result.output
+
+
+def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    cfg = tmp_path / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('[stt]\nmodel = "base.en"\ncleanup = true\nmax_seconds = 30\n',
+                   encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "stt.model=base.en" in result.output
+    assert "stt.language=en" in result.output
+    assert "stt.cleanup=true" in result.output
+    assert "stt.max_seconds=30" in result.output
 
 
 def test_settings_prints_defaults_when_nothing_is_configured(monkeypatch, tmp_path):
@@ -1499,3 +1525,318 @@ def test_chain_rejects_a_duplicate_provider(monkeypatch, tmp_path):
 
     assert result.exit_code == 2
     assert "Duplicate" in result.output
+
+
+# --- the interrupt record (DEC-003, T-46) ------------------------------
+#
+# The real chain, the real _StreamPlayer and the real audio module over
+# two fakes: a provider that renders tiny WAVs, and a player process that
+# a dictation's `stop_playback(remember=True)` kills at a chosen piece.
+
+
+def _tiny_wav(seconds: float, *, byte: int = 1) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(8000)
+        writer.writeframes(bytes([byte, 0]) * int(8000 * seconds))
+    return out.getvalue()
+
+
+class _FakeProvider:
+    """One provider module's contract, rendering a distinguishable piece."""
+
+    MAX_CHARS = 25
+    DEFAULTS: ClassVar[dict] = {"voice": "test-voice"}
+
+    def __init__(self, *, streaming, ext, delay_after=None, stop_in_gap=None):
+        self.STREAMING = streaming
+        self.AUDIO_EXT = ext
+        self._delay_after = delay_after
+        self._stop_in_gap = stop_in_gap
+        self.calls = []
+        self.produced = []
+        self.played = []
+
+    def check(self, settings=None, **kwargs):
+        pass
+
+    def synthesize(self, text, settings, **kwargs):
+        self.calls.append(text)
+        if self._stop_in_gap == len(self.calls):
+            # The hotkey pressed while this chunk renders. Every earlier
+            # piece has been played and this one is not queued yet, so no
+            # player can start: the stop finds nothing to name or kill.
+            deadline = time.monotonic() + 5
+            while len(self.played) < self._stop_in_gap - 1 or audio_module._PID_FILE.exists():
+                assert time.monotonic() < deadline, "the read never reached the gap"
+                time.sleep(0.01)
+            audio_module.stop_playback(remember=True)
+        if self._delay_after is not None and len(self.calls) > self._delay_after:
+            # A chunk that takes real time to render: the stop landed long
+            # before this one finished, and the record still has to happen.
+            time.sleep(self._delay_after_seconds)
+        audio = (_tiny_wav(0.05, byte=len(self.calls)) if self.AUDIO_EXT == "wav"
+                 else f"[piece {len(self.calls)}]".encode())
+        self.produced.append(audio)
+        return audio
+
+    _delay_after_seconds = 0.6
+
+
+class _FakePlayer:
+    """A player that a stop kills at `stop_at`, and that plays on otherwise."""
+
+    def __init__(self, stop_at, remember, pid, wait_for=None):
+        self.pid = pid
+        self._stop_at = stop_at
+        self._remember = remember
+        self._wait_for = wait_for
+        self.path = None
+
+    def wait(self):
+        time.sleep(0.05)
+        if self.path is not None and self.path.stem == str(self._stop_at):
+            deadline = time.monotonic() + 5
+            while self._wait_for is not None and not self._wait_for():
+                assert time.monotonic() < deadline, "the read never got that far"
+                time.sleep(0.01)
+            # What the dictation does in its own process, milliseconds
+            # earlier: name this player, then signal it.
+            audio_module.stop_playback(remember=self._remember)
+            return -signal.SIGTERM
+        return 0
+
+
+def _interrupted_read(monkeypatch, tmp_path, *, streaming=True, ext="wav",
+                      stop_at=1, remember=True, delay_after=None, marker=None,
+                      wait_for=None, stop_in_gap=None):
+    """Run a read that a dictation stops. Returns (result, provider)."""
+    provider = _FakeProvider(streaming=streaming, ext=ext, delay_after=delay_after,
+                             stop_in_gap=stop_in_gap)
+    monkeypatch.setattr("vocalize.providers.get", lambda name: provider)
+    monkeypatch.setattr(cli_module, "load_config_file", dict)
+
+    real_run = cli_module.chain_run
+    monkeypatch.setattr(
+        cli_module, "chain_run",
+        lambda text, **kwargs: real_run(text, cache_dir=tmp_path / "cache", **kwargs),
+    )
+
+    monkeypatch.setattr(audio_module, "_PID_FILE", tmp_path / "play.pid")
+    monkeypatch.setattr(audio_module, "_proc_start_time", lambda pid: "FAKE-START")
+    monkeypatch.setattr(audio_module, "_is_known_player", lambda pid: True)
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    if marker is not None:
+        monkeypatch.setattr(audio_module, "_write_interrupt_request", marker)
+
+    pids = iter(range(9000, 9100))
+
+    def fake_popen(cmd, **kwargs):
+        player = _FakePlayer(stop_at, remember, next(pids), wait_for)
+        player.path = Path(cmd[-1])
+        provider.played.append(player.path.name)  # every piece that reached a player
+        return player
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    text = ("First sentence here. Second sentence here. Third one here. "
+            "Fourth sentence here. Fifth sentence here.")
+    result = CliRunner().invoke(
+        main, ["speak", text, "--provider", "kokoro", "--output", str(tmp_path / f"out.{ext}")]
+    )
+    assert result.exit_code == 0, result.output
+    return result, provider
+
+
+def _record(name):
+    return interrupted.CACHE_DIR / name
+
+
+def _record_json():
+    return json.loads(_record("interrupted.json").read_text())
+
+
+def test_an_interrupted_streamed_read_records_the_piece_that_was_playing(
+    monkeypatch, tmp_path
+):
+    # Not PlaybackStopped.audio, which is every piece so far joined: the
+    # record needs the one file an offset means something in.
+    _result, provider = _interrupted_read(monkeypatch, tmp_path, stop_at=3)
+
+    chunks = provider.calls
+    assert len(chunks) == 5
+    assert _record("interrupted.wav").read_bytes() == provider.produced[2]
+    assert _record("interrupted.txt").read_text() == " ".join(chunks[3:])
+    saved = _record_json()
+    assert saved["version"] == 2
+    assert saved["ext"] == "wav"
+    assert saved["provider"] == "kokoro"
+    assert saved["remaining_chars"] == len(" ".join(chunks[3:]))
+    assert 0 < saved["offset_seconds"] < 10
+
+
+def test_the_interrupt_record_is_private(monkeypatch, tmp_path):
+    _interrupted_read(monkeypatch, tmp_path, stop_at=2)
+
+    for name in ("interrupted.wav", "interrupted.txt", "interrupted.json"):
+        assert _record(name).stat().st_mode & 0o777 == 0o600, name
+
+
+def test_a_stop_during_a_slow_chunk_still_writes_an_interrupt_record(
+    monkeypatch, tmp_path
+):
+    # The marker is consumed by the thread that ran the player, when the
+    # player dies — not when the CLI finally notices, which is a whole
+    # synthesis later. Proved by shrinking the window under that gap.
+    monkeypatch.setattr(audio_module, "INTERRUPT_WINDOW", 0.3)
+
+    _result, provider = _interrupted_read(
+        monkeypatch, tmp_path, stop_at=3, delay_after=3
+    )
+
+    assert _record("interrupted.wav").read_bytes() == provider.produced[2]
+
+
+def test_an_interrupted_read_records_nothing_after_a_plain_stop(monkeypatch, tmp_path):
+    # `vocalize stop` leaves no marker, so there is nothing to resume.
+    _interrupted_read(monkeypatch, tmp_path, stop_at=3, remember=False)
+
+    assert not _record("interrupted.json").exists()
+    assert not _record("interrupted.wav").exists()
+
+
+def test_an_interrupt_marker_for_another_player_records_nothing(
+    monkeypatch, tmp_path
+):
+    def someone_elses_marker(pid):
+        audio_module._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        audio_module._INTERRUPT_FILE.write_text(f"424242\n{time.time()}\n")
+
+    _interrupted_read(monkeypatch, tmp_path, stop_at=3, marker=someone_elses_marker)
+
+    assert not _record("interrupted.json").exists()
+    assert audio_module._INTERRUPT_FILE.read_text().splitlines()[0] == "424242"
+
+
+def test_a_stale_marker_writes_no_interrupt_record(monkeypatch, tmp_path):
+    def old_marker(pid):
+        audio_module._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        stale = time.time() - audio_module.INTERRUPT_WINDOW - 1
+        audio_module._INTERRUPT_FILE.write_text(f"{pid}\n{stale}\n")
+
+    _interrupted_read(monkeypatch, tmp_path, stop_at=3, marker=old_marker)
+
+    assert not _record("interrupted.json").exists()
+    assert not audio_module._INTERRUPT_FILE.exists()  # ours, so it goes
+
+
+def test_an_interrupted_non_streamed_read_records_the_whole_file(monkeypatch, tmp_path):
+    # Nothing was rendered ahead, so nothing is left to say: the file is
+    # the whole read and the remaining text is empty.
+    _interrupted_read(monkeypatch, tmp_path, streaming=False, ext="mp3", stop_at="out")
+
+    assert _record("interrupted.mp3").read_bytes() == (tmp_path / "out.mp3").read_bytes()
+    assert _record("interrupted.txt").read_text() == ""
+    assert _record_json()["ext"] == "mp3"
+
+
+def test_an_interrupt_between_two_pieces_stops_the_read_and_records_it(
+    monkeypatch, tmp_path
+):
+    # The gap the whole marker exists for: piece 3 has finished, piece 4 is
+    # still rendering, and for those seconds no player is running. The stop
+    # names nothing and kills nothing — and without the gap check piece 4
+    # would then play straight into the open microphone (DEC-012).
+    _result, provider = _interrupted_read(
+        monkeypatch, tmp_path, stop_at=None, stop_in_gap=4
+    )
+
+    assert provider.played == ["1.wav", "2.wav", "3.wav"]  # never piece 4
+    assert _record("interrupted.wav").read_bytes() == provider.produced[3]
+    assert _record("interrupted.txt").read_text() == " ".join(provider.calls[4:])
+    assert _record_json()["offset_seconds"] == 0.0
+
+
+def test_a_gap_interrupt_from_before_the_read_is_ignored(monkeypatch, tmp_path):
+    # A dictation that stopped nothing leaves the same marker behind. A
+    # read started after it must play to the end, not stop on itself.
+    audio_module._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    audio_module._INTERRUPT_FILE.write_text(f"0\n{time.time()}\n")
+
+    _result, provider = _interrupted_read(monkeypatch, tmp_path, stop_at=None)
+
+    assert provider.played == ["1.wav", "2.wav", "3.wav", "4.wav", "5.wav"]
+    assert not _record("interrupted.json").exists()
+
+
+def test_an_interrupt_after_every_piece_was_handed_over_is_still_recorded(
+    monkeypatch, tmp_path
+):
+    # The third stop site, found by run 5's live drill: a read whose audio
+    # is already cached renders far faster than it plays, so the last piece
+    # can be handed over before the stop lands. `chain.run` returns
+    # normally, nothing is raised — and the read was still cut off.
+    players = []
+    stream_player = cli_module._StreamPlayer
+
+    class _Recorded(stream_player):
+        def __init__(self, workdir):
+            super().__init__(workdir)
+            players.append(self)
+
+    monkeypatch.setattr(cli_module, "_StreamPlayer", _Recorded)
+
+    def all_pieces_handed():
+        # The player of piece 4 waits for piece 5 to be queued, then dies.
+        return bool(players) and players[0].pieces == 5
+
+    _result, provider = _interrupted_read(
+        monkeypatch, tmp_path, stop_at=4, wait_for=all_pieces_handed
+    )
+
+    assert len(provider.calls) == 5  # nothing was raised: the read finished
+    assert _record("interrupted.wav").read_bytes() == provider.produced[3]
+    assert _record("interrupted.txt").read_text() == provider.calls[4]
+
+
+def test_a_stop_while_a_non_streaming_read_renders_is_still_obeyed(monkeypatch, tmp_path):
+    """The read is inside `synthesize()`; there is no player to kill.
+
+    Nothing was stopped, so the finished file played out loud seconds
+    later — into the microphone the dictation had just opened (DEC-013).
+    """
+    provider = _FakeProvider(streaming=False, ext="wav")
+    rendered = provider.synthesize
+
+    def synthesize(text, settings, **kwargs):
+        audio_module.stop_playback(remember=True)  # the hotkey, mid-render
+        return rendered(text, settings, **kwargs)
+
+    provider.synthesize = synthesize
+    monkeypatch.setattr("vocalize.providers.get", lambda name: provider)
+    monkeypatch.setattr(cli_module, "load_config_file", dict)
+    real_run = cli_module.chain_run
+    monkeypatch.setattr(
+        cli_module, "chain_run",
+        lambda text, **kwargs: real_run(text, cache_dir=tmp_path / "cache", **kwargs),
+    )
+    monkeypatch.setattr(audio_module, "_PID_FILE", tmp_path / "play.pid")
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+
+    def never_play(cmd, **kwargs):
+        raise AssertionError("played a read the user had already stopped")
+
+    monkeypatch.setattr(subprocess, "Popen", never_play)
+
+    result = CliRunner().invoke(
+        main, ["speak", "One short sentence.", "--provider", "kokoro",
+               "--output", str(tmp_path / "out.wav")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _record_json()["provider"] == "kokoro"  # and it is resumable

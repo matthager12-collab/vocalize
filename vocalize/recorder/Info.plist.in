@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- `vocalize local install --stt` copies this file to Contents/Info.plist
+	     inside the bundle it builds. Nothing is substituted: every byte here is
+	     part of the TCC identity the user grants, and a plist that moved with
+	     the vocalize version would change the ad-hoc signature — and so cost a
+	     microphone re-grant — on every release (DEC-010). The bundle version
+	     below is the recorder's own and changes only when the recorder does. -->
+	<key>CFBundleIdentifier</key>
+	<string>cards.arda.vocalize.recorder</string>
+	<key>CFBundleName</key>
+	<string>Vocalize Recorder</string>
+	<key>CFBundleDisplayName</key>
+	<string>Vocalize Recorder</string>
+	<key>CFBundleExecutable</key>
+	<string>recorder</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- Never in the Dock, never takes focus: the recorder is launched by a
+	     hotkey while the user is typing somewhere else. LSUIElement alone gives
+	     that. LSBackgroundOnly, the stronger Apple-discouraged key, declares an
+	     app that can never come to the foreground — an unnecessary risk on the
+	     one bundle whose entire job is to be the identity a microphone prompt
+	     names (DEC-010). -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Vocalize records your voice for on-device dictation. Audio never leaves this Mac.</string>
+</dict>
+</plist>

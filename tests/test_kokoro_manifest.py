@@ -60,3 +60,22 @@ def test_file_paths_follow_the_model_dir(tmp_path):
     assert model == tmp_path / manifest.MODEL_FILE
     assert voices == tmp_path / manifest.VOICES_FILE
     assert manifest.file_paths()[0].parent == manifest.MODEL_DIR
+
+
+def test_selftest_argv_reproduces_the_pre_generalization_hardcoded_list(tmp_path):
+    """T-21 moved this argv out of install.py's selftest() and into the
+    manifest that owns it. The list below is exactly what install.py used
+    to build inline — this test is the proof nothing shifted in the move.
+    """
+    model, voices = manifest.file_paths(tmp_path)
+
+    assert manifest.selftest_argv(tmp_path) == [
+        "run", "--no-project",
+        "--python", manifest.PYTHON_VERSION,
+        "--with", manifest.RUNTIME_PACKAGE,
+        str(manifest.worker_path()),
+        "--model", str(model),
+        "--voices", str(voices),
+        "--voice", manifest.DEFAULT_VOICE,
+        "--selftest",
+    ]

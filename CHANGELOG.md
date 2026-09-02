@@ -3,6 +3,127 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.10.0 - 2026-09-02
+
+### Added
+
+- **Local dictation.** Press a hotkey, speak, press it again, and the
+  transcript is on your clipboard — speech to text, entirely on-device via
+  [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+  (`pywhispercpp`). Nothing about a dictation leaves the machine unless
+  `[stt] cleanup` is turned on, and even then only the transcript is sent
+  (to `claude -p`, tools denied), never the audio. See
+  [docs/dictation.md](docs/dictation.md) for the full guide.
+- `vocalize listen` (`--toggle`, `--cancel`, `--check`, `--list-devices`,
+  `--wav FILE`, `--cleanup`, `--max-seconds`) and `vocalize dictate` (an
+  alias for `listen --toggle`, under the name the hotkey uses).
+- New Quick Action, **"Dictate with Vocalize"** — a no-input Service for
+  the dictation hotkey (⌃⌥⌘D suggested), installed by the existing
+  `hooks/install_quick_action.py` alongside the other three.
+- `vocalize local install --stt [--model base.en|small.en|large-v3-turbo-q5_0]`
+  and `vocalize local uninstall --stt` — opt-in download-and-verify of a
+  whisper.cpp model, plus build-and-sign of **Vocalize Recorder**, the
+  small `.app` bundle that holds the microphone permission (macOS only
+  grants that to something with an identity). Nothing is downloaded or
+  compiled until you run `install --stt`, mirroring Kokoro's opt-in
+  install; the one-time Metal shader warm-up (~8s) is paid here, never
+  during a dictation.
+- New `[stt]` config table — `model`, `language`, `input_device`,
+  `cleanup`, `paste` (reserved, not implemented yet), `max_seconds`,
+  `sounds` — validated on the way in the same way `[providers.*]` is, and
+  printed by `vocalize settings` as `stt.*` lines.
+- `vocalize status` — a one-screen readiness check across every provider
+  in your chain, plus four dictation rows (`stt model`, `recorder`,
+  `microphone`, `input device`) once dictation has been set up at all.
+  `--json` prints the same rows as a list; exit 0 when everything is `ok`,
+  1 otherwise.
+- `vocalize resume [--forget]` — continue (or discard) a text-to-speech
+  read that a dictation interrupted. Starting a dictation stops any read
+  in progress, but vocalize now remembers exactly where it stopped and
+  offers to continue once the transcript has landed (a macOS dialog,
+  default Continue, 15s to answer); the record lives at
+  `~/.cache/vocalize/interrupted.*`, mode 0600, for at most an hour.
+- New [docs/dictation.md](docs/dictation.md): install, the hotkey, every
+  `[stt]` key, `vocalize status`'s dictation rows, `resume`, and
+  troubleshooting keyed on `vocalize listen --check`'s exact messages and
+  exit codes.
+
+### Changed
+
+- `vocalize/local/install.py` generalized to support more than one local
+  runtime's manifest and model files (previously hard-coded to Kokoro's).
+  Kokoro's own install, stamp, and `local status` output are unchanged
+  byte-for-byte; the whisper runtime downloads and stamps only the single
+  model you selected, not all three.
+- `vocalize listen --check` measures the microphone permission by
+  launching Vocalize Recorder the same way a real dictation does
+  (through LaunchServices), not by exec'ing its binary directly — macOS
+  attributes a TCC grant to the *responsible* process, and exec'ing the
+  binary as a child of your shell reported the terminal's own grant
+  instead. Exit codes: 0 authorized-and-ready, 2 denied, 3 no usable
+  input device, 5 not asked yet (macOS `notDetermined`) — matching the
+  recorder's own contract — plus a new exit 1 meaning "vocalize's own
+  local install isn't finished" (not built, no model on disk, or the
+  recorder never reported back), which is a setup problem, not a
+  permission one.
+- `audio.stop_playback()` gained a `remember=` flag. A dictation's stop
+  passes it, leaving a marker so the process that was playing can record
+  where it stopped — this is what makes `vocalize resume` possible. A
+  plain `vocalize stop` records nothing, as before.
+- **A stop now silences every read already in flight**, not only the
+  player it kills. Playback is serialized machine-wide, so stopping one
+  read used to let the next queued one start speaking immediately — into
+  the microphone a dictation had just opened. A read *started* after the
+  stop is unaffected.
+- Dictated text reaches the clipboard as a single line. Newlines are
+  collapsed there so a paste into a terminal cannot run as several
+  commands; `vocalize listen`'s stdout keeps them.
+- `vocalize listen --check` now measures the input device configured in
+  `[stt] input_device` rather than the system default, and records what it
+  saw with a timestamp — so `vocalize status` says how old that
+  "authorized" verdict is instead of implying it is current.
+
+### Fixed
+
+- `vocalize local install --stt`, re-run against a model that already
+  verified, now re-warms the runtime instead of reporting "already
+  installed" and stopping — a machine where only the runtime failed to
+  start (no Metal, a build hiccup) previously had no way to retry that
+  short of a full uninstall and 465 MB re-download.
+- `vocalize local status` reports every installed speech-to-text model,
+  not just the default — installing a non-default model with `--model`
+  no longer looks unfinished.
+- `vocalize local uninstall --stt` no longer crashes on a symlinked model
+  directory or recorder bundle; it reports the symlink and leaves it for
+  you to remove.
+- `vocalize status` no longer raises on an unrecognized `VOCALIZE_CHAIN`;
+  like any other misconfiguration, it degrades to one failing row instead
+  of crashing the command. A probe that raises is reported by exception
+  type only — never its message, which could otherwise echo
+  credential-shaped text onto the screen.
+- A read stopped by a dictation while a streaming provider's next chunk
+  was still rendering (nothing audible playing at that exact instant)
+  used to lose the rest of the read with no way to get it back; it's now
+  recorded and resumable like any other interruption. The same now holds
+  for a read still being synthesized (no player exists yet) and for a
+  plain `vocalize stop` landing in that gap.
+- The first dictation on a fresh install no longer fails while macOS is
+  asking for the microphone. The permission dialog can sit on screen for
+  minutes; the press now waits for your answer and starts recording when
+  you click Allow, instead of giving up after five seconds and reporting
+  a failure that had not happened.
+- `vocalize resume` continues the read in the voice, model, speed and
+  chunk size it was stopped in. It previously fell back to the config
+  defaults, which also missed the audio cache and re-synthesized (and
+  re-charged for) the whole remainder.
+- A ten-minute dictation is no longer mistaken for a crashed one. The
+  claim a stop puts on a take is now aged from its own progress rather
+  than from when recording began, so a long take or a stop queued behind
+  a long read cannot be reaped mid-transcription.
+- `~/.cache/vocalize` and `~/.cache/vocalize/bin` are tightened to 0700
+  even when they already existed. The files inside were always 0600, but
+  the directory listing said whether a dictation was in progress.
+
 ## 0.9.1 - 2026-09-01
 
 ### Fixed

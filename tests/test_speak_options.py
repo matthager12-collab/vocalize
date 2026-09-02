@@ -121,6 +121,19 @@ def test_settings_nonzero_exit_falls_back(monkeypatch, rec):
     assert rec.speak_calls()  # still spoke via fallback
 
 
+def test_settings_tolerates_the_stt_lines(rec):
+    # `vocalize settings` gained stt.* lines in 0.10.0 (DEC-006). Same
+    # invariant as the chain line: the picker's parser must ignore every
+    # line it does not recognize rather than failing closed on new keys.
+    rec.settings = _Result(
+        0,
+        "overflow=ask\nmax_chars=1000\nchain=elevenlabs,say\n"
+        "stt.model=small.en\nstt.language=en\nstt.cleanup=false\nstt.max_seconds=120\n",
+    )
+
+    assert speak_options._read_settings("/opt/vocalize") == ("ask", 1000)
+
+
 def test_settings_tolerates_a_chain_line(rec):
     # The chain=... line settings gained is additive; the parser only ever
     # looks for overflow=/max_chars= prefixes, so an unrecognized line must

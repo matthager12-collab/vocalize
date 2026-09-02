@@ -83,14 +83,34 @@ class PlaybackStopped(VocalizeError):
     in, joined into one file, and `audio_ext` its extension. A stop that
     came from a broken player rather than a human is the reason: that
     audio is paid for, and throwing it away would be the second failure.
+
+    `remaining_text` is the part of the read nobody heard and `provider`
+    the one that spoke, so a stop a dictation asked to remember can be
+    continued later (DEC-003). The text never leaves this process unless
+    the interrupt record is written.
     """
 
     def __init__(
-        self, message: str, audio: bytes | None = None, audio_ext: str | None = None
+        self,
+        message: str,
+        audio: bytes | None = None,
+        audio_ext: str | None = None,
+        remaining_text: str = "",
+        provider: str | None = None,
     ) -> None:
         super().__init__(message)
         self.audio = audio
         self.audio_ext = audio_ext
+        self.remaining_text = remaining_text
+        self.provider = provider
+
+
+class DictationError(VocalizeError):
+    """Raised when a dictation cannot be recorded, transcribed or delivered.
+
+    Never carries any part of a transcript: the message is shown in a
+    terminal and its wording is the only thing that reaches a log.
+    """
 
 
 class ClipboardError(VocalizeError):

@@ -14,22 +14,26 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
-from . import __version__, ledger, providers, wizard
+from . import __version__, dictate, interrupted, ledger, providers, wizard
 from .audio import play as play_audio
-from .audio import play_sequence, stop_playback
+from .audio import play_sequence, stop_playback, take_gap_stop
 from .audio import save as save_audio
 from .auth import (
     PROVIDER_LABELS,
@@ -45,6 +49,7 @@ from .auth import (
     stored_key,
 )
 from .chain import run as chain_run
+from .chain import unheard_text as chain_unheard
 from .clipboard import read_clipboard
 from .config import (
     DEFAULT_MODEL,
@@ -59,9 +64,11 @@ from .config import (
     resolve_overflow,
     resolve_provider_settings,
     resolve_settings,
+    resolve_stt,
 )
 from .exceptions import (
     AudioPlaybackError,
+    DictationError,
     MissingAPIKeyError,
     PlaybackStopped,
     TTSRequestError,
@@ -72,6 +79,7 @@ from .preprocess import (
     flatten_markdown,
     truncate_for_budget,
 )
+from .readiness import readiness
 from .tts import DEFAULT_CACHE_DIR, build_client, get_usage, list_voices
 from .wizard import run_wizard
 
@@ -238,6 +246,8 @@ class _StreamPlayer:
         self._workdir = workdir
         self._queue: queue.Queue = queue.Queue(maxsize=1)
         self._stopped = threading.Event()
+        # A stop older than this read is somebody else's; see take_gap_stop.
+        self._started = time.time()
         self.pieces = 0
         self.error: BaseException | None = None
         self._thread = threading.Thread(target=self._drain, daemon=True)
@@ -250,6 +260,13 @@ class _StreamPlayer:
                 return
             if self._stopped.is_set():
                 continue  # keep draining so put() never blocks forever
+            if take_gap_stop(item, self._started):
+                # The stop landed while the last piece had finished and
+                # this one was still rendering: no player was running, so
+                # nothing was killed and this piece has never been heard.
+                # Playing it now would read into the open microphone.
+                self._stopped.set()
+                continue
             try:
                 if not play_sequence([item]):
                     self._stopped.set()
@@ -270,6 +287,11 @@ class _StreamPlayer:
         self._queue.put(own_copy)
         return not self._stopped.is_set()
 
+    @property
+    def stopped(self) -> bool:
+        """Whether a piece of this read was stopped mid-playback."""
+        return self._stopped.is_set()
+
     def close(self) -> None:
         self._queue.put(None)
         self._thread.join()
@@ -282,6 +304,10 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
             f"--api-key only applies to ElevenLabs; use `vocalize auth login "
             f"--provider {provider}` or the provider's env var"
         )
+
+    # When this read began, for `take_gap_stop`: a stop older than this
+    # belongs to somebody else and must never silence this read.
+    read_started = time.time()
 
     text = raw_text if raw else flatten_markdown(raw_text)
 
@@ -318,6 +344,10 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
     chain = resolve_chain(provider, file_config)
     overrides = {"voice_id": voice_id, "model_id": model_id, "speed": speed,
                  "api_key": api_key}
+    # What a resume has to be given back to be the *same* read. Built
+    # separately from `overrides` so `api_key` cannot follow it onto disk.
+    spoken_with = {"voice_id": voice_id, "model_id": model_id, "speed": speed,
+                   "chunk_chars": chunk_chars}
 
     def echo(message: str) -> None:
         click.echo(message, err=True)
@@ -325,12 +355,18 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
     with tempfile.TemporaryDirectory(prefix="vocalize-play-") as workdir:
         player = _StreamPlayer(Path(workdir)) if play else None
         try:
-            audio, _name, ext = chain_run(
+            audio, spoke_as, ext = chain_run(
                 text, chain=chain, file_config=file_config, overrides=overrides,
                 chunk_chars=chunk_chars, forced=provider is not None,
                 echo=echo, on_chunk=player.on_chunk if player else None,
             )
         except PlaybackStopped as stopped:
+            # The piece that was playing is still in `workdir` here: the
+            # chain's own copy went with its temporary directory, and
+            # player.close() has not run yet (it is in the `finally`).
+            interrupted.remember_stop(
+                stopped.remaining_text, stopped.provider, stopped.audio_ext, spoken_with
+            )
             if player is not None and player.error is not None:
                 # The player broke, not the render: everything spoken so far
                 # was already paid for, so it gets saved before we complain.
@@ -345,6 +381,14 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
             if player is not None:
                 player.close()
 
+        if player is not None and player.stopped:
+            # The third stop site. A read whose pieces are all cached
+            # renders far faster than it plays, so every piece can be
+            # handed over before the stop lands — `chain.run` then returns
+            # normally and nothing was ever raised, but the read was still
+            # cut off mid-sentence (found by the live drill, run 5).
+            interrupted.remember_stop(chain_unheard(ext), spoke_as, ext, spoken_with)
+
         dest = output_path or (DEFAULT_CACHE_DIR / f"last.{ext}")
         save_audio(audio, dest)
         click.echo(f"Saved audio to {dest}", err=True)
@@ -352,7 +396,16 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
         # A streaming provider already played every piece as it landed;
         # playing the joined file now would read the whole thing twice.
         if play and (player is None or player.pieces == 0):
-            play_audio(dest)
+            # A stop that landed while this read was still inside
+            # `synthesize()` killed nothing — there was no player yet — so
+            # without this the whole read would play seconds later, into
+            # the microphone that stop was opening (DEC-013).
+            stopped_before_it_started = take_gap_stop(dest, read_started)
+            if stopped_before_it_started:
+                click.echo("Stopped.", err=True)
+            if stopped_before_it_started or play_audio(dest) == -signal.SIGTERM:
+                # Nothing was left unspoken: the file is the whole read.
+                interrupted.remember_stop("", spoke_as, ext, spoken_with)
         elif player is not None and player.error is not None:
             # Every piece rendered and the file is saved; only playback
             # broke. Say so rather than exiting 0 on a silent read.
@@ -430,6 +483,13 @@ def settings() -> None:
     click.echo(f"max_chars={cap if cap is not None else 'unset'}")
     click.echo(f"overflow={mode}")
     click.echo(f"chain={','.join(resolve_chain(None, file_config))}")
+    # Additive, per DEC-006: hooks/speak_options.py reads only the lines it
+    # knows and ignores the rest, so new keys can never break the picker.
+    stt = resolve_stt(file_config)
+    click.echo(f"stt.model={stt['model']}")
+    click.echo(f"stt.language={stt['language']}")
+    click.echo(f"stt.cleanup={'true' if stt['cleanup'] else 'false'}")
+    click.echo(f"stt.max_seconds={stt['max_seconds']}")
 
 
 @main.command()
@@ -464,6 +524,84 @@ def chain(provider_names) -> None:
     wizard._write_config(path, data)
     click.echo(f"chain={','.join(provider_names)}")
     click.echo(f"wrote {path}")
+
+
+def resume_interrupted() -> bool:
+    """Continue the read a dictation stopped. False if there was none.
+
+    Plays the saved piece from where the stop landed, then speaks whatever
+    was never rendered through the normal path — same provider, same cache,
+    same budget gate and the same playback lock — so anything already
+    rendered is a cache hit and the continuation starts at once (DEC-003).
+
+    Called by `vocalize resume` and by the dialog `dictate` shows after a
+    transcript lands.
+
+    The record outlives every way this can go wrong (DEC-012): a dictation
+    that stops the replay re-records what is left of it, and a continuation
+    that fails before it speaks leaves the record where it was. It is
+    deleted once, at the end, and only if nothing has replaced it.
+    """
+    record = interrupted.load()
+    if record is None:
+        return False
+    with tempfile.TemporaryDirectory(prefix="vocalize-resume-") as workdir:
+        piece = interrupted.slice_from(record, Path(workdir))
+        if piece is None:
+            if not record.text.strip():
+                # Nothing to play and nothing to say — a stop in the last
+                # moments of a read, or audio this machine cannot convert.
+                # Say so through "Nothing to resume" rather than exiting 0
+                # in silence having quietly discarded the record.
+                interrupted.forget()
+                return False
+            click.echo("Could not replay the saved audio; reading on from the text.",
+                       err=True)
+        elif play_audio(piece) == -signal.SIGTERM:
+            # A dictation stopped the replay too: the rest of the slice and
+            # the same text become the new record, so the read is still
+            # there to continue. A plain `vocalize stop` drops it, as it
+            # drops any other read.
+            kept = {key: getattr(record, key) for key in interrupted.SETTING_KEYS}
+            if not interrupted.remember_stop(record.text, record.provider, "wav", kept):
+                interrupted.forget()
+            click.echo("Stopped.", err=True)
+            return True
+    if record.text.strip():
+        # raw=True: this text was flattened before it was ever spoken.
+        # Anything raised here leaves the record for another try.
+        # The voice, model, speed and chunking the read was stopped in.
+        # Without them the rest is spoken in the config-default voice, and
+        # every already-rendered chunk misses the cache and is paid for a
+        # second time (DEC-014).
+        _run_tts(record.text, api_key=None, voice_id=record.voice_id,
+                  model_id=record.model_id, speed=record.speed,
+                  output_path=None, play=True, raw=True, max_chars=None,
+                  chunk_chars=record.chunk_chars,
+                  overflow=None, default_max_chars=None, provider=record.provider)
+    again = interrupted.load()
+    if again is not None and again.saved_at == record.saved_at:
+        # Still the same record: the read is done with. A stop during the
+        # continuation wrote a newer one, and that is not this one to take.
+        interrupted.forget()
+    return True
+
+
+@main.command()
+@click.option("--forget", "forget_only", is_flag=True,
+              help="Discard the interrupted read instead of continuing it.")
+def resume(forget_only) -> None:
+    """Continue a read a dictation interrupted.
+
+    Plays the piece that was cut off from where it stopped, then reads on
+    through the rest of the text. Nothing is kept for more than an hour.
+    """
+    if forget_only:
+        interrupted.forget()
+        click.echo("Discarded the interrupted read.")
+        return
+    if not resume_interrupted():
+        click.echo("Nothing to resume.")
 
 
 @main.command()
@@ -573,6 +711,393 @@ def usage(api_key) -> None:
     else:
         total_bytes = sum(f.stat().st_size for f in cache_files)
         click.echo(f"Local cache: {len(cache_files)} files, {_human_readable_size(total_bytes)}")
+
+
+_STATE_COLORS = {"ok": "green", "warn": "yellow", "fail": "red"}
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True,
+              help="Print the rows as a JSON list instead of the formatted screen.")
+def status(as_json) -> None:
+    """Check whether each provider in the chain is ready to speak.
+
+    Exits 0 when every row is ok, 1 otherwise (a warn row included) — so
+    this composes with `&&` in a script the way any other check does.
+    """
+    file_config = load_config_file()
+    rows = readiness(file_config)
+
+    if as_json:
+        click.echo(json.dumps([row._asdict() for row in rows]))
+    else:
+        for row in rows:
+            label = click.style(f"[{row.state.upper()}]", fg=_STATE_COLORS.get(row.state), bold=True)
+            line = f"{label} {row.name}: {row.detail}"
+            if row.action:
+                line += f" — {row.action}"
+            click.echo(line)
+
+    if any(row.state != "ok" for row in rows):
+        sys.exit(1)
+
+
+_RECORDER_TIMEOUT = 20
+
+# LaunchServices, by absolute path — never a bare name resolved against PATH.
+_OPEN = "/usr/bin/open"
+
+# "vocalize's own local install is not finished": the recorder is not built,
+# the model is missing, or the recorder did not report back. Distinct from the
+# recorder's own 0/2/3/5, and the one code `listen --check` adds (DEC-010).
+_CHECK_INCOMPLETE = 1
+
+# The recorder's exit codes, in the words `vocalize listen --check` says them
+# in — and the one next step each of them needs (design.md § Recorder contract).
+_CHECK_NEXT_STEP = {
+    0: "Speech-to-text is ready.",
+    2: (
+        'Allow "Vocalize Recorder" in System Settings › Privacy & Security › '
+        "Microphone, then run this again."
+    ),
+    3: (
+        "No usable input device. Connect or select a microphone — "
+        "vocalize listen --list-devices shows what macOS can see."
+    ),
+    5: (
+        'macOS has not asked yet. The first dictation prompts for "Vocalize '
+        'Recorder"; answer Allow, then run this again.'
+    ),
+}
+_CHECK_WORDS = {0: "authorized", 2: "denied", 3: "unknown", 5: "notDetermined"}
+
+
+def _recorder_or_exit():
+    """The built recorder binary, or a message naming how to build it.
+
+    Never a traceback: `listen --check` is the command a user runs when
+    something is already wrong.
+    """
+    install_module, _ = _stt_modules()
+    binary = install_module.recorder_binary()
+    if not binary.is_file():
+        click.echo(f"Recorder: not built — run: {_STT_INSTALL_HINT}", err=True)
+        sys.exit(_CHECK_INCOMPLETE)
+    if not install_module.recorder_is_current():
+        click.echo(
+            f"Recorder: does not match what vocalize built — run: {_STT_INSTALL_HINT}",
+            err=True,
+        )
+        sys.exit(_CHECK_INCOMPLETE)
+    return install_module, binary
+
+
+def _run_recorder(binary: Path, args: list[str]) -> subprocess.CompletedProcess:
+    """Run the recorder directly. `--list-devices` only.
+
+    Enumerating input devices touches no permission, so it does not need
+    the bundle's launch path. `--check` does — see `_check_via_bundle`.
+    """
+    try:
+        return subprocess.run(
+            [str(binary), *args], capture_output=True, text=True,
+            timeout=_RECORDER_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(f"The recorder would not run: {exc}") from exc
+
+
+def _printable(text: str, fallback: str = "none") -> str:
+    """Hardware-supplied text, fit to print.
+
+    Device names come from CoreAudio, which got them from the hardware — a
+    USB device names itself — and recorder diagnostics can quote them. So
+    everything on this path is cleaned before it reaches a terminal: control
+    characters out (no escape sequences), and the same 128-character shape
+    the `[stt] input_device` validator uses.
+    """
+    cleaned = "".join(ch for ch in text if ch.isprintable())[:128].strip()
+    return cleaned or fallback
+
+
+def _check_via_bundle(bundle: Path, device: str = "") -> tuple[int | None, str, str, str]:
+    """(exit code, authorization word, device, note) from the recorder,
+    launched the way a dictation launches it.
+
+    TCC answers for the *responsible* process, so exec'ing the binary as a
+    child of this shell reports whatever the terminal was granted — the
+    wrong identity, and never the one dictation runs under. Going through
+    LaunchServices makes the bundle its own responsible process, which is
+    the whole point of the command. `open -W` relays neither stdout nor the
+    app's exit status, so the recorder reports through a file in a
+    directory only this user can enter.
+
+    A None code means the recorder never reported; the note says why.
+
+    `device` is the resolved `[stt] input_device`, passed through so the
+    check measures the device a dictation would actually use. Without it
+    the recorder resolved the *system default* and reported "ready" on a
+    machine whose configured microphone was not even connected — which is
+    the failure `input_device` exists for (DEC-014). An empty value still
+    means the system default and is not passed at all.
+    """
+    with tempfile.TemporaryDirectory(prefix="vocalize-check-") as workdir:
+        status_file = Path(workdir) / "status"
+        try:
+            launch = subprocess.run(
+                [
+                    _OPEN, "-W", "-n", "-a", str(bundle),
+                    "--args", "--check", "--status-file", str(status_file),
+                    *(["--device", device] if device else []),
+                ],
+                capture_output=True, text=True, timeout=_RECORDER_TIMEOUT, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise click.ClickException(f"The recorder would not run: {exc}") from exc
+        try:
+            report = status_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            report = ""
+
+    parsed = _parse_status_report(report)
+    if parsed is not None:
+        return parsed
+    detail = (launch.stderr or "").strip().splitlines()
+    return None, "unknown", "none", _printable(detail[-1] if detail else "", "")
+
+
+def _parse_status_report(report: str) -> tuple[int, str, str, str] | None:
+    """The recorder's `key: value` status file, or None if it wrote none."""
+    fields = {}
+    for line in report.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key.strip()] = value.strip()
+    try:
+        code = int(fields.get("exit", ""))
+    except ValueError:
+        return None
+    return (
+        code,
+        _printable(fields.get("status", ""), _CHECK_WORDS.get(code, "unknown")),
+        _printable(fields.get("device", "")),
+        _printable(fields.get("note", ""), ""),
+    )
+
+
+def _installed_stt_models(install_module, manifest) -> list[str]:
+    return [
+        model for model in manifest.MODELS
+        if install_module.installed(
+            manifest, files=[manifest.file_for(model)], install_hint=_STT_INSTALL_HINT,
+        )[0]
+    ]
+
+
+def _listen_check() -> None:
+    install_module, _ = _recorder_or_exit()
+    _, manifest = _stt_modules()
+
+    models = _installed_stt_models(install_module, manifest)
+    click.echo(f"Model: {', '.join(models) if models else f'none — run: {_STT_INSTALL_HINT}'}")
+    bundle = install_module.recorder_bundle()
+    click.echo(f"Recorder: {bundle}")
+
+    try:
+        wanted = resolve_stt(load_config_file())["input_device"]
+    except VocalizeError as exc:
+        click.echo(f"Note: {exc}", err=True)
+        wanted = ""  # the config is unusable; report on the system default
+
+    code, word, device, note = _check_via_bundle(bundle, wanted)
+    click.echo(f"Input device: {device}")
+    # Remember the answer. `vocalize status` reports the microphone from
+    # this file rather than launching the bundle itself, so a status screen
+    # (and the portal polling it) never opens an app.
+    # The recorder's own word, not one derived from its exit code: with the
+    # microphone granted but no device connected it exits 3 while reporting
+    # `status: authorized`, and `_CHECK_WORDS[3]` would have written
+    # "unknown" over a grant we do know about (DEC-014). The missing device
+    # has its own `vocalize status` row.
+    dictate.write_mic_status(
+        word if code is not None and word in dictate.MIC_STATUS_WORDS else "incomplete"
+    )
+
+    step = _CHECK_NEXT_STEP.get(code)
+    if code is None:
+        click.echo(
+            "Microphone: unknown — the recorder did not report back. "
+            f"Rebuild it with: {_STT_INSTALL_HINT}"
+        )
+        code = _CHECK_INCOMPLETE
+    elif step is None:
+        click.echo(
+            f"Microphone: {word} — the recorder exited with an unexpected status "
+            f"{code}. Rebuild it with: {_STT_INSTALL_HINT}"
+        )
+        code = _CHECK_INCOMPLETE
+    elif code == 0 and not models:
+        # Never "ready" with nothing to transcribe with. The exit status is
+        # what a script or a Quick Action gates on, so it has to disagree
+        # with "ready" here too, not just the wording.
+        click.echo(
+            f"Microphone: {word} — the microphone is ready; install a model "
+            f"with: {_STT_INSTALL_HINT}"
+        )
+        code = _CHECK_INCOMPLETE
+    else:
+        click.echo(f"Microphone: {word} — {step}")
+    if note:
+        # Why, when the three-word vocabulary cannot say it: a policy-blocked
+        # microphone shows as "denied" in a System Settings pane the user
+        # cannot change.
+        click.echo(note)
+    sys.exit(code)
+
+
+def _listen_list_devices() -> None:
+    _, binary = _recorder_or_exit()
+    result = _run_recorder(binary, ["--list-devices"])
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        reason = _printable(detail[-1], f"exit {result.returncode}") if detail else (
+            f"exit {result.returncode}"
+        )
+        click.echo(f"The recorder could not list input devices: {reason}", err=True)
+        sys.exit(result.returncode if result.returncode > 0 else _CHECK_INCOMPLETE)
+    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not names:
+        click.echo("No input devices found.")
+        return
+    for name in names:
+        printable = _printable(name)
+        if printable == name:
+            click.echo(printable)
+        else:
+            # These names are documented as copy-paste values for
+            # `[stt] input_device`, and the recorder matches them exactly.
+            # A name we had to clean up would never match what it came from.
+            click.echo(
+                f"{printable}  — cannot be used as [stt] input_device: "
+                "the real name has characters this list cannot show"
+            )
+
+
+def _stt_options(cleanup: bool, max_seconds: int | None) -> dict:
+    """The `[stt]` table with this invocation's overrides applied.
+
+    `--max-seconds` is range-checked by click, so both routes into these
+    values — the config file and the flag — are validated before any of
+    them can become a recorder argument.
+    """
+    stt = resolve_stt(load_config_file())
+    if cleanup:
+        stt["cleanup"] = True
+    if max_seconds is not None:
+        stt["max_seconds"] = max_seconds
+    return stt
+
+
+def _wait_for_enter(deadline: float) -> None:
+    """Block until Enter, Ctrl-C, or the recording's own time limit.
+
+    `select` on a terminal rather than a blocking read, so the time limit
+    is still enforced when nobody presses anything. With no terminal at
+    all (a pipe, a test) there is nothing to press, and the recording runs
+    to its limit.
+    """
+    import select
+
+    click.echo("Recording — press Enter to stop.", err=True)
+    interactive = sys.stdin is not None and sys.stdin.isatty()
+    while time.time() < deadline:
+        if not interactive:
+            time.sleep(0.2)
+            continue
+        ready, _writable, _failed = select.select([sys.stdin], [], [], 0.2)
+        if ready:
+            sys.stdin.readline()
+            return
+
+
+def _print_transcript(text: str | None) -> None:
+    """The transcript on stdout, so `vocalize listen` composes with a pipe."""
+    if text is None:
+        click.echo("Nothing heard.", err=True)
+        sys.exit(1)
+    click.echo(text)
+
+
+@main.command()
+@click.option("--check", "check_only", is_flag=True,
+              help="Report microphone authorization, the input device and what is installed.")
+@click.option("--list-devices", "list_devices", is_flag=True,
+              help="Print the input device names [stt] input_device accepts.")
+@click.option("--toggle", is_flag=True,
+              help="Start a dictation, or stop the one already running (the hotkey's path).")
+@click.option("--cancel", is_flag=True, help="Discard a dictation in progress.")
+@click.option("--wav", type=click.Path(path_type=Path), default=None,
+              help="Transcribe an existing 16 kHz mono 16-bit WAV instead of recording.")
+@click.option("--cleanup", is_flag=True,
+              help="Tidy the transcript with Claude before delivering it.")
+@click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
+              help="Stop recording after this many seconds (default: [stt] max_seconds).")
+def listen(check_only, list_devices, toggle, cancel, wav, cleanup, max_seconds) -> None:
+    """Record from the microphone and print what was said.
+
+    \b
+        vocalize listen                 # record until Enter, print the transcript
+        vocalize listen --toggle        # start, or stop and copy to the clipboard
+        vocalize listen --wav clip.wav  # transcribe a file you already have
+        vocalize listen --check         # what the microphone and install look like
+
+    The audio never leaves a temporary directory this command deletes on
+    its way out, and the transcript is never written anywhere.
+    """
+    if check_only:
+        _listen_check()
+        return
+    if list_devices:
+        _listen_list_devices()
+        return
+
+    modes = [name for name, on in (("--toggle", toggle), ("--cancel", cancel),
+                                   ("--wav", wav is not None)) if on]
+    if len(modes) > 1:
+        raise click.UsageError(f"Use only one of {', '.join(modes)}.")
+
+    stt = _stt_options(cleanup, max_seconds)
+    try:
+        if cancel:
+            sys.exit(dictate.cancel(stt))
+        if toggle:
+            sys.exit(dictate.toggle(stt))
+        if wav is not None:
+            # Trusted input: the user named this file. The format is still
+            # checked, here and again inside the worker.
+            _print_transcript(dictate.transcribe_wav(wav, stt))
+            return
+        _print_transcript(dictate.listen(stt, wait=_wait_for_enter))
+    except DictationError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("dictate")
+@click.option("--cleanup", is_flag=True,
+              help="Tidy the transcript with Claude before copying it.")
+@click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
+              help="Stop recording after this many seconds (default: [stt] max_seconds).")
+def dictate_cmd(cleanup, max_seconds) -> None:
+    """Start a dictation, or stop the one already running.
+
+    The same thing as `vocalize listen --toggle`, under the name the
+    keyboard shortcut uses: press once to record, press again to stop and
+    copy what you said to the clipboard.
+    """
+    try:
+        sys.exit(dictate.toggle(_stt_options(cleanup, max_seconds)))
+    except DictationError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @main.command("config")
@@ -721,7 +1246,7 @@ if __name__ == "__main__":
 
 @main.group("local")
 def local() -> None:
-    """Install and inspect the on-device speech provider (Kokoro)."""
+    """Install and inspect the on-device speech providers (Kokoro, Whisper)."""
 
 
 def _kokoro_modules():
@@ -733,23 +1258,51 @@ def _kokoro_modules():
     return install_module, manifest, provider
 
 
-def _require_uv(provider) -> str:
-    uv = provider.uv_path()
+def _stt_modules():
+    """Imported inside the commands: `vocalize speak` must never pay for this."""
+    from .local import install as install_module
+    from .local import whisper_manifest as manifest
+
+    return install_module, manifest
+
+
+_STT_INSTALL_HINT = "vocalize local install --stt"
+
+
+def _require_uv(uv: str | None) -> str:
     if uv is None:
         raise click.ClickException(
-            "uv is not installed, and Kokoro's runtime needs it. Install it from "
-            "https://docs.astral.sh/uv/ and run this again. Nothing was downloaded."
+            "uv is not installed, and the on-device runtime needs it. Install it "
+            "from https://docs.astral.sh/uv/ and run this again. Nothing was "
+            "downloaded."
         )
     return uv
 
 
 @local.command("install")
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
-def local_install(yes) -> None:
-    """Download and verify Kokoro's model files, then warm the runtime."""
+@click.option(
+    "--stt", is_flag=True,
+    help="Install the on-device speech-to-text runtime (whisper.cpp) instead of Kokoro.",
+)
+@click.option(
+    "--model", "model_name", default=None, metavar="NAME",
+    help="Which speech-to-text model to install (--stt only; default: small.en).",
+)
+def local_install(yes, stt, model_name) -> None:
+    """Download and verify a local runtime's model files, then warm it."""
+    if stt:
+        _install_stt(yes, model_name)
+        return
+    if model_name is not None:
+        raise click.ClickException("--model only applies together with --stt")
+    _install_kokoro(yes)
+
+
+def _install_kokoro(yes: bool) -> None:
     install_module, manifest, provider = _kokoro_modules()
 
-    uv = _require_uv(provider)
+    uv = _require_uv(provider.uv_path())
 
     ready, _ = provider.installed()
     if ready:
@@ -808,6 +1361,123 @@ def local_install(yes) -> None:
     click.echo('Kokoro installed. Try: vocalize speak "hello" --provider kokoro')
 
 
+_REGRANT_WARNING = (
+    "Vocalize Recorder was rebuilt — re-grant the microphone in "
+    "System Settings › Privacy & Security › Microphone"
+)
+
+
+def _build_recorder_step(install_module) -> None:
+    """Compile the recorder bundle if it is missing or out of date.
+
+    Runs on every `local install --stt`, including the "already installed"
+    path: the model is a 488 MB download and the bundle is a two-second
+    compile, so a re-run must be able to fix a missing recorder without
+    fetching a byte.
+    """
+    try:
+        status, bundle = install_module.build_recorder()
+    except install_module.InstallError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if status == "current":
+        click.echo(f"  recorder: already built ({bundle.name})")
+    elif status == "built":
+        click.echo(f"  recorder: built ({bundle})")
+        click.echo("  macOS will ask for microphone access the first time you dictate.")
+    else:
+        click.echo(f"  recorder: rebuilt ({bundle})")
+        click.echo(f"  {_REGRANT_WARNING}")
+
+
+def _stt_model_or_raise(manifest, model_name: str | None) -> str:
+    model = model_name or manifest.DEFAULT_MODEL
+    if model not in manifest.MODELS:
+        raise click.ClickException(
+            f"Unknown model {model!r}. Choose one of: {', '.join(manifest.MODELS)}"
+        )
+    return model
+
+
+def _install_stt(yes: bool, model_name: str | None) -> None:
+    from . import local as local_module
+
+    install_module, manifest = _stt_modules()
+    uv = _require_uv(local_module.uv_path())
+    model = _stt_model_or_raise(manifest, model_name)
+    entry = manifest.file_for(model)
+
+    ready, _ = install_module.installed(manifest, files=[entry], install_hint=_STT_INSTALL_HINT)
+    if ready:
+        # write_stamp() runs before the selftest below, so a machine where
+        # the runtime itself never started (Metal unavailable, a build
+        # failure) still has a verified stamp — "already installed" would
+        # otherwise never retry the one thing that actually failed, with
+        # no in-CLI way to force it short of a full uninstall/re-download.
+        click.echo(f"{model} is already installed. Re-warming the runtime...")
+        try:
+            install_module.selftest(uv, manifest=manifest, model=model)
+        except install_module.InstallError as exc:
+            raise click.ClickException(
+                f"The model file is installed, but the speech-to-text runtime "
+                f"would not start: {exc}"
+            ) from exc
+        _build_recorder_step(install_module)
+        click.echo(f"{model} is ready.")
+        return
+
+    click.echo(
+        "Speech-to-text runs entirely on this machine — no audio or text ever leaves it."
+    )
+    click.echo("")
+    click.echo(f"This will download {_human_readable_size(entry['size'])}:")
+    click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
+    click.echo(f"    {entry['url']}")
+    click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo("")
+    click.echo("It will also have uv fetch, into its own cache:")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo("")
+
+    if not yes and not click.confirm("Download and install now?", default=False):
+        click.echo("Aborted, nothing downloaded.")
+        sys.exit(1)
+
+    if install_module.file_is_verified(entry, manifest=manifest):
+        click.echo(f"  {entry['name']}: already verified, skipping")
+    else:
+        click.echo(f"Downloading {entry['name']}...")
+        try:
+            install_module.download_file(
+                entry["url"],
+                manifest.MODEL_DIR / entry["name"],
+                entry["size"],
+                entry["sha256"],
+                progress=_download_progress(),
+            )
+        except install_module.InstallError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"  verified {entry['name']} (sha256 matches).")
+
+    install_module.write_stamp(manifest=manifest, files=[entry])
+
+    click.echo("Warming the runtime (pays a one-time ~8s Metal shader compile)...")
+    try:
+        install_module.selftest(uv, manifest=manifest, model=model)
+    except install_module.InstallError as exc:
+        # The file is verified and staying put — only the runtime failed.
+        raise click.ClickException(
+            f"The model file is installed, but the speech-to-text runtime "
+            f"would not start: {exc}"
+        ) from exc
+
+    _build_recorder_step(install_module)
+
+    # `listen` takes its model from [stt] config, not a flag (DEC-006) —
+    # this must never suggest a --model option `listen` doesn't define.
+    click.echo(f"Speech-to-text installed ({model}). Try: vocalize listen --check")
+
+
 def _download_progress():
     """Percentage every 10%. Plain lines, so a piped install stays readable."""
     state = {"last": -10}
@@ -825,13 +1495,27 @@ def _download_progress():
 
 @local.command("status")
 def local_status() -> None:
-    """Report whether the on-device provider is ready, and what is missing."""
+    """Report whether the on-device providers are ready, and what is missing."""
+    from . import local as local_module
+
+    # Both runtimes share one uv invocation, resolved the same way
+    # `_install_stt` does (`vocalize.local.uv_path()`) rather than through
+    # Kokoro's re-exported name — a test (or caller) patching one now
+    # reliably covers both `local install --stt` and `local status`.
+    uv = local_module.uv_path()
+    click.echo(f"uv: {uv}" if uv else "uv: not found — see https://docs.astral.sh/uv/")
+    click.echo("")
+
+    _status_kokoro(uv)
+    click.echo("")
+    _status_stt(uv)
+
+
+def _status_kokoro(uv: str | None) -> None:
     install_module, manifest, provider = _kokoro_modules()
 
-    uv = provider.uv_path()
-    click.echo(f"uv: {uv}" if uv else "uv: not found — see https://docs.astral.sh/uv/")
-
-    click.echo(f"Model directory: {manifest.MODEL_DIR}")
+    click.echo("Kokoro (text-to-speech):")
+    click.echo(f"  Model directory: {manifest.MODEL_DIR}")
     for entry in manifest.FILES:
         path = manifest.MODEL_DIR / entry["name"]
         try:
@@ -857,3 +1541,112 @@ def local_status() -> None:
         click.echo("Kokoro's model files are ready, but uv is missing.")
     else:
         click.echo(f"Kokoro is not usable: {reason}")
+
+
+def _status_stt(uv: str | None) -> None:
+    install_module, manifest = _stt_modules()
+
+    click.echo("STT (speech-to-text):")
+    click.echo(f"  Model directory: {manifest.MODEL_DIR}")
+
+    stamp = install_module.read_stamp(manifest=manifest)
+    recorded = install_module.stamp_files(stamp, manifest)
+    any_present = False
+    for entry in manifest.FILES:
+        path = manifest.MODEL_DIR / entry["name"]
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        any_present = True
+        seen = recorded.get(entry["name"]) or {}
+        verified = size == entry["size"] and (seen.get("sha256"), seen.get("size")) == (
+            entry["sha256"], entry["size"],
+        )
+        state = "verified" if verified else "present, not verified"
+        click.echo(f"  {entry['name']}: {state} ({_human_readable_size(size)})")
+    if not any_present:
+        click.echo("  no models installed")
+
+    click.echo(f"  runtime: {manifest.RUNTIME_PACKAGE} via uv")
+
+    if install_module.recorder_binary().is_file():
+        click.echo(f"  recorder: built ({install_module.recorder_bundle()})")
+    else:
+        click.echo(f"  recorder: not built — run: {_STT_INSTALL_HINT}")
+
+    # Readiness is over every model that verifies, not just the default:
+    # `local install --stt --model base.en` is a real, complete install,
+    # and reporting it as "not ready" tells the user to redo work they
+    # already did.
+    ready_models = [
+        m for m in manifest.MODELS
+        if install_module.installed(
+            manifest, files=[manifest.file_for(m)], install_hint=_STT_INSTALL_HINT,
+        )[0]
+    ]
+    if ready_models and uv:
+        click.echo(f"STT: ready ({', '.join(ready_models)})")
+    elif ready_models:
+        click.echo("STT: not ready — uv is missing")
+    else:
+        _, reason = install_module.installed(
+            manifest, files=[manifest.file_for(manifest.DEFAULT_MODEL)],
+            install_hint=_STT_INSTALL_HINT,
+        )
+        click.echo(f"STT: not ready — default model ({manifest.DEFAULT_MODEL}) {reason}")
+
+
+@local.command("uninstall")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.option(
+    "--stt", is_flag=True,
+    help="Remove the speech-to-text model files and recorder bundle.",
+)
+def local_uninstall(yes, stt) -> None:
+    """Remove a local runtime's downloaded files."""
+    if not stt:
+        raise click.ClickException("Specify what to uninstall: --stt")
+    _uninstall_stt(yes)
+
+
+def _uninstall_stt(yes: bool) -> None:
+    install_module, manifest = _stt_modules()
+
+    model_dir = manifest.MODEL_DIR
+    # ~/.cache/vocalize/bin — the recorder bundle `local install --stt`
+    # compiles. Removing it drops the ad-hoc signature the microphone
+    # grant is attached to; the grant itself stays in System Settings.
+    bin_dir = install_module.BIN_DIR
+    # is_dir() + not is_symlink(): path.exists() follows symlinks, and a
+    # bare `shutil.rmtree()` on a symlinked target raises OSError instead
+    # of removing anything — a user who pointed the model dir at an
+    # external disk gets a clean message instead.
+    candidates = (model_dir, bin_dir)
+    targets = [path for path in candidates if path.is_dir() and not path.is_symlink()]
+    symlinked = [path for path in candidates if path.is_symlink()]
+
+    if not targets and not symlinked:
+        click.echo("Nothing to remove.")
+        return
+
+    click.echo("This will remove:")
+    for path in targets:
+        click.echo(f"  {path}")
+    for path in symlinked:
+        click.echo(f"  {path} (a symlink — remove it yourself)")
+    click.echo("")
+    click.echo("The microphone permission grant, if any, stays in System Settings.")
+
+    if not yes and not click.confirm("Remove now?", default=False):
+        click.echo("Aborted, nothing removed.")
+        sys.exit(1)
+
+    for path in targets:
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise click.ClickException(f"Could not remove {path}: {exc}") from exc
+        click.echo(f"  removed {path}")
+
+    click.echo("Speech-to-text uninstalled.")

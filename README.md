@@ -253,6 +253,12 @@ in the current directory, then the OS keychain. `vocalize auth login` sets
 up the keychain entry; `vocalize auth status` shows which of those sources
 is currently supplying the key.
 
+A `[stt]` table configures dictation the same way `[providers.<name>]`
+configures a TTS provider — see
+[Configuration: the `[stt]` table](#configuration-the-stt-table) under
+[Dictation](#dictation-speech-to-text) below for every key and its
+allowlist.
+
 ## Providers and fallback
 
 vocalize tries providers in order — a **chain** — until one speaks. The
@@ -381,9 +387,200 @@ instead of waiting for the whole thing to render. Measured on this Mac
 rendering. `vocalize stop`, run from any terminal, halts a Kokoro read
 mid-sentence the same as any other provider.
 
+## Dictation (speech to text)
+
+Everything above turns text into speech. Dictation runs the other way:
+press a hotkey, speak, press it again, and the words land on your
+clipboard. It's [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via
+[`pywhispercpp`](https://github.com/absadiki/pywhispercpp), entirely
+on-device — nothing you say leaves the Mac unless you turn on `--cleanup`
+(below), and even then only the *transcript* goes anywhere, never the audio.
+
+### Install
+
+```bash
+vocalize local install --stt
+```
+
+A separate opt-in from Kokoro's `vocalize local install` — nothing here is
+downloaded or built until you run this. It:
+
+1. Downloads one whisper.cpp model (`small.en` by default, ~465 MB) from a
+   pinned Hugging Face revision, verified against a pinned sha256 before
+   it's kept.
+2. Compiles and ad-hoc signs a small Swift recorder bundle, **Vocalize
+   Recorder** — the thing that actually owns the microphone permission;
+   macOS won't grant that to a bare command-line tool.
+3. Warms the runtime, paying a one-time ~8-second Metal shader compile
+   right here, so no dictation ever stalls on it later.
+
+The first real dictation prompts for microphone access naming **"Vocalize
+Recorder"** — approve it once, like any other app's first-run permission
+prompt. Pick a different model with `--model large-v3-turbo-q5_0` (~547 MB,
+more accurate) or `--model base.en` (~141 MB, fastest, least accurate).
+
+### The hotkey
+
+```bash
+python3 hooks/install_quick_action.py
+```
+
+then assign a shortcut under **System Settings › Keyboard › Keyboard
+Shortcuts › Services › Text › "Dictate with Vocalize"** — ⌃⌥⌘D is free by
+default and a sensible pick. `vocalize dictate` is the same command from a
+terminal, if you'd rather trigger it that way.
+
+### How a dictation works
+
+- **Press** the hotkey — a Tink plays, the recorder starts, and any read
+  currently playing is stopped first (dictation and playback never
+  overlap; vocalize remembers where the read was cut off — see
+  [Continuing an interrupted read](#continuing-an-interrupted-read)).
+- **Speak.**
+- **Press again** — a Pop plays, recording stops, and the audio is
+  transcribed on-device. If anything was heard, a Glass plays and the
+  transcript is on your clipboard; nothing is typed for you automatically.
+- **Nothing heard** (silence, or a microphone that isn't actually picking
+  anything up) ends the dictation quietly — no clipboard write.
+- **Cancel** with a second press *within two seconds* of the first, or at
+  any point with `vocalize listen --cancel` — the audio is discarded, never
+  transcribed.
+- **A third press while transcribing is refused**: a Pop, and "Still
+  transcribing the last dictation." Wait for the clipboard notification, or
+  `--cancel`, before dictating again.
+
+### `vocalize listen`
+
+`vocalize dictate` (the hotkey's command) is `vocalize listen --toggle`
+under another name. `listen` is the general primitive:
+
+```bash
+vocalize listen                     # record until Enter/Ctrl-C, print to stdout
+vocalize listen --toggle            # start, or stop and copy to the clipboard
+vocalize listen --cancel            # discard whatever is in progress
+vocalize listen --wav clip.wav      # transcribe a file you already have
+vocalize listen --check             # microphone + install readiness
+vocalize listen --list-devices      # input device names for [stt] input_device
+vocalize listen --max-seconds 30    # cap this one recording
+```
+
+`--wav` is trusted input — the file has to be 16 kHz mono 16-bit WAV
+(exactly what the recorder, and `say --data-format=LEI16@16000`, produce);
+a malformed file gets a plain error naming the format, not a crash.
+`--cleanup` tidies the transcript with Claude before it's delivered; it
+applies to a live recording (`--toggle`/`dictate`, or plain `listen`) and
+has no effect on `--wav`, which transcribes literally. `--max-seconds`
+overrides `[stt] max_seconds` for one invocation.
+
+### Configuration: the `[stt]` table
+
+```toml
+[stt]
+model = "small.en"     # base.en | small.en | large-v3-turbo-q5_0
+language = "en"        # a whisper.cpp language code
+input_device = ""      # "" = system default; else an exact name from --list-devices
+cleanup = false        # send the transcript (never audio) to Claude first
+max_seconds = 120      # 1-600; the recorder self-stops here, dictate backstops it
+sounds = true          # the Tink/Pop/Glass feedback sounds
+```
+
+| Key | Allowed values | Default |
+|---|---|---|
+| `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0` | `small.en` |
+| `language` | a whisper.cpp language code (`en`, `es`, `fr`, …); an `.en` model must stay `en` | `en` |
+| `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable, can't start with `-` | `""` |
+| `cleanup` | `true` / `false` | `false` |
+| `paste` | reserved — not implemented in 0.10.0 | `false` |
+| `max_seconds` | integer, 1–600 | `120` |
+| `sounds` | `true` / `false` | `true` |
+
+An unknown key warns on stderr; a bad value is a `ConfigError` naming it —
+every one of these becomes a subprocess argument eventually, so nothing
+here is trusted on the way in.
+
+**The input-device gotcha:** a pair of Bluetooth earbuds that are *paired*
+but not actually in your ears still shows up as the default input device —
+and delivers digital silence. If dictation keeps saying nothing was heard,
+run `vocalize listen --list-devices`, copy the real microphone's name, and
+set it:
+
+```toml
+[stt]
+input_device = "MacBook Pro Microphone"
+```
+
+### `vocalize status`
+
+```bash
+vocalize status
+```
+
+prints one row per provider in your chain, plus four dictation rows once
+dictation has been set up at all — an `[stt]` table in your config, a
+built recorder, or a model on disk (a machine that never opted in doesn't
+get four permanent red rows for a feature nobody asked for):
+
+| Row | Reports |
+|---|---|
+| `stt model` | whether a whisper.cpp model is on disk |
+| `recorder` | whether Vocalize Recorder is built |
+| `microphone` | authorized / denied / not asked yet — from the last `listen --check`, never by launching the recorder itself |
+| `input device` | whether the configured (or default) input device is actually present |
+
+`--json` prints the same rows as a list. Exit code is 0 when every row —
+providers and dictation both — is `ok`, 1 otherwise, so it composes with
+`&&` in a script.
+
+### Continuing an interrupted read
+
+Starting a dictation stops any read in progress, but doesn't throw the rest
+of it away (DEC-003). The process that was speaking remembers exactly
+where it stopped, and once your transcript has landed, vocalize asks:
+**"Continue the read you interrupted?"** — answer, or let the dialog give
+up after 15 seconds (counted as no). From a terminal, the same thing is:
+
+```bash
+vocalize resume            # continue where the last read left off
+vocalize resume --forget   # discard it instead
+```
+
+The record — one piece of audio and the text not yet spoken — lives at
+`~/.cache/vocalize/interrupted.*`, mode 0600, for at most an hour, and is
+deleted the moment you resume, decline, or `--forget` it. This is the
+interrupted *read*, not dictation audio or a transcript — see Privacy,
+below.
+
+### Uninstall
+
+```bash
+vocalize local uninstall --stt
+```
+
+Removes the downloaded model file and the recorder bundle. The microphone
+permission grant itself stays in System Settings — remove it there
+(Privacy & Security › Microphone) if you want that gone too.
+
+### Privacy
+
+vocalize writes no transcript to disk and shows none in a notification —
+it's held in memory and goes to your clipboard (or stdout, for
+`vocalize listen`) and nowhere else. Recorded audio lives only in a
+private temporary directory deleted the moment a dictation ends, one way
+or another (a sweep clears anything a hard kill leaves behind after 24
+hours). The **only** thing that ever leaves the machine is the transcript,
+and only when you turn on `--cleanup`: it's sent to `claude -p` with every
+tool denied, purely to fix punctuation and casing. The audio itself is
+never sent anywhere.
+
+`--cleanup` has one consequence worth knowing before you turn it on:
+Claude Code logs the prompt and stdin of every print-mode run, so the
+transcript is written in plaintext to `~/.claude/projects/…`. vocalize
+cannot suppress that. It is off by default. Full accounting in
+[docs/dictation.md](docs/dictation.md#privacy).
+
 ## macOS Quick Actions (highlight → speak)
 
-Two Services let you use vocalize from any app without a terminal:
+Four Services let you use vocalize from any app without a terminal:
 
 - **Speak with Vocalize** — highlight text anywhere, right-click →
   Services → Speak with Vocalize. It stops whatever was already playing
@@ -400,8 +597,11 @@ Two Services let you use vocalize from any app without a terminal:
   (`~/.claude/plans/`) aloud on demand. Made for the plan-approval moment:
   the proposal card is up, you press your shortcut, hear the plan, then
   accept or reject. Nothing reads unless you trigger it.
+- **Dictate with Vocalize** — the dictation hotkey (see
+  [Dictation](#dictation-speech-to-text) above). Takes no input and shows
+  no window; press it, speak, press it again.
 
-Install both:
+Install all four:
 
 ```bash
 python3 hooks/install_quick_action.py
@@ -569,14 +769,26 @@ vocalize/
   chain.py        # tries each provider in the chain in turn until one speaks
   ledger.py       # ~/.cache/vocalize/usage.json — local monthly budget tracking
   providers/      # elevenlabs.py, openai.py, google.py, polly.py, say.py, kokoro.py
-  local/          # Kokoro's opt-in download/verify + the uv-run worker script
+  local/          # opt-in download/verify + the uv-run worker scripts —
+                   # kokoro_manifest.py/kokoro_worker.py (TTS) and
+                   # whisper_manifest.py/whisper_worker.py (dictation)
+  recorder/       # VocalizeRecorder.swift + Info.plist.in — the ad-hoc-signed
+                   # .app bundle that owns the microphone permission
   audio.py        # save to disk + play via the OS's native player
                    # (afplay / mpg123 / ffplay / PowerShell, whichever exists)
+  dictate.py      # the hotkey's toggle state machine: record, transcribe,
+                   # clipboard — nothing here ever becomes a file or a log line
+  interrupted.py  # the record of a read a dictation interrupted, and the
+                   # slice `vocalize resume` plays to continue it
+  readiness.py    # vocalize status's per-provider + per-dictation-row probes,
+                   # each on a timed daemon thread so a wedged keychain or
+                   # microphone check can never hang the command
   cli.py          # click-based CLI wiring the above together
 hooks/
   claude_stop_hook.py  # Claude Code Stop hook -> calls the vocalize CLI
   install_hook.py      # safely merges the hook into ~/.claude/settings.json
-tests/                  # pytest, all mocked — no API key needed to run these
+tests/                  # pytest, all mocked — no API key, network, or
+                        # microphone needed to run these
 ```
 
 ## Testing
@@ -586,8 +798,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-All tests run offline: the ElevenLabs client is dependency-injected into
-`tts.py`, so tests pass in a fake client instead of hitting the real API.
+Over 1,180 tests, all offline: the ElevenLabs client is dependency-injected
+into `tts.py`, so tests pass in a fake client instead of hitting the real
+API, and dictation's tests fake the recorder (a tiny shell script honoring
+a stop file) and the whisper worker instead of touching a microphone or a
+model.
 
 ## Known limitations
 
@@ -640,6 +855,22 @@ All tests run offline: the ElevenLabs client is dependency-injected into
   confidential information"); until you click Always Allow, every command
   that needs that key waits. Click it once per Python binary, or supply the
   key through its environment variable instead.
+- **Dictation is macOS only.** It depends on `AVFoundation`, LaunchServices,
+  and a Swift-compiled `.app` bundle for the microphone permission — there's
+  no equivalent path on Linux or Windows.
+- **Rebuilding the recorder means re-granting the microphone.** Vocalize
+  Recorder's ad-hoc code signature is what macOS ties the permission grant
+  to; when its Swift source changes (a vocalize upgrade that touches it),
+  `vocalize local install --stt` rebuilds the bundle and warns you to
+  re-approve it in System Settings › Privacy & Security › Microphone. An
+  install that doesn't change the source never re-signs, so this isn't
+  every upgrade — only ones that touch the recorder.
+- **`small.en` mishears jargon.** The default model does fine on ordinary
+  speech but can mangle project-specific words (`pyproject`, a function
+  name) — pick `large-v3-turbo-q5_0` for better accuracy, or turn on
+  `[stt] cleanup` so Claude fixes obvious transcription noise before it
+  reaches your clipboard (it still can't guess a word it never heard
+  correctly).
 
 ## License
 

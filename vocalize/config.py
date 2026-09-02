@@ -29,7 +29,9 @@ DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
-KNOWN_CONFIG_KEYS = ("voice", "model", "speed", "max_chars", "overflow", "chain", "providers")
+KNOWN_CONFIG_KEYS = (
+    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt",
+)
 
 # Keys allowed inside a [providers.<name>] table.
 KNOWN_PROVIDER_KEYS = (
@@ -45,6 +47,40 @@ KNOWN_PROVIDER_KEYS = (
 
 # What to do when input is longer than the resolved character cap.
 OVERFLOW_MODES = ("truncate", "ask", "never")
+
+# Keys allowed inside the [stt] table (DEC-006, design § [stt] config table).
+KNOWN_STT_KEYS = (
+    "model",
+    "language",
+    "input_device",
+    "cleanup",
+    "paste",
+    "max_seconds",
+    "sounds",
+)
+
+# `paste` is reserved by DEC-006 and deliberately does nothing in 0.10.0.
+STT_DEFAULTS = {
+    "model": "small.en",
+    "language": "en",
+    "input_device": "",
+    "cleanup": False,
+    "paste": False,
+    "max_seconds": 120,
+    "sounds": True,
+}
+
+# The recorder self-stops at max_seconds and `dictate` backstops it, so this
+# is a real resource bound, not a cosmetic one.
+STT_MAX_SECONDS_MIN = 1
+STT_MAX_SECONDS_MAX = 600
+
+# `input_device` is passed to the recorder as one argv entry. It is a device
+# name a human copied out of `vocalize listen --list-devices`, so the shape
+# check is all that is needed — but it has to be a real one: a control
+# character would let a hardware-shaped name drive a terminal, and a leading
+# '-' would turn a config value into a recorder flag.
+STT_DEVICE_MAX_CHARS = 128
 
 # chain = ["elevenlabs", "say"]: ElevenLabs today, degrading to the always-
 # free `say` on failure instead of erroring.
@@ -135,6 +171,8 @@ def load_config_file() -> dict:
         _validate_chain(data["chain"], path)
     if "providers" in data:
         _validate_providers_table(data["providers"], path)
+    if "stt" in data:
+        _validate_stt_table(data["stt"], path)
 
     return data
 
@@ -188,6 +226,109 @@ def _validate_providers_table(value, path: Path) -> None:
                 )
             if key == "monthly_chars":
                 _validate_monthly_chars(val, name, path)
+
+
+def _validate_stt_table(value, path: Path) -> None:
+    """Check the `[stt]` table. Unknown keys warn; bad values raise.
+
+    Every value here becomes an argument to a subprocess — the recorder's
+    `--device`, or the whisper worker's `--model` and `--language` — so
+    each one is checked against an allowlist or a shape before it can get
+    that far, the same way `[providers.*]` values are.
+    """
+    from .local import whisper_manifest  # lazy: config is imported by everything
+
+    if not isinstance(value, dict):
+        raise ConfigError(f"config key 'stt' in {path} must be a table")
+
+    for key in value:
+        if key not in KNOWN_STT_KEYS:
+            print(f"vocalize: unknown config key {key!r} in [stt] in {path}", file=sys.stderr)
+
+    model = value.get("model")
+    if model is not None and model not in whisper_manifest.MODELS:
+        raise ConfigError(
+            f"Invalid stt.model {model!r} in {path}. "
+            f"Known: {', '.join(whisper_manifest.MODELS)}"
+        )
+
+    language = value.get("language")
+    if language is not None and language not in whisper_manifest.LANGUAGES:
+        raise ConfigError(
+            f"Invalid stt.language {language!r} in {path}: not a whisper.cpp language code."
+        )
+
+    # An .en model transcribes English whatever it is asked for, so this
+    # pairing would quietly produce English while claiming otherwise.
+    resolved_model = model if model is not None else STT_DEFAULTS["model"]
+    if (
+        language is not None
+        and language != "en"
+        and whisper_manifest.is_english_only(resolved_model)
+    ):
+        raise ConfigError(
+            f"stt.model {resolved_model!r} in {path} is English-only, so "
+            f"stt.language must be 'en', not {language!r}."
+        )
+
+    seconds = value.get("max_seconds")
+    if seconds is not None and (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or not STT_MAX_SECONDS_MIN <= seconds <= STT_MAX_SECONDS_MAX
+    ):
+        raise ConfigError(
+            f"Invalid stt.max_seconds {seconds!r} in {path}: expected an integer "
+            f"between {STT_MAX_SECONDS_MIN} and {STT_MAX_SECONDS_MAX}."
+        )
+
+    device = value.get("input_device")
+    if device is not None:
+        _validate_input_device(device, path)
+
+    for key in ("cleanup", "paste", "sounds"):
+        flag = value.get(key)
+        if flag is not None and not isinstance(flag, bool):
+            raise ConfigError(f"Invalid stt.{key} {flag!r} in {path}: expected true or false.")
+
+
+def _validate_input_device(device, path: Path) -> None:
+    if not isinstance(device, str):
+        raise ConfigError(
+            f"Invalid stt.input_device {device!r} in {path}: expected a device name."
+        )
+    if len(device) > STT_DEVICE_MAX_CHARS:
+        raise ConfigError(
+            f"Invalid stt.input_device in {path}: a device name is at most "
+            f"{STT_DEVICE_MAX_CHARS} characters."
+        )
+    if any(not ch.isprintable() for ch in device):
+        raise ConfigError(
+            f"Invalid stt.input_device in {path}: a device name cannot contain "
+            f"control characters."
+        )
+    if device.startswith("-"):
+        raise ConfigError(
+            f"Invalid stt.input_device {device!r} in {path}: a device name cannot "
+            f"start with '-'."
+        )
+
+
+def resolve_stt(file_config: dict | None = None) -> dict:
+    """The `[stt]` settings with defaults filled in, re-validated.
+
+    Re-validated rather than trusted: `load_config_file` checks the table
+    on the way in, but this function is also handed hand-built dicts (the
+    portal, tests, a caller that never read the file), and the values it
+    returns go straight into a subprocess argv.
+    """
+    if file_config is None:
+        file_config = load_config_file()
+    table = file_config.get("stt") or {}
+    _validate_stt_table(table, config_path())
+    resolved = dict(STT_DEFAULTS)
+    resolved.update({key: table[key] for key in KNOWN_STT_KEYS if key in table})
+    return resolved
 
 
 def _coerce_speed(value, source: str) -> float:

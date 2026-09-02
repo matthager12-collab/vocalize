@@ -88,3 +88,22 @@ def file_paths(model_dir: Path | None = None) -> tuple[Path, Path]:
     """(model, voices) under `model_dir`, defaulting to MODEL_DIR."""
     base = MODEL_DIR if model_dir is None else model_dir
     return base / MODEL_FILE, base / VOICES_FILE
+
+
+def selftest_argv(model_dir: Path | None = None) -> list[str]:
+    """The argv `local install` runs (after `uv run --no-project ...`) to
+    warm the runtime. Owned here, not by install.py, so install.py never
+    has to know what a voice or a language is — only Whisper's manifest
+    differs (it needs a `model=` kwarg; Kokoro needs none).
+    """
+    model, voices = file_paths(model_dir)
+    return [
+        "run", "--no-project",
+        "--python", PYTHON_VERSION,
+        "--with", RUNTIME_PACKAGE,
+        str(worker_path()),
+        "--model", str(model),
+        "--voices", str(voices),
+        "--voice", DEFAULT_VOICE,
+        "--selftest",
+    ]
