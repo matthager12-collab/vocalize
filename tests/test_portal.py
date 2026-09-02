@@ -780,3 +780,17 @@ def test_a_ping_keeps_the_portal_open(running_portal):
     conn.close()
     assert response.status == 200
     assert started.state.last_seen > 0.0
+
+
+def test_the_handler_refuses_a_non_decimal_content_length(running_portal):
+    """int() would read "5_0" as 50; anything in front of this server
+    would not, and a length two parsers disagree on is a smuggling seed."""
+    started = running_portal
+    conn = _connect(started)
+    conn.putrequest("POST", "/api/session", skip_accept_encoding=True)
+    conn.putheader("Content-Length", "1_0")
+    conn.endheaders()
+    response = conn.getresponse()
+    response.read()
+    assert response.status == 400
+    conn.close()

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -83,6 +84,8 @@ TOKEN_HEADER = "X-Vocalize-Token"
 # query string lands in history and `Referer`, a body lands in a form
 # post. Refused wherever they appear, whatever their value.
 _TOKEN_PARAM_NAMES = ("token", "access_token", "session", "x-vocalize-token")
+
+_DECIMAL = re.compile(r"[0-9]+")
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
@@ -500,13 +503,15 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = -1
-        if length < 0:
+        # Strictly decimal, not int()'s idea of a number: it accepts
+        # "5_0", unicode digits and surrounding space, and a length the
+        # server reads differently from the way anything in front of it
+        # would is the seed of a request-smuggling bug.
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is not None and not _DECIMAL.fullmatch(raw_length):
             self._respond(*_json(400, {"error": "bad Content-Length"}), close=True)
             return
+        length = int(raw_length) if raw_length else 0
         if length > MAX_BODY_BYTES:
             # Refused without reading it: the point of a cap is not to
             # buffer the bytes in the first place.
