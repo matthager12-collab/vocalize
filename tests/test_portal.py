@@ -396,6 +396,20 @@ def test_served_page_has_no_inline_script_and_no_external_url():
     assert re.search(r"https?://", js) is None
 
 
+def test_the_page_keeps_pinging_so_the_watchdog_leaves_it_open():
+    """The watchdog closes the portal after four missed pings; the page
+    this run ships is the only client that would send them, so a page with
+    no keepalive means a server that exits a minute after it loads."""
+    js = (portal.ASSETS_DIR / "portal.js").read_text()
+    assert "/api/ping" in js
+
+    match = re.search(r"setInterval\([\s\S]*?/api/ping[\s\S]*?,\s*(\d+)\s*\)", js)
+    assert match, "the page must schedule a repeating /api/ping"
+    every = int(match.group(1)) / 1000
+    assert 0 < every <= portal.PING_INTERVAL_SECONDS
+    assert every * portal.MISSED_PINGS_BEFORE_SHUTDOWN <= portal.DEFAULT_IDLE_TIMEOUT
+
+
 def test_the_page_stores_the_token_nowhere_persistent():
     # Comments stripped: the file names these APIs to say it avoids them.
     js = "\n".join(

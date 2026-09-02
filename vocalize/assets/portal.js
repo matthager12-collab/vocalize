@@ -14,6 +14,7 @@
 
   var statusEl = document.getElementById("status");
   var stateEl = document.getElementById("state");
+  var token = null;
 
   function say(message) {
     // textContent, never innerHTML: server text is never markup here.
@@ -40,8 +41,16 @@
       return response.json();
     })
     .then(function (session) {
+      token = session.token;
+      // The server closes itself once the page stops answering (four
+      // missed 15 s pings), so an open tab has to keep saying it is here.
+      // Without this the portal would exit a minute after it loaded and
+      // the next click would fail with a connection error.
+      window.setInterval(function () {
+        fetch("/api/ping", { headers: { "X-Vocalize-Token": token } });
+      }, 15000);
       return fetch("/api/state", {
-        headers: { "X-Vocalize-Token": session.token }
+        headers: { "X-Vocalize-Token": token }
       });
     })
     .then(function (response) {
