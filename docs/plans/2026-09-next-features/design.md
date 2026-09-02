@@ -115,10 +115,12 @@ sequenceDiagram
   B->>S: GET /  (no secret in the page, no token required; Host checked here too)
   S-->>B: portal.html + portal.js (CSP default-src 'self'; frame-ancestors 'none')
   B->>S: POST /api/session {code}  (fragment never reaches the server log)
-  S-->>B: {token}  (code = secrets.token_urlsafe(32), single-use, expires 60 s after start; five wrong codes → server exits with a message)
+  S-->>B: {token}  (code = secrets.token_urlsafe(32), single-use, expires 60 s after start; five refused exchanges → server exits with a message)
   B->>S: every other call: header X-Vocalize-Token; Host must equal 127.0.0.1:PORT on EVERY request, static and session included
   B->>S: POST /api/voices/google/preview → audio bytes → Blob → <audio>
 ```
+
+A *refused exchange* is any of wrong, expired or already used — all three count toward the five, because after the first success there is no code left to hand out and a caller still hammering the route is not the browser we opened. The shutdown message says "refused codes" rather than "wrong codes" for that reason: re-opening the URL from history sends a used code, not a guess.
 
 ## Contracts
 

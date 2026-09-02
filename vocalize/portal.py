@@ -67,8 +67,12 @@ PING_INTERVAL_SECONDS = 15.0
 MISSED_PINGS_BEFORE_SHUTDOWN = 4
 DEFAULT_IDLE_TIMEOUT = PING_INTERVAL_SECONDS * MISSED_PINGS_BEFORE_SHUTDOWN
 
+# "Refused", not "wrong": an already-used or expired code counts toward
+# the lockout too (see `PortalState.exchange`), and re-opening the URL
+# from history or a second browser sends exactly that. Naming wrong codes
+# would report five bad guesses to a user who made none.
 LOCKOUT_REASON = (
-    "the portal shut down after five wrong codes — run `vocalize portal` again"
+    "the portal shut down after five refused codes — run `vocalize portal` again"
 )
 IDLE_REASON = "the portal closed after the page stopped answering"
 

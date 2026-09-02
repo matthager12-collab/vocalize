@@ -18,6 +18,7 @@ import re
 import socket
 import threading
 import time
+import webbrowser
 
 import pytest
 
@@ -260,6 +261,24 @@ def test_lockout_message_names_the_command_and_leaks_no_secret():
         assert state.code not in result[2].decode()
         assert state.token not in result[2].decode()
     assert "vocalize portal" in portal.LOCKOUT_REASON
+
+
+def test_the_lockout_message_never_calls_a_re_sent_code_a_wrong_one():
+    """Re-opening the URL — a second browser, the Back button, history —
+    re-sends a code that has already been used, and that counts toward the
+    lockout like any other refusal. The message says so: it must not
+    report five wrong guesses to a user who made none."""
+    state = _state()
+    code = state.code
+    assert _post(state, "/api/session", {"code": code})[0] == 200
+
+    for _ in range(portal.MAX_CODE_ATTEMPTS):
+        result = _post(state, "/api/session", {"code": code})
+        assert result[0] == 401
+        assert "already been used" in _payload(result)["error"]
+
+    assert state.shutdown_reason == portal.LOCKOUT_REASON
+    assert "wrong" not in portal.LOCKOUT_REASON
 
 
 def test_lockout_counts_an_expired_code_too(monkeypatch):
@@ -765,11 +784,22 @@ def test_the_opening_url_carries_the_code_in_the_fragment():
     assert "?" not in state.url()
 
 
-def test_serve_opens_the_browser_only_when_asked():
+def test_serve_opens_the_browser_only_when_asked(monkeypatch):
     opened = []
     started = portal.serve({"chain": ["say"]}, open_browser=opened.append, idle_timeout=30.0)
     try:
         assert opened == [started.url]
+    finally:
+        started.stop()
+
+    # And the default is inert, not `webbrowser.open`: five tests in this
+    # file call serve() without one, and a regressed default would open a
+    # real browser on the developer's machine with the suite still green.
+    launched = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: launched.append(url))
+    started = portal.serve({"chain": ["say"]}, idle_timeout=30.0)
+    try:
+        assert launched == []
     finally:
         started.stop()
 
