@@ -2035,6 +2035,29 @@ def test_a_second_install_while_one_runs_is_409(fake_install):
     _wait_for_install(state)
 
 
+def test_a_thread_that_never_starts_frees_the_install_slot(fake_install, monkeypatch):
+    """A refused thread must not wedge the slot or suspend the watchdog for good."""
+    state = _state()
+
+    def _refuse(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(portal.threading.Thread, "start", _refuse)
+    status, _headers, body = _authed_post(
+        state, "/api/local/install/start", {"target": "stt"}
+    )
+
+    assert status == 503
+    assert "could not start" in json.loads(body)["error"]
+    assert state.install["running"] is False
+    assert state.watchdog_suspended is False
+
+    monkeypatch.undo()
+    # And the next install is allowed, rather than a permanent 409.
+    assert _authed_post(state, "/api/local/install/start", {"target": "stt"})[0] == 200
+    _wait_for_install(state)
+
+
 def test_the_idle_watchdog_never_fires_during_an_install(fake_install):
     """The page goes quiet while a 488 MB model downloads; that is allowed."""
     fake_install.paused = True

@@ -896,13 +896,23 @@ def post_install_start(state: PortalState, payload: dict):
     if not state.begin_install(target):
         raise _Refused(409, "an install is already running")
 
-    state.install_thread = threading.Thread(
+    thread = threading.Thread(
         target=_install_worker,
         args=(state, target, model),
         daemon=True,
         name="vocalize-portal-install",
     )
-    state.install_thread.start()
+    state.install_thread = thread
+    try:
+        thread.start()
+    except RuntimeError:
+        # A thread that never started would leave the slot claimed and the
+        # watchdog suspended for the life of the process: the portal would
+        # refuse every later install and never close itself.
+        state.install = _idle_install()
+        state.install_thread = None
+        state.watchdog_suspended = False
+        raise _Refused(503, "could not start the install") from None
     return _json(200, dict(state.install))
 
 
