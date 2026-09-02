@@ -15,6 +15,7 @@ import email.message
 import http.client
 import json
 import re
+import socket
 import threading
 import time
 
@@ -641,6 +642,25 @@ def _connect(started):
     return http.client.HTTPConnection(portal.BIND_HOST, started.port, timeout=5)
 
 
+def _raw(started, request: bytes, timeout=5.0) -> bytes:
+    """Send bytes http.client would not, and read until the server closes."""
+    sock = socket.create_connection((portal.BIND_HOST, started.port), timeout=timeout)
+    try:
+        sock.sendall(request)
+        chunks = []
+        while True:
+            piece = sock.recv(4096)
+            if not piece:
+                return b"".join(chunks)
+            chunks.append(piece)
+    finally:
+        sock.close()
+
+
+def _head_of(raw: bytes) -> str:
+    return raw.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+
+
 def _port_is_gone(started, deadline=3.0):
     """Whether the listening socket has stopped answering.
 
@@ -848,6 +868,34 @@ def test_a_ping_keeps_the_portal_open(running_portal):
     conn.close()
     assert response.status == 200
     assert started.state.last_seen > 0.0
+
+
+@pytest.mark.parametrize(
+    ("label", "request_line", "status"),
+    (
+        # fetch() may send any verb but CONNECT/TRACE/TRACK, and one with
+        # no do_* method is refused by http.server itself.
+        ("unknown verb", b"FOO / HTTP/1.1", b" 501 "),
+        # <iframe src="http://127.0.0.1:PORT/?<padding>"> — the shape that
+        # would frame a portal page if X-Frame-Options were missing.
+        ("over-long request line", b"GET /?" + b"x" * 70000 + b" HTTP/1.1", b" 414 "),
+    ),
+)
+def test_http_servers_own_refusals_carry_the_security_headers(
+    running_portal, label, request_line, status
+):
+    """Every response means every response, including the ones route()
+    never sees: these are answered inside handle_one_request, before the
+    Host check and before _handle."""
+    raw = _raw(
+        running_portal,
+        request_line + f"\r\nHost: {portal.BIND_HOST}:{running_portal.port}\r\n\r\n".encode(),
+    )
+    head = _head_of(raw)
+    assert status.decode() in head, head[:200]
+    assert "text/html" not in head
+    for name, value in portal.SECURITY_HEADERS.items():
+        assert f"{name}: {value}" in head, f"{label} is missing {name}"
 
 
 def test_the_handler_refuses_a_non_decimal_content_length(running_portal):

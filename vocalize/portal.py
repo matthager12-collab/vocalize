@@ -494,6 +494,19 @@ class _Handler(BaseHTTPRequestHandler):
         anywhere.
         """
 
+    def send_error(self, code, message=None, explain=None):
+        """Answer http.server's own refusals through the same path.
+
+        `handle_one_request` refuses a verb with no `do_*` method, a
+        request line over 64 KiB and an unparsable request version by
+        itself, before `_handle` ever runs — and the stock `send_error`
+        answers those with an HTML page carrying none of the security
+        headers, so an `<iframe>` pointed at a long URL would get a
+        framable page served by this port. The reason is not echoed
+        back: it quotes the request line, which is attacker text.
+        """
+        self._respond(*_json(code, {"error": "the portal refused this request"}), close=True)
+
     def _respond(self, status, headers, body, *, close=False):
         self.send_response(status)
         for name, value in headers.items():
