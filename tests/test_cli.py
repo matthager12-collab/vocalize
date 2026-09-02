@@ -20,6 +20,7 @@ import vocalize.cli as cli_module
 from vocalize import interrupted
 from vocalize.cli import main
 from vocalize.config import resolve_provider_settings
+from vocalize.exceptions import ConfigChangedError
 
 
 def _patch_tts(monkeypatch, audio=b"fake-mp3-bytes", calls=None, echo_lines=()):
@@ -1525,6 +1526,148 @@ def test_chain_rejects_a_duplicate_provider(monkeypatch, tmp_path):
 
     assert result.exit_code == 2
     assert "Duplicate" in result.output
+
+
+def test_chain_refuses_to_clobber_a_file_that_moved_under_it(monkeypatch, tmp_path):
+    """DEC-005 for the CLI: the window is microseconds, and it still holds.
+
+    The behaviour only changes when the file really did move between the
+    read and the write, so the test makes that happen — another writer
+    landing while `vocalize chain` has the parsed dict in hand.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('chain = ["say"]\n', encoding="utf-8")
+    changed = 'voice = "from-another-writer"\n'
+
+    real_load = cli_module.load_config_file
+
+    def load_then_another_writer():
+        data = real_load()
+        cfg_path.write_text(changed, encoding="utf-8")
+        return data
+
+    monkeypatch.setattr(cli_module, "load_config_file", load_then_another_writer)
+
+    result = CliRunner().invoke(main, ["chain", "google", "say"])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ConfigChangedError)
+    assert cfg_path.read_text(encoding="utf-8") == changed
+
+
+def test_chain_rewrites_a_config_that_has_an_stt_table(monkeypatch, tmp_path):
+    """A 0.10.0 config has [stt] in it, and the setter has to survive that."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('chain = ["say"]\n\n[stt]\nmodel = "base.en"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "google", "say"])
+
+    assert result.exit_code == 0, result.output
+    text = cfg_path.read_text(encoding="utf-8")
+    assert 'chain = ["google", "say"]' in text
+    assert '[stt]\nmodel = "base.en"' in text
+
+
+# --- vocalize portal (T-64) -------------------------------------------
+#
+# The command itself, over a fake server and a fake browser opener: no
+# socket is bound and nothing is ever opened on the developer's machine.
+
+
+class _FakePortal:
+    def __init__(self, reason=None):
+        self.url = "http://127.0.0.1:45678/#code=fake-code"
+        self._reason = reason
+        self.stopped = False
+
+    def wait(self, timeout=None):
+        return self._reason
+
+    def stop(self, reason="stopped"):
+        self.stopped = True
+
+
+def _fake_portal(monkeypatch, reason=None, boom=None):
+    import webbrowser
+
+    from vocalize import portal as portal_module
+
+    started = _FakePortal(reason)
+    if boom is not None:
+        started.wait = boom
+    monkeypatch.setattr(portal_module, "serve", lambda *args, **kwargs: started)
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: opened.append(url))
+    return started, opened
+
+
+def test_portal_opens_the_browser_at_the_one_time_url(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    started, opened = _fake_portal(monkeypatch)
+
+    result = CliRunner().invoke(main, ["portal"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == [started.url]
+    assert started.url in result.output
+    # The two things the user has to be told, in the output, once.
+    assert result.output.count(started.url) == 1
+    assert "works once" in result.output
+    assert "single-user machine" in result.output
+    assert started.stopped
+
+
+def test_portal_no_browser_prints_the_url_and_opens_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    started, opened = _fake_portal(monkeypatch)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert opened == []
+    assert started.url in result.output
+
+
+def test_portal_exits_1_when_the_server_locked_itself_out(monkeypatch, tmp_path):
+    from vocalize import portal as portal_module
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    _fake_portal(monkeypatch, reason=portal_module.LOCKOUT_REASON)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 1
+    assert portal_module.LOCKOUT_REASON in result.output
+
+
+def test_portal_exits_0_when_the_idle_watchdog_closed_it(monkeypatch, tmp_path):
+    from vocalize import portal as portal_module
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    _fake_portal(monkeypatch, reason=portal_module.IDLE_REASON)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert portal_module.IDLE_REASON in result.output
+
+
+def test_portal_stops_the_server_on_ctrl_c(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    def interrupted_wait(timeout=None):
+        raise KeyboardInterrupt
+
+    started, _opened = _fake_portal(monkeypatch, boom=interrupted_wait)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert started.stopped
 
 
 # --- the interrupt record (DEC-003, T-46) ------------------------------

@@ -9,7 +9,12 @@ from click.testing import CliRunner
 from vocalize import auth, wizard
 from vocalize.cli import main
 from vocalize.config import DEFAULT_MODEL, load_config_file, resolve_settings
-from vocalize.exceptions import ConfigError, MissingAPIKeyError, TTSRequestError
+from vocalize.exceptions import (
+    ConfigChangedError,
+    ConfigError,
+    MissingAPIKeyError,
+    TTSRequestError,
+)
 
 UP = "\x1b[A"
 DOWN = "\x1b[B"
@@ -616,3 +621,52 @@ def test_the_current_voice_starts_under_the_cursor(monkeypatch, tmp_path, capsys
         'voice = "def456"\n'
         f'model = "{DEFAULT_MODEL}"\n'
     )
+
+
+def test_stt_table_round_trips_byte_for_byte(monkeypatch, tmp_path):
+    """A 0.10.0 config has an [stt] table, and every writer meets it.
+
+    The renderer had no way to write a table other than [providers.*], so
+    a file with [stt] in it could not be rewritten at all: the wizard and
+    `vocalize chain` both refused it as "edit that file by hand".
+    """
+    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, ENTER])
+    ctx.path.parent.mkdir(parents=True)
+    original = (
+        'chain = ["elevenlabs", "google"]\n'
+        "\n[stt]\n"
+        'model = "small.en"\n'
+        "cleanup = false\n"
+    )
+    ctx.path.write_text(original)
+
+    wizard.run_wizard()
+
+    assert ctx.path.read_text() == original
+
+
+def test_the_wizard_refuses_to_write_over_a_file_that_changed_while_it_asked(
+    monkeypatch, tmp_path
+):
+    """DEC-005: three questions is plenty of time for another writer."""
+    changed = 'voice = "from-another-writer"\n'
+
+    def confirm_and_change_the_file(label):
+        # The wizard's last question, so the file moves between the read
+        # it started from and the write it is about to make.
+        ctx.path.write_text(changed, encoding="utf-8")
+        return True
+
+    ctx = _setup(
+        monkeypatch,
+        tmp_path,
+        [ENTER, UP, ENTER, ENTER],
+        confirm=confirm_and_change_the_file,
+    )
+    ctx.path.parent.mkdir(parents=True)
+    ctx.path.write_text('chain = ["elevenlabs", "google"]\n', encoding="utf-8")
+
+    with pytest.raises(ConfigChangedError):
+        wizard.run_wizard()
+
+    assert ctx.path.read_text(encoding="utf-8") == changed

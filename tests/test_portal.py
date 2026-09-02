@@ -14,8 +14,10 @@ from __future__ import annotations
 import email.message
 import http.client
 import json
+import os
 import re
 import socket
+import stat
 import threading
 import time
 import webbrowser
@@ -23,7 +25,9 @@ import webbrowser
 import pytest
 
 import vocalize.readiness as readiness_module
-from vocalize import portal
+from vocalize import config as config_module
+from vocalize import portal, wizard
+from vocalize.exceptions import ConfigChangedError, ConfigError, VocalizeError
 
 PORT = 45678
 TOKEN_HEADER = portal.TOKEN_HEADER
@@ -531,7 +535,7 @@ def test_state_payload_carries_rows_chain_providers_budgets_and_stt():
     assert headers["Content-Type"] == "application/json"
 
     payload = json.loads(body)
-    assert {"rows", "chain", "providers", "budgets", "stt"} == set(payload)
+    assert {"fingerprint", "rows", "chain", "providers", "budgets", "stt"} == set(payload)
     assert payload["chain"] == {"order": ["say"], "source": "config file"}
     assert [r["name"] for r in payload["rows"]] == ["say"]
     assert {"name", "state", "detail", "action"} == set(payload["rows"][0])
@@ -1064,3 +1068,629 @@ def test_a_stalled_connection_is_dropped_instead_of_pinning_a_thread(
         assert sock.recv(4096) == b"", f"{label}: the connection is still open"
     finally:
         sock.close()
+
+
+# --- writes: compare-and-swap on the config file (DEC-005) ------------
+#
+# The helper is exercised directly as well as through the routes: the
+# compare-and-swap is what stops the page, the wizard, `vocalize chain`
+# and a hand edit from silently dropping each other's changes, and it has
+# to hold whether or not there is an HTTP request in front of it.
+
+
+@pytest.fixture
+def config_file():
+    """The isolated config path (conftest points XDG_CONFIG_HOME at tmp)."""
+    path = config_module.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _authed_post(state, path, payload, **extra):
+    return _post(state, path, payload, **{TOKEN_HEADER: state.token}, **extra)
+
+
+def _fingerprint():
+    return wizard.fingerprint_config(config_module.config_path())
+
+
+ONE_SAY = 'chain = ["say"]\n'
+
+
+def _seed(path, text=ONE_SAY):
+    path.write_text(text, encoding="utf-8")
+    return text
+
+
+def test_cas_writes_when_the_file_has_not_changed(config_file):
+    _seed(config_file)
+    fingerprint = wizard.fingerprint_config(config_file)
+    wizard.write_config_if_unchanged(config_file, {"chain": ["say", "kokoro"]}, fingerprint)
+    assert config_file.read_text(encoding="utf-8") == 'chain = ["say", "kokoro"]\n'
+
+
+def test_cas_refuses_a_file_whose_contents_changed_underneath_it(config_file):
+    _seed(config_file)
+    fingerprint = wizard.fingerprint_config(config_file)
+    other = _seed(config_file, 'chain = ["google"]\n')
+
+    with pytest.raises(ConfigChangedError) as refused:
+        wizard.write_config_if_unchanged(config_file, {"chain": ["say"]}, fingerprint)
+
+    assert str(refused.value) == wizard.CONFIG_CHANGED
+    assert config_file.read_text(encoding="utf-8") == other
+
+
+def test_cas_refuses_a_file_whose_mtime_changed_underneath_it(config_file):
+    """Same bytes, new mtime — a restored copy is still not the file we read.
+
+    This is why the fingerprint is both halves: content alone would call a
+    file replaced with an identical copy unchanged, and mtime alone would
+    miss a rewrite inside one filesystem timestamp.
+    """
+    _seed(config_file)
+    fingerprint = wizard.fingerprint_config(config_file)
+    later = fingerprint["mtime_ns"] + 5_000_000_000
+    os.utime(config_file, ns=(later, later))
+
+    with pytest.raises(ConfigChangedError):
+        wizard.write_config_if_unchanged(config_file, {"chain": ["say"]}, fingerprint)
+
+
+def test_cas_creates_the_file_when_the_fingerprint_is_absent(config_file):
+    assert not config_file.exists()
+    assert wizard.fingerprint_config(config_file) == wizard.ABSENT_CONFIG
+
+    wizard.write_config_if_unchanged(config_file, {"chain": ["say"]}, wizard.ABSENT_CONFIG)
+
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+    assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
+
+
+def test_cas_refuses_a_file_created_underneath_an_absent_fingerprint(config_file):
+    """O_EXCL is the check here: a file that appeared is a file that changed."""
+    fingerprint = wizard.fingerprint_config(config_file)
+    assert fingerprint == wizard.ABSENT_CONFIG
+    other = _seed(config_file, 'chain = ["google"]\n')
+
+    with pytest.raises(ConfigChangedError) as refused:
+        wizard.write_config_if_unchanged(config_file, {"chain": ["say"]}, fingerprint)
+
+    assert str(refused.value) == wizard.CONFIG_CHANGED
+    assert config_file.read_text(encoding="utf-8") == other
+
+
+def test_cas_refuses_a_write_before_it_renders_an_unwritable_config(config_file):
+    """A value the renderer cannot write must not truncate the file first."""
+    _seed(config_file)
+    with pytest.raises(ConfigError):
+        wizard.write_config_if_unchanged(
+            config_file, {"chain": [["nested"]]}, wizard.fingerprint_config(config_file)
+        )
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+# --- writes: the routes -----------------------------------------------
+
+
+def test_writing_the_chain_rewrites_the_file_and_returns_the_new_fingerprint(config_file):
+    _seed(config_file)
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state, "/api/chain", {"order": ["say", "kokoro"], "fingerprint": _fingerprint()}
+    )
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert payload["fingerprint"] == wizard.fingerprint_config(config_file)
+    assert config_file.read_text(encoding="utf-8") == 'chain = ["say", "kokoro"]\n'
+    # And the state the page reads next agrees with the file.
+    assert state.file_config["chain"] == ["say", "kokoro"]
+
+
+def test_writing_the_chain_with_a_stale_fingerprint_is_409_and_changes_nothing(config_file):
+    _seed(config_file)
+    state = _state()
+    stale = _fingerprint()
+    other = _seed(config_file, 'chain = ["google"]\n')
+
+    status, _headers, body = _authed_post(
+        state, "/api/chain", {"order": ["say", "kokoro"], "fingerprint": stale}
+    )
+
+    assert status == 409
+    assert json.loads(body)["error"] == wizard.CONFIG_CHANGED
+    assert config_file.read_text(encoding="utf-8") == other
+
+
+def test_writing_the_chain_into_an_absent_file_creates_it(config_file):
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/chain", {"order": ["say"], "fingerprint": wizard.ABSENT_CONFIG}
+    )
+    assert status == 200
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+def test_writing_into_a_file_created_under_an_absent_fingerprint_is_409(config_file):
+    state = _state()
+    other = _seed(config_file, 'chain = ["google"]\n')
+
+    status, _headers, body = _authed_post(
+        state, "/api/chain", {"order": ["say"], "fingerprint": wizard.ABSENT_CONFIG}
+    )
+
+    assert status == 409
+    assert json.loads(body)["error"] == wizard.CONFIG_CHANGED
+    assert config_file.read_text(encoding="utf-8") == other
+
+
+def test_a_write_keeps_every_other_key_and_table(config_file):
+    """The merge base is the file, not the page: nothing it never saw is lost."""
+    _seed(
+        config_file,
+        'voice = "abc"\n'
+        'chain = ["say"]\n'
+        "\n[stt]\n"
+        'model = "base.en"\n'
+        "\n[providers.google]\n"
+        'voice = "en-US-Neural2-C"\n'
+        "monthly_chars = 1000\n",
+    )
+    state = _state()
+
+    status, _headers, _body = _authed_post(
+        state, "/api/chain", {"order": ["google", "say"], "fingerprint": _fingerprint()}
+    )
+
+    assert status == 200
+    written = config_module.load_config_file()
+    assert written["chain"] == ["google", "say"]
+    assert written["voice"] == "abc"
+    assert written["stt"] == {"model": "base.en"}
+    assert written["providers"] == {
+        "google": {"voice": "en-US-Neural2-C", "monthly_chars": 1000}
+    }
+
+
+@pytest.mark.parametrize(
+    "order", ([], ["say", "say"], ["nope"], ["say", 3], "say", {"say": True})
+)
+def test_writing_a_bad_chain_is_400(config_file, order):
+    _seed(config_file)
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/chain", {"order": order, "fingerprint": _fingerprint()}
+    )
+    assert status == 400
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+def test_writing_an_unknown_provider_in_the_chain_uses_the_cli_wording(config_file):
+    _seed(config_file)
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state, "/api/chain", {"order": ["say", "nope"], "fingerprint": _fingerprint()}
+    )
+
+    with pytest.raises(ConfigError) as expected:
+        config_module._validate_chain(["say", "nope"], config_module.config_path())
+    assert status == 400
+    assert json.loads(body)["error"] == str(expected.value)
+
+
+def test_writing_a_provider_speed_out_of_range_uses_the_cli_wording(config_file):
+    _seed(config_file)
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state,
+        "/api/provider/say",
+        {"settings": {"speed": 9}, "fingerprint": _fingerprint()},
+    )
+
+    with pytest.raises(ConfigError) as expected:
+        config_module._coerce_speed(
+            9, f"'speed' in [providers.say] in {config_module.config_path()}"
+        )
+    assert status == 400
+    assert json.loads(body)["error"] == str(expected.value)
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+def test_writing_a_provider_budget_uses_the_cli_wording(config_file):
+    _seed(config_file)
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state,
+        "/api/provider/say",
+        {"settings": {"monthly_chars": -1}, "fingerprint": _fingerprint()},
+    )
+
+    with pytest.raises(ConfigError) as expected:
+        config_module._validate_providers_table(
+            {"say": {"monthly_chars": -1}}, config_module.config_path()
+        )
+    assert status == 400
+    assert json.loads(body)["error"] == str(expected.value)
+
+
+def test_writing_a_provider_setting_saves_it_and_keeps_the_rest(config_file):
+    _seed(config_file, 'chain = ["say"]\n\n[providers.say]\nvoice = "Alex"\n')
+    state = _state()
+
+    status, _headers, _body = _authed_post(
+        state,
+        "/api/provider/say",
+        {"settings": {"speed": 1.1}, "fingerprint": _fingerprint()},
+    )
+
+    assert status == 200
+    assert config_module.load_config_file()["providers"]["say"] == {
+        "voice": "Alex",
+        "speed": 1.1,
+    }
+
+
+def test_writing_a_null_provider_setting_clears_that_key(config_file):
+    _seed(config_file, 'chain = ["say"]\n\n[providers.say]\nvoice = "Alex"\nspeed = 1.1\n')
+    state = _state()
+
+    status, _headers, _body = _authed_post(
+        state,
+        "/api/provider/say",
+        {"settings": {"speed": None}, "fingerprint": _fingerprint()},
+    )
+
+    assert status == 200
+    assert config_module.load_config_file()["providers"]["say"] == {"voice": "Alex"}
+
+
+@pytest.mark.parametrize(
+    "settings",
+    (
+        {"nope": "x"},  # not a key any [providers.*] table has
+        {"voice": 3},  # not a string
+        {"voice": "a\nb"},  # a control character in a value bound for argv
+        {"voice": "x" * 201},  # unbounded length
+        {"monthly_chars": "lots"},
+    ),
+)
+def test_writing_a_bad_provider_setting_is_400(config_file, settings):
+    _seed(config_file)
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/provider/say", {"settings": settings, "fingerprint": _fingerprint()}
+    )
+    assert status == 400
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+@pytest.mark.parametrize("name", ("nope", "..", "../../etc/passwd", "SAY"))
+def test_writing_to_an_unknown_provider_is_404(config_file, name):
+    _seed(config_file)
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, f"/api/provider/{name}", {"settings": {}, "fingerprint": _fingerprint()}
+    )
+    assert status == 404
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+def test_writing_the_stt_table_saves_it(config_file):
+    _seed(config_file)
+    state = _state()
+
+    status, _headers, _body = _authed_post(
+        state,
+        "/api/stt",
+        {
+            "settings": {"model": "base.en", "input_device": "MacBook Pro Microphone"},
+            "fingerprint": _fingerprint(),
+        },
+    )
+
+    assert status == 200
+    assert config_module.resolve_stt(config_module.load_config_file())["model"] == "base.en"
+    assert config_file.read_text(encoding="utf-8").endswith(
+        '[stt]\nmodel = "base.en"\ninput_device = "MacBook Pro Microphone"\n'
+    )
+
+
+def test_writing_a_bad_stt_model_uses_the_cli_wording(config_file):
+    _seed(config_file)
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state,
+        "/api/stt",
+        {"settings": {"model": "../../etc/passwd"}, "fingerprint": _fingerprint()},
+    )
+
+    with pytest.raises(ConfigError) as expected:
+        config_module._validate_stt_table(
+            {"model": "../../etc/passwd"}, config_module.config_path()
+        )
+    assert status == 400
+    assert json.loads(body)["error"] == str(expected.value)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    (
+        {"language": "fr"},  # small.en, the default model, is English-only
+        {"input_device": "-rf"},  # a device name that is really a flag
+        {"input_device": "mi\x07c"},  # a control character in a device name
+        {"max_seconds": 0},
+        {"cleanup": "yes"},
+        {"nope": 1},
+    ),
+)
+def test_writing_a_bad_stt_value_is_400(config_file, settings):
+    _seed(config_file)
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/stt", {"settings": settings, "fingerprint": _fingerprint()}
+    )
+    assert status == 400
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+def test_the_stt_language_rule_is_checked_against_the_merged_table(config_file):
+    """Half the pair can already be in the file, so the whole table is checked."""
+    _seed(
+        config_file,
+        'chain = ["say"]\n\n[stt]\nmodel = "large-v3-turbo-q5_0"\nlanguage = "fr"\n',
+    )
+    state = _state()
+
+    status, _headers, _body = _authed_post(
+        state, "/api/stt", {"settings": {"model": "small.en"}, "fingerprint": _fingerprint()}
+    )
+
+    assert status == 400  # small.en is English-only and the language is already "fr"
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    (
+        None,
+        {},
+        "unchanged",
+        {"mtime_ns": 1, "sha256": "a", "extra": 1},
+        {"mtime_ns": True, "sha256": "a"},
+        {"mtime_ns": "1", "sha256": "a"},
+    ),
+)
+def test_a_write_with_a_fingerprint_of_the_wrong_shape_is_400(config_file, fingerprint):
+    _seed(config_file)
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/chain", {"order": ["say"], "fingerprint": fingerprint}
+    )
+    assert status == 400
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+# --- the key: in, never out -------------------------------------------
+
+CANARY_KEY = "sk-not-a-real-key-canary-0000"
+
+
+@pytest.fixture
+def fake_login(monkeypatch):
+    """`auth.login`'s validation seam, with no API call in it."""
+    stored = {}
+
+    def fake_validate(key, provider="elevenlabs"):
+        stored["validated"] = (provider, key)
+
+    monkeypatch.setattr("vocalize.auth.validate_key", fake_validate)
+    return stored
+
+
+def test_the_login_response_never_contains_the_key(config_file, fake_login, fake_keychain):
+    state = _state()
+
+    status, headers, body = _authed_post(
+        state, "/api/auth/login", {"provider": "google", "key": CANARY_KEY}
+    )
+
+    assert status == 200
+    # The whole response, headers included — not just the JSON body.
+    assert CANARY_KEY.encode() not in body
+    assert CANARY_KEY not in json.dumps(headers)
+    assert CANARY_KEY not in "".join(str(value) for value in json.loads(body).values())
+    # And it really was stored, so this is not passing by doing nothing.
+    assert fake_keychain[("vocalize", "google-api-key")] == CANARY_KEY
+
+
+def test_a_rejected_key_is_scrubbed_out_of_the_error(config_file, monkeypatch):
+    """Messages we did not write quote what they were given."""
+
+    def rejects(key, provider="elevenlabs"):
+        raise VocalizeError(f"HTTP 401 for key {key}")
+
+    monkeypatch.setattr("vocalize.auth.validate_key", rejects)
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state, "/api/auth/login", {"provider": "google", "key": CANARY_KEY}
+    )
+
+    assert status == 400
+    assert CANARY_KEY.encode() not in body
+    assert b"[key]" in body
+
+
+def test_the_login_route_never_logs_the_key(running_portal, capsys, monkeypatch, fake_login):
+    started = running_portal
+    conn = _connect(started)
+    conn.request(
+        "POST",
+        "/api/auth/login",
+        body=json.dumps({"provider": "google", "key": CANARY_KEY}),
+        headers={TOKEN_HEADER: started.state.token, "Content-Type": "application/json"},
+    )
+    response = conn.getresponse()
+    body = response.read()
+    conn.close()
+
+    assert response.status == 200
+    assert CANARY_KEY.encode() not in body
+    captured = capsys.readouterr()
+    assert CANARY_KEY not in captured.out
+    assert CANARY_KEY not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("provider", "key"),
+    (
+        ("polly", CANARY_KEY),  # AWS credentials, nothing to store
+        ("say", CANARY_KEY),  # local, no credentials
+        ("kokoro", CANARY_KEY),
+        ("google", ""),  # the CLI's "nothing was stored"
+        ("google", 7),
+        ("google", None),
+    ),
+)
+def test_a_login_the_cli_would_refuse_is_400(config_file, provider, key, fake_keychain):
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/auth/login", {"provider": provider, "key": key}
+    )
+    assert status == 400
+    assert fake_keychain == {}
+
+
+def test_a_login_for_an_unknown_provider_is_404(config_file, fake_keychain):
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, "/api/auth/login", {"provider": "nope", "key": CANARY_KEY}
+    )
+    assert status == 404
+    assert fake_keychain == {}
+
+
+def test_logout_removes_the_stored_key(config_file, fake_keychain):
+    fake_keychain[("vocalize", "google-api-key")] = CANARY_KEY
+    state = _state()
+
+    status, _headers, body = _authed_post(state, "/api/auth/logout", {"provider": "google"})
+
+    assert status == 200
+    assert fake_keychain == {}
+    assert CANARY_KEY.encode() not in body
+
+
+def test_logout_for_a_provider_with_no_key_slot_is_400(config_file, fake_keychain):
+    state = _state()
+    status, _headers, _body = _authed_post(state, "/api/auth/logout", {"provider": "say"})
+    assert status == 400
+
+
+# --- the security matrix, over the mutating routes --------------------
+#
+# Everything the read-only routes are held to, held to on the routes that
+# write the config file, store a key, spend money and start a download.
+# Each of these also asserts the config file did not move.
+
+MUTATING_ROUTES = (
+    "/api/chain",
+    "/api/provider/say",
+    "/api/stt",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/voices/say/preview",
+    "/api/local/install/start",
+)
+
+# A body that would be a valid write on every route above if it were ever
+# allowed to reach one.
+LIVE_BODY = {
+    "order": ["kokoro"],
+    "settings": {"speed": 1.1},
+    "provider": "google",
+    "key": "sk-would-be-stored",
+    "target": "stt",
+}
+
+
+@pytest.fixture
+def guarded_config(config_file):
+    """A config file every refusal below must leave exactly as it is."""
+    _seed(config_file)
+    LIVE_BODY["fingerprint"] = _fingerprint()
+    yield config_file
+    assert config_file.read_text(encoding="utf-8") == ONE_SAY
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_refuses_a_token_in_the_query_string(guarded_config, path):
+    state = _state()
+    status, _headers, _body = _post(state, f"{path}?token={state.token}", LIVE_BODY)
+    assert status == 401
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_refuses_a_token_in_the_body(guarded_config, path):
+    state = _state()
+    status, _headers, _body = _post(state, path, {**LIVE_BODY, "token": state.token})
+    assert status == 401
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_refuses_a_missing_token(guarded_config, path):
+    state = _state()
+    assert _post(state, path, LIVE_BODY)[0] == 401
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_refuses_a_rebound_host(guarded_config, path):
+    state = _state()
+    status, _headers, _body = portal.route(
+        "POST",
+        path,
+        {"Host": "evil.example", TOKEN_HEADER: state.token},
+        json.dumps(LIVE_BODY).encode(),
+        state=state,
+    )
+    assert status == 421
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_refuses_a_foreign_origin(guarded_config, path):
+    state = _state()
+    status, _headers, _body = _authed_post(
+        state, path, LIVE_BODY, Origin="http://evil.example"
+    )
+    assert status == 403
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_refuses_an_oversized_body(guarded_config, path):
+    state = _state()
+    body = b"x" * (portal.MAX_BODY_BYTES + 1)
+    status, _sent, _body = portal.route(
+        "POST", path, _headers(state, **{TOKEN_HEADER: state.token}), body, state=state
+    )
+    assert status == 413
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_carries_the_security_headers(guarded_config, path):
+    state = _state()
+    _status, headers, _body = _post(state, path, LIVE_BODY)
+    for name, value in portal.SECURITY_HEADERS.items():
+        assert headers[name] == value
+
+
+@pytest.mark.parametrize("path", MUTATING_ROUTES)
+def test_a_mutating_route_is_not_reachable_with_a_get(guarded_config, path):
+    """A GET is what a link, an <img> or a prefetch would send."""
+    state = _state()
+    assert _authed_get(state, path)[0] == 404

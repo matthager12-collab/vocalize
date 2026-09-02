@@ -24,10 +24,16 @@ a hostname it controls at 127.0.0.1 and talk to this server from its own
 origin (DNS rebinding); the browser would send `Host: attacker.example`,
 and only this check notices.
 
-What this module deliberately does not do yet: writes, previews, installs
-and the `vocalize portal` command are run 8 (DEC-005), and the real page
-is run 9 — `assets/portal.html` here is a placeholder that does the code
-exchange and prints the state.
+Writes are compare-and-swap (DEC-005): `/api/state` hands the page the
+config file's fingerprint, every write hands it back, and a file that
+moved in between is refused with 409 rather than clobbered. Every value
+goes through the same `config._validate_*` the CLI uses, so the page
+cannot write anything a hand-edited file could not, and a bad value comes
+back with the CLI's own wording.
+
+What this module deliberately does not do yet: the real page is run 9 —
+`assets/portal.html` here is a placeholder that does the code exchange
+and prints the state.
 """
 
 from __future__ import annotations
@@ -45,8 +51,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import auth, config, ledger, readiness
-from .exceptions import VocalizeError
+from . import auth, config, ledger, readiness, tts, wizard
+from .exceptions import ConfigChangedError, ConfigError, ProviderError, VocalizeError
 
 # Loopback only, always. The portal exposes the machine's provider
 # settings and can (from run 8) write the config file: it must never be
@@ -91,6 +97,35 @@ SECURITY_HEADERS = {
 
 TOKEN_HEADER = "X-Vocalize-Token"
 
+# The preview's fixed sentence. A constant, never text from the page: a
+# preview is a voice check, and letting the browser choose the words
+# would turn a settings page into an unmetered synthesis endpoint.
+PREVIEW_TEXT = "This is how vocalize will sound."
+
+# Content-Type by the provider's AUDIO_EXT. Anything unrecognised is
+# served as bytes rather than guessed at — with nosniff, a wrong type is
+# a preview that will not play, and a guessed one is worse.
+PREVIEW_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4"}
+
+# The same audio cache `vocalize speak` uses — that is the point: a
+# preview of a voice you then read with is already rendered and paid for.
+# Named here rather than left to `chain.run`'s default only so a test can
+# point it somewhere else.
+CACHE_DIR = tts.DEFAULT_CACHE_DIR
+
+# One preview at a time, process-wide. Kokoro's provider keeps a single
+# resident worker session whose JSON-lines protocol has no request ids,
+# so two previews at once would read each other's replies; it also bounds
+# what a page holding down a preview button can spend.
+_preview_lock = threading.Lock()
+
+INSTALL_TARGETS = ("kokoro", "stt")
+
+# The download seam. `install.download_file` takes an `opener=`; None
+# means its real HTTPS-only opener. Tests and the live check set this so
+# a portal being exercised never fetches a byte.
+OPENER = None
+
 # Names that would smuggle the session token somewhere it can leak: a
 # query string lands in history and `Referer`, a body lands in a form
 # post. Refused wherever they appear, whatever their value.
@@ -130,6 +165,19 @@ def _same_secret(offered: str, secret: str) -> bool:
 # --- state ------------------------------------------------------------
 
 
+def _idle_install() -> dict:
+    """The install progress dict before anything has been started."""
+    return {
+        "running": False,
+        "target": None,
+        "step": "idle",
+        "downloaded": 0,
+        "total": 0,
+        "done": False,
+        "error": None,
+    }
+
+
 class PortalState:
     """One running portal's secrets, counters and shutdown switch.
 
@@ -158,9 +206,11 @@ class PortalState:
         self.code_expires_at = _now() + CODE_TTL_SECONDS
         self.failed_codes = 0
         self.last_seen = _now()
-        # Run 8's hook: a long install must not let the idle watchdog
-        # close the portal out from under it.
+        # A long install must not let the idle watchdog close the portal
+        # out from under it.
         self.watchdog_suspended = False
+        self.install: dict = _idle_install()
+        self.install_thread: threading.Thread | None = None
         self.shutdown_reason: str | None = None
         self.on_shutdown: Callable[[], None] | None = None
         self._lock = threading.Lock()
@@ -216,6 +266,29 @@ class PortalState:
         if locked_out:
             self.request_shutdown(LOCKOUT_REASON)
         return None, failure
+
+    def begin_install(self, target: str) -> bool:
+        """Claim the one install slot. False when one is already running.
+
+        Under the lock with the liveness check, so two clicks arriving on
+        two handler threads cannot both start a download into the same
+        model directory.
+        """
+        with self._lock:
+            if self.install["running"]:
+                # Set here, under this lock, before the caller has even
+                # built the thread — so a second click racing the first
+                # cannot slip through the gap between claiming and
+                # starting.
+                return False
+            if self.install_thread is not None and self.install_thread.is_alive():
+                return False
+            self.install = _idle_install()
+            self.install.update(running=True, target=target, step="starting")
+            # The page legitimately goes quiet during a long install: this
+            # is the one time the watchdog must not close the portal.
+            self.watchdog_suspended = True
+            return True
 
     def token_matches(self, offered: str | None) -> bool:
         if not offered:
@@ -388,6 +461,10 @@ def state_payload(file_config: dict, *, timeout: float = 2.0) -> dict:
         stt = {"error": str(exc)}
 
     return {
+        # What every write must hand back (DEC-005). An early read is the
+        # safe direction: a change landing after it is refused, where a
+        # late one would call a change that already happened "unchanged".
+        "fingerprint": wizard.fingerprint_config(config.config_path()),
         "rows": rows,
         "chain": chain,
         "providers": {
@@ -399,6 +476,434 @@ def state_payload(file_config: dict, *, timeout: float = 2.0) -> dict:
         "budgets": budgets,
         "stt": stt,
     }
+
+
+# --- writes (DEC-005) -------------------------------------------------
+#
+# Every one of these takes a JSON object from the page and turns it into
+# a config file the CLI has to be able to read back. Two rules hold for
+# all of them:
+#
+#   * nothing is written that `config._validate_*` would not accept from
+#     a hand-edited file — the page gets the CLI's own error text, so a
+#     rejected value reads the same wherever you met it;
+#   * nothing is written unless the file still matches the fingerprint
+#     the page was given, and the merge base is re-read from disk so
+#     every key the page never saw survives the write.
+
+
+class _Refused(Exception):
+    """A request this handler answers with a status and one line of text."""
+
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        self.message = message
+        super().__init__(message)
+
+
+def _answer(work: Callable[[], tuple]):
+    """Run a mutating handler, mapping our error families onto responses.
+
+    ConfigChangedError is the compare-and-swap refusal and has its own
+    status: 409 is what tells the page to reload rather than retry.
+    """
+    try:
+        return work()
+    except _Refused as exc:
+        return _json(exc.status, {"error": exc.message})
+    except ConfigChangedError as exc:
+        return _json(409, {"error": str(exc)})
+    except ConfigError as exc:
+        return _json(400, {"error": str(exc)})
+    except VocalizeError as exc:
+        return _json(400, {"error": str(exc)})
+
+
+def _provider_or_404(name: str) -> str:
+    """`name` if it is a provider, else 404 — the allowlist is the check.
+
+    It is also the path check: the name arrives as a URL segment and is
+    only ever compared against this tuple, so no `..` or separator of any
+    kind can reach a filesystem or a subprocess through it.
+    """
+    if name not in auth.PROVIDER_NAMES:
+        raise _Refused(
+            404, f"Unknown provider {name!r}. Known: {', '.join(auth.PROVIDER_NAMES)}"
+        )
+    return name
+
+
+def _fingerprint_from(payload: dict):
+    """The fingerprint the page is handing back, shape-checked.
+
+    Untrusted, and it decides whether a write lands: accepted only in the
+    two shapes `wizard.fingerprint_config` produces, so a caller cannot
+    send `{}` (which would match nothing) or a value whose comparison
+    quietly succeeds for the wrong reason.
+    """
+    value = payload.get("fingerprint")
+    if value == wizard.ABSENT_CONFIG:
+        return wizard.ABSENT_CONFIG
+    if (
+        isinstance(value, dict)
+        and set(value) == {"mtime_ns", "sha256"}
+        and isinstance(value["mtime_ns"], int)
+        and not isinstance(value["mtime_ns"], bool)
+        and isinstance(value["sha256"], str)
+    ):
+        return {"mtime_ns": value["mtime_ns"], "sha256": value["sha256"]}
+    raise _Refused(400, "expected the 'fingerprint' this page was given by /api/state")
+
+
+def _settings_from(payload: dict) -> dict:
+    settings = payload.get("settings")
+    if not isinstance(settings, dict) or not all(isinstance(key, str) for key in settings):
+        raise _Refused(400, "expected a 'settings' object")
+    return settings
+
+
+def _saved(state: PortalState, data: dict, fingerprint):
+    """Write the merged config, then re-read what the CLI would read."""
+    path = config.config_path()
+    wizard.write_config_if_unchanged(path, data, fingerprint)
+    state.file_config = config.load_config_file()
+    return _json(200, {"ok": True, "fingerprint": wizard.fingerprint_config(path)})
+
+
+def post_chain(state: PortalState, payload: dict):
+    order = payload.get("order")
+    if not isinstance(order, list) or not all(isinstance(name, str) for name in order):
+        raise _Refused(400, "expected an 'order' list of provider names")
+    fingerprint = _fingerprint_from(payload)
+    # The CLI's own validator, so an unknown or duplicated name comes back
+    # in the words `vocalize speak` would have used.
+    config._validate_chain(order, config.config_path())
+
+    data = dict(config.load_config_file())
+    data["chain"] = list(order)
+    return _saved(state, data, fingerprint)
+
+
+def _provider_value(name: str, key: str, value):
+    """One `[providers.<name>]` value, coerced and shape-checked."""
+    if key == "speed":
+        return config._coerce_speed(
+            value, f"'speed' in [providers.{name}] in {config.config_path()}"
+        )
+    if key == "monthly_chars":
+        # _validate_providers_table has the message for a bad one; this
+        # only keeps a float or a string from reaching it as an int-alike.
+        return value
+    if not isinstance(value, str):
+        raise _Refused(
+            400, f"Invalid {key} {value!r} for provider {name!r}: expected a string."
+        )
+    if len(value) > 200 or any(not character.isprintable() for character in value):
+        raise _Refused(
+            400,
+            f"Invalid {key} for provider {name!r}: expected a short line with no "
+            f"control characters.",
+        )
+    return value
+
+
+def post_provider(state: PortalState, name: str, payload: dict):
+    _provider_or_404(name)
+    settings = _settings_from(payload)
+    fingerprint = _fingerprint_from(payload)
+
+    data = dict(config.load_config_file())
+    tables = {key: dict(table) for key, table in (data.get("providers") or {}).items()}
+    table = dict(tables.get(name) or {})
+    for key, value in settings.items():
+        if key not in config.KNOWN_PROVIDER_KEYS:
+            # The CLI only warns on stderr here, which a page cannot see;
+            # a write refuses instead, so a typo is never saved.
+            raise _Refused(
+                400,
+                f"unknown config key {key!r} in [providers.{name}]. "
+                f"Known: {', '.join(config.KNOWN_PROVIDER_KEYS)}",
+            )
+        if value is None:
+            table.pop(key, None)  # null clears a key rather than writing "None"
+        else:
+            table[key] = _provider_value(name, key, value)
+
+    if table:
+        tables[name] = table
+    else:
+        tables.pop(name, None)
+    if tables:
+        data["providers"] = tables
+    else:
+        data.pop("providers", None)
+
+    config._validate_providers_table(tables, config.config_path())
+    return _saved(state, data, fingerprint)
+
+
+def post_stt(state: PortalState, payload: dict):
+    settings = _settings_from(payload)
+    fingerprint = _fingerprint_from(payload)
+
+    data = dict(config.load_config_file())
+    table = dict(data.get("stt") or {})
+    for key, value in settings.items():
+        if key not in config.KNOWN_STT_KEYS:
+            raise _Refused(
+                400,
+                f"unknown config key {key!r} in [stt]. "
+                f"Known: {', '.join(config.KNOWN_STT_KEYS)}",
+            )
+        if value is None:
+            table.pop(key, None)
+        else:
+            table[key] = value
+
+    # The whole merged table, not just what changed: the model/language
+    # pairing rule is a check on the pair, and half of it may be already
+    # in the file.
+    config._validate_stt_table(table, config.config_path())
+    if table:
+        data["stt"] = table
+    else:
+        data.pop("stt", None)
+    return _saved(state, data, fingerprint)
+
+
+def post_login(state: PortalState, payload: dict):
+    """Store an API key. The key never leaves this function.
+
+    Not in the response, not in a log (the handler logs nothing at all),
+    not in the URL — the route is a POST and the key is a body field.
+    Every error message is scrubbed of it before it is returned, because
+    the ones we do not write ourselves quote what they were given.
+    """
+    name = _provider_or_404(payload.get("provider"))
+    key = payload.get("key")
+    if not isinstance(key, str) or not key:
+        raise _Refused(400, "No API key given — nothing was stored.")
+
+    # The same two refusals `vocalize auth login` makes before it prompts.
+    if name == "polly":
+        raise _Refused(
+            400,
+            "Polly uses your AWS credentials (env, ~/.aws/credentials, or a "
+            "profile) — nothing to store.",
+        )
+    if name not in auth.PROVIDER_USERNAMES:
+        label = auth.PROVIDER_LABELS.get(name, name)
+        raise _Refused(400, f"{label} is local and needs no credentials.")
+
+    try:
+        message = auth.login(key, name)
+    except VocalizeError as exc:
+        raise _Refused(400, auth.scrub(str(exc), key)) from None
+    return _json(200, {"ok": True, "message": auth.scrub(message, key)})
+
+
+def post_logout(state: PortalState, payload: dict):
+    name = _provider_or_404(payload.get("provider"))
+    if name not in auth.PROVIDER_USERNAMES:
+        raise _Refused(400, f"nothing stored for {name}")
+    auth.delete_key(name)  # reads the entry back, so this is a fact
+    return _json(200, {"ok": True, "message": "Removed the stored API key."})
+
+
+# --- preview ----------------------------------------------------------
+
+
+def _one_line(exc: BaseException) -> str:
+    """One short line for the page, never an upstream's response body.
+
+    `chain.run`'s failure is a small report — a header line, one line per
+    provider tried, then a hint about fallback — so the reason is the
+    second line when there is one. Capped as well as cut: a provider's
+    own message can carry whatever the API said back.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    if not lines:
+        return type(exc).__name__
+    reason = lines[1] if len(lines) > 1 and lines[0].endswith(":") else lines[0]
+    return reason[:200]
+
+
+def post_preview(state: PortalState, name: str):
+    """Speak the fixed sentence through one provider and return the bytes.
+
+    Through `chain.run` with the provider forced, exactly as `vocalize
+    speak --provider` does, so the budget gate, the ledger and the audio
+    cache all apply — a capped provider is refused here for the same
+    reason and in the same words as in a terminal. `run` never plays: it
+    returns the audio, which goes to the page as bytes for a Blob. That
+    is the one sound in this project that does not take the machine-wide
+    playback lock, because it is the browser that plays it.
+    """
+    _provider_or_404(name)
+    from . import chain as chain_module
+    from . import providers as providers_module
+
+    file_config = state.file_config
+    with _preview_lock:
+        try:
+            # The gate the chain would run, called first so a refusal can
+            # be told apart from a provider that broke: same call, same
+            # message, but here it is a 402 rather than one line of a
+            # multi-provider failure report.
+            chain_module._budget_gate(
+                name, providers_module.get(name), PREVIEW_TEXT, file_config
+            )
+        except ProviderError as exc:
+            return _json(402, {"error": str(exc)})
+
+        try:
+            audio, _spoken, ext = chain_module.run(
+                PREVIEW_TEXT,
+                chain=[name],
+                file_config=file_config,
+                cache_dir=CACHE_DIR,
+                forced=True,
+            )
+        except VocalizeError as exc:
+            return _json(502, {"error": _one_line(exc)})
+
+    return _response(
+        200,
+        PREVIEW_TYPES.get(ext, "application/octet-stream"),
+        audio,
+        # No range requests: this is one short blob fetched once with a
+        # header on it, and a partial-content path is only a way for the
+        # server to be asked the same question twice.
+        extra={"Accept-Ranges": "none"},
+    )
+
+
+# --- the local install thread -----------------------------------------
+
+
+def _progress(state: PortalState, already: int):
+    def report(done: int, total: int) -> None:
+        state.install["downloaded"] = already + done
+
+    return report
+
+
+def _opener_kwargs() -> dict:
+    return {} if OPENER is None else {"opener": OPENER}
+
+
+def _install_kokoro(state: PortalState) -> None:
+    from . import local as local_module
+    from .local import install as install_module
+    from .local import kokoro_manifest as manifest
+
+    uv = _uv_or_raise(local_module, install_module)
+    state.install["total"] = sum(entry["size"] for entry in manifest.FILES)
+    done = 0
+    for entry in manifest.FILES:
+        state.install["step"] = f"downloading {entry['name']}"
+        if not install_module.file_is_verified(entry):
+            install_module.download_file(
+                entry["url"],
+                manifest.MODEL_DIR / entry["name"],
+                entry["size"],
+                entry["sha256"],
+                progress=_progress(state, done),
+                **_opener_kwargs(),
+            )
+        done += entry["size"]
+        state.install["downloaded"] = done
+
+    install_module.write_stamp()
+    state.install["step"] = "warming the runtime"
+    install_module.selftest(uv)
+
+
+def _install_stt(state: PortalState, model: str | None) -> None:
+    from . import local as local_module
+    from .local import install as install_module
+    from .local import whisper_manifest as manifest
+
+    uv = _uv_or_raise(local_module, install_module)
+    model = model or manifest.DEFAULT_MODEL
+    if model not in manifest.MODELS:
+        # An allowlist, and the only check there is: this name reaches a
+        # file path and a subprocess argv.
+        raise install_module.InstallError(
+            f"Unknown model {model!r}. Choose one of: {', '.join(manifest.MODELS)}"
+        )
+
+    entry = manifest.file_for(model)
+    state.install["total"] = entry["size"]
+    state.install["step"] = f"downloading {entry['name']}"
+    if not install_module.file_is_verified(entry, manifest=manifest):
+        install_module.download_file(
+            entry["url"],
+            manifest.MODEL_DIR / entry["name"],
+            entry["size"],
+            entry["sha256"],
+            progress=_progress(state, 0),
+            **_opener_kwargs(),
+        )
+    state.install["downloaded"] = entry["size"]
+
+    install_module.write_stamp(manifest=manifest, files=[entry])
+    state.install["step"] = "warming the runtime"
+    install_module.selftest(uv, manifest=manifest, model=model)
+    state.install["step"] = "building the recorder"
+    install_module.build_recorder()
+
+
+def _uv_or_raise(local_module, install_module) -> str:
+    uv = local_module.uv_path()
+    if uv is None:
+        raise install_module.InstallError(
+            "uv is not installed, and the on-device runtime needs it. Install it "
+            "from https://docs.astral.sh/uv/ and try again. Nothing was downloaded."
+        )
+    return uv
+
+
+def _install_worker(state: PortalState, target: str, model: str | None) -> None:
+    try:
+        if target == "kokoro":
+            _install_kokoro(state)
+        else:
+            _install_stt(state, model)
+        state.install["step"] = "installed"
+    except Exception as exc:  # noqa: BLE001 — a thread's traceback goes nowhere
+        # One line, and never a traceback: this reaches a web page, and
+        # an installer's exception text can name paths and URLs.
+        state.install["error"] = _one_line(exc)
+        state.install["step"] = "failed"
+    finally:
+        state.install["running"] = False
+        state.install["done"] = True
+        state.watchdog_suspended = False
+        # The page was not pinging while the watchdog was suspended; without
+        # this the first tick after it resumes could close the portal.
+        state.note_ping()
+
+
+def post_install_start(state: PortalState, payload: dict):
+    target = payload.get("target")
+    if target not in INSTALL_TARGETS:
+        raise _Refused(400, f"expected 'target' to be one of: {', '.join(INSTALL_TARGETS)}")
+    model = payload.get("model")
+    if model is not None and not isinstance(model, str):
+        raise _Refused(400, "expected 'model' to be a model name")
+
+    if not state.begin_install(target):
+        raise _Refused(409, "an install is already running")
+
+    state.install_thread = threading.Thread(
+        target=_install_worker,
+        args=(state, target, model),
+        daemon=True,
+        name="vocalize-portal-install",
+    )
+    state.install_thread.start()
+    return _json(200, dict(state.install))
 
 
 # --- routing ----------------------------------------------------------
@@ -426,8 +931,10 @@ def _header(headers, name: str) -> str | None:
     return headers.get(name)
 
 
-def _response(status: int, content_type: str, body: bytes):
-    return status, {**SECURITY_HEADERS, "Content-Type": content_type}, body
+def _response(status: int, content_type: str, body: bytes, *, extra: dict | None = None):
+    # `extra` first: a caller adding a header must never be able to drop
+    # or rewrite one of the security headers by name.
+    return status, {**(extra or {}), **SECURITY_HEADERS, "Content-Type": content_type}, body
 
 
 def _json(status: int, payload: dict):
@@ -510,6 +1017,29 @@ def route(method: str, path: str, headers, body: bytes, *, state: PortalState):
     if parts.path == "/api/ping" and method == "GET":
         state.note_ping()
         return _json(200, {"ok": True})
+
+    if parts.path == "/api/local/install/status" and method == "GET":
+        state.note_ping()
+        return _json(200, dict(state.install))
+
+    if method == "POST":
+        state.note_ping()
+        if parts.path == "/api/chain":
+            return _answer(lambda: post_chain(state, payload))
+        if parts.path.startswith("/api/provider/"):
+            name = parts.path[len("/api/provider/"):]
+            return _answer(lambda: post_provider(state, name, payload))
+        if parts.path == "/api/stt":
+            return _answer(lambda: post_stt(state, payload))
+        if parts.path == "/api/auth/login":
+            return _answer(lambda: post_login(state, payload))
+        if parts.path == "/api/auth/logout":
+            return _answer(lambda: post_logout(state, payload))
+        if parts.path.startswith("/api/voices/") and parts.path.endswith("/preview"):
+            name = parts.path[len("/api/voices/"): -len("/preview")]
+            return _answer(lambda: post_preview(state, name))
+        if parts.path == "/api/local/install/start":
+            return _answer(lambda: post_install_start(state, payload))
 
     return _json(404, {"error": "no such route"})
 

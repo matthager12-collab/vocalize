@@ -138,6 +138,21 @@ def _no_real_dictation_cache(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_audio_cache(monkeypatch, tmp_path):
+    """Keep the portal's previews out of the real ~/.cache/vocalize.
+
+    Autouse for the same reason as the model-cache fixture: the portal's
+    preview goes through `chain.run` with the same audio cache
+    `vocalize speak` uses, so a fake provider's bytes would otherwise be
+    written into the developer's own cache under the key of a real
+    voice — and the next real read of that sentence would play them.
+    """
+    from vocalize import portal
+
+    monkeypatch.setattr(portal, "CACHE_DIR", tmp_path / "audio-cache")
+
+
+@pytest.fixture(autouse=True)
 def fake_keychain(monkeypatch):
     """Keep every test off the real OS keychain.
 

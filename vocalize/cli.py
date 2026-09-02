@@ -517,11 +517,16 @@ def chain(provider_names) -> None:
             raise click.UsageError(f"Duplicate provider {name!r} in the chain.")
         seen.add(name)
 
+    path = config_path()
+    # Fingerprint first, then read: taken the other way round, a write
+    # that landed between the read and the stat would look unchanged and
+    # be clobbered. This window is microseconds wide, so the behaviour
+    # only changes when something really did move the file (DEC-005).
+    fingerprint = wizard.fingerprint_config(path)
     data = dict(load_config_file())
     data["chain"] = list(provider_names)
-    path = config_path()
     wizard._render_config_text(data)  # fail fast before writing anything
-    wizard._write_config(path, data)
+    wizard.write_config_if_unchanged(path, data, fingerprint)
     click.echo(f"chain={','.join(provider_names)}")
     click.echo(f"wrote {path}")
 
@@ -1224,6 +1229,48 @@ def auth_logout(provider) -> None:
         raise click.ClickException(str(exc)) from exc
     # delete_key reads the entry back, so this line is a fact, not a hope.
     click.echo("Removed the stored API key from the system keychain.")
+
+
+@main.command("portal")
+@click.option(
+    "--no-browser", is_flag=True,
+    help="Print the address instead of opening a browser.",
+)
+def portal_command(no_browser) -> None:
+    """Open the local settings portal in a browser.
+
+    Serves on 127.0.0.1 only, for as long as the page stays open. Stop it
+    with Ctrl-C, or close the tab and let it time out.
+    """
+    import webbrowser
+
+    from . import portal as portal_module
+
+    started = portal_module.serve(load_config_file())
+    click.echo(started.url)
+    click.echo("This link works once, for 60 seconds, from this Mac only.")
+    click.echo("")
+    click.echo(
+        "NOTE: the portal assumes a single-user machine. While it is open, "
+        "anything running as you on this Mac can reach it on 127.0.0.1 — it "
+        "shows your settings and can change them."
+    )
+    click.echo("Press Ctrl-C to close it.")
+
+    if not no_browser:
+        webbrowser.open(started.url)
+
+    try:
+        reason = started.wait()
+    except KeyboardInterrupt:
+        click.echo("")
+        reason = None
+    finally:
+        started.stop()
+
+    click.echo(reason or "The portal is closed.")
+    if reason == portal_module.LOCKOUT_REASON:
+        sys.exit(1)
 
 
 def run() -> None:

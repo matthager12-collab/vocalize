@@ -19,6 +19,7 @@ uses — nothing here re-implements policy that already exists.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -39,7 +40,12 @@ from .config import (
     resolve_settings,
     validate_speed,
 )
-from .exceptions import ConfigError, MissingAPIKeyError, VocalizeError
+from .exceptions import (
+    ConfigChangedError,
+    ConfigError,
+    MissingAPIKeyError,
+    VocalizeError,
+)
 from .tts import DEFAULT_CACHE_DIR, build_client, list_voices, synthesize
 
 PREVIEW_TEXT = "This is how vocalize will sound."
@@ -402,8 +408,23 @@ def _toml_value(key: str, value) -> str:
     return f'"{text}"'
 
 
+# Keys whose value is a table and is therefore rendered as its own
+# `[section]` after every flat key, never as `key = …`.
+_TABLE_KEYS = ("providers", "stt")
+
+
+def _table_lines(header: str, table, what: str) -> list[str]:
+    """One `[header]` block of flat keys, or a refusal to rewrite the file."""
+    if not isinstance(table, dict):
+        raise ConfigError(
+            f"The config file has a non-table value under {what}. The wizard "
+            f"only manages tables of flat keys — edit that file by hand."
+        )
+    return ["", f"[{header}]"] + [f"{key} = {_toml_value(key, value)}" for key, value in table.items()]
+
+
 def _render_config_text(data: dict) -> str:
-    """Render `data` as TOML: flat keys first, then any `[providers.*]` tables.
+    """Render `data` as TOML: flat keys first, then `[stt]` and `[providers.*]`.
 
     Pure — no filesystem access — so `_walk`'s pre-flight dry run can call
     it purely to raise early, and `_write_config` can call it for the text
@@ -414,7 +435,18 @@ def _render_config_text(data: dict) -> str:
     so root keys have to come before every table or a re-read would nest
     them somewhere they don't belong.
     """
-    lines = [f"{key} = {_toml_value(key, value)}" for key, value in data.items() if key != "providers"]
+    lines = [
+        f"{key} = {_toml_value(key, value)}"
+        for key, value in data.items()
+        if key not in _TABLE_KEYS
+    ]
+
+    # [stt] is a table like [providers.*], and rendering it is not
+    # optional: without this every writer of the file — `vocalize chain`
+    # and the wizard included — refuses to rewrite a config that has an
+    # [stt] table in it, because _toml_value has no way to render a dict.
+    if "stt" in data:
+        lines.extend(_table_lines("stt", data["stt"], "'stt'"))
 
     providers = data.get("providers")
     if providers is not None:
@@ -424,17 +456,76 @@ def _render_config_text(data: dict) -> str:
                 "wizard only manages [providers.*] tables — edit that file by hand."
             )
         for name, table in providers.items():
-            if not isinstance(table, dict):
-                raise ConfigError(
-                    f"The config file has a non-table value under providers.{name!r}. "
-                    f"The wizard only manages [providers.*] tables of flat keys — "
-                    f"edit that file by hand."
-                )
-            lines.append("")
-            lines.append(f"[providers.{name}]")
-            lines.extend(f"{pkey} = {_toml_value(pkey, pvalue)}" for pkey, pvalue in table.items())
+            lines.extend(_table_lines(f"providers.{name}", table, f"providers.{name!r}"))
 
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+# The fingerprint of a file that was not there when it was read. A
+# sentinel rather than None so it survives a JSON round trip to the
+# portal page and back (DEC-005).
+ABSENT_CONFIG = "absent"
+
+CONFIG_CHANGED = "config changed on disk — reload"
+
+
+def fingerprint_config(path: Path):
+    """What `path` looked like when it was read: mtime_ns + sha256, or `"absent"`.
+
+    Both, not either: mtime alone misses a write inside the same
+    filesystem timestamp, and content alone would call a file that was
+    rewritten with identical bytes "changed" — nothing, which is right,
+    but it would also treat a restored backup as no change at all. The
+    stat comes from the open file descriptor, so the two halves can never
+    describe two different files.
+    """
+    try:
+        with path.open("rb") as fh:
+            data = fh.read()
+            stat = os.fstat(fh.fileno())
+    except FileNotFoundError:
+        return ABSENT_CONFIG
+    except OSError as exc:
+        raise ConfigError(f"Could not read config file {path}: {exc}") from exc
+    return {"mtime_ns": stat.st_mtime_ns, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def write_config_if_unchanged(path: Path, data: dict, fingerprint) -> str:
+    """Write `data` only if `path` still matches `fingerprint` (DEC-005).
+
+    Every caller reads the whole file, merges its change into the parsed
+    dict and writes the lot back, so two writers — the portal page, the
+    wizard, `vocalize chain`, a hand edit — would otherwise silently
+    drop each other's work. `fingerprint` is what `fingerprint_config`
+    returned at the read; anything else on disk now raises
+    ConfigChangedError and nothing is written.
+
+    An `"absent"` fingerprint creates the file with O_EXCL, so a file
+    that appeared underneath the reader is refused exactly like a file
+    that changed underneath it — the check and the create are one atomic
+    operation there, which is the one case where a stat-then-write race
+    can be closed completely.
+    """
+    text = _render_config_text(data)  # fail before touching the file at all
+
+    if fingerprint == ABSENT_CONFIG:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            raise ConfigChangedError(CONFIG_CHANGED) from None
+        except OSError as exc:
+            raise ConfigError(f"Could not write config file {path}: {exc}") from exc
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError as exc:
+            raise ConfigError(f"Could not write config file {path}: {exc}") from exc
+        return text
+
+    if fingerprint_config(path) != fingerprint:
+        raise ConfigChangedError(CONFIG_CHANGED)
+    return _write_config(path, data)
 
 
 def _write_config(path: Path, data: dict) -> str:
@@ -477,6 +568,11 @@ def run_wizard() -> None:
 
 def _walk(ui) -> None:
     path = config_path()
+    # Before the read, not after it: the wizard then sits on three
+    # interactive questions, and whatever the file looked like when it
+    # was parsed is what the write at the end is allowed to replace
+    # (DEC-005).
+    fingerprint = fingerprint_config(path)
     existing = load_config_file()
     # Dry-run the serialiser before asking any questions: fail fast rather
     # than walking someone through three steps we can't write at the end.
@@ -555,7 +651,7 @@ def _walk(ui) -> None:
         click.echo("Cancelled — nothing changed.", file=ui)
         return
 
-    text = _write_config(path, data)
+    text = write_config_if_unchanged(path, data, fingerprint)
     click.echo(f"Wrote {path}", file=ui)
     if ui is not sys.stdout:
         # The outcome line is the one thing a wrapper or a log should still
