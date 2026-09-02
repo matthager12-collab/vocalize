@@ -77,7 +77,7 @@ cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
 echo "=== Entry criteria ==="
 check 'on branch config-portal' .venv/bin/python -c 'import subprocess,sys; sys.exit(subprocess.run(['"'"'git'"'"','"'"'branch'"'"','"'"'--show-current'"'"'],capture_output=True,text=True).stdout.strip()!='"'"'config-portal'"'"')'
-check '0.10.0 shipped (version on main ≥ 0.10.0)' .venv/bin/python -c 'import subprocess,re; v=subprocess.run(['"'"'git'"'"','"'"'show'"'"','"'"'main:pyproject.toml'"'"'],capture_output=True,text=True).stdout; m=re.search(r'"'"'^version = "(\d+)\.(\d+)'"'"', v, re.M); assert m and (int(m[1]),int(m[2]))>=(0,10), v[:200]'
+check '0.10.0 shipped (version on main >= 0.10.0)' .venv/bin/python -c 'import subprocess,re; v=subprocess.run(["git","show","main:vocalize/__init__.py"],capture_output=True,text=True).stdout; m=re.search(r"^__version__ = \"(\d+)\.(\d+)", v, re.M); assert m and (int(m[1]),int(m[2]))>=(0,10), v[:200]'
 check 'suite green at entry' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 
 echo ""
