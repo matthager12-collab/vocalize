@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- `hooks/claude_stop_hook.py --latest`, run from inside a Claude Code turn
+  (which is how `/speak` runs it), spoke the agent's own status line —
+  "Checking settings." — instead of the response the user asked to hear.
+  It now skips the turn in progress, back past the `/speak` message
+  itself, and speaks the response before it. From a plain terminal, where
+  no turn is in progress, `--latest` still speaks the newest response; the
+  hook tells the two apart by the `CLAUDECODE` variable Claude Code sets
+  in its shell. The Stop-hook path is unchanged.
+
 ## 0.10.0 - 2026-09-02
 
 ### Added

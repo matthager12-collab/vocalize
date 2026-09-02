@@ -7,7 +7,10 @@
 2. On demand, with `--latest`. Nothing is read from stdin; the script finds
    the most recently written transcript under ~/.claude/projects and speaks
    that response. Run it when you want speech instead of installing the
-   hook and getting it after every turn.
+   hook and getting it after every turn. Run from inside a Claude Code turn
+   (the /speak command does this; Claude Code sets CLAUDECODE=1 in its
+   shell) it skips that turn — the newest text there is the agent's own
+   status line — and speaks the response before it.
 
 Add `--print-length` to either mode to print the response's character
 count instead of speaking — for wrappers deciding whether to ask about
@@ -59,7 +62,27 @@ def _speech_timeout(text: str) -> int:
     return min(TIMEOUT_CEILING_SECONDS, TIMEOUT_BASE_SECONDS + len(text) // CHARS_PER_SECOND)
 
 
-def _extract_last_assistant_text(transcript_path: str) -> str:
+def _is_human_message(entry: dict) -> bool:
+    """A user entry the person typed, not one Claude Code wrote.
+
+    Claude Code logs tool results and its own injected text — a skill's
+    body, say — as user entries too; the latter carry ``isMeta``.
+    """
+    if entry.get("type") != "user" or entry.get("isMeta"):
+        return False
+    content = (entry.get("message") or {}).get("content") or []
+    if isinstance(content, str):
+        return True
+    return any(isinstance(b, dict) and b.get("type") != "tool_result" for b in content)
+
+
+def _extract_last_assistant_text(transcript_path: str, skip_current_turn: bool = False) -> str:
+    """Newest assistant text in the transcript.
+
+    With skip_current_turn, everything after the newest human message is
+    the turn still in progress (the one running this script); skip it and
+    return the response before that message instead.
+    """
     last_text_parts: list[str] = []
     try:
         with open(transcript_path, "r", encoding="utf-8") as f:
@@ -74,6 +97,11 @@ def _extract_last_assistant_text(transcript_path: str) -> str:
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
+            continue
+
+        if skip_current_turn:
+            if _is_human_message(entry):
+                skip_current_turn = False  # past the /speak message; older is fair game
             continue
 
         if entry.get("type") != "assistant":
@@ -117,17 +145,24 @@ def main() -> int:
     if "--latest" in sys.argv[1:]:
         # On-demand mode: no hook payload on stdin, so don't read it at all.
         transcript_path = _find_latest_transcript()
+        # Run from inside a Claude Code turn (the /speak command does this,
+        # and Claude Code sets CLAUDECODE=1 in its shell), the newest
+        # assistant text is that turn's own status line — "Checking
+        # settings." — not the response the user asked to hear. From a plain
+        # terminal there is no turn in progress and the newest text is right.
+        skip_current_turn = bool(os.environ.get("CLAUDECODE"))
     else:
         try:
             payload = json.load(sys.stdin)
         except json.JSONDecodeError:
             payload = {}
         transcript_path = payload.get("transcript_path")
+        skip_current_turn = False  # at Stop the turn is over: newest text is the target
 
     if not transcript_path:
         return 0  # nothing to do — don't block Claude Code on a hook error
 
-    text = _extract_last_assistant_text(transcript_path)
+    text = _extract_last_assistant_text(transcript_path, skip_current_turn)
     if not text.strip():
         if "--print-length" in sys.argv[1:]:
             print(0)

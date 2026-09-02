@@ -14,6 +14,10 @@ def _assistant(content) -> str:
     return json.dumps({"type": "assistant", "message": {"content": content}})
 
 
+def _user(content, **extra) -> str:
+    return json.dumps({"type": "user", "message": {"content": content}, **extra})
+
+
 def _text(text: str) -> dict:
     return {"type": "text", "text": text}
 
@@ -28,6 +32,9 @@ def _patch_main(monkeypatch, payload, which="/usr/local/bin/vocalize", run=None,
     """Wire up stdin, PATH lookup and subprocess so main() can't shell out."""
     monkeypatch.delenv("VOCALIZE_MAX_CHARS", raising=False)
     monkeypatch.delenv("VOCALIZE_BIN", raising=False)
+    # The suite itself often runs inside a Claude Code turn, where this is
+    # set; a --latest test must not change meaning depending on who ran it.
+    monkeypatch.delenv("CLAUDECODE", raising=False)
     monkeypatch.setattr(hook.sys, "argv", ["claude_stop_hook.py"])
     monkeypatch.setattr(
         hook.sys, "stdin", io.StringIO(json.dumps(payload)) if stdin is None else stdin
@@ -100,6 +107,31 @@ def test_falls_back_past_tool_use_only_entry(tmp_path):
     )
 
     assert hook._extract_last_assistant_text(path) == "the spoken answer"
+
+
+def test_skip_current_turn_returns_the_response_before_the_newest_human_message(tmp_path):
+    # /speak runs the hook mid-turn. By then the agent has written a status
+    # line and Claude Code has logged the Bash call that runs the hook (and
+    # its result). The response the user wants is the one BEFORE /speak.
+    # Only the typed /speak line counts as the person speaking: tool results
+    # and Claude Code's own injected text (isMeta) are user entries too.
+    path = _write_transcript(
+        tmp_path,
+        [
+            _assistant([_text("the long response the user asked to hear")]),
+            _user("<command-name>/speak</command-name>"),
+            _user([_text("Base directory for this skill: ...")], isMeta=True),
+            _assistant([_text("Checking settings.")]),
+            _assistant([{"type": "tool_use", "name": "Bash", "input": {}}]),
+            _user([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+        ],
+    )
+
+    assert hook._extract_last_assistant_text(path, skip_current_turn=True) == (
+        "the long response the user asked to hear"
+    )
+    # The Stop-hook path still wants the newest text: at Stop, the turn is over.
+    assert hook._extract_last_assistant_text(path) == "Checking settings."
 
 
 def test_ignores_malformed_json_lines(tmp_path):
@@ -324,6 +356,35 @@ def test_latest_mode_speaks_newest_transcript_without_reading_stdin(monkeypatch,
 
     assert hook.main() == 0
     assert calls[0][-1] == "newest session"
+
+
+def test_latest_mode_skips_the_current_turn_only_inside_claude_code(monkeypatch, tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                _assistant([_text("the long response")]),
+                _user("/speak"),
+                _assistant([_text("Checking settings.")]),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls = _patch_main(monkeypatch, {})
+    monkeypatch.setattr(hook.sys, "argv", ["claude_stop_hook.py", "--latest"])
+    monkeypatch.setattr(hook, "_find_latest_transcript", lambda: str(transcript))
+
+    # From a plain terminal there is no turn in progress: newest text wins,
+    # exactly as the README's on-demand mode promises.
+    assert hook.main() == 0
+    assert calls[-1][-1] == "Checking settings."
+
+    # Inside a Claude Code turn, that newest text is the agent's own status
+    # line; the user wants the response before their /speak.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    assert hook.main() == 0
+    assert calls[-1][-1] == "the long response"
 
 
 def test_subprocess_failure_is_logged_not_raised(monkeypatch, tmp_path, capsys):
