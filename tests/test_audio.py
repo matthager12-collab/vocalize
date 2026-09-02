@@ -12,6 +12,8 @@ import platform
 import shutil
 import signal
 import subprocess
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -373,3 +375,60 @@ def test_join_audio_refuses_to_stitch_two_m4a_pieces():
 
 def test_join_audio_passes_a_single_m4a_piece_straight_through():
     assert audio_module.join_audio([b"the only piece"], "m4a") == b"the only piece"
+
+
+def test_play_waits_for_the_playback_slot(monkeypatch, tmp_path):
+    """A play() started while another read holds the slot must not launch
+    its player until the slot frees — the bug this guards against was two
+    Claude Code sessions speaking over each other.
+    """
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    calls = _patch_player(monkeypatch, tmp_path)
+    done = threading.Event()
+
+    def queued_play():
+        play(tmp_path / "queued.mp3")
+        done.set()
+
+    with audio_module._playback_slot():  # someone else is mid-read
+        thread = threading.Thread(target=queued_play)
+        thread.start()
+        assert not done.wait(0.3)  # still queued behind the held slot
+        assert calls == []
+    thread.join(timeout=5)
+    assert done.is_set()
+    assert len(calls) == 1
+
+
+def test_play_sequence_holds_one_slot_for_the_whole_read(monkeypatch, tmp_path):
+    """The slot is acquired once for a whole sequence, not per piece —
+    otherwise a queued read could interleave between two chunks.
+    """
+    acquisitions = []
+
+    @contextmanager
+    def counting_slot():
+        acquisitions.append(1)
+        yield
+
+    monkeypatch.setattr(audio_module, "_playback_slot", counting_slot)
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(shutil, "which", lambda exe: "/usr/bin/afplay" if exe == "afplay" else None)
+    calls = _patch_player(monkeypatch, tmp_path)
+
+    paths = [tmp_path / f"{i}.mp3" for i in range(3)]
+    assert audio_module.play_sequence(paths) is True
+
+    assert acquisitions == [1]
+    assert len(calls) == 3
+
+
+def test_playback_slot_is_a_noop_without_fcntl(monkeypatch):
+    """Windows has no fcntl; the slot degrades to a pass-through rather
+    than crashing, and leaves no lock file behind.
+    """
+    monkeypatch.setattr(audio_module, "fcntl", None)
+    with audio_module._playback_slot():
+        pass
+    assert not audio_module._LOCK_FILE.exists()

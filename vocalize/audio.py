@@ -4,6 +4,11 @@ Deliberately avoids pulling in a heavy playback dependency (pydub /
 simpleaudio / ffmpeg-python) — this just shells out to a system
 player that's virtually always already installed, and fails with a
 clear message if none is found.
+
+Playback is serialized machine-wide: concurrent vocalize invocations (a
+/speak issued while another read is going, two Claude Code sessions
+finishing at once) queue on an exclusive file lock and come out one after
+the other, never over each other.
 """
 
 from __future__ import annotations
@@ -15,7 +20,13 @@ import shutil
 import signal
 import subprocess
 import wave
+from contextlib import contextmanager
 from pathlib import Path
+
+try:  # POSIX-only. Windows playback is already an untested known limitation.
+    import fcntl
+except ImportError:  # pragma: no cover — no Windows CI
+    fcntl = None
 
 from .exceptions import AudioPlaybackError, NoAudioPlayerError
 
@@ -32,6 +43,36 @@ _PID_FILE = Path.home() / ".cache" / "vocalize" / "play.pid"
 # whose process isn't one of these — the recorded PID may have been reused
 # by something else after the player exited uncleanly.
 _PLAYER_NAMES = {"afplay", "mpg123", "ffplay", "cvlc", "powershell"}
+
+# The machine-wide playback queue. Held (flock LOCK_EX) for the duration of
+# one audible read; everyone else blocks here until it frees.
+_LOCK_FILE = Path.home() / ".cache" / "vocalize" / "play.lock"
+
+
+@contextmanager
+def _playback_slot():
+    """Hold the machine-wide right to be the one audible playback.
+
+    Concurrent invocations queue on an exclusive file lock instead of
+    talking over each other; waiters proceed in the order the OS grants
+    the lock. Only playback is serialized — a waiter's synthesis has
+    already happened by the time it gets here. The lock dies with its
+    process (flock semantics), so a killed or timed-out waiter can never
+    leave a stale lock behind.
+
+    Platforms without fcntl (Windows) skip the lock: playback there is
+    already documented as untested, and overlapping beats crashing.
+    """
+    if fcntl is None:
+        yield
+        return
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocks until the current read ends
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
 
 
 def _proc_start_time(pid: int) -> str:
@@ -52,9 +93,10 @@ def _proc_start_time(pid: int) -> str:
 def _clear_own_record(pid: int) -> None:
     """Remove the PID file only if it still holds this play's own record.
 
-    When plays overlap, the later one overwrote the file; the earlier
-    play's exit must not destroy the record of a player that is still
-    running.
+    Defensive: with the playback slot serializing reads, records should
+    never overlap — but on no-fcntl platforms (and against any future
+    bypass) a later play may have overwritten the file, and the earlier
+    play's exit must not destroy the record of a player still running.
     """
     try:
         if _PID_FILE.read_text().splitlines()[:1] == [str(pid)]:
@@ -101,8 +143,9 @@ def stop_playback() -> bool:
     """Kill the player a previous play() recorded. True if one was stopped.
 
     Works across processes: the /speak hook's playback can be stopped from
-    any terminal. When two plays overlap, the last one to start wins the
-    PID file — stopping ends that one.
+    any terminal. Playback is serialized machine-wide, so there is at most
+    one player at a time; stopping it lets the next queued read (if any)
+    begin — run stop again to silence that one too.
 
     Kills only a process that still matches the full recorded identity:
     same PID, same ps launch timestamp, and a known player name. A stale
@@ -143,9 +186,17 @@ def save(audio: bytes, path: Path) -> Path:
 def play(path: Path) -> int:
     """Play one file, blocking until it ends. Returns the player's exit code.
 
-    `-signal.SIGTERM` means `vocalize stop` ended it; 0 means it played to
-    the end.
+    Queues behind any playback already running anywhere on the machine —
+    two concurrent plays come out one after the other, never over each
+    other. `-signal.SIGTERM` means `vocalize stop` ended it; 0 means it
+    played to the end.
     """
+    with _playback_slot():
+        return _play_now(path)
+
+
+def _play_now(path: Path) -> int:
+    """The actual player launch — the caller must hold the playback slot."""
     system = platform.system()
 
     if system == "Windows":
@@ -187,16 +238,19 @@ def play(path: Path) -> int:
 def play_sequence(paths, *, stop_check=None) -> bool:
     """Play each path in order. False as soon as the user stopped one.
 
-    Each piece goes through play(), so the PID file always names the
-    player that is running right now and `vocalize stop` keeps working
-    unchanged. A piece killed by SIGTERM is the user stopping the read:
-    the rest of the sequence is abandoned rather than played on.
+    The whole sequence holds a single playback slot, so a read queued
+    behind it starts only after the last piece — chunks of two reads never
+    interleave. Each piece still goes through _play_now(), so the PID file
+    always names the player that is running right now and `vocalize stop`
+    keeps working unchanged. A piece killed by SIGTERM is the user stopping
+    the read: the rest of the sequence is abandoned rather than played on.
     """
-    for path in paths:
-        if stop_check is not None and stop_check():
-            return False
-        if play(path) == -signal.SIGTERM:
-            return False
+    with _playback_slot():
+        for path in paths:
+            if stop_check is not None and stop_check():
+                return False
+            if _play_now(path) == -signal.SIGTERM:
+                return False
     return True
 
 

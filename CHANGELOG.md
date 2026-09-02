@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.1 - 2026-09-01
+
+### Fixed
+
+- Concurrent invocations no longer talk over each other. Playback is now
+  serialized machine-wide on an exclusive file lock
+  (`~/.cache/vocalize/play.lock`): a read that arrives while another is
+  playing queues and starts the moment the first one ends. Only the audible
+  part is serialized — synthesis still runs concurrently — and the lock
+  dies with its process, so a killed or timed-out waiter can never leave a
+  stale lock behind. Chunked reads hold the slot for the whole sequence, so
+  pieces of two reads never interleave. On platforms without `fcntl`
+  (Windows), the lock is skipped and the old overlapping behavior remains.
+
+### Changed
+
+- `vocalize stop` semantics with a queue: stopping kills the *current*
+  player; the next queued read (if any) then begins. Run `stop` again to
+  silence that one too.
+
 ## 0.9.0 - 2026-09-01
 
 ### Added

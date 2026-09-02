@@ -43,6 +43,17 @@ class _FakeKeyring:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_playback_lock(monkeypatch, tmp_path):
+    """Keep every test off the real playback lock at ~/.cache/vocalize.
+
+    Autouse for the same reason as the ledger fixture: a real lock held by
+    an actual read on the developer's machine would otherwise make any
+    play() test block until the audio finished — a hang with no error.
+    """
+    monkeypatch.setattr("vocalize.audio._LOCK_FILE", tmp_path / "play.lock")
+
+
+@pytest.fixture(autouse=True)
 def _no_real_ledger(monkeypatch, tmp_path):
     """Keep every test off the real usage ledger at ~/.cache/vocalize.
 
