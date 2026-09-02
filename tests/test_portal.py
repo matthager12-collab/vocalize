@@ -621,6 +621,65 @@ def test_state_survives_a_credential_probe_that_blocks(monkeypatch):
     }
 
 
+def test_state_ten_polls_against_a_blocked_key_probe_start_one_thread(monkeypatch):
+    """T-61's criterion, aimed at `portal._probes`.
+
+    The readiness sibling above proves `readiness._inflight`, which is run
+    5's registry. This one proves the portal's own: it is what makes a
+    keychain read wedged behind a permission dialog cost one thread per
+    provider for the life of the process, not six per poll.
+    """
+    blocked = threading.Event()  # never set until the assertions are done
+
+    def wedged(name, file_config):
+        blocked.wait()
+
+    monkeypatch.setattr(portal, "_key_status", wedged)
+    state = _state(readiness_timeout=0.05)
+    try:
+        _authed_get(state, "/api/state")
+        after_first = _alive_threads()
+        for _ in range(9):
+            _authed_get(state, "/api/state")
+        assert _alive_threads() == after_first
+    finally:
+        blocked.set()
+
+
+def test_state_bounds_every_credential_probe_by_one_deadline(monkeypatch):
+    """Six wedged keychain reads cost about one timeout between them.
+
+    Joined one after another they made the first page load — the one the
+    user is actually waiting on — six times slower than the timeout says,
+    and the in-flight registry saves the thread, not the wait.
+    """
+    from vocalize import auth
+
+    blocked = threading.Event()  # never set until the assertions are done
+
+    def wedged(name, file_config):
+        blocked.wait()
+
+    monkeypatch.setattr(portal, "_key_status", wedged)
+    timeout = 0.3
+    state = _state(readiness_timeout=timeout)
+    try:
+        start = time.monotonic()
+        status, _headers, body = _authed_get(state, "/api/state")
+        elapsed = time.monotonic() - start
+
+        assert status == 200
+        providers = json.loads(body)["providers"]
+        assert len(providers) == len(auth.PROVIDER_NAMES) >= 6
+        assert all(
+            entry["key"] == {"source": "not checked", "masked": None}
+            for entry in providers.values()
+        )
+        assert elapsed < timeout * 3, f"{elapsed:.2f}s for {len(providers)} providers"
+    finally:
+        blocked.set()
+
+
 def test_state_survives_a_credential_probe_that_raises(monkeypatch):
     def boom(name, file_config):
         raise RuntimeError("sk_secret_in_the_message")

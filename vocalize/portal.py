@@ -240,32 +240,44 @@ _probe_lock = threading.Lock()
 _probes: dict[str, _Slot] = {}
 
 
-def _bounded(name: str, work: Callable[[], object], timeout: float, fallback):
+def _start(name: str, work: Callable[[], object]) -> _Slot:
+    """Run `work` on a daemon thread — or hand back the one still running.
+
+    Starting is separate from waiting so that a payload needing several
+    probes can start them all and then wait once: six wedged keychain
+    reads joined one after another cost six timeouts, and the page polls
+    this route.
+    """
     with _probe_lock:
         slot = _probes.get(name)
-        if slot is None or slot.thread is None or not slot.thread.is_alive():
-            slot = _Slot()
-            _probes[name] = slot
+        if slot is not None and slot.thread is not None and slot.thread.is_alive():
+            return slot
 
-            def target() -> None:
-                try:
-                    slot.value = work()
-                except Exception:  # noqa: BLE001 — a probe must never break /api/state
-                    # Never the message: like readiness's registry this
-                    # runs credential code, and an exception's text can
-                    # carry credential-shaped material.
-                    slot.value = None
+        slot = _Slot()
+        _probes[name] = slot
 
-            slot.thread = threading.Thread(
-                target=target, daemon=True, name=f"vocalize-portal-{name}"
-            )
-            slot.thread.start()
-        thread = slot.thread
+        def target() -> None:
+            try:
+                slot.value = work()
+            except Exception:  # noqa: BLE001 — a probe must never break /api/state
+                # Never the message: like readiness's registry this
+                # runs credential code, and an exception's text can
+                # carry credential-shaped material.
+                slot.value = None
 
-    thread.join(timeout)
-    if thread.is_alive() or slot.value is None:
-        return fallback
-    return slot.value
+        slot.thread = threading.Thread(target=target, daemon=True, name=f"vocalize-portal-{name}")
+        slot.thread.start()
+        return slot
+
+
+def _collect(slot: _Slot, timeout: float, fallback):
+    """What the probe returned, or `fallback` if it is still running."""
+    thread = slot.thread
+    if thread is not None:
+        thread.join(max(timeout, 0.0))
+        if thread.is_alive():
+            return fallback
+    return fallback if slot.value is None else slot.value
 
 
 # --- /api/state -------------------------------------------------------
@@ -300,13 +312,16 @@ def _key_status(name: str, file_config: dict) -> dict:
     return {"source": source, "masked": auth.masked(key) if key else None}
 
 
-def _provider_entry(name: str, file_config: dict, primary: bool, timeout: float) -> dict:
+def _provider_entry(name: str, file_config: dict, primary: bool, key: _Slot, deadline: float) -> dict:
     entry: dict = {
         "monthly_chars": config.budget_for(name, file_config),
-        "key": _bounded(
-            f"key:{name}",
-            lambda: _key_status(name, file_config),
-            timeout,
+        # A floor rather than the bare remainder: once the deadline has
+        # passed, a probe that has already finished should still have its
+        # answer collected rather than every later one reading "not
+        # checked".
+        "key": _collect(
+            key,
+            max(deadline - _now(), 0.05),
             {"source": "not checked", "masked": None},
         ),
     }
@@ -331,10 +346,19 @@ def _provider_entry(name: str, file_config: dict, primary: bool, timeout: float)
 def state_payload(file_config: dict, *, timeout: float = 2.0) -> dict:
     """Everything the page renders read-only, with no secret in it.
 
-    Bounded by `timeout` per readiness row and per credential probe, so a
-    wedged keychain yields a "still checking" row and the response still
-    returns.
+    Bounded by `timeout` per readiness row, and by one shared deadline
+    across all six credential probes — which are started here, before the
+    readiness rows, so they overlap those instead of queueing behind
+    them. A wedged keychain therefore costs about one timeout for the
+    whole payload rather than one per provider, and yields "still
+    checking" rather than a hung route.
     """
+    deadline = _now() + timeout
+    key_probes = {
+        name: _start(f"key:{name}", lambda n=name: _key_status(n, file_config))
+        for name in auth.PROVIDER_NAMES
+    }
+
     rows = [row._asdict() for row in readiness.readiness(file_config, timeout=timeout)]
 
     try:
@@ -363,7 +387,9 @@ def state_payload(file_config: dict, *, timeout: float = 2.0) -> dict:
         "rows": rows,
         "chain": chain,
         "providers": {
-            name: _provider_entry(name, file_config, bool(order) and name == order[0], timeout)
+            name: _provider_entry(
+                name, file_config, bool(order) and name == order[0], key_probes[name], deadline
+            )
             for name in auth.PROVIDER_NAMES
         },
         "budgets": budgets,
