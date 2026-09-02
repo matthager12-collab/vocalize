@@ -12,6 +12,7 @@ same rules through.
 from __future__ import annotations
 
 import email.message
+import hashlib
 import http.client
 import json
 import os
@@ -21,6 +22,8 @@ import stat
 import threading
 import time
 import webbrowser
+from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -325,7 +328,9 @@ def test_token_in_the_request_body_is_refused_and_costs_no_code():
     assert state.failed_codes == 0
 
 
-@pytest.mark.parametrize("path", ("/api/state", "/api/ping", "/api/nope"))
+@pytest.mark.parametrize(
+    "path", ("/api/state", "/api/ping", "/api/local/install/status", "/api/nope")
+)
 def test_api_routes_refuse_a_missing_token(path):
     state = _state()
     assert _get(state, path)[0] == 401
@@ -1694,3 +1699,400 @@ def test_a_mutating_route_is_not_reachable_with_a_get(guarded_config, path):
     """A GET is what a link, an <img> or a prefetch would send."""
     state = _state()
     assert _authed_get(state, path)[0] == 404
+
+
+# --- previews (T-63) ---------------------------------------------------
+#
+# The preview goes through `chain.run` with the provider forced, which is
+# what makes the budget gate, the ledger and the audio cache apply to it
+# exactly as they do to `vocalize speak --provider`. The provider module
+# is a fake; nothing here reaches a network or a speaker.
+
+
+class _FakeProvider:
+    """One provider module's contract, and a record of what it was asked."""
+
+    DEFAULTS: ClassVar[dict] = {}
+
+    def __init__(self, ext="m4a", audio=b"AUDIO-BYTES", error=None):
+        self.AUDIO_EXT = ext
+        self.NAME = "say"
+        self.audio = audio
+        self.error = error
+        self.calls = []
+        self.checked = []
+
+    def check(self, settings, **kwargs):
+        self.checked.append(settings)
+
+    def synthesize(self, text, settings, **kwargs):
+        self.calls.append(text)
+        if self.error is not None:
+            raise self.error
+        return self.audio
+
+
+@pytest.fixture
+def fake_provider(monkeypatch):
+    provider = _FakeProvider()
+    monkeypatch.setattr("vocalize.providers.get", lambda name: provider)
+    return provider
+
+
+@pytest.mark.parametrize(
+    ("ext", "content_type"),
+    (("mp3", "audio/mpeg"), ("wav", "audio/wav"), ("m4a", "audio/mp4")),
+)
+def test_a_preview_answers_with_the_audio_and_its_content_type(
+    fake_provider, ext, content_type
+):
+    fake_provider.AUDIO_EXT = ext
+    state = _state()
+
+    status, headers, body = _authed_post(state, "/api/voices/say/preview", {})
+
+    assert status == 200
+    assert headers["Content-Type"] == content_type
+    assert headers["Accept-Ranges"] == "none"
+    assert body == b"AUDIO-BYTES"
+    assert fake_provider.calls == [portal.PREVIEW_TEXT]
+    for name, value in portal.SECURITY_HEADERS.items():
+        assert headers[name] == value
+
+
+@pytest.mark.parametrize("name", ("nope", "..", "say/../google", ""))
+def test_a_preview_of_an_unknown_provider_is_404(fake_provider, name):
+    state = _state()
+    status, _headers, _body = _authed_post(state, f"/api/voices/{name}/preview", {})
+    assert status == 404
+    assert fake_provider.calls == []
+
+
+def test_a_preview_spends_the_ledger_and_a_repeat_is_a_cache_hit(fake_provider):
+    from vocalize import ledger
+
+    state = _state()
+
+    assert _authed_post(state, "/api/voices/say/preview", {})[0] == 200
+    assert ledger.status("say") == (len(portal.PREVIEW_TEXT), False)
+
+    assert _authed_post(state, "/api/voices/say/preview", {})[0] == 200
+    # One synthesis, one charge: the second click was served from the same
+    # audio cache `vocalize speak` uses.
+    assert fake_provider.calls == [portal.PREVIEW_TEXT]
+    assert ledger.status("say") == (len(portal.PREVIEW_TEXT), False)
+
+
+def test_a_budget_capped_preview_is_refused_in_the_chains_own_words(fake_provider):
+    from vocalize import chain as chain_module
+
+    file_config = {"chain": ["say"], "providers": {"say": {"monthly_chars": 5}}}
+    state = _state(file_config)
+
+    status, _headers, body = _authed_post(state, "/api/voices/say/preview", {})
+
+    with pytest.raises(VocalizeError) as expected:
+        chain_module._budget_gate("say", fake_provider, portal.PREVIEW_TEXT, file_config)
+    assert status == 402
+    assert json.loads(body)["error"] == str(expected.value)
+    assert fake_provider.calls == []
+
+
+def test_an_exhausted_provider_is_refused_before_it_is_asked(fake_provider):
+    from vocalize import ledger
+
+    ledger.mark_exhausted("say")
+    state = _state()
+
+    status, _headers, body = _authed_post(state, "/api/voices/say/preview", {})
+
+    assert status == 402
+    assert "quota" in json.loads(body)["error"]
+    assert fake_provider.calls == []
+
+
+def test_a_failed_preview_is_502_and_never_the_upstream_body(fake_provider):
+    from vocalize.exceptions import ProviderTransientError
+
+    fake_provider.error = ProviderTransientError(
+        "say", "HTTP 500\n<html><body>internal trace and quota details</body></html>"
+    )
+    state = _state()
+
+    status, _headers, body = _authed_post(state, "/api/voices/say/preview", {})
+
+    assert status == 502
+    error = json.loads(body)["error"]
+    assert "\n" not in error
+    assert "<html>" not in error
+    assert "internal trace" not in error
+    assert len(error) <= 200
+
+
+def test_two_previews_run_one_at_a_time(fake_provider):
+    """One module lock, which is also what keeps Kokoro's session single-threaded."""
+    state = _state()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_synthesize(text, settings, **kwargs):
+        fake_provider.calls.append(text)
+        entered.set()
+        assert release.wait(5)
+        return b"AUDIO-BYTES"
+
+    fake_provider.synthesize = blocking_synthesize
+    answers = {}
+
+    def preview(label):
+        answers[label] = _authed_post(state, "/api/voices/say/preview", {})
+
+    first = threading.Thread(target=preview, args=("first",), daemon=True)
+    first.start()
+    assert entered.wait(5)
+
+    second = threading.Thread(target=preview, args=("second",), daemon=True)
+    second.start()
+    second.join(0.3)
+    assert second.is_alive(), "the second preview did not wait for the first"
+
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert answers["first"][0] == 200
+    assert answers["second"][0] == 200
+    # And the one that waited found the first one's audio in the cache.
+    assert fake_provider.calls == [portal.PREVIEW_TEXT]
+
+
+def test_a_preview_never_goes_through_the_playback_path(fake_provider, monkeypatch):
+    """The browser plays the blob; nothing here takes the machine-wide lock."""
+
+    def never(*args, **kwargs):
+        raise AssertionError("a preview must not play audio on this machine")
+
+    monkeypatch.setattr("vocalize.audio.play", never)
+    monkeypatch.setattr("vocalize.audio.play_sequence", never)
+    monkeypatch.setattr("vocalize.audio._run_tracked", never)
+    state = _state()
+
+    assert _authed_post(state, "/api/voices/say/preview", {})[0] == 200
+
+
+# --- the local install thread (T-63) -----------------------------------
+#
+# The download seam is `portal.OPENER`, so these exercise the real
+# `download_file` — its size and sha256 checks included — without a byte
+# leaving the machine. The runtime selftest and the recorder build are
+# fakes: both shell out.
+
+
+class _FakeDownload:
+    """One response, delivered in blocks, pausing once if asked to."""
+
+    def __init__(self, blob, pause=None, reached=None):
+        self._blob = blob
+        self._at = 0
+        self._pause = pause
+        self._reached = reached
+
+    def read(self, size):
+        if self._pause is not None and self._at:
+            # Once, after the first block has been written and reported:
+            # the caller wants a half-finished download to look at.
+            self._reached.set()
+            assert self._pause.wait(5)
+            self._pause = None
+        chunk = self._blob[self._at:self._at + size]
+        self._at += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def fake_install(monkeypatch):
+    """A one-file STT install with every subprocess and the network faked."""
+    from vocalize import local as local_module
+    from vocalize.local import install as install_module
+    from vocalize.local import whisper_manifest as manifest
+
+    blob = b"m" * 64
+    entry = {
+        "name": "ggml-fake.bin",
+        "url": "https://example.invalid/ggml-fake.bin",
+        "size": len(blob),
+        "sha256": hashlib.sha256(blob).hexdigest(),
+    }
+    seen = SimpleNamespace(
+        blob=blob,
+        entry=entry,
+        urls=[],
+        selftest=[],
+        recorder=[],
+        pause=threading.Event(),
+        reached=threading.Event(),
+        paused=False,
+        model_dir=manifest.MODEL_DIR,
+    )
+
+    def opener(url, timeout=None):
+        seen.urls.append(url)
+        pause = seen.pause if seen.paused else None
+        return _FakeDownload(seen.blob, pause, seen.reached)
+
+    monkeypatch.setattr(manifest, "file_for", lambda model: seen.entry)
+    monkeypatch.setattr(install_module, "_BLOCK", 16)
+    monkeypatch.setattr(portal, "OPENER", opener)
+    monkeypatch.setattr(local_module, "uv_path", lambda: "/usr/bin/true")
+    monkeypatch.setattr(
+        install_module, "selftest", lambda *a, **k: seen.selftest.append(k) or "ok"
+    )
+    monkeypatch.setattr(
+        install_module,
+        "build_recorder",
+        lambda *a, **k: (seen.recorder.append(1), ("current", seen.model_dir))[1],
+    )
+    return seen
+
+
+def _install_status(state):
+    return json.loads(_authed_get(state, "/api/local/install/status")[2])
+
+
+def _wait_for_install(state, timeout=5.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        status = _install_status(state)
+        if status["done"]:
+            return status
+        time.sleep(0.01)
+    raise AssertionError("the install never finished")
+
+
+def test_an_install_downloads_verifies_stamps_and_warms_the_runtime(fake_install):
+    state = _state()
+
+    status, _headers, body = _authed_post(
+        state, "/api/local/install/start", {"target": "stt"}
+    )
+
+    assert status == 200
+    # A snapshot, not a promise: a fast install can be over before the
+    # start call has finished serialising its answer.
+    assert json.loads(body)["target"] == "stt"
+    final = _wait_for_install(state)
+
+    assert final["error"] is None
+    assert final["running"] is False
+    assert final["downloaded"] == final["total"] == len(fake_install.blob)
+    assert fake_install.urls == [fake_install.entry["url"]]
+    assert (fake_install.model_dir / "ggml-fake.bin").read_bytes() == fake_install.blob
+    assert fake_install.selftest and fake_install.recorder
+
+
+def test_an_install_reports_progress_while_it_runs(fake_install):
+    fake_install.paused = True
+    state = _state()
+
+    assert _authed_post(state, "/api/local/install/start", {"target": "stt"})[0] == 200
+    assert fake_install.reached.wait(5)
+
+    midway = _install_status(state)
+    assert midway["running"] is True
+    assert midway["target"] == "stt"
+    assert midway["done"] is False
+    assert 0 < midway["downloaded"] < midway["total"]
+    assert "ggml-fake.bin" in midway["step"]
+
+    fake_install.pause.set()
+    assert _wait_for_install(state)["error"] is None
+
+
+def test_a_second_install_while_one_runs_is_409(fake_install):
+    fake_install.paused = True
+    state = _state()
+
+    assert _authed_post(state, "/api/local/install/start", {"target": "stt"})[0] == 200
+    assert fake_install.reached.wait(5)
+
+    status, _headers, body = _authed_post(
+        state, "/api/local/install/start", {"target": "kokoro"}
+    )
+
+    assert status == 409
+    assert "already running" in json.loads(body)["error"]
+
+    fake_install.pause.set()
+    _wait_for_install(state)
+    # And once it is over, the next one is allowed.
+    assert _authed_post(state, "/api/local/install/start", {"target": "stt"})[0] == 200
+    _wait_for_install(state)
+
+
+def test_the_idle_watchdog_never_fires_during_an_install(fake_install):
+    """The page goes quiet while a 488 MB model downloads; that is allowed."""
+    fake_install.paused = True
+    started = portal.serve({"chain": ["say"]}, idle_timeout=0.05)
+    try:
+        result = portal.route(
+            "POST",
+            "/api/local/install/start",
+            {"Host": started.state.expected_host, TOKEN_HEADER: started.state.token},
+            json.dumps({"target": "stt"}).encode(),
+            state=started.state,
+        )
+        assert result[0] == 200
+        assert fake_install.reached.wait(5)
+        assert started.state.watchdog_suspended is True
+        assert started.wait(0.4) is None  # still up, long past the idle timeout
+
+        fake_install.pause.set()
+        _wait_for_install(started.state)
+        assert started.state.watchdog_suspended is False
+        # And the watchdog is watching again the moment the install ends.
+        assert started.wait(5.0) == portal.IDLE_REASON
+    finally:
+        started.stop()
+
+
+def test_a_failed_install_reports_one_line_and_leaves_nothing_behind(fake_install):
+    fake_install.blob = b"not the file the manifest names".ljust(64, b".")
+    state = _state()
+
+    assert _authed_post(state, "/api/local/install/start", {"target": "stt"})[0] == 200
+    final = _wait_for_install(state)
+
+    assert final["running"] is False
+    assert final["error"] and "\n" not in final["error"]
+    assert "checksum" in final["error"]
+    assert not (fake_install.model_dir / "ggml-fake.bin").exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ({}, {"target": "say"}, {"target": ["stt"]}, {"target": "stt", "model": 7}),
+)
+def test_an_install_start_with_a_bad_target_is_400(fake_install, payload):
+    state = _state()
+    status, _headers, _body = _authed_post(state, "/api/local/install/start", payload)
+    assert status == 400
+    assert fake_install.urls == []
+
+
+def test_an_install_of_an_unknown_model_downloads_nothing(fake_install):
+    """The model name reaches a file path and an argv: allowlist or nothing."""
+    state = _state()
+
+    assert _authed_post(
+        state, "/api/local/install/start", {"target": "stt", "model": "../../evil"}
+    )[0] == 200
+    final = _wait_for_install(state)
+
+    assert "Unknown model" in final["error"]
+    assert fake_install.urls == []
