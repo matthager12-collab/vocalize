@@ -47,7 +47,9 @@
       // Without this the portal would exit a minute after it loaded and
       // the next click would fail with a connection error.
       window.setInterval(function () {
-        fetch("/api/ping", { headers: { "X-Vocalize-Token": token } });
+        // Swallowed on purpose: once the portal has closed, every ping
+        // fails, and an uncaught rejection every 15 s is only noise.
+        fetch("/api/ping", { headers: { "X-Vocalize-Token": token } }).catch(function () {});
       }, 15000);
       return fetch("/api/state", {
         headers: { "X-Vocalize-Token": token }
