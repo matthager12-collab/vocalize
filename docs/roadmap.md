@@ -8,6 +8,8 @@ Future work, with the research behind each item. Status legend: **planned** = an
 | `vocalize status` one-screen readiness check | **shipped** in 0.10.0 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) |
 | Spoken cues for dictation (`[stt] cues = "words"`: "start" / "stopped" / "ready" instead of, or as well as, the sounds) | **shipped** in 0.10.2 | — | owner request, 2026-09-02 |
 | Cue timing: the "talk now" cue must follow the *open* microphone and never be recorded (recorder warms the input, reports ready, waits for a `go` marker; `dictate` plays the cue, then touches `go`) | planned | [#2](https://github.com/matthager12-collab/vocalize/issues/2) | first live use of 0.10.2: people talk after "Start." and lose the first word |
+| Transcript cleanup: drop restatements, false starts and filler by default, with a spoken keyword that turns it off for a verbatim dictation | planned | [#3](https://github.com/matthager12-collab/vocalize/issues/3) | owner, 2026-09-03: "one of the problems with these vocalization tools is that they don't do a good job of that" |
+| Words run together in fast speech (`"toget"` for `"to get"`) — whisper.cpp is loaded with greedy sampling and no beam search | planned | [#4](https://github.com/matthager12-collab/vocalize/issues/4) | observed live on 0.10.2 |
 | Config portal (`vocalize portal`, stdlib local web page on top of the same readiness rows) | planned — runs 7–10 of the [plan](plans/2026-09-next-features/plan.md) | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-config-portal-design.md) |
 
 ## Decisions (2026-09-01, closed 2026-09-02)
