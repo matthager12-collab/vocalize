@@ -149,7 +149,13 @@ silently drops one either. Wait for the clipboard notification, or use
 
 New to the sounds and can't tell Tink from Pop from Glass? Set
 `[stt] cues = "words"` and vocalize says "Start.", "Stopped." and "Ready."
-instead — see the `[stt]` table below.
+instead, or `"both"` to hear the word and then its sound — see the `[stt]`
+table below. Timing matters: "Start." is spoken *before* the microphone
+opens (so it is never in your recording), and the microphone is open
+about a second later — the Tink marks that moment. So in `"both"` mode
+talk after the Tink; in `"words"` mode give it a beat after "Start.".
+Closing that gap is
+[#2](https://github.com/matthager12-collab/vocalize/issues/2).
 
 ## `vocalize listen`
 
@@ -232,7 +238,7 @@ cues = "sounds"  # "sounds" | "words" | "both"
 | `paste` | reserved | `false` | not implemented in 0.10.0 — setting it does nothing |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
-| `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound. Has no effect while `sounds = false`. |
+| `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
 
 Every value here eventually becomes a subprocess argument — the recorder's
 `--device`, or the whisper worker's `--model`/`--language` — so each one is

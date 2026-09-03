@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.10.2 - 2026-09-02
 
 ### Added
 
@@ -12,11 +12,22 @@ All notable changes to this project are documented here. Format follows
   is unchanged; `"words"` speaks "Start.", "Stopped.", "Ready." in their
   place; `"both"` speaks the word and then plays the sound. The word files
   ship in `vocalize/assets/cues/`, generated with the local Kokoro voice.
-  When a cue is spoken, the start cue now plays *before* the recorder
-  launches rather than after — a spoken "Start." played once the
-  microphone was already open would otherwise be recorded and transcribed
-  along with the dictation. The plain Tink is unaffected and still plays
-  after launch, as before.
+  A spoken "Start." plays *before* the recorder launches — played once the
+  microphone was open it would be recorded and transcribed along with the
+  dictation. In `"both"` mode the Tink still plays *after* the microphone
+  opens, so the two cues keep distinct meanings: the word is "get ready",
+  the sound is "talk now". The plain Tink is unaffected.
+
+### Known issue
+
+- In `"words"` mode there is no cue for the moment the microphone actually
+  opens, which is a second or so after "Start." finishes (LaunchServices
+  start-up plus the input device switching on). People start talking too
+  soon and lose their first word. The fix — open and warm the microphone
+  first, play the cue, and only then capture — is tracked in
+  [#2](https://github.com/matthager12-collab/vocalize/issues/2). Until
+  then: in `"words"` mode, wait a beat after "Start."; in `"both"` mode,
+  talk after the Tink.
 
 ## 0.10.1 - 2026-09-02
 

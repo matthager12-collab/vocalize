@@ -319,8 +319,8 @@ def _recorder_pid(workdir: Path) -> int | None:
 # --- feedback: sounds and notifications -------------------------------
 
 
-def _play(sound: Path, stt: dict) -> None:
-    """One feedback sound, through the machine-wide playback lock.
+def _play(sound: Path, stt: dict, *, only: str | None = None) -> None:
+    """One feedback cue, through the machine-wide playback lock.
 
     Through `audio.play` and not a raw `afplay` so a sound queues behind
     (and can be stopped with) any read in progress — the overlap 0.9.1
@@ -331,19 +331,22 @@ def _play(sound: Path, stt: dict) -> None:
     of the sound; "both" speaks it and then plays the sound. A missing
     word file — a package installed without `vocalize/assets/cues/`, say
     — falls back to the sound rather than saying nothing at all.
+
+    `only` plays just the "word" half or just the "sound" half of the cue,
+    for the one caller that needs them at different moments: `_start`
+    speaks before the microphone opens and plays the sound after.
     """
     if not stt.get("sounds", True):
         return
     cues = stt.get("cues", "sounds")
+    word = _CUE_WORDS.get(sound) if cues in ("words", "both") else None
+    if word is not None and not word.is_file():
+        word = None  # fall back to the sound
     try:
-        if cues in ("words", "both"):
-            word = _CUE_WORDS.get(sound)
-            if word is not None and word.is_file():
-                audio.play(word)
-                if cues == "both":
-                    audio.play(sound)
-                return
-        audio.play(sound)
+        if word is not None and only != "sound":
+            audio.play(word)
+        if only != "word" and (word is None or cues == "both"):
+            audio.play(sound)
     except Exception:  # noqa: BLE001, S110 — feedback is never worth failing a dictation for
         pass
 
@@ -1063,14 +1066,14 @@ def _start(workdir: Path, stt: dict) -> int:
     # that read saves its place, and this dictation offers it back once the
     # transcript has landed (DEC-003).
     audio.stop_playback(remember=True)
-    # A spoken cue has to finish *before* the microphone opens, or "Start"
-    # gets recorded and transcribed along with the dictation. `audio.play`
-    # blocks until playback ends, so playing it here — before the recorder
-    # launches — is safe; the plain Tink stays after launch, exactly as
-    # before, since nothing spoken is at risk.
-    spoken_start = stt.get("cues", "sounds") in ("words", "both")
-    if spoken_start:
-        _play(_SOUND_START, stt)
+    # A spoken "Start." has to finish *before* the microphone opens, or it
+    # is recorded and transcribed along with the dictation (`audio.play`
+    # blocks until playback ends). The Tink plays *after* the recorder
+    # reports it is recording, as it always has — so in "both" mode the
+    # two cues keep distinct meanings: the word is "get ready", the sound
+    # is "the microphone is open, talk now". The gap between them is the
+    # recorder's start-up; closing it is issue #2.
+    _play(_SOUND_START, stt, only="word")
     try:
         _launch_recorder(workdir, stt)
     except DictationError:
@@ -1088,8 +1091,7 @@ def _start(workdir: Path, stt: dict) -> int:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
         return 1
-    if not spoken_start:
-        _play(_SOUND_START, stt)
+    _play(_SOUND_START, stt, only="sound")
     return 0
 
 

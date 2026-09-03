@@ -430,6 +430,18 @@ def test_both_mode_speaks_the_word_then_plays_the_sound(
     recorder()
     transcriber()
 
+    original_launch = dictate._launch_recorder
+
+    def launch_between_word_and_sound(workdir, settings):
+        # "Start." is "get ready" and plays before the microphone opens;
+        # the Tink is "talk now" and must wait until the recorder reports
+        # it is recording — otherwise the sound promises a microphone that
+        # is still a second away.
+        assert harness.played == ["start.wav"]
+        return original_launch(workdir, settings)
+
+    monkeypatch.setattr(dictate, "_launch_recorder", launch_between_word_and_sound)
+
     assert start(cues="both") == 0
     assert press_again(monkeypatch, cues="both") == 0
 

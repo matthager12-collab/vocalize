@@ -6,7 +6,8 @@ Future work, with the research behind each item. Status legend: **planned** = an
 |---|---|---|---|
 | Hotkey-triggered local dictation (voice → text via a local Whisper model, Quick Action toggle, clipboard output, optional cleanup) | **shipped** in 0.10.0, usable from 0.10.1 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) · [plan](plans/2026-09-next-features/plan.md) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-dictation-design.md) · [voicebox findings](research/2026-09-01-voicebox-findings.md) |
 | `vocalize status` one-screen readiness check | **shipped** in 0.10.0 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) |
-| Spoken cues for dictation (`[stt] cues = "words"`: "start" / "stopped" / "ready" instead of, or as well as, the sounds) | building | — | owner request, 2026-09-02 |
+| Spoken cues for dictation (`[stt] cues = "words"`: "start" / "stopped" / "ready" instead of, or as well as, the sounds) | **shipped** in 0.10.2 | — | owner request, 2026-09-02 |
+| Cue timing: the "talk now" cue must follow the *open* microphone and never be recorded (recorder warms the input, reports ready, waits for a `go` marker; `dictate` plays the cue, then touches `go`) | planned | [#2](https://github.com/matthager12-collab/vocalize/issues/2) | first live use of 0.10.2: people talk after "Start." and lose the first word |
 | Config portal (`vocalize portal`, stdlib local web page on top of the same readiness rows) | planned — runs 7–10 of the [plan](plans/2026-09-next-features/plan.md) | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-config-portal-design.md) |
 
 ## Decisions (2026-09-01, closed 2026-09-02)
