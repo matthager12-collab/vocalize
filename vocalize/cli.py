@@ -490,6 +490,7 @@ def settings() -> None:
     click.echo(f"stt.language={stt['language']}")
     click.echo(f"stt.cleanup={'true' if stt['cleanup'] else 'false'}")
     click.echo(f"stt.max_seconds={stt['max_seconds']}")
+    click.echo(f"stt.cues={stt['cues']}")
 
 
 @main.command()

@@ -147,6 +147,10 @@ never runs two transcriptions over the same recording, and it never
 silently drops one either. Wait for the clipboard notification, or use
 `--cancel`.
 
+New to the sounds and can't tell Tink from Pop from Glass? Set
+`[stt] cues = "words"` and vocalize says "Start.", "Stopped." and "Ready."
+instead — see the `[stt]` table below.
+
 ## `vocalize listen`
 
 The terminal-facing primitive behind the hotkey:
@@ -216,6 +220,7 @@ cleanup = false
 paste = false
 max_seconds = 120
 sounds = true
+cues = "sounds"  # "sounds" | "words" | "both"
 ```
 
 | Key | Type / allowlist | Default | Notes |
@@ -226,7 +231,8 @@ sounds = true
 | `cleanup` | `true` / `false` | `false` | see `--cleanup` above |
 | `paste` | reserved | `false` | not implemented in 0.10.0 — setting it does nothing |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
-| `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three |
+| `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
+| `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound. Has no effect while `sounds = false`. |
 
 Every value here eventually becomes a subprocess argument — the recorder's
 `--device`, or the whisper worker's `--model`/`--language` — so each one is
@@ -243,6 +249,7 @@ stt.model=small.en
 stt.language=en
 stt.cleanup=false
 stt.max_seconds=120
+stt.cues=sounds
 ```
 
 ### The input-device gotcha

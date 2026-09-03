@@ -136,6 +136,16 @@ _SOUND_START = _SOUND_DIR / "Tink.aiff"
 _SOUND_STOP = _SOUND_DIR / "Pop.aiff"
 _SOUND_DONE = _SOUND_DIR / "Glass.aiff"
 
+# Spoken alternatives to the three system sounds (`[stt] cues`), shipped
+# with the package — same package-relative pattern as
+# `local/install.py`'s `_RECORDER_DIR`.
+_CUES_DIR = Path(__file__).resolve().parent / "assets" / "cues"
+_CUE_WORDS = {
+    _SOUND_START: _CUES_DIR / "start.wav",
+    _SOUND_STOP: _CUES_DIR / "stopped.wav",
+    _SOUND_DONE: _CUES_DIR / "ready.wav",
+}
+
 # Every notification this module can ever show. Fixed strings, no
 # interpolation: a transcript must never reach Notification Center, and
 # `_notify` enforces that by refusing anything not in this set.
@@ -315,10 +325,24 @@ def _play(sound: Path, stt: dict) -> None:
     Through `audio.play` and not a raw `afplay` so a sound queues behind
     (and can be stopped with) any read in progress — the overlap 0.9.1
     fixed. Never fatal: a missing system sound must not lose a dictation.
+
+    `[stt] cues` picks what plays instead of (or alongside) the sound:
+    "sounds" (default) is unchanged; "words" speaks the cue word in place
+    of the sound; "both" speaks it and then plays the sound. A missing
+    word file — a package installed without `vocalize/assets/cues/`, say
+    — falls back to the sound rather than saying nothing at all.
     """
     if not stt.get("sounds", True):
         return
+    cues = stt.get("cues", "sounds")
     try:
+        if cues in ("words", "both"):
+            word = _CUE_WORDS.get(sound)
+            if word is not None and word.is_file():
+                audio.play(word)
+                if cues == "both":
+                    audio.play(sound)
+                return
         audio.play(sound)
     except Exception:  # noqa: BLE001, S110 — feedback is never worth failing a dictation for
         pass
@@ -1039,6 +1063,14 @@ def _start(workdir: Path, stt: dict) -> int:
     # that read saves its place, and this dictation offers it back once the
     # transcript has landed (DEC-003).
     audio.stop_playback(remember=True)
+    # A spoken cue has to finish *before* the microphone opens, or "Start"
+    # gets recorded and transcribed along with the dictation. `audio.play`
+    # blocks until playback ends, so playing it here — before the recorder
+    # launches — is safe; the plain Tink stays after launch, exactly as
+    # before, since nothing spoken is at risk.
+    spoken_start = stt.get("cues", "sounds") in ("words", "both")
+    if spoken_start:
+        _play(_SOUND_START, stt)
     try:
         _launch_recorder(workdir, stt)
     except DictationError:
@@ -1056,7 +1088,8 @@ def _start(workdir: Path, stt: dict) -> int:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
         return 1
-    _play(_SOUND_START, stt)
+    if not spoken_start:
+        _play(_SOUND_START, stt)
     return 0
 
 

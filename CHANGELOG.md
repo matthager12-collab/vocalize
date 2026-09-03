@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- **`[stt] cues`** picks what a dictation's feedback sounds — say instead
+  of, or alongside, the Tink/Pop/Glass system sounds. `"sounds"` (default)
+  is unchanged; `"words"` speaks "Start.", "Stopped.", "Ready." in their
+  place; `"both"` speaks the word and then plays the sound. The word files
+  ship in `vocalize/assets/cues/`, generated with the local Kokoro voice.
+  When a cue is spoken, the start cue now plays *before* the recorder
+  launches rather than after — a spoken "Start." played once the
+  microphone was already open would otherwise be recorded and transcribed
+  along with the dictation. The plain Tink is unaffected and still plays
+  after launch, as before.
+
 ## 0.10.1 - 2026-09-02
 
 Three fixes found in the first owner-present run of 0.10.0's dictation.

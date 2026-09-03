@@ -697,6 +697,30 @@ def test_a_non_boolean_stt_flag_is_refused(monkeypatch, tmp_path, key):
     assert f"stt.{key}" in str(excinfo.value)
 
 
+@pytest.mark.parametrize("value", ['"chime"', "1"])
+def test_an_invalid_stt_cues_value_is_refused(monkeypatch, tmp_path, value):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\ncues = {value}\n")
+
+    message = str(excinfo.value)
+    assert "stt.cues" in message
+    assert "sounds" in message and "words" in message and "both" in message
+
+
+@pytest.mark.parametrize("value", ["sounds", "words", "both"])
+def test_each_stt_cues_mode_is_accepted(monkeypatch, tmp_path, value):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, f'[stt]\ncues = "{value}"\n')
+    assert resolve_stt(data)["cues"] == value
+
+
+def test_stt_cues_defaults_to_sounds(monkeypatch, tmp_path):
+    from vocalize.config import resolve_stt
+
+    assert resolve_stt(_load_stt(monkeypatch, tmp_path, ""))["cues"] == "sounds"
+
+
 def test_an_stt_value_that_is_not_a_table_is_refused(monkeypatch, tmp_path):
     with pytest.raises(ConfigError) as excinfo:
         _load_stt(monkeypatch, tmp_path, 'stt = "small.en"\n')

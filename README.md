@@ -449,6 +449,8 @@ terminal, if you'd rather trigger it that way.
 - **A third press while transcribing is refused**: a Pop, and "Still
   transcribing the last dictation." Wait for the clipboard notification, or
   `--cancel`, before dictating again.
+- Can't tell Tink from Pop from Glass yet? Set `[stt] cues = "words"` and
+  vocalize says "Start.", "Stopped.", "Ready." instead.
 
 ### `vocalize listen`
 
@@ -483,6 +485,7 @@ input_device = ""      # "" = system default; else an exact name from --list-dev
 cleanup = false        # send the transcript (never audio) to Claude first
 max_seconds = 120      # 1-600; the recorder self-stops here, dictate backstops it
 sounds = true          # the Tink/Pop/Glass feedback sounds
+cues = "sounds"        # "sounds" | "words" | "both" — speak "Start."/"Stopped."/"Ready." instead
 ```
 
 | Key | Allowed values | Default |
@@ -494,6 +497,7 @@ sounds = true          # the Tink/Pop/Glass feedback sounds
 | `paste` | reserved — not implemented in 0.10.0 | `false` |
 | `max_seconds` | integer, 1–600 | `120` |
 | `sounds` | `true` / `false` | `true` |
+| `cues` | `sounds`, `words`, `both` | `sounds` |
 
 An unknown key warns on stderr; a bad value is a `ConfigError` naming it —
 every one of these becomes a subprocess argument eventually, so nothing

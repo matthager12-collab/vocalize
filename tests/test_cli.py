@@ -624,8 +624,10 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     _isolate_overflow_env(monkeypatch, tmp_path)
     cfg = tmp_path / "vocalize" / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text('[stt]\nmodel = "base.en"\ncleanup = true\nmax_seconds = 30\n',
-                   encoding="utf-8")
+    cfg.write_text(
+        '[stt]\nmodel = "base.en"\ncleanup = true\nmax_seconds = 30\ncues = "sounds"\n',
+        encoding="utf-8",
+    )
 
     result = CliRunner().invoke(main, ["settings"])
 
@@ -634,6 +636,7 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert "stt.language=en" in result.output
     assert "stt.cleanup=true" in result.output
     assert "stt.max_seconds=30" in result.output
+    assert "stt.cues=sounds" in result.output
 
 
 def test_settings_prints_defaults_when_nothing_is_configured(monkeypatch, tmp_path):

@@ -57,7 +57,11 @@ KNOWN_STT_KEYS = (
     "paste",
     "max_seconds",
     "sounds",
+    "cues",
 )
+
+# What `cues` may be: the fixed system sounds, spoken words instead, or both.
+STT_CUE_MODES = ("sounds", "words", "both")
 
 # `paste` is reserved by DEC-006 and deliberately does nothing in 0.10.0.
 STT_DEFAULTS = {
@@ -68,6 +72,7 @@ STT_DEFAULTS = {
     "paste": False,
     "max_seconds": 120,
     "sounds": True,
+    "cues": "sounds",
 }
 
 # The recorder self-stops at max_seconds and `dictate` backstops it, so this
@@ -290,6 +295,13 @@ def _validate_stt_table(value, path: Path) -> None:
         flag = value.get(key)
         if flag is not None and not isinstance(flag, bool):
             raise ConfigError(f"Invalid stt.{key} {flag!r} in {path}: expected true or false.")
+
+    cues = value.get("cues")
+    if cues is not None and cues not in STT_CUE_MODES:
+        raise ConfigError(
+            f"Invalid stt.cues {cues!r} in {path}. Expected one of: "
+            f"{', '.join(STT_CUE_MODES)}."
+        )
 
 
 def _validate_input_device(device, path: Path) -> None:

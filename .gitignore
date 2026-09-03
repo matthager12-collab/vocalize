@@ -11,5 +11,6 @@ dist/
 venv/
 *.mp3
 *.wav
+!vocalize/assets/cues/*.wav
 .claude/
 uv.lock

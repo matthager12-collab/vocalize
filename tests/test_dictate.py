@@ -399,6 +399,79 @@ def test_the_second_press_transcribes_and_copies_to_the_clipboard(
     assert any(dictate._NOTIFY_COPIED in line for line in harness.notifications())
 
 
+# --- spoken cues (`[stt] cues`) ----------------------------------------
+
+
+def test_words_mode_speaks_start_stop_and_done(
+    recorder, transcriber, harness, monkeypatch
+):
+    recorder()
+    transcriber()
+
+    original_launch = dictate._launch_recorder
+
+    def launch_after_start_cue(workdir, settings):
+        # The spoken "Start." must finish before the microphone opens, or
+        # it would be recorded and transcribed along with the dictation.
+        assert "start.wav" in harness.played
+        return original_launch(workdir, settings)
+
+    monkeypatch.setattr(dictate, "_launch_recorder", launch_after_start_cue)
+
+    assert start(cues="words") == 0
+    assert press_again(monkeypatch, cues="words") == 0
+
+    assert harness.played == ["start.wav", "stopped.wav", "ready.wav"]
+
+
+def test_both_mode_speaks_the_word_then_plays_the_sound(
+    recorder, transcriber, harness, monkeypatch
+):
+    recorder()
+    transcriber()
+
+    assert start(cues="both") == 0
+    assert press_again(monkeypatch, cues="both") == 0
+
+    assert harness.played == [
+        "start.wav", "Tink.aiff",
+        "stopped.wav", "Pop.aiff",
+        "ready.wav", "Glass.aiff",
+    ]
+
+
+def test_sounds_false_silences_words_too(recorder, transcriber, harness, monkeypatch):
+    recorder()
+    transcriber()
+
+    assert start(cues="words", sounds=False) == 0
+    assert press_again(monkeypatch, cues="words", sounds=False) == 0
+
+    assert harness.played == []
+
+
+def test_a_missing_cue_word_file_falls_back_to_the_sound(
+    recorder, transcriber, harness, monkeypatch, tmp_path
+):
+    empty = tmp_path / "no-cues"
+    empty.mkdir()
+    monkeypatch.setattr(
+        dictate, "_CUE_WORDS",
+        {
+            dictate._SOUND_START: empty / "start.wav",
+            dictate._SOUND_STOP: empty / "stopped.wav",
+            dictate._SOUND_DONE: empty / "ready.wav",
+        },
+    )
+    recorder()
+    transcriber()
+
+    assert start(cues="words") == 0
+    assert press_again(monkeypatch, cues="words") == 0
+
+    assert harness.played == ["Tink.aiff", "Pop.aiff", "Glass.aiff"]
+
+
 def test_the_working_directory_and_session_are_gone_after_a_stop(
     recorder, transcriber, monkeypatch
 ):
