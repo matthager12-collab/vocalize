@@ -77,7 +77,14 @@ cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
 echo "=== Entry criteria ==="
 check 'on branch config-portal' .venv/bin/python -c 'import subprocess,sys; sys.exit(subprocess.run(['"'"'git'"'"','"'"'branch'"'"','"'"'--show-current'"'"'],capture_output=True,text=True).stdout.strip()!='"'"'config-portal'"'"')'
-check '0.10.0 shipped (version on main ≥ 0.10.0)' .venv/bin/python -c 'import subprocess,re; v=subprocess.run(['"'"'git'"'"','"'"'show'"'"','"'"'main:pyproject.toml'"'"'],capture_output=True,text=True).stdout; m=re.search(r'"'"'^version = "(\d+)\.(\d+)'"'"', v, re.M); assert m and (int(m[1]),int(m[2]))>=(0,10), v[:200]'
+# Amended by the run-7 executor, 2026-09-02: this check read the version
+# from `main:pyproject.toml`, which has never carried one — the project is
+# `dynamic = ["version"]` and `[tool.hatch.version]` points at
+# vocalize/__init__.py. The regex therefore could not match on any commit
+# in this repository's history, so the check failed with main at 0.10.1
+# exactly as it had with main at 0.9.1: a gate that cannot pass proves as
+# little as one that cannot fail. It now reads the version hatch reads.
+check '0.10.0 shipped (version on main ≥ 0.10.0)' .venv/bin/python -c 'import subprocess,re; v=subprocess.run(['"'"'git'"'"','"'"'show'"'"','"'"'main:vocalize/__init__.py'"'"'],capture_output=True,text=True).stdout; m=re.search(r'"'"'^__version__ = .(\d+)\.(\d+)'"'"', v, re.M); assert m and (int(m[1]),int(m[2]))>=(0,10), v[:200]'
 check 'suite green at entry' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 
 echo ""

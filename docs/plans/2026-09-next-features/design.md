@@ -181,6 +181,95 @@ Recorder identity: the bundle is compiled once by `local install --stt`; the sta
 | `POST /api/local/install/start`, `GET /api/local/install/status` | token header | background thread + progress dict; idle timer suspended while running |
 | `GET /api/ping` | token header | keepalive; N misses → shutdown |
 
+#### `GET /api/state` payload
+
+The one contract run 9's page renders from — written down because the page
+is meant to be mechanical from it, and reverse-engineering `_state()`
+instead means special-casing four different error conventions by hand.
+
+| Key | Type | On failure |
+|---|---|---|
+| `rows` | list of `{name, state, detail, action}` — `readiness()`'s rows | never fails; a probe that raised or hung is a `warn` row |
+| `chain` | list of provider names | `[]` for a bad `VOCALIZE_CHAIN`; the **default** chain for a bad config file — see below |
+| `chain_source` | string: the provenance phrase, *or* the error message | **overloaded, but only for the environment** — see below |
+| `providers` | `{name: entry}` for every `auth.PROVIDER_NAMES`, always all of them | per-entry, below |
+| `stt` | the resolved `[stt]` settings dict, defaults filled in | **cannot fail** — see below |
+| `config_path` | string, always present | — |
+| `config_error` | string or `null` — the file would not parse, read *or validate* | non-`null` means the **whole file was discarded**; every other key then describes defaults, *except* `chain`/`chain_source` when `VOCALIZE_CHAIN` is also bad — see below |
+
+**A bad chain has two shapes, and they look nothing alike.** Run 9's page has to
+render both. Verified against a running portal:
+
+| Bad input | `chain` | `chain_source` | `config_error` |
+|---|---|---|---|
+| `VOCALIZE_CHAIN=nope` | `[]` | `"Unknown provider 'nope' in VOCALIZE_CHAIN. Known: …"` | `null` |
+| `chain = ["nope"]` in the config file | `["elevenlabs", "say"]` — the **default** chain | `"default"` | `"Unknown provider 'nope' in 'chain' in <path>. Known: …"` |
+
+`load_config_file()` validates `chain`, `[stt]`, the *shape* of the `providers`
+table and `monthly_chars` while it parses, so any of those being wrong raises before
+`_state()` ever holds a dict. `_state()`
+catches that into `config_error` and carries on with `file_config = {}` — so a bad
+file does not produce an empty chain, it produces the *default* one. The trap: with
+nothing but the `chain` rows to go on, the page would show `["elevenlabs", "say"]`
+from `"default"` and no sign anything was wrong. **A non-`null` `config_error`
+outranks every other key on the page.** Both can be set at once — a bad file *and* a
+bad `VOCALIZE_CHAIN` gives the env error in `chain_source` and the file's in
+`config_error`.
+
+**`config_error` is `null` for the mistake a human is most likely to make.** The
+per-provider *values* — `speed`, `voice`, `model`, `language`, `region`, `profile` —
+are **not** validated at parse time. `_validate_providers_table()` raises only for the
+table's shape and for `monthly_chars`; everything else warns or passes untouched.
+Of the six, **only `speed` is checked later**, per provider. `voice`, `model`,
+`language`, `region` and `profile` are never validated at all and reach `settings` as
+whatever type the file held — verified: `voice = 12345` gives `settings.voice == 12345`
+with `error` `null`, `config_error` `null`, and nothing on stderr. Verified against a running portal with
+`[providers.elevenlabs] speed = 99`:
+
+| Key | Value |
+|---|---|
+| `config_error` | `null` |
+| `chain` / `chain_source` | `["elevenlabs", "say"]` / `"default"` |
+| `providers.elevenlabs.error` | `"Invalid speed 99.0 from 'speed' in [providers.elevenlabs] in <path>: must be between 0.7 and 1.2."` |
+| `providers.elevenlabs.settings` | `null` |
+
+So `config_error == null` does **not** mean the file is fine. Run 9's page must read
+`providers.<name>.error` as well; the per-entry bullets below describe that path.
+
+**`stt` never carries an error.** `_state()` wraps `resolve_stt()` in a try/except
+that cannot fire: `resolve_stt` re-validates through the same `_validate_stt_table()`
+that `load_config_file()` already ran, so for either dict `_state()` can hand it — a
+parsed config, or `{}` after a `ConfigError` — the second validation is the first one
+repeated and raises nothing. A bad `[stt]` in the file arrives as `config_error` with
+`stt` holding the defaults (verified: `model = "nope"` gives a set `config_error` and
+`stt.model == "small.en"`). **Run 9's page must not draw an `stt.error` branch** —
+nothing reaches it. The guard stays because `resolve_stt` is also called on
+hand-built dicts from `POST /api/stt`, where it genuinely can raise; reaching it from
+`/api/state` would take `_state()` resolving `[stt]` from the raw file table instead
+of the validated one, which is not a change to make.
+
+One `providers` entry: `label`, `in_chain` (bool), `budget` (int or `null`),
+`used` (int), `exhausted` (bool), `settings` (`{voice, model, speed, language,
+region, profile}` or `null`), `key` (`{source, masked}`), `error` (string or
+`null`).
+
+* `key.source` is one of the five `auth.key_source` words, plus `"not
+  applicable"` (a local provider), `"checking"` (the probe thread is still
+  running — poll again) and `"error"` (the probe finished by raising).
+  `key.masked` is a preview, never a key, and is `null` unless there is one.
+* `error` is that provider's alone and never the page's: a broken
+  `[providers.<name>]`, ledger or budget is caught per provider. Two
+  unrelated failures are joined with `"; "` rather than one silently
+  replacing the other.
+* An unplanned exception contributes its *type name*, never its message —
+  `readiness._start_probe`'s rule, because a message is untrusted text.
+
+A route that raises anyway answers `500 {"error": "The portal hit an
+internal error."}` with the same headers, so the page can always tell a
+server error from the portal having exited.
+
+Lockout: **every failed `POST /api/session` exchange counts** toward the five, not only a wrong code value — a replay of a used code, an expired one and a malformed body all count, because the server keeps nothing that could tell a replay from an attack (DEC-015). Five closes the portal; the recovery is `vocalize portal` again, and **run 9's page must strip the `#code=` fragment once exchanged and must never retry the exchange on its own.** A request whose `Origin` header is present and is not `http://127.0.0.1:<port>` is refused immediately after the `Host` pin and *before* the counter can see it, so a cross-origin POST from any tab cannot close the portal; an absent `Origin` — every non-browser client — is unaffected (DEC-016). That last clause is also the accepted limitation: **any local process can close the portal with five `Origin`-less POSTs**, no code and no token needed. Availability only, and accepted rather than fixed — DEC-018.
+
 Every response carries `Content-Security-Policy: default-src 'self'; media-src 'self' blob:; frame-ancestors 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`. The token is accepted from the header only — never query string or body — with one negative test per mutating route. The Local tab edits the `[stt]` table (model, language, input device from `--list-devices`) through `POST /api/stt`, so the readiness rows that say "set input_device" can be acted on in the page.
 
 ## Decision summary
@@ -201,6 +290,8 @@ Every response carries `Content-Security-Policy: default-src 'self'; media-src '
 | DEC-012 | A stop with no player to name, a stopped resume replay, a continuation that fails, and the plaintext remainder | § Interrupted-read resume |
 | DEC-013 | A stop silences every read in flight, not only the player it names | § Interrupted-read resume, verification Manual 4c |
 | DEC-014 | The contract changes the 0.10.0 release review forced | § Key flows, § Interrupted-read resume, § Input device, § Terminal primitive |
+| DEC-015 | The lockout counts every failed `/api/session` exchange, not only a wrong code | § Portal routes |
+| DEC-016 | A present-and-wrong `Origin` is refused before the lockout counter sees it | § Portal routes |
 
 ## Testing strategy
 

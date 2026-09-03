@@ -734,3 +734,24 @@ def test_resolve_stt_revalidates_a_hand_built_dict():
 
     with pytest.raises(ConfigError):
         resolve_stt({"stt": {"model": "--serve"}})
+
+
+def test_an_unknown_key_warns_once_however_often_the_file_is_read(
+    monkeypatch, tmp_path, capsys
+):
+    """The portal re-reads and re-validates the file on every /api/state poll.
+
+    One typo used to write a stderr line every few seconds for the life of
+    the process, burying the portal's own lockout and idle-shutdown notices,
+    which print to the same terminal.
+    """
+    import vocalize.config as config_module
+
+    monkeypatch.setattr(config_module, "_warned", set())
+    _isolate(monkeypatch, tmp_path, 'voise = "typo"\n[stt]\nmodle = "typo"\n')
+
+    config_module.load_config_file()
+    assert "unknown config key" in capsys.readouterr().err
+
+    config_module.load_config_file()
+    assert capsys.readouterr().err == ""

@@ -164,29 +164,35 @@ def test_raising_probe_never_leaks_exception_message(monkeypatch, tmp_path, fake
 
 
 def test_blocked_probe_yields_warn_within_timeout():
-    event = threading.Event()  # never set
+    event = threading.Event()  # released in the finally, or its thread outlives us
     readiness_module._PROBES["blocked"] = event.wait
 
-    start = time.monotonic()
-    rows = readiness({"chain": ["say"]}, timeout=0.2)
-    elapsed = time.monotonic() - start
+    try:
+        start = time.monotonic()
+        rows = readiness({"chain": ["say"]}, timeout=0.2)
+        elapsed = time.monotonic() - start
 
-    row = next(r for r in rows if r.name == "blocked")
-    assert row.state == "warn"
-    assert "still checking" in row.detail
-    assert elapsed < 0.2 + 0.5
+        row = next(r for r in rows if r.name == "blocked")
+        assert row.state == "warn"
+        assert "still checking" in row.detail
+        assert elapsed < 0.2 + 0.5
+    finally:
+        event.set()
 
 
 def test_repeated_call_reuses_thread_across_calls():
-    event = threading.Event()  # never set
+    event = threading.Event()  # released in the finally, or its thread outlives us
     readiness_module._PROBES["wedged"] = event.wait
 
-    readiness({"chain": ["say"]}, timeout=0.05)
-    count_after_first = threading.active_count()
-    readiness({"chain": ["say"]}, timeout=0.05)
-    count_after_second = threading.active_count()
+    try:
+        readiness({"chain": ["say"]}, timeout=0.05)
+        count_after_first = threading.active_count()
+        readiness({"chain": ["say"]}, timeout=0.05)
+        count_after_second = threading.active_count()
 
-    assert count_after_second == count_after_first
+        assert count_after_second == count_after_first
+    finally:
+        event.set()
 
 
 def test_registry_accepts_a_name_not_in_provider_names():
@@ -606,3 +612,26 @@ def test_a_running_probe_is_never_dropped_when_its_row_disappears(monkeypatch):
         release.set()
         readiness_module._PROBES.pop("microphone", None)
         readiness_module._inflight.pop("microphone", None)
+
+
+def test_wedged_probes_are_joined_against_one_shared_deadline():
+    """Three blocked probes cost one timeout, not three.
+
+    The portal polls this while a keychain dialog is up, so joining each
+    probe for the full timeout in turn is paid on every poll — 4x2s with
+    the default chain, and the docstring's "never blocks longer than
+    `timeout`" is a promise the caller reads as a bound on the call.
+    """
+    blocked = threading.Event()  # released in the finally: three daemon threads
+    for name in ("wedged-1", "wedged-2", "wedged-3"):
+        readiness_module._PROBES[name] = blocked.wait
+
+    try:
+        start = time.monotonic()
+        rows = readiness({"chain": ["say"]}, timeout=0.5)
+        elapsed = time.monotonic() - start
+
+        assert sum(r.detail == readiness_module.STILL_CHECKING for r in rows) == 3
+        assert elapsed < 1.0, f"three wedged probes took {elapsed:.2f}s of a 0.5s budget"
+    finally:
+        blocked.set()

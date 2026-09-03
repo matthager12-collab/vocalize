@@ -139,6 +139,22 @@ def resolve_api_key(explicit: str | None = None) -> str:
     return resolve_provider_key("elevenlabs", explicit)
 
 
+#: Config warnings already printed. The portal re-reads and re-validates the
+#: file on every `/api/state` poll, so without this one typo writes a stderr
+#: line every few seconds for the life of the process — burying the two
+#: messages the portal actually needs the user to see, its lockout and its
+#: idle shutdown, which go to the same terminal. A single-shot CLI run warns
+#: exactly as it did before.
+_warned: set[str] = set()
+
+
+def _warn(message: str) -> None:
+    """Print a config warning once per process."""
+    if message not in _warned:
+        _warned.add(message)
+        print(message, file=sys.stderr)
+
+
 def config_path() -> Path:
     """Path of the optional TOML config file."""
     base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
@@ -170,7 +186,7 @@ def load_config_file() -> dict:
 
     for key in data:
         if key not in KNOWN_CONFIG_KEYS:
-            print(f"vocalize: unknown config key {key!r} in {path}", file=sys.stderr)
+            _warn(f"vocalize: unknown config key {key!r} in {path}")
 
     if "chain" in data:
         _validate_chain(data["chain"], path)
@@ -218,16 +234,14 @@ def _validate_providers_table(value, path: Path) -> None:
 
     for name, table in value.items():
         if name not in auth.PROVIDER_NAMES:
-            print(
+            _warn(
                 f"vocalize: unknown provider {name!r} under 'providers' in {path}. "
-                f"Known: {', '.join(auth.PROVIDER_NAMES)}",
-                file=sys.stderr,
+                f"Known: {', '.join(auth.PROVIDER_NAMES)}"
             )
         for key, val in table.items():
             if key not in KNOWN_PROVIDER_KEYS:
-                print(
-                    f"vocalize: unknown config key {key!r} in [providers.{name}] in {path}",
-                    file=sys.stderr,
+                _warn(
+                    f"vocalize: unknown config key {key!r} in [providers.{name}] in {path}"
                 )
             if key == "monthly_chars":
                 _validate_monthly_chars(val, name, path)
@@ -248,7 +262,7 @@ def _validate_stt_table(value, path: Path) -> None:
 
     for key in value:
         if key not in KNOWN_STT_KEYS:
-            print(f"vocalize: unknown config key {key!r} in [stt] in {path}", file=sys.stderr)
+            _warn(f"vocalize: unknown config key {key!r} in [stt] in {path}")
 
     model = value.get("model")
     if model is not None and model not in whisper_manifest.MODELS:

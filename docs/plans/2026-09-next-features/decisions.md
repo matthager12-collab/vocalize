@@ -15,6 +15,10 @@
 | DEC-012 | What does the interrupt record do when the stop finds no player, when the replay is stopped, and when the continuation fails? | Decided | A stop always leaves a marker (PID `0` when nothing is playing); the record is only ever replaced, never dropped, while a read is still recoverable | R4 |
 | DEC-013 | Whose playback does a stop silence — the player it names, or every read in flight? | Decided | Every read in flight: the marker is left for the window rather than consumed, and any read about to start a piece takes it | R5 |
 | DEC-014 | The contract changes the 0.10.0 release review forced | Decided | Claims age from themselves, the clipboard is one line, `--cleanup` is logged by Claude Code, resume carries its voice, and the first press waits out the permission dialog | R5 |
+| DEC-015 | What counts toward the portal's five-attempt lockout? | Decided | Every failed `/api/session` exchange, not only a wrong code | R6 |
+| DEC-016 | How is a cross-origin POST kept from closing the portal? | Decided | Refused on `Origin` in `route()`, before the lockout counter can see it | R6 |
+| DEC-017 | May a run amend its own exit gate, and did run 7's amendment hold? | Decided | Yes when the check cannot pass on any commit; proved red and green before use | R6 |
+| DEC-018 | Any local process can close the portal with five `Origin`-less POSTs | Decided — accepted limitation | Accepted, not fixed: availability only, and the attacker who matters can already kill the process. A timed cooldown is the alternative, deliberately not taken | R6 |
 
 ---
 
@@ -443,3 +447,189 @@ The adversarial review of the shipped 0.10.0 branch ([review-0.10.0.md](./review
 - `vocalize/dictate.py`, `vocalize/interrupted.py`, `vocalize/readiness.py`, `vocalize/cli.py`, `vocalize/audio.py`, `vocalize/local/install.py`, `vocalize/recorder/VocalizeRecorder.swift`
 - `README.md`, `docs/dictation.md`
 - [review-0.10.0.md](./review-0.10.0.md)
+
+---
+
+## Round 6
+
+Run 7 shipped the portal server. Three choices it made were argued only in code
+comments and in [run-7's report](./run-7-portal-read/report.md); the adversarial
+review ([review-findings.md](./run-7-portal-read/review-findings.md), finding 14)
+called the first of them out by name. Recorded here because run 9 writes the page
+that has to live with DEC-015 and DEC-016. DEC-018 was added by a later fix round:
+it decides nothing new, it writes down the limitation the first two leave behind.
+
+### DEC-015: What counts toward the portal's five-attempt lockout?
+
+**Date**: 2026-09-03
+**Decided by**: run 7 executor, ratified against the adversarial review
+**Status**: Decided
+
+**Context**: design § Portal auth scoped the shutdown to "five wrong codes". `POST
+/api/session` can fail four other ways: the code has already been used, it has
+expired, the body is not JSON, and the body is JSON with no `code` in it. A replay
+of a used code is the awkward one — the server keeps no record of who used it, so a
+legitimate page reload and an attacker replaying a code it sniffed are the same
+request byte for byte.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Count only a wrong `code` value | Matches the design's words; but the server would have to tell a replay from an attack to do it, and it deliberately keeps nothing that can — so the counter becomes trivially bypassable by replaying a used code instead of guessing a new one |
+| B | Count every failed exchange | One counter, no state to distinguish anything, nothing to bypass; but a real user who reloads the tab five times closes their own portal |
+| C | Keep per-reason counters | Preserves the design's wording and the user's reloads; but it is more state on the auth path than the whole exchange has, and every extra bucket is another thing that has to be right |
+
+**Recommendation**: B.
+
+**Decision**: B. `_refuse_code` increments on every failure path, and the fifth
+calls `lock_out()`. The response carries `attempts_left` so a page can see it coming.
+
+**Consequences**: Reloading the portal page five times closes the portal; the
+recovery is to run `vocalize portal` again, which mints a fresh code. **Run 9's page
+must strip the `#code=` fragment as soon as it has exchanged it, and must never retry
+the exchange on its own** — an automatic retry loop would burn all five attempts
+without a person doing anything. This decision is what makes DEC-016 necessary: a
+counter that fires on any failure is a counter anyone who can send a request can
+fire, so cross-origin requests had to stop reaching it.
+
+**Applied to**:
+- `vocalize/portal.py` (`_refuse_code`), `tests/test_portal.py`
+- [run-7-portal-read/report.md](./run-7-portal-read/report.md) § Deviations 4
+- [design.md](./design.md) § Portal routes
+
+---
+
+### DEC-016: How is a cross-origin POST kept from closing the portal?
+
+**Date**: 2026-09-03
+**Decided by**: run 7 executor, on the adversarial review's finding 1
+**Status**: Decided
+
+**Context**: With DEC-015 in force, any page in any tab could shut the user's portal
+down. `POST /api/session` needs no token, and a simple cross-origin form POST needs
+no CORS preflight and does not need to read the answer — five of them and the portal
+is gone. `Host` does not stop it: the browser sends the real `Host` for
+`127.0.0.1:<port>`. The one thing that separates a hostile page's POST from our own
+page's is that both carry `Origin`, and only ours carries ours.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Require a correct `Origin` on every request | Strictest; but `curl` and any non-browser client send no `Origin` at all, and the portal's own smoke tests are `curl` |
+| B | Refuse a *present and wrong* `Origin`, before the lockout counter | Kills the attack at the only point where it is distinguishable, leaves `curl` (no `Origin`) working, and costs two lines |
+| C | Leave it, and narrow the lockout instead | Undoes DEC-015 and puts the replay-vs-attack problem back |
+
+**Recommendation**: B.
+
+**Decision**: B. `route()` refuses a request whose `Origin` is present and is not
+`http://<host>:<port>` with a 403, immediately after the `Host` pin and **before**
+`_refuse_code` can count it. An absent `Origin` is allowed through, because that is
+what every non-browser client sends and a browser cannot forge an absent one on a
+cross-origin POST.
+
+**Consequences**: A hostile page's POST is refused and costs the user nothing. A
+CORS preflight also fails, which is the intended answer — the portal has no
+cross-origin callers. The check is not itself the authentication: it is the guard
+that keeps DEC-015's counter out of a stranger's reach, and the token gate is
+unchanged behind it. Run 9's page is same-origin, so its own `Origin` matches and it
+is unaffected.
+
+**Applied to**:
+- `vocalize/portal.py` (`route()`, `_refuse_code`'s docstring), `tests/test_portal.py`
+- [run-7-portal-read/report.md](./run-7-portal-read/report.md) § Deviations 4
+- [design.md](./design.md) § Portal routes
+
+---
+
+### DEC-017: May a run amend its own exit gate, and did run 7's amendment hold?
+
+**Date**: 2026-09-03
+**Decided by**: run 7 executor, flagged for the owner in the handoff report
+**Status**: Decided
+
+**Context**: Run 7's `validate-exit.sh` entry check `0.10.0 shipped (version on main
+≥ 0.10.0)` read `main:pyproject.toml` for a `version = "…"` line. This project
+declares `dynamic = ["version"]` and `[tool.hatch.version]` points at
+`vocalize/__init__.py`, so that line has never existed on any commit in this
+repository. The check failed with main at 0.10.1 exactly as it had with main at
+0.9.1. A run may not normally edit its own gate — that is the owner's lever, and a
+run that can move its own bar has no bar.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Leave it failing and hand over 10 / 11 | Honest, and touches nothing; but the run then ships with a red gate whose redness says nothing about the run, and every later run inherits the same dead check |
+| B | Delete the check | Smallest diff; but it drops a real entry criterion — 0.11.0's portal genuinely does depend on 0.10.0 having shipped |
+| C | Point it at the file hatch reads, and prove it both ways | Restores the criterion the check was written to enforce; but it is a run editing its own gate, which needs to be visible rather than quiet |
+
+**Recommendation**: C.
+
+**Decision**: C, with the amendment declared in the handoff report rather than made
+silently. The check now reads `main:vocalize/__init__.py` for `__version__`. It was
+proved green on the real `0.10.1`, red on a synthetic `0.9.1` and red on an empty
+file before it was used, so it is not a vacuous pass. Commit `e53c48c`, with the
+reasoning in a comment above the check itself.
+
+**Consequences**: The amendment is legitimate on a narrow ground and only that one:
+the original check could not pass on *any* commit, so it tested nothing and lowered
+no bar when it was replaced — a gate that cannot pass proves as little as one that
+cannot fail. Changing a check that *can* fail, on a branch where it is failing,
+would not be. It also brings run 7's gate into line with the only two siblings that
+check a version at all — run 6's and run 10's both already read
+`grep '^__version__' vocalize/__init__.py` — which is corroboration that
+`main:pyproject.toml` was an authoring slip in this one script and not a different
+reading of where the version lives. No other run's `validate-exit.sh` was touched.
+
+**Applied to**:
+- [run-7-portal-read/validate-exit.sh](./run-7-portal-read/validate-exit.sh)
+- [run-7-portal-read/report.md](./run-7-portal-read/report.md) § Deviations 1
+- Deliberately not in [design.md](./design.md): this is a process decision about a
+  run's gate script, not a decision about what vocalize does.
+
+---
+
+### DEC-018: Any local process can close the portal with five `Origin`-less POSTs
+
+**Date**: 2026-09-03
+**Decided by**: run 7 fix round, on the adversarial review's residual list
+**Status**: Decided — accepted limitation
+
+**Context**: DEC-016 refuses a request whose `Origin` is *present and wrong*, and lets
+an **absent** `Origin` through on purpose: that is what `curl`, the portal's own smoke
+tests and every non-browser client send, and a browser cannot forge an absent `Origin`
+on a cross-origin request. The gap that leaves is not a browser one. The listening
+socket is on `127.0.0.1`, which every process on the Mac can reach **regardless of
+which unix user owns it**, and `POST /api/session` needs no token. So any local
+process can send five `Origin`-less POSTs carrying garbage — no code, no token, no
+knowledge of anything — and DEC-015's counter closes the owner's portal.
+
+The blast radius is availability and nothing else. Every route that reads or writes
+sits behind the token gate, so nothing is read, nothing is written and no key or
+config value leaks. The owner sees the portal close and runs `vocalize portal` again,
+which mints a fresh code on a fresh port.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Accept it and write it down | Costs nothing, and against the attacker who matters most — a process running as the owner — the boundary buys nothing, because that process can `kill` the portal, read `config.toml` and reach the keychain anyway. Leaves a different-user process a nuisance it would not otherwise have |
+| B | A timed cooldown instead of a shutdown | The fifth failure refuses further exchanges for a fixed interval rather than closing the server, so a spammer costs the owner a wait rather than a restart. Keeps DEC-015's "count every failure" property intact — still no replay-vs-attack state. But it adds a clock and one more piece of state to the auth path, and a determined spammer can hold the portal in cooldown indefinitely, which is the same denial in a slower coat |
+| C | Require a correct `Origin` on every request (DEC-016 option A) | Does not help here at all: a local process sends whatever `Origin` string it likes, including the right one. It would only break `curl` |
+
+**Recommendation**: A, with B named for later.
+
+**Decision**: A. Recorded, not fixed. Vocalize's stated model is a single-user
+personal Mac (DEC-004), and on that machine the boundary this would defend is one the
+attacker is already inside. **B is the alternative that was not taken** — a timed
+cooldown in place of the shutdown — and it is the right first move if this is ever
+revisited, because it removes the permanent effect without reintroducing the state
+DEC-015 exists to avoid. It is deliberately not implemented on this branch.
+
+**Consequences**: On a multi-user Mac, a process belonging to another user can close
+this user's portal at will and repeatedly. That is nuisance, not compromise. Nothing
+in run 8 or run 9 should be built assuming the portal cannot be closed under it: the
+page already has to survive the server going away, because DEC-015's own five-reload
+case and the 15-minute idle watchdog both produce the same outcome. Revisit if the
+portal ever becomes long-lived, is bound to anything but loopback, or ships on a
+machine with more than one human on it.
+
+**Applied to**:
+- Nothing in `vocalize/` — this decision changes no code
+- [design.md](./design.md) § Portal routes, in the DEC-016 paragraph
+- Not in `verification.md`: there is no behaviour here to verify that DEC-015's and
+  DEC-016's own tests do not already cover

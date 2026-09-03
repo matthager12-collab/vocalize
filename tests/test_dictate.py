@@ -1080,6 +1080,15 @@ def test_racing_starts_produce_exactly_one_recorder(recorder, harness, monkeypat
     recorder()
     losses = []
     monkeypatch.setattr(dictate, "_second_press", lambda settings: losses.append(1) or 0)
+    # And the debounce, for the same reason: `_is_key_repeat` reads `now`,
+    # then reads the stamp, then rewrites it. A sibling press landing in
+    # that window leaves `last` *ahead* of `now`, and with the harness's
+    # `_DEBOUNCE = 0.0` a negative difference is still `< 0.0` — so that
+    # press returns 0 as a key repeat and never reaches the claim at all.
+    # It is a microsecond window, which is why this only ever failed under
+    # a full run's load. Presses are serialized in production; only this
+    # test runs them at once.
+    monkeypatch.setattr(dictate, "_is_key_repeat", lambda: False)
 
     barrier = threading.Barrier(4)
     results = []

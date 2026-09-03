@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -33,6 +34,11 @@ from .exceptions import VocalizeError
 # auth.PROVIDER_ENV_VARS / PROVIDER_USERNAMES. Polly, say and kokoro each
 # get their own probe below.
 _CREDENTIAL_PROVIDERS = ("elevenlabs", "openai", "google")
+
+#: The detail on the row a probe that is still running gets. Named because
+#: callers have to tell "no answer yet" from "the probe raised" — see
+#: portal._key_info.
+STILL_CHECKING = "still checking — a keychain dialog may be waiting"
 
 
 class Row(NamedTuple):
@@ -294,7 +300,8 @@ def _drop_inflight(name: str) -> None:
         _inflight.pop(name, None)
 
 
-def _run_probe(name: str, probe: Callable[[], Row], timeout: float) -> Row:
+def _start_probe(name: str, probe: Callable[[], Row]) -> tuple[threading.Thread, _Slot]:
+    """The in-flight thread for `name`, started if none is running."""
     with _lock:
         slot = _inflight.get(name)
         if slot is None or slot.thread is None or not slot.thread.is_alive():
@@ -315,12 +322,30 @@ def _run_probe(name: str, probe: Callable[[], Row], timeout: float) -> Row:
 
             slot.thread = threading.Thread(target=target, daemon=True)
             slot.thread.start()
-        thread = slot.thread
+        return slot.thread, slot
 
-    thread.join(timeout)
+
+def _join_probe(name: str, thread: threading.Thread, slot: _Slot, timeout: float) -> Row:
+    thread.join(max(0.0, timeout))
     if thread.is_alive():
-        return Row(name, "warn", "still checking — a keychain dialog may be waiting", "")
+        return Row(name, "warn", STILL_CHECKING, "")
     return slot.row if slot.row is not None else Row(name, "warn", "probe returned nothing", "")
+
+
+def run_probes(probes: list[tuple[str, Callable[[], Row]]], timeout: float) -> list[Row]:
+    """Every probe at once, the whole batch inside one `timeout`.
+
+    All of them are started before any of them is joined, and they share
+    one deadline. Joining each in turn instead costs `len(probes) x
+    timeout` whenever a keychain dialog is up — and the portal pays that on
+    every poll, not once.
+    """
+    started = [(name, *_start_probe(name, probe)) for name, probe in probes]
+    deadline = time.monotonic() + timeout
+    return [
+        _join_probe(name, thread, slot, deadline - time.monotonic())
+        for name, thread, slot in started
+    ]
 
 
 def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
@@ -353,7 +378,7 @@ def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
     # ThreadingHTTPServer, and two handler threads mutating `_PROBES` while
     # a third iterates it raises "dictionary changed size during iteration"
     # out of a function whose contract is that it never raises. Released
-    # before `_run_probe`, which takes the same lock for `_inflight`.
+    # before `_start_probe`, which takes the same lock for `_inflight`.
     with _lock:
         for stale in [n for n in _PROBES if n in auth.PROVIDER_NAMES and n not in chain]:
             del _PROBES[stale]
@@ -377,4 +402,4 @@ def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
 
         probes = list(_PROBES.items())
 
-    return [_run_probe(name, probe, timeout) for name, probe in probes]
+    return run_probes(probes, timeout)
