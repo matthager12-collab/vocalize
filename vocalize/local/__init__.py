@@ -11,6 +11,10 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+# Where uv lives when it is on neither PATH nor in its own installer's
+# spot (~/.local/bin): Homebrew on Apple silicon, then on Intel.
+UV_FALLBACKS = (Path("/opt/homebrew/bin/uv"), Path("/usr/local/bin/uv"))
+
 
 def uv_path() -> str | None:
     """uv's executable, or None. PATH first, then its default install spot.
@@ -21,5 +25,9 @@ def uv_path() -> str | None:
     found = shutil.which("uv")
     if found:
         return found
-    fallback = Path.home() / ".local" / "bin" / "uv"
-    return str(fallback) if fallback.is_file() else None
+    # A Services (Quick Action) environment has a bare PATH, so the usual
+    # install spots are tried by name: uv's own installer, then Homebrew.
+    for fallback in (Path.home() / ".local" / "bin" / "uv", *UV_FALLBACKS):
+        if fallback.is_file():
+            return str(fallback)
+    return None

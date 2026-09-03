@@ -234,6 +234,42 @@ def test_the_signature_turns_the_hardened_runtime_on(bin_dir):
     assert fake.calls[-1][0][fake.calls[-1][0].index("--options") + 1] == "runtime"
 
 
+def test_the_hardened_runtime_is_signed_with_the_microphone_entitlement(bin_dir):
+    """Under the hardened runtime, AVCaptureDevice.requestAccess is refused
+    on the spot — no dialog, status stays notDetermined — unless the binary
+    declares com.apple.security.device.audio-input. Seen live on 2026-09-02:
+    every first dictation ended in "The recorder did not start"."""
+    import plistlib
+
+    fake = FakeToolchain()
+
+    install_module.build_recorder(bin_dir=bin_dir, runner=fake)
+
+    argv = fake.calls[-1][0]
+    assert "--entitlements" in argv
+    entitlements = Path(argv[argv.index("--entitlements") + 1])
+    assert entitlements == install_module.RECORDER_ENTITLEMENTS
+    with entitlements.open("rb") as f:
+        declared = plistlib.load(f)
+    assert declared == {"com.apple.security.device.audio-input": True}
+
+
+def test_a_changed_entitlements_file_forces_a_rebuild(bin_dir, tmp_path, monkeypatch):
+    """The entitlements are part of the signature, so they are part of the
+    recorder's identity: change them and the bundle must be rebuilt (and
+    the user told to re-grant), exactly like a source change."""
+    copy = tmp_path / "Recorder.entitlements"
+    shutil.copy(install_module.RECORDER_ENTITLEMENTS, copy)
+    monkeypatch.setattr(install_module, "RECORDER_ENTITLEMENTS", copy)
+
+    assert install_module.build_recorder(bin_dir=bin_dir, runner=FakeToolchain())[0] == "built"
+    assert install_module.build_recorder(bin_dir=bin_dir, runner=FakeToolchain())[0] == "current"
+
+    copy.write_text(copy.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    assert install_module.build_recorder(bin_dir=bin_dir, runner=FakeToolchain())[0] == "rebuilt"
+
+
 def test_the_compile_argv_is_a_list_naming_only_our_own_paths(bin_dir):
     fake = FakeToolchain()
 

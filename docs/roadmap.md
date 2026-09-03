@@ -4,14 +4,16 @@ Future work, with the research behind each item. Status legend: **planned** = an
 
 | Item | Status | Tracking | Research |
 |---|---|---|---|
-| Hotkey-triggered local dictation (voice → text via a local Whisper model, Quick Action toggle, clipboard output, optional cleanup) | planned | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-dictation-design.md) · [voicebox findings](research/2026-09-01-voicebox-findings.md) |
-| Config portal (`vocalize portal`, stdlib local web page with a readiness checklist) — or the one-day `vocalize status` screen first | planned | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-config-portal-design.md) |
+| Hotkey-triggered local dictation (voice → text via a local Whisper model, Quick Action toggle, clipboard output, optional cleanup) | **shipped** in 0.10.0, usable from 0.10.1 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) · [plan](plans/2026-09-next-features/plan.md) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-dictation-design.md) · [voicebox findings](research/2026-09-01-voicebox-findings.md) |
+| `vocalize status` one-screen readiness check | **shipped** in 0.10.0 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) |
+| Spoken cues for dictation (`[stt] cues = "words"`: "start" / "stopped" / "ready" instead of, or as well as, the sounds) | building | — | owner request, 2026-09-02 |
+| Config portal (`vocalize portal`, stdlib local web page on top of the same readiness rows) | planned — runs 7–10 of the [plan](plans/2026-09-next-features/plan.md) | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-config-portal-design.md) |
 
-## Open decisions (2026-09-01)
+## Decisions (2026-09-01, closed 2026-09-02)
 
-1. Run the 3-hour dictation spike? It measures Whisper (`base.en` / `small.en` / `large-v3-turbo-q5_0`) against Apple's on-device recognizer on the owner's own voice with developer jargon, plus latency and RAM on the 8 GB M3. If Apple's engine wins, the Whisper branch is deleted from the plan.
-2. Portal (~50 h) or `vocalize status` (~1 day) first?
-3. Hotkey chord — proposed ⌃⌥⌘D.
+1. The dictation spike ran ([results](plans/2026-09-next-features/spike-2026-09-01.md)); Whisper `small.en` is the default.
+2. `vocalize status` first (0.10.0); the portal follows as 0.11.0.
+3. Hotkey chord ⌃⌥⌘D, set by the user in System Settings.
 
 ## Deferred on purpose
 

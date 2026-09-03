@@ -132,7 +132,10 @@ touching System Settings at all.
 
 **A second press within two seconds of the first is a cancel**, not a
 stop — treated as "I changed my mind" rather than the end of a very short
-sentence. So is `vocalize listen --cancel`, from a terminal, at any point
+sentence. (Presses closer than half a second apart are the key being
+*held* — macOS repeats a Service shortcut at the key-repeat rate — and are
+ignored, so a cancel is "press, a beat, press".) So is
+`vocalize listen --cancel`, from a terminal, at any point
 — including while a take is being transcribed. (The transcription that was
 already running keeps its own copy of the recording and finishes normally;
 `--cancel` only releases the hotkey so your next press starts a fresh

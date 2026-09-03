@@ -75,6 +75,16 @@ _WORKDIR_PREFIX = "vocalize-dictate-"
 # A second press this soon after the first is the user changing their mind,
 # not the end of a sentence (design § Key flows).
 _CANCEL_WINDOW = 2.0
+# ...but a press this soon after the *previous press* is the key still being
+# held: macOS re-fires a Service shortcut at its key-repeat rate, and every
+# repeat used to land as a cancel, then a fresh start, for as long as the
+# chord was down. The runner executes presses serially, so the gap between
+# a press ending and the queued repeat beginning is one process start-up
+# (~0.3 s here); this has to be comfortably longer than that and shorter
+# than a deliberate second tap. The stamp lives outside the session so it
+# also covers repeats arriving while a stop is being finished.
+_DEBOUNCE = 1.0
+_PRESS_NAME = "dictate.press"
 
 # How long the first press waits for the recorder to say it started. Also
 # the window in which a second press treats a missing `rec.pid` as "still
@@ -967,13 +977,46 @@ def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool]:
 # --- the toggle state machine -----------------------------------------
 
 
+def _stamp_press() -> None:
+    """Record the moment as the latest press. Best effort: a stamp that
+    cannot be written simply never debounces."""
+    try:
+        audio.ensure_private_dir(CACHE_DIR)
+        (CACHE_DIR / _PRESS_NAME).write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _is_key_repeat() -> bool:
+    """Whether this press arrived within `_DEBOUNCE` of the previous stamp.
+
+    The Services runner executes presses one after another, so a repeat
+    queued behind a running press starts the moment that press *ends* —
+    which is why `toggle` stamps on the way out as well as on the way in.
+    A held key keeps refreshing the stamp and stays ignored until it is
+    released.
+    """
+    now = time.time()
+    try:
+        last = float((CACHE_DIR / _PRESS_NAME).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        last = 0.0
+    _stamp_press()
+    return now - last < _DEBOUNCE
+
+
 def toggle(stt: dict) -> int:
     """One press of the dictation hotkey. Returns the process exit code."""
-    workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX))
-    if _claim_session(workdir):
-        return _start(workdir, stt)
-    shutil.rmtree(workdir, ignore_errors=True)
-    return _second_press(stt)
+    if _is_key_repeat():
+        return 0
+    try:
+        workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX))
+        if _claim_session(workdir):
+            return _start(workdir, stt)
+        shutil.rmtree(workdir, ignore_errors=True)
+        return _second_press(stt)
+    finally:
+        _stamp_press()  # a repeat queued behind this press begins right now
 
 
 def _start(workdir: Path, stt: dict) -> int:

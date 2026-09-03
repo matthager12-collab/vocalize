@@ -315,11 +315,13 @@ def selftest(
 _RECORDER_DIR = Path(__file__).resolve().parent.parent / "recorder"
 RECORDER_SOURCE = _RECORDER_DIR / "VocalizeRecorder.swift"
 RECORDER_PLIST_TEMPLATE = _RECORDER_DIR / "Info.plist.in"
+RECORDER_ENTITLEMENTS = _RECORDER_DIR / "Recorder.entitlements"
 
 BIN_DIR = Path.home() / ".cache" / "vocalize" / "bin"
 BUNDLE_NAME = "Vocalize Recorder.app"
 RECORDER_STAMP_NAME = ".recorder"
-RECORDER_STAMP_VERSION = 2
+# 3: the entitlements joined the fingerprint (0.10.0 signed without them).
+RECORDER_STAMP_VERSION = 3
 
 _BUILD_TIMEOUT = 600
 
@@ -369,6 +371,7 @@ def _recorder_fingerprint() -> dict:
         "stamp_version": RECORDER_STAMP_VERSION,
         "source_sha256": _sha256_of(RECORDER_SOURCE),
         "plist_sha256": _sha256_of(RECORDER_PLIST_TEMPLATE),
+        "entitlements_sha256": _sha256_of(RECORDER_ENTITLEMENTS),
     }
 
 
@@ -525,7 +528,7 @@ def build_recorder(
     through a fake compiler: nothing here should ever need Xcode to be
     installed on the machine running the suite.
     """
-    if not RECORDER_SOURCE.is_file() or not RECORDER_PLIST_TEMPLATE.is_file():
+    if not all(p.is_file() for p in (RECORDER_SOURCE, RECORDER_PLIST_TEMPLATE, RECORDER_ENTITLEMENTS)):
         raise InstallError(
             "This install of vocalize is missing the recorder source "
             f"({RECORDER_SOURCE.name}); reinstall vocalize to get it back."
@@ -570,14 +573,21 @@ def build_recorder(
         # --options runtime is the hardened runtime, which under the ad-hoc
         # signature refuses DYLD_INSERT_LIBRARIES — so nothing can inject a
         # dylib into the one process on this machine holding a microphone
-        # grant. It does *not* stop that bundle being launched directly:
+        # grant. The hardened runtime also refuses the microphone itself,
+        # silently and with no dialog, unless the signature carries
+        # com.apple.security.device.audio-input — hence --entitlements
+        # (0.10.0 shipped without it and no first dictation could start).
+        # It does *not* stop that bundle being launched directly:
         # the grant belongs to the bundle, and anything running as this user
         # can `open` it with its own --out and record. That is inherent to
         # DEC-001 and is stated in docs/dictation.md § Privacy; there is no
         # code mitigation, only `local uninstall --stt` plus revoking the
         # grant in System Settings.
         _run_build_step(
-            ["codesign", "-s", "-", "--force", "--options", "runtime", str(staging)],
+            [
+                "codesign", "-s", "-", "--force", "--options", "runtime",
+                "--entitlements", str(RECORDER_ENTITLEMENTS), str(staging),
+            ],
             runner, _CLT_HINT, "signed",
         )
         _swap_in(staging, bundle)

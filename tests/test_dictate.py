@@ -162,6 +162,9 @@ def harness(tmp_path, monkeypatch):
     # the grace for a record no fake read is going to write. The wait has
     # its own two tests below; these are about the toggle.
     monkeypatch.setattr(dictate, "_RESUME_GRACE", 0.05)
+    # Presses here land microseconds apart, which to the real debounce is
+    # a held key. Its own tests below put the window back.
+    monkeypatch.setattr(dictate, "_DEBOUNCE", 0.0)
 
     # A live PID is our recorder; a dead one is nothing. Replaced because
     # no shebang script can ever be *named* `recorder` to real `ps`.
@@ -484,6 +487,74 @@ def test_a_second_press_within_the_window_cancels(recorder, transcriber, harness
     assert harness.clipboard() == ""
     assert not dictate.session_path().exists()
     assert any(dictate._NOTIFY_CANCELLED in line for line in harness.notifications())
+
+
+def test_a_held_key_is_ignored_not_cancelled(recorder, transcriber, harness, monkeypatch):
+    """macOS re-fires a Service shortcut at the key-repeat rate while the
+    chord is held. Seen live 2026-09-02: every repeat landed as a cancel and
+    then a fresh start, dozens of times a minute. Presses inside the
+    debounce are the same press."""
+    recorder()
+    transcriber()
+    monkeypatch.setattr(dictate, "_DEBOUNCE", 0.5)
+    assert start() == 0
+
+    for _ in range(3):  # the key is still down
+        assert dictate.toggle(stt()) == 0
+
+    assert dictate.session_path().is_file()  # still recording
+    assert harness.played == ["Tink.aiff"]  # no Pop, no cancel
+    assert harness.notifications() == []
+    assert lines(harness.uv_argv) == []
+
+
+def test_a_second_tap_after_the_debounce_still_cancels(recorder, transcriber, harness, monkeypatch):
+    recorder()
+    transcriber()
+    monkeypatch.setattr(dictate, "_DEBOUNCE", 0.05)
+    start()
+    time.sleep(0.06)
+
+    assert dictate.toggle(stt()) == 0  # inside the two-second cancel window
+
+    assert not dictate.session_path().exists()
+    assert any(dictate._NOTIFY_CANCELLED in line for line in harness.notifications())
+
+
+def test_a_repeat_queued_behind_a_slow_press_is_still_ignored(recorder, harness, monkeypatch):
+    """The Services runner runs presses one after another: a repeat fired
+    while a press was still launching the recorder begins the instant that
+    press returns. Measured from the press's *start*, it would look like a
+    deliberate second tap; the exit stamp is what catches it."""
+    recorder()
+    monkeypatch.setattr(dictate, "_DEBOUNCE", 0.1)
+    launch = dictate._launch_recorder
+
+    def slow_launch(workdir, stt):
+        time.sleep(0.15)  # longer than the whole debounce window
+        return launch(workdir, stt)
+
+    monkeypatch.setattr(dictate, "_launch_recorder", slow_launch)
+    assert start() == 0
+
+    assert dictate.toggle(stt()) == 0  # the queued repeat
+
+    assert dictate.session_path().is_file()
+    assert harness.played == ["Tink.aiff"]
+
+
+def test_the_press_stamp_is_refreshed_by_ignored_presses(recorder, harness, monkeypatch):
+    """Each repeat re-arms the window, so a key held longer than the window
+    stays ignored until it is released."""
+    recorder()
+    monkeypatch.setattr(dictate, "_DEBOUNCE", 0.1)
+    start()
+    for _ in range(4):
+        time.sleep(0.05)  # each gap is inside the window; the total is not
+        assert dictate.toggle(stt()) == 0
+
+    assert dictate.session_path().is_file()
+    assert harness.played == ["Tink.aiff"]
 
 
 def test_cancel_from_the_command_line_discards_the_recording(

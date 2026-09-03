@@ -177,6 +177,8 @@ def no_uv(monkeypatch, tmp_path):
     monkeypatch.setattr(local.shutil, "which", lambda name: None)
     # Path.home() reads $HOME, so this empties the ~/.local/bin fallback too.
     monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    # ...and the Homebrew spots are real paths on a developer's machine.
+    monkeypatch.setattr(local, "UV_FALLBACKS", ())
 
 
 @pytest.fixture

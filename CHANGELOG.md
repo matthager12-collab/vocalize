@@ -3,10 +3,33 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.10.1 - 2026-09-02
+
+Three fixes found in the first owner-present run of 0.10.0's dictation.
+Together they meant no hotkey dictation could succeed on 0.10.0; upgrade.
 
 ### Fixed
 
+- **No dictation could ever start on a fresh install.** The recorder was
+  signed with the hardened runtime but without the
+  `com.apple.security.device.audio-input` entitlement, so macOS refused the
+  microphone on the spot — no permission dialog, status stuck at
+  `notDetermined` — and every first press ended in "The recorder did not
+  start". The bundle is now signed with
+  `vocalize/recorder/Recorder.entitlements`, and the entitlements are part
+  of the recorder's fingerprint, so `vocalize local install --stt` rebuilds
+  the bundle once (and, as with any rebuild, macOS asks for the microphone
+  again — it never actually asked before).
+- **Every hotkey dictation ended in "Dictation failed" on a machine whose
+  `uv` came from Homebrew.** A Services environment has a bare PATH, and
+  `uv_path()` looked only there and in `~/.local/bin`; the same dictation
+  worked from a terminal. `/opt/homebrew/bin/uv` and `/usr/local/bin/uv`
+  are now tried too (this also covers Kokoro from a Quick Action).
+- **Holding the dictation hotkey down turned into a cancel-and-restart
+  loop.** macOS re-fires a Service shortcut at the key-repeat rate, and
+  every repeat landed as a second press. Presses within half a second of
+  the previous one are now ignored as the same press; a deliberate cancel
+  is "press, a beat, press" inside the two-second window, as before.
 - `hooks/claude_stop_hook.py --latest`, run from inside a Claude Code turn
   (which is how `/speak` runs it), spoke the agent's own status line —
   "Checking settings." — instead of the response the user asked to hear.

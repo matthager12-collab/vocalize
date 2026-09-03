@@ -442,7 +442,8 @@ terminal, if you'd rather trigger it that way.
   transcript is on your clipboard; nothing is typed for you automatically.
 - **Nothing heard** (silence, or a microphone that isn't actually picking
   anything up) ends the dictation quietly — no clipboard write.
-- **Cancel** with a second press *within two seconds* of the first, or at
+- **Cancel** with a second press *within two seconds* of the first (but
+  not within half a second — that's a held key, and it's ignored), or at
   any point with `vocalize listen --cancel` — the audio is discarded, never
   transcribed.
 - **A third press while transcribing is refused**: a Pop, and "Still
