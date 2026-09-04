@@ -19,6 +19,7 @@
 | DEC-016 | How is a cross-origin POST kept from closing the portal? | Decided | Refused on `Origin` in `route()`, before the lockout counter can see it | R6 |
 | DEC-017 | May a run amend its own exit gate, and did run 7's amendment hold? | Decided | Yes when the check cannot pass on any commit; proved red and green before use | R6 |
 | DEC-018 | Any local process can close the portal with five `Origin`-less POSTs | Decided — accepted limitation | Accepted, not fixed: availability only, and the attacker who matters can already kill the process. A timed cooldown is the alternative, deliberately not taken | R6 |
+| DEC-019 | Run 8's gate names a branch that does not exist, and times out inside its own suite | Decided | Check the isolation criterion's substance instead of the literal name, and raise `CHECK_TIMEOUT` to 600 | R7 |
 
 ---
 
@@ -633,3 +634,75 @@ machine with more than one human on it.
 - [design.md](./design.md) § Portal routes, in the DEC-016 paragraph
 - Not in `verification.md`: there is no behaviour here to verify that DEC-015's and
   DEC-016's own tests do not already cover
+
+---
+
+## Round 7
+
+Run 8's own exit gate, on the same narrow ground DEC-017 opened and no wider.
+
+### DEC-019: Run 8's gate names a branch that does not exist, and times out inside its own suite
+
+**Date**: 2026-09-03
+**Decided by**: run 8 close-out, on the adversarial review's residual list
+**Status**: Decided
+
+**Context**: Two independent faults in
+[run-8-portal-write/validate-exit.sh](./run-8-portal-write/validate-exit.sh), both
+of which make the gate report something other than the branch's state.
+
+**The branch name.** The entry check is `on branch config-portal`, matching the
+literal string. Run 8 was built on `portal-writes` — the parent's own worktree
+setup, and the right call, because run 7's `config-portal` is merged and gone. So
+the check failed on every commit run 8 ever made and the gate has never passed as
+written. The isolation criterion behind it is met and always was: the work is on
+its own branch, forked from a commit that already carries run 7's portal module.
+
+**The timeout.** `CHECK_TIMEOUT` defaults to 120s. Two of the eleven checks run the
+whole suite, which takes 115-121s on this machine. The cap sits *inside* that
+spread, so "suite green at entry" and "full suite green" were a coin flip between
+`PASS` and `FAIL: … (timed out after 120s)` — and a timeout is indistinguishable in
+the output from a hung command, which is exactly the failure mode the template's
+own header warns about. The previous executor worked around it by exporting
+`CHECK_TIMEOUT=600` and said so in its report; a workaround every future runner has
+to know about is a defect in the script.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Rename the branch to `config-portal` | Makes the literal check pass without touching the script. But it renames live work to satisfy a string, and `config-portal` is run 7's merged branch name — reusing it invites exactly the confusion the separate name avoids |
+| B | Delete the check | Smallest diff; but isolation is a real entry criterion. Run 8 mutates config files, and "not on main" is the guard that keeps a half-built write path off `main` |
+| C | Check the substance: on a branch that is not `main`, forked from a base carrying `vocalize/portal.py` | Keeps the criterion, drops the accident. Two facts a rename cannot fake, and it survives the next run picking its own branch name |
+
+**Recommendation**: C for the name, and raise the timeout default for the second
+fault — they are separate faults in one file, decided together because they are one
+edit and one commit.
+
+**Decision**: C, plus `CHECK_TIMEOUT` defaulting to 600, both declared here rather
+than changed quietly. The check now asserts `git branch --show-current` is neither
+empty (a detached HEAD is not isolation, it is an accident waiting to be lost) nor
+`main`, and that `git merge-base main HEAD` names a commit whose tree contains
+`vocalize/portal.py` — which is run 7's whole artifact, so the base cannot predate
+run 7. Proved four ways in a scratch repository before use: green on a branch off a
+base carrying `portal.py`; red sitting on `main`; red on a branch off a base without
+`portal.py`; red on a detached HEAD. The timeout was raised to six times the suite's
+own runtime rather than to something merely larger than 121s, so an ordinary slow
+machine does not put it back on the knife edge.
+
+**Consequences**: DEC-017's ground was "the check cannot pass on any commit, so it
+tested nothing". That is exactly true of the branch-name check here and it is why
+this amendment is legitimate; it is **not** true of the timeout, which could pass —
+about half the time. So the two halves rest on different arguments, and the timeout
+half is worth being plain about: raising a cap so a check stops failing is normally
+the wrong move, and it is only right here because the thing being measured (does the
+suite pass) was never the thing being reported (did the suite finish inside an
+arbitrary 120s). Nothing else in the gate changed; no other run's
+`validate-exit.sh` was touched, and the 120s default in the other nine remains theirs
+to raise if their own suites grow into it — run 10's release gate is the one to
+watch, because it runs the same suite.
+
+**Applied to**:
+- [run-8-portal-write/validate-exit.sh](./run-8-portal-write/validate-exit.sh)
+- [run-8-portal-write/report.md](./run-8-portal-write/report.md) § Deviations
+- Deliberately not in [design.md](./design.md) or
+  [verification.md](./verification.md): like DEC-017, this is a process decision
+  about a run's gate script, not a decision about what vocalize does

@@ -20,6 +20,7 @@ import vocalize.cli as cli_module
 from vocalize import interrupted
 from vocalize.cli import main
 from vocalize.config import resolve_provider_settings
+from vocalize.exceptions import ConfigChangedError, ConfigError
 
 
 def _patch_tts(monkeypatch, audio=b"fake-mp3-bytes", calls=None, echo_lines=()):
@@ -1530,6 +1531,62 @@ def test_chain_rejects_a_duplicate_provider(monkeypatch, tmp_path):
     assert "Duplicate" in result.output
 
 
+def test_chain_writes_a_config_that_has_an_stt_table(monkeypatch, tmp_path):
+    """0.10.0 ships `[stt]`, and the renderer had no way to write one back —
+    so a dictation user's config was unwritable by every writer there is."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('chain = ["say"]\n\n[stt]\nmodel = "base.en"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "kokoro"])
+
+    assert result.exit_code == 0, result.output
+    text = cfg_path.read_text()
+    assert 'chain = ["kokoro"]' in text
+    assert 'model = "base.en"' in text
+
+
+def test_chain_refuses_a_file_that_changed_between_its_read_and_its_write(
+    monkeypatch, tmp_path
+):
+    """DEC-005 names three writers, and this is one of them."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('chain = ["say"]\n', encoding="utf-8")
+    real_load = cli_module.load_config_file
+
+    def load_then_race():
+        data = real_load()
+        cfg_path.write_text('chain = ["kokoro"]\n', encoding="utf-8")
+        return data
+
+    monkeypatch.setattr(cli_module, "load_config_file", load_then_race)
+
+    result = CliRunner().invoke(main, ["chain", "polly"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ConfigChangedError)
+    # A ConfigError subclass, so `run()`'s funnel prints it rather than a
+    # traceback.
+    assert isinstance(result.exception, ConfigError)
+    assert "config changed on disk" in str(result.exception)
+    assert cfg_path.read_text() == 'chain = ["kokoro"]\n'
+
+
+def test_chain_creates_a_missing_file_through_the_absent_fingerprint(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+
+    result = CliRunner().invoke(main, ["chain", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert 'chain = ["say"]' in cfg_path.read_text()
+
+
 # --- the interrupt record (DEC-003, T-46) ------------------------------
 #
 # The real chain, the real _StreamPlayer and the real audio module over
@@ -1843,3 +1900,168 @@ def test_a_stop_while_a_non_streaming_read_renders_is_still_obeyed(monkeypatch, 
 
     assert result.exit_code == 0, result.output
     assert _record_json()["provider"] == "kokoro"  # and it is resumable
+
+
+# --- vocalize portal (T-64) -------------------------------------------
+#
+# The command over a fake Portal and conftest's fake browser opener: no
+# socket is bound and nothing opens on the developer's machine. The real
+# Portal's own lifecycle is tests/test_portal.py's job.
+
+
+class _FakePortal:
+    """Main's Portal surface, and only the five members the command uses."""
+
+    def __init__(self, *, locked_out=False, boom=None, cut_short=None):
+        self.locked_out = locked_out
+        self.stopped = False
+        self._boom = boom
+        self._cut_short = cut_short
+        self.started = False
+
+    def discard_partial_download(self):
+        return self._cut_short
+
+    def start(self):
+        self.started = True
+        return "http://127.0.0.1:45678/#code=fake-code"
+
+    def serve_until_stopped(self):
+        assert self.started, "served before the socket was bound"
+        if self._boom is not None:
+            raise self._boom
+
+    def stop(self):
+        self.stopped = True
+
+
+def _fake_portal(monkeypatch, **kwargs):
+    from vocalize import portal as portal_module
+
+    served = _FakePortal(**kwargs)
+    monkeypatch.setattr(portal_module, "Portal", lambda *a, **k: served)
+    return served
+
+
+def test_portal_opens_the_browser_at_the_one_time_url(monkeypatch, fake_browser):
+    served = _fake_portal(monkeypatch)
+
+    result = CliRunner().invoke(main, ["portal"])
+
+    assert result.exit_code == 0, result.output
+    url = served.start()
+    assert fake_browser == [url]
+    # Printed, and printed once: the fragment carries the one-time code and
+    # every extra copy of it is another line of scrollback holding a secret.
+    assert result.output.count(url) == 1
+    assert "works once" in result.output
+    assert "60 seconds" in result.output
+    assert served.stopped
+
+
+def test_portal_warns_that_the_machine_is_the_boundary(monkeypatch):
+    _fake_portal(monkeypatch)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    note = result.output
+    # DEC-018 has no other user-facing surface: both halves of it, or the
+    # note is telling a comfortable half-truth.
+    assert "single-user machine" in note
+    assert "behind a token" in note
+    assert "close the portal" in note
+
+
+def test_portal_no_browser_prints_the_url_and_opens_nothing(monkeypatch, fake_browser):
+    served = _fake_portal(monkeypatch)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert fake_browser == []
+    assert served.start() in result.output
+
+
+def test_portal_says_so_when_no_browser_would_open(monkeypatch):
+    import webbrowser
+
+    _fake_portal(monkeypatch)
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: False)
+
+    result = CliRunner().invoke(main, ["portal"])
+
+    assert result.exit_code == 0, result.output
+    assert "paste the link above" in result.output
+
+
+def test_portal_exits_1_when_the_server_locked_itself_out(monkeypatch):
+    _fake_portal(monkeypatch, locked_out=True)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    # The message is the Portal's own, on stderr (test_portal.py pins it);
+    # the exit code is this command's whole contribution.
+    assert result.exit_code == 1
+
+
+def test_portal_exits_0_when_the_idle_watchdog_closed_it(monkeypatch):
+    _fake_portal(monkeypatch, locked_out=False)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_portal_owns_up_to_an_install_it_cut_short(monkeypatch):
+    """A portal that closes over a running install must not close quietly.
+
+    Ctrl-C, the idle watchdog and a lockout all land in the same `finally`
+    with a daemon worker mid-download. The Portal deletes the part file;
+    this command is the only thing that can tell the user it happened.
+    """
+    _fake_portal(
+        monkeypatch,
+        cut_short="The stt install was cut short. Its partial download was "
+        "deleted (/scratch/ggml-small.en.bin.part).",
+    )
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert "cut short" in result.output
+    assert "/scratch/ggml-small.en.bin.part" in result.output
+
+
+def test_portal_stays_quiet_when_no_install_was_running(monkeypatch):
+    """The usual case. A line every time would train people to ignore it."""
+    _fake_portal(monkeypatch)
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert "cut short" not in result.output
+
+
+def test_portal_releases_the_socket_when_the_wait_blows_up(monkeypatch):
+    served = _fake_portal(monkeypatch, boom=RuntimeError("boom"))
+
+    result = CliRunner().invoke(main, ["portal", "--no-browser"])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert served.stopped, "a live socket was left bound behind the traceback"
+
+
+def test_portal_help_binds_nothing(monkeypatch):
+    from vocalize import portal as portal_module
+
+    def never(*a, **k):
+        raise AssertionError("--help built a Portal")
+
+    monkeypatch.setattr(portal_module, "Portal", never)
+
+    result = CliRunner().invoke(main, ["portal", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--no-browser" in result.output

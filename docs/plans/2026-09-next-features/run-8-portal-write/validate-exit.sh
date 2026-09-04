@@ -20,7 +20,12 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
-TIMEOUT="${CHECK_TIMEOUT:-120}"
+# 600, not the template's 120: two of the checks below run the whole suite,
+# which takes 115-121s on this machine. A 120s cap sits inside that spread,
+# so those two checks were a coin flip between "green" and "timed out after
+# 120s" — a gate that reports the machine's mood rather than the branch's
+# state. See DEC-019.
+TIMEOUT="${CHECK_TIMEOUT:-600}"
 
 # Portable timeout: GNU coreutils on Linux, gtimeout via brew on macOS, or none.
 # The no-timeout fallback is `env`, which just runs the command — an empty array
@@ -75,8 +80,30 @@ check_output() {
 # Every path below is relative to the repository root.
 cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
+# The isolation criterion, as substance rather than as a literal name. It
+# was written `on branch config-portal`, and this run is on `portal-writes`,
+# so it failed on every commit and the gate never passed as written. What
+# the criterion is actually for is two facts: the work is on its own branch
+# (not on main), and that branch forked from a commit that already carries
+# run 7's portal module. Both are checked; a rename cannot satisfy either.
+# See DEC-019.
+ISOLATED='
+import subprocess, sys
+
+def git(*args):
+    return subprocess.run(("git",) + args, capture_output=True, text=True)
+
+branch = git("branch", "--show-current").stdout.strip()
+base = git("merge-base", "main", "HEAD").stdout.strip()
+sys.exit(not (
+    branch not in ("", "main")
+    and base
+    and git("cat-file", "-e", base + ":vocalize/portal.py").returncode == 0
+))
+'
+
 echo "=== Entry criteria ==="
-check 'on branch config-portal' .venv/bin/python -c 'import subprocess,sys; sys.exit(subprocess.run(['"'"'git'"'"','"'"'branch'"'"','"'"'--show-current'"'"'],capture_output=True,text=True).stdout.strip()!='"'"'config-portal'"'"')'
+check "on its own branch, forked from run 7's merged state" .venv/bin/python -c "$ISOLATED"
 check 'run 7 validated' grep -q '^validate-exit: PASS' docs/plans/2026-09-next-features/run-7-portal-read/report.md
 check 'portal module present' test -f vocalize/portal.py
 check 'suite green at entry' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider

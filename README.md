@@ -180,6 +180,20 @@ Hotkeys: `↑`/`↓` or `k`/`j` move, `Enter` selects, `p` previews the
 highlighted voice, `m` types a value by hand, `q` or `Esc` cancels without
 writing anything.
 
+There's also a settings page in the browser:
+
+```bash
+vocalize portal              # opens your browser at a one-time link
+vocalize portal --no-browser # prints the link instead (headless, SSH)
+```
+
+It serves on `127.0.0.1` only, hands out a link that works once and for 60
+seconds, and closes itself on Ctrl-C or after fifteen minutes with nothing to
+do. It assumes a single-user machine: everything that reads or changes your
+settings is behind a token, but any process on the Mac can reach the socket
+and close the portal under you. Nothing leaks if that happens — run the
+command again.
+
 | Setting | Flag | Env var | Config file key | Default |
 |---|---|---|---|---|
 | API key | `--api-key` | `ELEVENLABS_API_KEY` | not read from the config file | stored via `vocalize auth` |

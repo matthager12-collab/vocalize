@@ -3,6 +3,41 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- **Nothing could rewrite a config file containing an `[stt]` table** —
+  which is every config a dictation user has had since 0.10.0 added the
+  table. The serialiser wrote flat keys and `[providers.*]` and had no
+  case for any other table, so `stt` reached the scalar renderer as a
+  `dict` and raised: "The config file has a table under 'stt'. The wizard
+  only manages flat keys, so it will not rewrite this file — edit that
+  file by hand." That refusal came out of `vocalize wizard` before it
+  asked its first question, and out of `vocalize chain google say` instead
+  of a write. The only way out was to delete the `[stt]` table, run the
+  command, and put it back. `[stt]` is now rendered as its own table, so
+  both commands rewrite the file and leave the dictation settings alone.
+  The rewritten file puts `[stt]` ahead of `[providers.*]` whatever order
+  they were in before — identical TOML, a one-off cosmetic diff.
+- **Two writers saving at the same moment could lose one of the two
+  changes.** The config write compared the file against the fingerprint it
+  had read and then renamed a temp file over it, with the two steps not
+  held together, so two saves that overlapped could both see an unchanged
+  file, both write, and both report success while only the second survived.
+  The compare and the rename now happen under one lock. Two `vocalize`
+  *processes* saving in the same instant can still race — the fingerprint
+  check narrows that to a window of microseconds, and closing it entirely
+  needs a lock file, which is deliberately not what this is.
+- **A config save rendered through a fixed `config.toml.tmp`**, so two
+  writers at once could render through the same temp file and leave one of
+  them writing a file the other had already renamed away — reported as
+  "Could not write config file", or worse, reported as success for bytes
+  that were not in the file. Each writer now gets its own temp file, made
+  with `mkstemp` in the same directory, still `0600`, and still renamed
+  into place atomically. The predictable name a local process could
+  pre-plant as a symlink is gone with it.
+
 ## 0.10.2 - 2026-09-02
 
 ### Added

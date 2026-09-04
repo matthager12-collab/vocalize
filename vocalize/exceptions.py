@@ -40,6 +40,21 @@ class ConfigError(VocalizeError):
     """Raised when the config file or one of its values is invalid."""
 
 
+class ConfigChangedError(ConfigError):
+    """The config file moved between a reader's read and its write.
+
+    DEC-005: every writer — the portal page, the wizard, `vocalize chain`,
+    a hand edit — reads the whole file and writes a merged copy back, so
+    the last one to write would otherwise silently drop everything the
+    others changed in between. The fingerprint taken at the read is
+    compared again at the write, and this is what a mismatch raises,
+    including the case where the file did not exist at the read and does
+    now. Subclassing ConfigError keeps every existing `except ConfigError`
+    handler working — `cli.run()`'s error funnel included, so an unhandled
+    refusal in a terminal is a clean error and not a traceback.
+    """
+
+
 class TTSRequestError(VocalizeError):
     """Raised when the ElevenLabs API call itself fails."""
 

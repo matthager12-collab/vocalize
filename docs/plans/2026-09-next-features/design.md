@@ -196,6 +196,18 @@ instead means special-casing four different error conventions by hand.
 | `stt` | the resolved `[stt]` settings dict, defaults filled in | **cannot fail** — see below |
 | `config_path` | string, always present | — |
 | `config_error` | string or `null` — the file would not parse, read *or validate* | non-`null` means the **whole file was discarded**; every other key then describes defaults, *except* `chain`/`chain_source` when `VOCALIZE_CHAIN` is also bad — see below |
+| `fingerprint` | `{mtime_ns, sha256}`, or the string `"absent"` for a file that is not there | `null` — the path could not be read at all; **no write can be made** until a later poll returns one |
+
+**`fingerprint` is taken before every other key on this page, and that ordering is
+the contract** (DEC-005, T-62). It is what every write route hands back, and a write
+carrying anything but one of the three shapes above is a 400. Taken *before* the
+`load_config_file()` whose values accompany it, a change landing during the poll
+makes the page's next write fail the compare-and-swap — a false refusal, which is
+safe. Taken *after*, the page would render the old values while holding a current
+fingerprint, its write would pass, and the other writer's change would be
+overwritten by a decision the user made without seeing it. A successful write
+returns the fingerprint of what it just wrote in the same key, so the page can write
+again without polling.
 
 **A bad chain has two shapes, and they look nothing alike.** Run 9's page has to
 render both. Verified against a running portal:

@@ -514,6 +514,16 @@ def _swap_in(staging: Path, bundle: Path) -> None:
     shutil.rmtree(previous, ignore_errors=True)
 
 
+#: What a caller must say when `build_recorder` answers "rebuilt". Lives
+#: beside the function that decides it rather than in one of its callers:
+#: the CLI prints it, the portal puts it in its progress dict, and a
+#: rebuild that goes unannounced silently breaks the user's dictation.
+REGRANT_WARNING = (
+    "Vocalize Recorder was rebuilt — re-grant the microphone in "
+    "System Settings › Privacy & Security › Microphone"
+)
+
+
 def build_recorder(
     bin_dir: Path | None = None, compiler=None, runner=subprocess.run,
 ) -> tuple[str, Path]:

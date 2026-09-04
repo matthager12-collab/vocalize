@@ -123,6 +123,21 @@ def _no_real_recorder_bin(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_audio_cache(monkeypatch, tmp_path):
+    """Keep the portal's previews out of the real audio cache.
+
+    Autouse for the same reason as the ledger fixture, and sharper: a
+    preview writes a *fake* provider's bytes into `~/.cache/vocalize`
+    under the cache key of a real voice's settings, and the developer's
+    next real `vocalize speak` of that sentence would play them back.
+    `chain.run` binds `DEFAULT_CACHE_DIR` as a default argument at def
+    time, so `portal.CACHE_DIR` — which the portal passes explicitly — is
+    the only thing there is to point elsewhere.
+    """
+    monkeypatch.setattr("vocalize.portal.CACHE_DIR", tmp_path / "audio-cache")
+
+
+@pytest.fixture(autouse=True)
 def _no_real_dictation_cache(monkeypatch, tmp_path):
     """Keep every test off ~/.cache/vocalize's dictation state.
 
@@ -135,6 +150,24 @@ def _no_real_dictation_cache(monkeypatch, tmp_path):
     from vocalize import dictate
 
     monkeypatch.setattr(dictate, "CACHE_DIR", tmp_path / "dictation-cache")
+
+
+@pytest.fixture(autouse=True)
+def fake_browser(monkeypatch):
+    """Keep every test from opening a real browser window.
+
+    Autouse because the damage of missing one is loud and unwanted rather
+    than silent: `vocalize portal` calls `webbrowser.open`, which on macOS
+    hands the URL to whatever browser is running. Returns True the way a
+    successful open does. Request it by name to assert what was opened.
+    """
+    import webbrowser
+
+    opened: list[str] = []
+    monkeypatch.setattr(
+        webbrowser, "open", lambda url, *a, **k: (opened.append(url), True)[1]
+    )
+    return opened
 
 
 @pytest.fixture(autouse=True)

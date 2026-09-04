@@ -348,6 +348,14 @@ def test_a_press_cancelled_while_it_was_still_launching_says_nothing(
     """
     recorder()
     monkeypatch.setattr(dictate, "_START_GRACE", 0.3)
+    # Freeze the wall clock the grace is measured against. The two checks
+    # that decide "cancelled" over "the recorder did not start" compare
+    # `time.time() - started` to `_START_GRACE`, so on a loaded machine the
+    # 0.3s budget was blown before the cancel branch was reached and this
+    # test failed at random (issue #6). `_stop_late_starter` bounds its own
+    # watch with `time.monotonic()`, which is left alone, so the grace stays
+    # short and the test stays fast.
+    monkeypatch.setattr(dictate.time, "time", lambda: 1_000.0)
 
     def cancelled_while_launching(workdir, settings):
         dictate.toggle(settings)  # the second press, inside the start grace

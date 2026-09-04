@@ -518,11 +518,15 @@ def chain(provider_names) -> None:
             raise click.UsageError(f"Duplicate provider {name!r} in the chain.")
         seen.add(name)
 
+    path = config_path()
+    # Fingerprint first, then read. The other order calls a write that
+    # landed in between "unchanged" and clobbers it; this order refuses a
+    # write that raced us, which is the safe direction (DEC-005).
+    fingerprint = wizard.fingerprint_config(path)
     data = dict(load_config_file())
     data["chain"] = list(provider_names)
-    path = config_path()
     wizard._render_config_text(data)  # fail fast before writing anything
-    wizard._write_config(path, data)
+    wizard.write_config_if_unchanged(path, data, fingerprint)
     click.echo(f"chain={','.join(provider_names)}")
     click.echo(f"wrote {path}")
 
@@ -1227,6 +1231,57 @@ def auth_logout(provider) -> None:
     click.echo("Removed the stored API key from the system keychain.")
 
 
+@main.command("portal")
+@click.option("--no-browser", is_flag=True,
+              help="Print the address instead of opening a browser.")
+def portal_command(no_browser) -> None:
+    """Open the local settings portal in a browser.
+
+    Serves on 127.0.0.1 only. Closes on Ctrl-C, after 15 minutes with
+    nothing to do, or after five wrong codes — the last of those exits 1.
+    """
+    import webbrowser
+
+    from . import portal as portal_module
+
+    served = portal_module.Portal()
+    url = served.start()
+    try:
+        # The code is in the fragment, so this line is the only place it is
+        # ever readable. Print it once: repeating it doubles the exposure
+        # for nothing.
+        click.echo(url)
+        click.echo(
+            f"This link works once, for {int(portal_module.CODE_TTL)} seconds, "
+            "from this Mac only."
+        )
+        click.echo("")
+        # DEC-018, in the one place a user will ever see it.
+        click.echo(
+            "NOTE: the portal assumes a single-user machine. Everything that "
+            "reads or changes your settings is behind a token this link hands "
+            "out once — but the socket itself is open to every process on this "
+            "Mac, and five junk requests will close the portal under you. "
+            "Nothing leaks if that happens; run the command again."
+        )
+        click.echo("Press Ctrl-C to close it.")
+        if not no_browser and not webbrowser.open(url):
+            click.echo("No browser opened — paste the link above into one.")
+        served.serve_until_stopped()
+    finally:
+        served.stop()
+        # Ctrl-C, the idle watchdog and a lockout all arrive here with a
+        # model install possibly still running on a daemon thread that is
+        # about to be killed mid-download. Say so — the alternative is a
+        # portal that closes quietly over a part-file the size of the
+        # model — and take the unusable file back.
+        cut_short = served.discard_partial_download()
+        if cut_short:
+            click.echo(cut_short, err=True)
+    if served.locked_out:
+        sys.exit(1)
+
+
 def run() -> None:
     """Entry point that turns our VocalizeError family into clean CLI errors."""
     try:
@@ -1362,12 +1417,6 @@ def _install_kokoro(yes: bool) -> None:
     click.echo('Kokoro installed. Try: vocalize speak "hello" --provider kokoro')
 
 
-_REGRANT_WARNING = (
-    "Vocalize Recorder was rebuilt — re-grant the microphone in "
-    "System Settings › Privacy & Security › Microphone"
-)
-
-
 def _build_recorder_step(install_module) -> None:
     """Compile the recorder bundle if it is missing or out of date.
 
@@ -1388,7 +1437,7 @@ def _build_recorder_step(install_module) -> None:
         click.echo("  macOS will ask for microphone access the first time you dictate.")
     else:
         click.echo(f"  recorder: rebuilt ({bundle})")
-        click.echo(f"  {_REGRANT_WARNING}")
+        click.echo(f"  {install_module.REGRANT_WARNING}")
 
 
 def _stt_model_or_raise(manifest, model_name: str | None) -> str:
