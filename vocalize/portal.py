@@ -40,7 +40,9 @@ Writes (`POST /api/chain`, `/api/provider/<name>`, `/api/stt`,
 `/api/auth/login`) are compare-and-swap (DEC-005): `/api/state` hands the
 page the config file's fingerprint, taken *before* the values that go with
 it are parsed, every write hands that fingerprint back, and a file that
-moved in between is refused with 409 rather than clobbered. Each value
+moved in between is refused with 409 rather than clobbered. On the wire the
+fingerprint's `mtime_ns` is a decimal string, never a number: it has 19
+digits and JavaScript rounds past 16 (`_wire`). Each value
 goes through the same `config._validate_*` the CLI uses, so a bad one
 comes back in the CLI's own wording. Two places are stricter than a hand
 edit, deliberately: an unknown key in `[providers.*]` or `[stt]` is
@@ -56,6 +58,13 @@ Playback). Previews are serialized on one *module* lock — Kokoro's
 resident worker is process-global — and the wait for it is bounded, so a
 held-down preview button answers 503 rather than queueing one handler
 thread and one paid synthesis per click (DEC-018).
+
+`GET /api/voices/<name>` is the provider module's own `list_voices()`,
+run through readiness' probe registry so a keychain read or a network call
+that hangs costs `probe_timeout` and a daemon thread, never a stuck page,
+and so two requests for one provider join one call. A list is kept for the
+life of the object; a failure answers one fixed line, because the SDK's
+error text is where a rejected key gets echoed.
 
 `POST /api/local/install/start` runs the download off the request thread
 and `GET /api/local/install/status` returns the progress dict the page
@@ -81,7 +90,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import auth, config, ledger, readiness, wizard
-from .exceptions import ConfigChangedError, ProviderError, VocalizeError
+from .exceptions import (
+    ConfigChangedError,
+    MissingAPIKeyError,
+    ProviderError,
+    ProviderUnavailableError,
+    VocalizeError,
+)
 from .tts import DEFAULT_CACHE_DIR
 
 #: The header the session token is read from. The only place it is read from.
@@ -114,7 +129,20 @@ STATE_TIMEOUT = 2.0
 #: probe means the probe did not finish — see `_key_info`.
 _KEY_SOURCES = ("flag", "environment", ".env file", "keychain", "not found")
 
-CSP = "default-src 'self'; media-src 'self' blob:; frame-ancestors 'none'"
+#: `style-src` is spelled out because `default-src 'self'` does not cover an
+#: inline `<style>` element — "self" is a source for *fetched* stylesheets,
+#: and an inline one needs `'unsafe-inline'`, a nonce or a hash. The portal
+#: serves exactly two asset files and has no route for a third, and the page
+#: is served verbatim so a per-response nonce would mean templating it. What
+#: the relaxation buys an attacker here is nothing: script is still 'self'
+#: with no inline script on the page, the page builds every node with
+#: `textContent` so there is no markup injection point to write CSS from,
+#: and `default-src 'self'` still refuses the outbound request a CSS
+#: exfiltration channel would need.
+CSP = (
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "media-src 'self' blob:; frame-ancestors 'none'"
+)
 
 #: On every response, including every error. `media-src ... blob:` is there
 #: for the preview audio run 8 serves: the page fetches bytes with the token
@@ -176,6 +204,19 @@ _preview_lock = threading.Lock()
 #: button pile up one handler thread — and one paid synthesis — per click.
 PREVIEW_WAIT = 30.0
 
+#: The providers whose `list_voices()` is a network call, so the page can say
+#: "live". The other three list offline — `say` from the system, kokoro from
+#: its manifest, openai from a constant — and are "builtin".
+LIVE_VOICE_LISTS = frozenset({"elevenlabs", "google", "polly"})
+
+#: The one line a listing that failed or timed out answers with. Fixed, never
+#: the provider's own text: `tts.list_voices` wraps the SDK's error verbatim,
+#: and an SDK that echoes a rejected header value echoes the key.
+VOICES_FAILED = (
+    "Could not fetch this provider's voice list. The field still takes a "
+    "typed voice id."
+)
+
 #: What `POST /api/local/install/start` will install.
 INSTALL_TARGETS = ("kokoro", "stt")
 
@@ -200,6 +241,7 @@ _PLACEHOLDER_JS = "// The vocalize config portal script is not built yet.\n"
 _PARAMETERIZED = (
     (re.compile(r"^/api/provider/([a-z0-9_-]{1,32})$"), "/api/provider/*"),
     (re.compile(r"^/api/voices/([a-z0-9_-]{1,32})/preview$"), "/api/voices/*/preview"),
+    (re.compile(r"^/api/voices/([a-z0-9_-]{1,32})$"), "/api/voices/*"),
 )
 
 
@@ -233,6 +275,7 @@ ROUTES: tuple[tuple[str, str, str], ...] = (
     ("POST", "/api/provider/elevenlabs", "token"),
     ("POST", "/api/stt", "token"),
     ("POST", "/api/auth/login", "token"),
+    ("GET", "/api/voices/kokoro", "token"),
     ("POST", "/api/voices/kokoro/preview", "token"),
     ("POST", "/api/local/install/start", "token"),
     ("GET", "/api/local/install/status", "token"),
@@ -421,13 +464,38 @@ def _provider_or_404(name) -> str:
     return name
 
 
+#: `mtime_ns` as it crosses the wire: ASCII digits only, and no more of them
+#: than a signed 64-bit nanosecond count has (19). Bounded so `int()` can
+#: never see the 64 KiB of digits the body cap would otherwise let through.
+_WIRE_MTIME = re.compile(r"[0-9]{1,20}")
+
+
+def _wire(fingerprint):
+    """A fingerprint as the page receives it: `mtime_ns` as a decimal string.
+
+    A nanosecond timestamp has 19 digits and JavaScript's one number type
+    is exact to 2**53 — 16. Sent as an integer, `JSON.parse` rounds it,
+    `JSON.stringify` sends the rounded value back, and the compare-and-swap
+    refuses every write the page ever makes. The page never looks inside a
+    fingerprint, it hands it back verbatim, so the string costs it nothing.
+    `"absent"` and `None` pass through unchanged; `wizard`'s CLI callers
+    never see this and keep their dict of ints.
+    """
+    if isinstance(fingerprint, dict):
+        return {"mtime_ns": str(fingerprint["mtime_ns"]), "sha256": fingerprint["sha256"]}
+    return fingerprint
+
+
 def _fingerprint_from(payload: dict):
     """The fingerprint the page is handing back, shape-checked.
 
     Untrusted, and it decides whether a write lands. Accepted only in the
-    two shapes `wizard.fingerprint_config` produces, and rebuilt rather
-    than passed through, so no extra key can ride along and no comparison
-    can succeed for the wrong reason.
+    two shapes `_wire` sends — `"absent"`, or the dict with `mtime_ns` as
+    a digit string — and rebuilt rather than passed through, so no extra
+    key can ride along and no comparison can succeed for the wrong reason.
+    A number in `mtime_ns` is refused with the rest: a page that parsed the
+    value into a double sends one, and it cannot be told from a hand-built
+    request that happens to be exact.
     """
     value = payload.get("fingerprint")
     if value == wizard.ABSENT_CONFIG:
@@ -435,12 +503,11 @@ def _fingerprint_from(payload: dict):
     if (
         isinstance(value, dict)
         and set(value) == {"mtime_ns", "sha256"}
-        # bool is an int subclass, and `True` is not a timestamp.
-        and isinstance(value["mtime_ns"], int)
-        and not isinstance(value["mtime_ns"], bool)
+        and isinstance(value["mtime_ns"], str)
+        and _WIRE_MTIME.fullmatch(value["mtime_ns"])
         and isinstance(value["sha256"], str)
     ):
-        return {"mtime_ns": value["mtime_ns"], "sha256": value["sha256"]}
+        return {"mtime_ns": int(value["mtime_ns"]), "sha256": value["sha256"]}
     raise _Refused(400, "Expected the 'fingerprint' this page was given by /api/state.")
 
 
@@ -555,6 +622,59 @@ def _uv_or_raise(install_module) -> str:
     return uv
 
 
+def _unavailable_reason(name: str, exc: ProviderUnavailableError) -> str:
+    """One short sentence for the page, by cause, never the module's text.
+
+    The module's message is written for a terminal: three sentences naming
+    commands, flags and environment variables. The page shows the reason
+    beside the voice field, whole, so it gets one line that fits there. The
+    cause is read off the exception chain — `require_key` raises from
+    `MissingAPIKeyError`, Polly's client from `ImportError` — and Polly is
+    the one provider whose remaining cause is AWS credentials.
+    """
+    cause = exc.__cause__
+    if isinstance(cause, MissingAPIKeyError):
+        return "No API key is stored for this provider yet."
+    if isinstance(cause, ImportError):
+        return "This provider's optional package is not installed."
+    if name == "polly":
+        return "No usable AWS credentials were found on this machine."
+    return "This provider is not set up on this machine yet."
+
+
+def _voice_list(name: str) -> dict:
+    """`GET /api/voices/<name>`'s payload, from the module's own `list_voices()`.
+
+    `name` is already allowlisted. No key where one is needed is a state,
+    not a failure: the module raises `ProviderUnavailableError` before it
+    builds a client or opens a connection, and the page shows the reason
+    beside the field. Anything else the module raises goes to the probe
+    thread, which keeps the type name and drops the text
+    (`readiness._start_probe`), and the route answers `VOICES_FAILED`.
+
+    Each voice is reduced to the two strings the page's `<datalist>` shows,
+    trimmed and cut at the length `_provider_value` accepts back — a longer
+    id could be offered but never saved, a padded one saved padded — and
+    anything that is not a voice, a blank id included, is dropped.
+    """
+    from . import providers as providers_module
+
+    try:
+        listed = providers_module.get(name).list_voices()
+    except ProviderUnavailableError as exc:
+        return {"voices": [], "source": "unavailable", "reason": _unavailable_reason(name, exc)}
+    voices = []
+    for entry in listed:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        voice_id = entry["id"].strip()
+        if not voice_id:
+            continue
+        label = str(entry.get("name") or "").strip() or voice_id
+        voices.append({"id": voice_id[:200], "name": label[:200]})
+    return {"voices": voices, "source": "live" if name in LIVE_VOICE_LISTS else "builtin"}
+
+
 class Portal:
     """One portal server: its secrets, its routes and its lifetime.
 
@@ -596,6 +716,11 @@ class Portal:
         # cleanup runs in the worker, and the worker is a daemon thread
         # that is killed without unwinding when the process exits.
         self._downloading: Path | None = None
+        # One voice list per provider, kept for the life of the object and
+        # bounded by the allowlist; one lock per provider so a second request
+        # for the same list waits for the first rather than starting another.
+        self._voice_lists: dict[str, dict] = {}
+        self._voice_locks = {name: threading.Lock() for name in auth.PROVIDER_NAMES}
 
     # --- lifetime -----------------------------------------------------
 
@@ -838,6 +963,8 @@ class Portal:
             return self._answer(lambda: self._login(body))
         if route_path == "/api/voices/*/preview":
             return self._answer(lambda: self._preview(name))
+        if route_path == "/api/voices/*":
+            return self._answer(lambda: self._voices(name))
         if route_path == "/api/local/install/start":
             return self._answer(lambda: self._install_start(body))
         if route_path == "/api/local/install/status":
@@ -968,7 +1095,7 @@ class Portal:
                 "stt": stt,
                 "config_path": str(config.config_path()),
                 "config_error": config_error,
-                "fingerprint": fingerprint,
+                "fingerprint": _wire(fingerprint),
             },
         )
 
@@ -1002,7 +1129,7 @@ class Portal:
         _text, written = wizard.write_config_if_unchanged(
             config.config_path(), data, fingerprint
         )
-        return self._reply(200, {"ok": True, "fingerprint": written})
+        return self._reply(200, {"ok": True, "fingerprint": _wire(written)})
 
     def _chain(self, body: bytes):
         payload = _payload(body)
@@ -1118,6 +1245,10 @@ class Portal:
             # `from None` drops __cause__ — the chain is exactly where a
             # leaked key would otherwise still be sitting.
             raise _Refused(400, auth.scrub(str(exc), key)) from None
+        # The remembered voice list was fetched with the old key, and the
+        # page asks again right after a store: that ask must be a fresh call.
+        with self._lock:
+            self._voice_lists.pop(name, None)
         return self._reply(200, {"ok": True, "message": auth.scrub(message, key)})
 
     # --- preview ------------------------------------------------------
@@ -1179,6 +1310,59 @@ class Portal:
             # be asked the same question twice.
             extra={"Accept-Ranges": "none"},
         )
+
+    # --- voice lists --------------------------------------------------
+
+    def _voices(self, name: str | None):
+        """One provider's voices, listed once and remembered.
+
+        Through readiness' probe registry rather than inline: a listing is
+        a keychain read and then a network call, either of which can hang,
+        and the registry is what already bounds a hang on this server — a
+        daemon thread joined against `probe_timeout`, and one in-flight
+        thread per name, so a request arriving while an earlier listing is
+        still running joins that thread instead of opening a second
+        connection. The probe's exception text goes nowhere: the registry
+        keeps the type name only, and this route answers a fixed line.
+
+        The per-provider lock makes check-then-list atomic, so two requests
+        cannot both find the cache empty and both start. Its wait is
+        bounded by the holder's own `probe_timeout`; the acquire timeout is
+        the belt to that pair of braces.
+
+        A list, once fetched, is kept for the life of this object and a
+        cache hit says "cached" where the list was "live". "unavailable" is
+        not kept: it is the state before a key is stored, and it should
+        clear when one is — so it is evicted before the next ask.
+        """
+        _provider_or_404(name)
+        lock = self._voice_locks[name]
+        if not lock.acquire(timeout=self.probe_timeout):
+            return self._reply(502, {"error": VOICES_FAILED})
+        try:
+            with self._lock:
+                known = self._voice_lists.get(name)
+                if known is not None and known["source"] == "unavailable":
+                    del self._voice_lists[name]
+                    known = None
+            if known is not None:
+                source = "cached" if known["source"] == "live" else known["source"]
+                return self._reply(200, {**known, "source": source})
+
+            def probe() -> readiness.Row:
+                listed = _voice_list(name)
+                with self._lock:
+                    self._voice_lists[name] = listed
+                return readiness.Row(f"voices {name}", "ok", "", "")
+
+            readiness.run_probes([(f"voices {name}", probe)], self.probe_timeout)
+            with self._lock:
+                listed = self._voice_lists.get(name)
+        finally:
+            lock.release()
+        if listed is None:
+            return self._reply(502, {"error": VOICES_FAILED})
+        return self._reply(200, listed)
 
     # --- the local install thread -------------------------------------
 

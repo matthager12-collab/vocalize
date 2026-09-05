@@ -185,7 +185,7 @@ def _client_that_raises(exc):
             raise exc
 
     class _Voices:
-        def search(self):
+        def search(self, **_kwargs):
             raise exc
 
     class _Client:

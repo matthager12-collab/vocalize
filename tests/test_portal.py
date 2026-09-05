@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import threading
 import time
@@ -31,6 +32,12 @@ import pytest
 import vocalize.readiness as readiness_module
 from vocalize import portal as portal_module
 from vocalize import wizard
+from vocalize.exceptions import (
+    MissingAPIKeyError,
+    ProviderAuthError,
+    ProviderError,
+    ProviderUnavailableError,
+)
 from vocalize.portal import (
     CSP,
     MAX_BODY,
@@ -351,7 +358,10 @@ def test_token_wrong_method_is_405_even_with_a_valid_token(portal):
 # --- security headers -------------------------------------------------
 
 _REQUIRED_HEADERS = {
-    "Content-Security-Policy": "default-src 'self'; media-src 'self' blob:; frame-ancestors 'none'",
+    "Content-Security-Policy": (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "media-src 'self' blob:; frame-ancestors 'none'"
+    ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -1320,6 +1330,21 @@ def _fingerprint(portal) -> object:
     return _body(portal.route("GET", "/api/state", _authed(portal)))["fingerprint"]
 
 
+def _on_the_wire(fingerprint: dict) -> dict:
+    """`wizard`'s dict of ints as the portal sends it: `mtime_ns` as a string.
+
+    A nanosecond timestamp has 19 digits and JavaScript's Number is exact
+    to 2**53, so an integer would come back rounded and every write would
+    be refused. The page returns the value verbatim and never reads it.
+    """
+    return {"mtime_ns": str(fingerprint["mtime_ns"]), "sha256": fingerprint["sha256"]}
+
+
+def _as_javascript_would(body: bytes) -> dict:
+    """Parse a response the way `JSON.parse` does: every number is a double."""
+    return json.loads(body.decode("utf-8"), parse_int=float)
+
+
 def _post(portal, path: str, payload: dict):
     """One authenticated write. Returns `(status, parsed body)`."""
     status, _, body = portal.route(
@@ -1332,7 +1357,7 @@ def test_state_carries_the_fingerprint_of_the_file_on_disk(portal, tmp_path):
     """The page cannot send back a fingerprint it was never given."""
     _write_config(tmp_path, 'chain = ["say"]\n')
     _exchange(portal)
-    assert _fingerprint(portal) == wizard.fingerprint_config(_config_file(tmp_path))
+    assert _fingerprint(portal) == _on_the_wire(wizard.fingerprint_config(_config_file(tmp_path)))
 
 
 def test_state_calls_a_missing_config_file_absent(portal):
@@ -1361,8 +1386,8 @@ def test_state_takes_the_fingerprint_before_the_values_it_ships(portal, tmp_path
     monkeypatch.setattr(portal_module.config, "load_config_file", load_and_race)
     issued = _fingerprint(portal)
 
-    assert issued == before
-    assert issued != wizard.fingerprint_config(_config_file(tmp_path))
+    assert issued == _on_the_wire(before)
+    assert issued != _on_the_wire(wizard.fingerprint_config(_config_file(tmp_path)))
 
 
 def test_state_survives_a_config_file_it_cannot_fingerprint(portal, monkeypatch):
@@ -1395,7 +1420,7 @@ def test_writing_the_chain_saves_it_and_returns_a_fresh_fingerprint(portal, tmp_
     assert 'chain = ["kokoro", "say"]' in path.read_text()
     # The page writes again without polling, so the fingerprint has to be
     # the one the file now holds.
-    assert body["fingerprint"] == wizard.fingerprint_config(path)
+    assert body["fingerprint"] == _on_the_wire(wizard.fingerprint_config(path))
 
 
 def test_writing_the_chain_keeps_every_other_key_and_table(portal, tmp_path):
@@ -1525,11 +1550,22 @@ def test_a_write_onto_a_config_file_that_does_not_validate_is_400(portal, tmp_pa
         None,
         {},
         "unchanged",
-        {"mtime_ns": 1, "sha256": "a", "extra": True},
+        {"mtime_ns": "1", "sha256": "a", "extra": True},
         {"mtime_ns": True, "sha256": "a"},
-        {"mtime_ns": "1", "sha256": "a"},
-        {"mtime_ns": 1, "sha256": 2},
-        {"mtime_ns": 1},
+        # The wire carries `mtime_ns` as a string; a number is what a page
+        # that parsed it into a double would send, and cannot be told apart.
+        {"mtime_ns": 1, "sha256": "a"},
+        {"mtime_ns": 1.0, "sha256": "a"},
+        {"mtime_ns": -1, "sha256": "a"},
+        {"mtime_ns": "-1", "sha256": "a"},
+        {"mtime_ns": "1.0", "sha256": "a"},
+        {"mtime_ns": "1e3", "sha256": "a"},
+        {"mtime_ns": "", "sha256": "a"},
+        {"mtime_ns": " 1", "sha256": "a"},
+        {"mtime_ns": "\u00b2", "sha256": "a"},  # str.isdigit() says yes, int() raises
+        {"mtime_ns": "1" * 21, "sha256": "a"},  # longer than any nanosecond timestamp
+        {"mtime_ns": "1", "sha256": 2},
+        {"mtime_ns": "1"},
         [1, "a"],
     ],
 )
@@ -1569,6 +1605,60 @@ def test_a_refused_fingerprint_is_never_echoed_back(portal, tmp_path):
 
     assert status == 400
     assert b"sk-canary" not in body
+
+
+def test_a_fingerprint_survives_the_page_and_the_write_is_accepted(portal, tmp_path):
+    """`mtime_ns` has 19 digits; JavaScript's Number is exact to 16.
+
+    Sent as an integer, `JSON.parse` rounded it, `JSON.stringify` sent the
+    rounded value back, and the compare-and-swap refused every write the
+    page ever made — one field, one click, no concurrency. So the wire
+    carries `mtime_ns` as a decimal string and the page hands it back
+    verbatim. This goes through the page's own arithmetic: parse as
+    JavaScript would, serialise again, post it back, twice — once with the
+    fingerprint `/api/state` issued and once with the one the write
+    returned, since the page writes again without polling in between.
+    """
+    _write_config(tmp_path, 'chain = ["say"]\n')
+    path = _config_file(tmp_path)
+    stamp = 1788565401918152383  # a real nanosecond timestamp, past 2**53
+    os.utime(path, ns=(stamp, stamp))
+    mtime = path.stat().st_mtime_ns
+    assert int(float(mtime)) != mtime, "this filesystem keeps too little precision to test with"
+    _exchange(portal)
+
+    _status, _headers, body = portal.route("GET", "/api/state", _authed(portal))
+    fingerprint = _as_javascript_would(body)["fingerprint"]
+    status, _, body = portal.route(
+        "POST",
+        "/api/chain",
+        _authed(portal),
+        json.dumps({"order": ["kokoro"], "fingerprint": fingerprint}).encode(),
+    )
+    assert status == 200, body
+
+    fingerprint = _as_javascript_would(body)["fingerprint"]
+    status, _, body = portal.route(
+        "POST",
+        "/api/chain",
+        _authed(portal),
+        json.dumps({"order": ["say"], "fingerprint": fingerprint}).encode(),
+    )
+    assert status == 200, body
+    assert 'chain = ["say"]' in path.read_text()
+
+
+def test_the_fingerprint_crosses_the_wire_with_mtime_ns_as_a_string(portal, tmp_path):
+    """Both places a fingerprint is sent: `/api/state` and a write's answer."""
+    _write_config(tmp_path, 'chain = ["say"]\n')
+    _exchange(portal)
+
+    issued = _fingerprint(portal)
+    assert isinstance(issued["mtime_ns"], str) and issued["mtime_ns"].isdigit()
+
+    _status, body = _post(portal, "/api/chain", {"order": ["kokoro"], "fingerprint": issued})
+    returned = body["fingerprint"]
+    assert isinstance(returned["mtime_ns"], str) and returned["mtime_ns"].isdigit()
 
 
 # --- POST /api/provider/<name> ----------------------------------------
@@ -2129,6 +2219,10 @@ class _FakeProvider:
         self.error = error
         self.calls = []
         self.settings = []
+        # The voice-list half of the contract, for `GET /api/voices/<name>`.
+        self.voices = [{"id": "v1", "name": "Rachel"}, {"id": "v2", "name": "Adam"}]
+        self.list_error = None
+        self.listed = 0
 
     def check(self, settings, **kwargs):
         self.settings.append(settings)
@@ -2139,6 +2233,12 @@ class _FakeProvider:
         if self.error is not None:
             raise self.error
         return self.audio
+
+    def list_voices(self):
+        self.listed += 1
+        if self.list_error is not None:
+            raise self.list_error
+        return self.voices
 
 
 @pytest.fixture
@@ -3085,3 +3185,611 @@ def test_the_model_that_reaches_the_runtime_argv_is_the_allowlisted_one(
     _wait_for_install(portal)
 
     assert fake_install.selftest == [{"manifest": manifest, "model": "base.en"}]
+
+
+# --- voice lists: GET /api/voices/<name> --------------------------------
+#
+# The provider module's own `list_voices()`, run through readiness' probe
+# registry: a daemon thread joined against `probe_timeout`, one in-flight
+# thread per provider name so a second request joins the call already
+# running, and the exception text kept out of every answer. The module is
+# `fake_provider` unless a test says otherwise, so nothing here reaches a
+# network, a keychain or a subprocess.
+
+
+def _voices(portal, name: str = "elevenlabs", query: str = ""):
+    return portal.route("GET", f"/api/voices/{name}{query}", _authed(portal))
+
+
+def _raise(*_args, **_kwargs):
+    raise AssertionError("the HTTP helper was reached")
+
+
+def test_the_voices_route_is_in_the_token_route_table():
+    """`_TOKEN_ROUTES` is derived from `ROUTES`, so the auth negatives above
+    cover the new route only if the table carries it."""
+    assert ("GET", "/api/voices/kokoro") in _TOKEN_ROUTES
+
+
+def test_a_voice_list_answers_the_providers_voices_and_says_they_are_live(portal, fake_provider):
+    _exchange(portal)
+
+    status, headers, body = _voices(portal, "elevenlabs")
+
+    assert status == 200
+    assert json.loads(body) == {
+        "voices": [{"id": "v1", "name": "Rachel"}, {"id": "v2", "name": "Adam"}],
+        "source": "live",
+    }
+    assert fake_provider.listed == 1
+    for name, value in portal_module.SECURITY_HEADERS.items():
+        assert headers[name] == value
+
+
+@pytest.mark.parametrize("name", ["say", "kokoro", "openai"])
+def test_a_list_that_needs_no_network_is_called_built_in(portal, fake_provider, name):
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, name)
+
+    assert status == 200
+    assert json.loads(body)["source"] == "builtin"
+
+
+def test_a_second_request_is_a_cache_hit_and_says_so(portal, fake_provider):
+    _exchange(portal)
+
+    first = json.loads(_voices(portal, "elevenlabs")[2])
+    second = json.loads(_voices(portal, "elevenlabs")[2])
+
+    assert fake_provider.listed == 1
+    assert first["source"] == "live"
+    assert second["source"] == "cached"
+    assert second["voices"] == first["voices"]
+
+
+def test_a_cached_built_in_list_stays_built_in(portal, fake_provider):
+    _exchange(portal)
+
+    _voices(portal, "say")
+    second = json.loads(_voices(portal, "say")[2])
+
+    assert fake_provider.listed == 1
+    assert second["source"] == "builtin"
+
+
+def test_a_voice_entry_is_reduced_to_a_string_id_and_name(portal, fake_provider):
+    """What comes back from a third-party API is shaped before the page sees
+    it: two strings per voice, nothing else, and nothing that is not a voice."""
+    fake_provider.voices = [
+        {"id": "ok", "name": "Fine", "preview_url": "https://cdn.example/x.mp3"},
+        {"id": "no-name"},
+        {"id": None, "name": "no id"},
+        {"id": 7, "name": "numeric id"},
+        {"name": "missing id"},
+        "not a dict",
+        {"id": "long", "name": "n" * 500},
+    ]
+    _exchange(portal)
+
+    voices = json.loads(_voices(portal, "elevenlabs")[2])["voices"]
+
+    assert voices == [
+        {"id": "ok", "name": "Fine"},
+        {"id": "no-name", "name": "no-name"},
+        {"id": "long", "name": "n" * 200},
+    ]
+
+
+def test_two_simultaneous_requests_make_one_provider_call(fake_provider):
+    """The probe registry hands the second request the thread already running."""
+    portal = Portal(probe_timeout=5.0)
+    portal.port = PORT
+    _exchange(portal)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_list():
+        fake_provider.listed += 1
+        entered.set()
+        assert release.wait(5)
+        return fake_provider.voices
+
+    fake_provider.list_voices = blocking_list
+    answers = {}
+
+    def ask(label):
+        answers[label] = _voices(portal, "elevenlabs")
+
+    first = threading.Thread(target=ask, args=("first",), daemon=True)
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=ask, args=("second",), daemon=True)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive(), "the second request did not wait for the first"
+
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert answers["first"][0] == 200
+    assert answers["second"][0] == 200
+    assert fake_provider.listed == 1
+
+
+def test_a_request_after_a_timed_out_listing_joins_the_running_call(portal, fake_provider):
+    """The registry layer, on its own: the first request gave up at
+    `probe_timeout` and its thread is still on the call. The next request
+    joins that thread rather than opening a second connection — the case the
+    per-provider lock cannot cover, because the first request has released it."""
+    _exchange(portal)
+    release = threading.Event()
+
+    def blocking_list():
+        fake_provider.listed += 1
+        assert release.wait(5)
+        return fake_provider.voices
+
+    fake_provider.list_voices = blocking_list
+
+    assert _voices(portal, "elevenlabs")[0] == 502
+    assert _voices(portal, "elevenlabs")[0] == 502
+    release.set()
+    # The one thread finishes and fills the cache; the next request is a hit.
+    deadline = time.monotonic() + 5
+    while portal._voice_lists.get("elevenlabs") is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert _voices(portal, "elevenlabs")[0] == 200
+    assert fake_provider.listed == 1
+
+
+def test_requests_for_one_provider_serialize_on_its_own_lock(fake_provider):
+    """The lock layer, on its own: check-then-list is atomic per provider,
+    and per provider only — a list for another provider is not held up."""
+    portal = Portal(probe_timeout=5.0)
+    portal.port = PORT
+    _exchange(portal)
+    answers = {}
+
+    def ask(name):
+        answers[name] = _voices(portal, name)
+
+    with portal._voice_locks["elevenlabs"]:
+        waiting = threading.Thread(target=ask, args=("elevenlabs",), daemon=True)
+        waiting.start()
+        waiting.join(0.3)
+        assert waiting.is_alive(), "a request did not wait for the lock on its provider"
+        assert fake_provider.listed == 0
+        ask("say")
+        assert answers["say"][0] == 200, "another provider's list was held up"
+    waiting.join(5)
+
+    assert answers["elevenlabs"][0] == 200
+    assert fake_provider.listed == 2
+
+
+def test_a_blocked_provider_is_502_within_the_bound_and_the_portal_still_answers(
+    portal, fake_provider
+):
+    """`probe_timeout` is the bound — the readiness probes' own — and a
+    listing that outlives it answers the fixed line while the thread it left
+    behind is a daemon nobody waits for."""
+    _exchange(portal)
+    release = threading.Event()
+
+    def blocking_list():
+        fake_provider.listed += 1
+        assert release.wait(5)
+        return fake_provider.voices
+
+    fake_provider.list_voices = blocking_list
+    started = time.monotonic()
+
+    status, headers, body = _voices(portal, "elevenlabs")
+    elapsed = time.monotonic() - started
+
+    assert status == 502
+    assert elapsed < 1.5
+    assert json.loads(body) == {"error": portal_module.VOICES_FAILED}
+    for name, value in portal_module.SECURITY_HEADERS.items():
+        assert headers[name] == value
+    assert portal.route("GET", "/api/ping", _authed(portal))[0] == 200
+    release.set()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError("elevenlabs", "HTTP 500\n<html>quota and trace</html>"),
+        RuntimeError("unplanned, with upstream text in it"),
+    ],
+    ids=["provider-error", "unplanned"],
+)
+def test_a_listing_that_fails_is_502_with_one_fixed_line(portal, fake_provider, error, capsys):
+    """Never the provider's words: `tts.list_voices` wraps the SDK's error
+    verbatim, and the fixed line is what keeps that text off the page."""
+    fake_provider.list_error = error
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, "elevenlabs")
+
+    assert status == 502
+    assert json.loads(body) == {"error": portal_module.VOICES_FAILED}
+    assert b"upstream" not in body
+    assert b"quota" not in body
+    captured = capsys.readouterr()
+    assert "upstream" not in captured.err + captured.out
+    assert "quota" not in captured.err + captured.out
+
+
+def test_a_failed_listing_is_not_cached(portal, fake_provider):
+    """A failure is not a list; the next page load asks again."""
+    fake_provider.list_error = RuntimeError("once")
+    _exchange(portal)
+    assert _voices(portal)[0] == 502
+
+    fake_provider.list_error = None
+    status, _headers, body = _voices(portal)
+
+    assert status == 200
+    assert json.loads(body)["source"] == "live"
+    assert fake_provider.listed == 2
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        lambda: ProviderError("elevenlabs", f"rejected header {CANARY}"),
+        lambda: RuntimeError(f"LocalProtocolError: Illegal header value b'{CANARY}'"),
+    ],
+    ids=["provider-error", "unplanned"],
+)
+def test_a_voice_list_never_carries_a_stored_key_anywhere(
+    portal, fake_provider, fake_keychain, monkeypatch, capsys, make_error
+):
+    """APP-SECRETS: the key is in the keychain and the environment, the
+    provider's failure quotes it, and it reaches neither the body, the
+    headers nor the terminal."""
+    fake_keychain[("vocalize", "elevenlabs-api-key")] = CANARY
+    monkeypatch.setenv("ELEVENLABS_API_KEY", CANARY)
+    fake_provider.list_error = make_error()
+    _exchange(portal)
+
+    status, headers, body = _voices(portal, "elevenlabs")
+
+    assert status == 502
+    assert CANARY.encode() not in body
+    assert CANARY[:12].encode() not in body
+    assert CANARY not in json.dumps(headers)
+    captured = capsys.readouterr()
+    assert CANARY[:12] not in captured.out
+    assert CANARY[:12] not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("name", "seam"),
+    [
+        ("elevenlabs", "vocalize.tts.build_client"),
+        ("google", "vocalize.providers._http.request"),
+    ],
+)
+def test_no_key_is_a_state_not_an_error_and_makes_no_call(portal, monkeypatch, name, seam):
+    """The REAL module, an empty keychain and no env var: `require_key`
+    raises before the client is built or a request is made, and the page
+    gets a reason to show beside the field rather than a red banner."""
+    for variable in portal_module.auth.PROVIDER_ENV_VARS.values():
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(seam, _raise)
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, name)
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["voices"] == []
+    assert payload["source"] == "unavailable"
+    assert "API key" in payload["reason"]
+    assert "\n" not in payload["reason"]
+    assert not payload["reason"].startswith(f"{name}:")
+    # A field hint, not the terminal's three sentences about commands: the
+    # page shows this beside the voice box, whole.
+    assert len(payload["reason"]) <= 80
+    assert payload["reason"].endswith(".")
+    assert "vocalize" not in payload["reason"]
+
+
+def test_an_unavailable_answer_is_not_cached(portal, fake_provider):
+    """It is the state before a key is stored, and it clears when one is."""
+    fake_provider.list_error = ProviderUnavailableError("elevenlabs", "no key")
+    _exchange(portal)
+    assert json.loads(_voices(portal)[2])["source"] == "unavailable"
+
+    fake_provider.list_error = None
+    status, _headers, body = _voices(portal)
+
+    assert status == 200
+    assert json.loads(body)["source"] == "live"
+    assert fake_provider.listed == 2
+
+
+def test_a_voice_list_for_an_unknown_provider_is_404_and_calls_nothing(portal, fake_provider):
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, "nope")
+
+    assert status == 404
+    assert b"nope" not in body
+    assert fake_provider.listed == 0
+    assert portal._voice_lists == {}
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../etc", "/etc/passwd", "say\x00", "a" * 40, "SAY", "kokoro/../say", "say%2F..%2Fgoogle", ""],
+)
+def test_a_voices_path_the_pattern_refuses_never_reaches_a_module(portal, monkeypatch, name):
+    """APP-PATH: `_PARAMETERIZED`'s regex is the validation. A name it refuses
+    is a 404 before `providers.get` — the only module lookup — is called."""
+    monkeypatch.setattr("vocalize.providers.get", _raise)
+    _exchange(portal)
+
+    status, _headers, _body = _voices(portal, name)
+
+    assert status == 404
+
+
+@pytest.mark.parametrize("name", portal_module.auth.PROVIDER_NAMES)
+def test_every_provider_name_reaches_the_voices_handler(portal, fake_provider, name):
+    _exchange(portal)
+
+    status, _headers, _body = _voices(portal, name)
+
+    assert status == 200
+    assert fake_provider.listed == 1
+
+
+def test_a_voice_list_refuses_a_token_in_the_query_string(portal):
+    """The mutating-route table is POST-only, so the GET is pinned here."""
+    token = _exchange(portal)
+    status, _, body = portal.route(
+        "GET", f"/api/voices/say?token={token}", _headers({TOKEN_HEADER: token})
+    )
+    assert status == 403
+    assert b"never accepted from a URL" in body
+
+
+def test_a_voice_list_is_get_only(portal, fake_provider):
+    _exchange(portal)
+
+    status, _headers, _body = portal.route("POST", "/api/voices/say", _authed(portal), b"{}")
+
+    assert status == 405
+    assert fake_provider.listed == 0
+
+
+def test_a_query_string_cannot_alter_the_listing(portal, fake_provider):
+    """Nothing in the request but the allowlisted name reaches the module."""
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, "say", "?voice=evil&url=http://x")
+
+    assert status == 200
+    assert json.loads(body)["voices"] == fake_provider.voices
+
+
+def test_the_google_listing_url_is_the_modules_constant_whatever_the_request(
+    portal, monkeypatch
+):
+    """APP-SSRF: the real module over a recording HTTP helper."""
+    monkeypatch.setenv("GOOGLE_API_KEY", CANARY)
+    seen = []
+
+    def record(method, url, *, headers, **kwargs):
+        seen.append((method, url, headers))
+        return 200, json.dumps({"voices": [{"name": "en-US-Neural2-F", "languageCodes": ["en-US"]}]}).encode()
+
+    monkeypatch.setattr("vocalize.providers._http.request", record)
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, "google", "?url=https://evil.example/&name=x")
+
+    assert status == 200
+    assert json.loads(body)["voices"] == [{"id": "en-US-Neural2-F", "name": "en-US-Neural2-F (en-US)"}]
+    assert seen == [("GET", "https://texttospeech.googleapis.com/v1/voices", {"X-goog-api-key": CANARY})]
+    assert CANARY.encode() not in body
+
+
+def test_the_elevenlabs_client_is_built_from_the_key_alone(portal, monkeypatch):
+    """APP-SSRF: the SDK client takes the key and nothing from the request;
+    its endpoint is the SDK's own default."""
+    monkeypatch.setenv("ELEVENLABS_API_KEY", CANARY)
+    built = []
+
+    class _Voice:
+        voice_id = "21m00"
+        name = "Rachel"
+
+    class _Client:
+        class voices:
+            @staticmethod
+            def search(**_kwargs):
+                return [_Voice()]
+
+    def build_client(api_key):
+        built.append(api_key)
+        return _Client()
+
+    monkeypatch.setattr("vocalize.tts.build_client", build_client)
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, "elevenlabs", "?base_url=https://evil.example")
+
+    assert status == 200
+    assert json.loads(body) == {"voices": [{"id": "21m00", "name": "Rachel"}], "source": "live"}
+    assert built == [CANARY]
+
+
+def test_the_polly_client_is_built_from_default_settings_alone(portal, monkeypatch):
+    """APP-SSRF: boto3's endpoint comes from the region, and the region and
+    profile the module passes are `Settings()`'s defaults, never the request's."""
+    from vocalize.providers import polly
+
+    got = []
+
+    class _Polly:
+        @staticmethod
+        def describe_voices(**kwargs):
+            got.append(kwargs)
+            return {"Voices": [{"Id": "Matthew", "Name": "Matthew", "LanguageCode": "en-US", "SupportedEngines": ["neural"]}]}
+
+    def client(settings):
+        got.append((settings.profile, settings.region))
+        return _Polly()
+
+    monkeypatch.setattr(polly, "_client", client)
+    _exchange(portal)
+
+    status, _headers, body = _voices(portal, "polly", "?region=evil&profile=other")
+
+    assert status == 200
+    assert json.loads(body)["voices"] == [{"id": "Matthew", "name": "Matthew (en-US; neural)"}]
+    assert got == [(None, None), {}]
+
+
+def test_say_kokoro_and_openai_list_with_the_http_helper_broken(portal, monkeypatch):
+    """The three offline lists, through the REAL modules, with every way onto
+    the network raising. `say -v ?` is a subprocess and is faked too, so this
+    holds off a Mac."""
+    import subprocess
+
+    from vocalize.providers import say
+
+    monkeypatch.setattr("vocalize.providers._http.request", _raise)
+    monkeypatch.setattr("vocalize.providers._http.urlopen", _raise)
+    monkeypatch.setattr(
+        say,
+        "_run",
+        lambda argv: subprocess.CompletedProcess(
+            argv, 0, stdout="Alex                en_US    # Hello\nSamantha            en_US    # Hi\n", stderr=""
+        ),
+    )
+    _exchange(portal)
+
+    for name in ("say", "kokoro", "openai"):
+        status, _headers, body = _voices(portal, name)
+        assert status == 200, name
+        payload = json.loads(body)
+        assert payload["source"] == "builtin", name
+        assert payload["voices"], name
+        assert all(set(voice) == {"id", "name"} for voice in payload["voices"]), name
+
+
+@pytest.mark.parametrize(
+    ("name", "cli_message", "cause", "sentence"),
+    [
+        (
+            "elevenlabs",
+            str(MissingAPIKeyError("elevenlabs")),
+            MissingAPIKeyError("elevenlabs"),
+            "No API key is stored for this provider yet.",
+        ),
+        (
+            "polly",
+            "needs boto3 — install it with: pip install 'vocalize-cli[polly]'",
+            ImportError("No module named 'boto3'"),
+            "This provider's optional package is not installed.",
+        ),
+        (
+            "polly",
+            "AWS credentials not usable",
+            None,
+            "No usable AWS credentials were found on this machine.",
+        ),
+        (
+            "kokoro",
+            "uv is not installed — see https://docs.astral.sh/uv/ then run: vocalize local install",
+            None,
+            "This provider is not set up on this machine yet.",
+        ),
+    ],
+    ids=["no-key", "no-boto3", "no-aws-credentials", "anything-else"],
+)
+def test_an_unavailable_reason_is_one_short_sentence_per_cause(
+    portal, fake_provider, name, cli_message, cause, sentence
+):
+    """The module's message is written for a terminal — three sentences that
+    name commands — and the page showed it cut at 200 characters, mid-word.
+    The server maps the cause to one line that fits beside a field."""
+    error = ProviderUnavailableError(name, cli_message)
+    error.__cause__ = cause
+    fake_provider.list_error = error
+    _exchange(portal)
+
+    payload = json.loads(_voices(portal, name)[2])
+
+    assert payload["source"] == "unavailable"
+    assert payload["reason"] == sentence
+    assert len(sentence) <= 80
+    assert sentence.endswith(".")
+    assert "vocalize" not in sentence
+    assert "pip " not in sentence
+
+
+def test_a_blank_voice_id_is_dropped_and_a_padded_one_is_trimmed(portal, fake_provider):
+    """A whitespace-only id passed the shape check and became an empty
+    option in the picker; a padded one would be offered but saved padded."""
+    fake_provider.voices = [
+        {"id": "  ", "name": "blank"},
+        {"id": " v1 ", "name": " Rachel "},
+        {"id": "v2", "name": "   "},
+        {"id": "", "name": "empty"},
+    ]
+    _exchange(portal)
+
+    voices = json.loads(_voices(portal)[2])["voices"]
+
+    assert voices == [{"id": "v1", "name": "Rachel"}, {"id": "v2", "name": "v2"}]
+
+
+def test_storing_a_key_evicts_that_providers_remembered_list(
+    portal, fake_provider, fake_keychain, no_network_validate
+):
+    """The remembered list was fetched with the old key. A key stored on the
+    Keys tab may be another account's, and the page asks again right after
+    a store — that ask must be a fresh call, not the old account's voices."""
+    _exchange(portal)
+    assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "live"
+    assert json.loads(_voices(portal, "google")[2])["source"] == "live"
+    fake_provider.voices = [{"id": "new", "name": "New"}]
+
+    status, _ = _post(portal, "/api/auth/login", {"provider": "elevenlabs", "key": CANARY})
+    assert status == 200
+    stored = json.loads(_voices(portal, "elevenlabs")[2])
+    other = json.loads(_voices(portal, "google")[2])
+
+    assert stored == {"voices": [{"id": "new", "name": "New"}], "source": "live"}
+    assert other["source"] == "cached", "only the provider whose key changed is asked again"
+    assert fake_provider.listed == 3
+
+
+def test_a_refused_key_leaves_the_remembered_list_alone(
+    portal, fake_provider, fake_keychain, monkeypatch
+):
+    """The provider rejected the key, so nothing was stored and nothing changed:
+    the list on file is still the one the working key fetched."""
+
+    def refuse(*_args, **_kwargs):
+        raise ProviderAuthError("elevenlabs", "invalid or missing API key")
+
+    monkeypatch.setattr(portal_module.auth, "validate_key", refuse)
+    _exchange(portal)
+    assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "live"
+
+    status, _ = _post(portal, "/api/auth/login", {"provider": "elevenlabs", "key": CANARY})
+    assert status == 400
+    assert not fake_keychain
+
+    assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "cached"
+    assert fake_provider.listed == 1

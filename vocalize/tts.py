@@ -86,14 +86,28 @@ def synthesize(
     return audio
 
 
+#: `voices.search` pages at ten by default and at most 100; the API says
+#: `has_more` and hands back `next_page_token`. Walked to the end, with a
+#: ceiling so an API that always says "more" cannot spin the CLI or the
+#: portal: 20 pages of 100 is 2,000 voices, far past any account.
+VOICE_PAGE_SIZE = 100
+MAX_VOICE_PAGES = 20
+
+
 def list_voices(client) -> list[dict]:
     """Return a simplified [{"id": ..., "name": ...}, ...] list of voices."""
+    voices: list = []
+    token = None
     try:
-        response = client.voices.search()
+        for _page in range(MAX_VOICE_PAGES):
+            response = client.voices.search(page_size=VOICE_PAGE_SIZE, next_page_token=token)
+            voices.extend(getattr(response, "voices", response))
+            token = getattr(response, "next_page_token", None)
+            if not getattr(response, "has_more", False) or not token:
+                break
     except Exception as exc:
         raise TTSRequestError(f"Could not list voices: {exc}") from exc
 
-    voices = getattr(response, "voices", response)
     return [
         {"id": getattr(v, "voice_id", getattr(v, "id", None)), "name": getattr(v, "name", "?")}
         for v in voices
@@ -126,4 +140,9 @@ def build_client(api_key: str):
     """
     from elevenlabs.client import ElevenLabs
 
-    return ElevenLabs(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS)
+    # follow_redirects=False: the SDK's httpx client otherwise follows a 3xx
+    # to whatever `Location` names — another origin, plain http — and
+    # re-sends `xi-api-key` there. Every endpoint is a fixed URL, so a
+    # redirect is never legitimate; refused, it surfaces as an ApiError.
+    # The same rule `providers/_http._NoRedirects` keeps for urllib.
+    return ElevenLabs(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=False)

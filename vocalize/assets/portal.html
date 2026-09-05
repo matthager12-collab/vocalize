@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vocalize config portal</title>
+<style>
+/* One stylesheet, in the document, because the portal serves exactly two
+   asset files and there is no route for a third. The CSP carries
+   `style-src 'self' 'unsafe-inline'` for this block; script stays on
+   'self' with no inline script anywhere on the page. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --panel: #f5f6f8;
+  --fg: #17181a;
+  --muted: #5b6068;
+  --line: #d5d8dd;
+  --accent: #0b57d0;
+  --ok: #14713a;
+  --warn: #8a5800;
+  --fail: #ad2020;
+  --alert-bg: #fdeaea;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c;
+    --panel: #1e2126;
+    --fg: #e9eaec;
+    --muted: #a4abb5;
+    --line: #333840;
+    --accent: #7cadff;
+    --ok: #5fd08a;
+    --warn: #e0b341;
+    --fail: #ff8a80;
+    --alert-bg: #3a1f1f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+code, .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 2rem;
+  align-items: baseline;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+}
+.top h1 { margin: 0; font-size: 1.25rem; letter-spacing: 0.01em; }
+.facts { display: flex; flex-wrap: wrap; gap: 0.25rem 1.5rem; margin: 0; color: var(--muted); font-size: 0.875rem; }
+.facts div { display: flex; gap: 0.4rem; }
+.facts dt { font-weight: 600; }
+.facts dd { margin: 0; }
+
+.banners { padding: 0 1.25rem; }
+.banner {
+  margin: 0.75rem 0 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--fail);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: var(--alert-bg);
+}
+.banner p { margin: 0.25rem 0 0; }
+.banner strong { display: block; }
+.banner.mild { border-color: var(--warn); background: var(--panel); }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22rem;
+  gap: 1.5rem;
+  align-items: start;
+  padding: 1.25rem;
+}
+@media (max-width: 60rem) { main { grid-template-columns: minmax(0, 1fr); } }
+
+[role="tablist"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--line);
+}
+[role="tab"] {
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+[role="tab"]:hover { color: var(--fg); background: var(--panel); }
+[role="tab"][aria-selected="true"] {
+  color: var(--fg);
+  font-weight: 600;
+  border-color: var(--line);
+  background: var(--bg);
+  margin-bottom: -1px;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.panel { padding: 1rem 0; }
+.panel h2 { margin-top: 0; font-size: 1.05rem; }
+.empty { color: var(--muted); }
+
+aside {
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+aside header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+aside h2 { margin: 0; font-size: 1rem; }
+aside button {
+  min-height: 2.5rem;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+aside button[disabled] { opacity: 0.5; cursor: default; }
+
+#rows { list-style: none; margin: 0.75rem 0 0; padding: 0; }
+#rows li { padding: 0.6rem 0; border-top: 1px solid var(--line); }
+#rows li:first-child { border-top: none; }
+.row-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.row-name { font-weight: 600; }
+.dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; flex: none; align-self: center; }
+.ok .dot { background: var(--ok); }
+.warn .dot { background: var(--warn); }
+.fail .dot { background: var(--fail); }
+.row-state { margin-left: auto; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.ok .row-state { color: var(--ok); }
+.warn .row-state { color: var(--warn); }
+.fail .row-state { color: var(--fail); }
+.row-detail { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.9rem; }
+.row-action { display: block; margin-top: 0.3rem; padding: 0.3rem 0.4rem; border-radius: 4px; background: var(--bg); border: 1px solid var(--line); overflow-wrap: anywhere; }
+.row-do { margin-top: 0.3rem; }
+.row-do .hint { margin-top: 0.2rem; }
+.note { color: var(--muted); font-size: 0.875rem; }
+
+/* Is there a key: the first line of a provider card, on both tabs. */
+.key-status { margin: 0.5rem 0 0; font-weight: 600; }
+.key-status.none { color: var(--warn); }
+.summary { margin: 0 0 0.5rem; font-weight: 600; }
+button.link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 400;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* --- the tab panels --- */
+
+.card { margin: 0 0 1rem; padding: 0.9rem 1rem; border: 1px solid var(--line); border-radius: 8px; }
+.card-head { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+.card h3 { margin: 0; font-size: 1rem; }
+.badge {
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.field { margin: 0.75rem 0 0; }
+.field label { display: block; margin-bottom: 0.2rem; font-weight: 600; font-size: 0.9rem; }
+input, select {
+  width: 100%;
+  max-width: 26rem;
+  min-height: 2.5rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+input[type="number"] { max-width: 10rem; }
+input[disabled] { opacity: 0.6; }
+
+.hint { margin: 0.2rem 0 0; color: var(--muted); font-size: 0.85rem; }
+.status { margin: 0.5rem 0 0; color: var(--muted); font-size: 0.9rem; }
+.flash { margin: 0.75rem 0 0; color: var(--ok); font-size: 0.9rem; }
+.bad { margin: 0.35rem 0 0; color: var(--fail); font-size: 0.9rem; }
+.note-strong { margin: 0.6rem 0 0; padding: 0.5rem 0.6rem; border: 1px solid var(--warn); border-radius: 6px; }
+
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
+button.action {
+  min-height: 2.5rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+button.action:hover:not([disabled]) { border-color: var(--accent); }
+button.action[disabled] { opacity: 0.5; cursor: default; }
+
+ol.chain, ul.plain { list-style: none; margin: 0.75rem 0 0; padding: 0; }
+ol.chain li { margin-bottom: 0.4rem; padding: 0.6rem 0.75rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+ul.plain li { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.6rem; padding: 0.6rem 0; border-top: 1px solid var(--line); }
+.controls { display: flex; gap: 0.35rem; margin-left: auto; }
+
+.grid { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+.grid th, .grid td { padding: 0.45rem 0.6rem; text-align: left; border-bottom: 1px solid var(--line); }
+.grid thead th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.grid .num { text-align: right; font-variant-numeric: tabular-nums; }
+.grid tr.fail th, .grid tr.fail td { color: var(--fail); }
+
+progress { width: 100%; max-width: 26rem; height: 0.9rem; margin-top: 0.4rem; }
+audio { width: 100%; max-width: 26rem; margin-top: 0.6rem; }
+
+body.dead main { opacity: 0.5; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <h1>vocalize config portal</h1>
+  <dl class="facts">
+    <div><dt>Machine</dt><dd id="machine">&mdash;</dd></div>
+    <div><dt>Config file</dt><dd id="config-path" class="path">&mdash;</dd></div>
+  </dl>
+</header>
+
+<div class="banners">
+  <div id="alert" class="banner" role="alert" hidden></div>
+  <div id="config-alert" class="banner" hidden></div>
+  <div id="chain-alert" class="banner mild" hidden></div>
+</div>
+
+<main>
+  <div>
+    <div role="tablist" aria-label="Settings">
+      <button type="button" role="tab" id="tab-chain" aria-controls="panel-chain" aria-selected="true">Chain</button>
+      <button type="button" role="tab" id="tab-providers" aria-controls="panel-providers" aria-selected="false">Providers</button>
+      <button type="button" role="tab" id="tab-keys" aria-controls="panel-keys" aria-selected="false">Keys</button>
+      <button type="button" role="tab" id="tab-usage" aria-controls="panel-usage" aria-selected="false">Usage</button>
+      <button type="button" role="tab" id="tab-local" aria-controls="panel-local" aria-selected="false">Local</button>
+    </div>
+
+    <section class="panel" id="panel-chain" role="tabpanel" aria-labelledby="tab-chain">
+      <p class="empty">Loading&hellip;</p>
+    </section>
+    <section class="panel" id="panel-providers" role="tabpanel" aria-labelledby="tab-providers" hidden>
+      <p class="empty">Loading&hellip;</p>
+    </section>
+    <section class="panel" id="panel-keys" role="tabpanel" aria-labelledby="tab-keys" hidden>
+      <p class="empty">Loading&hellip;</p>
+    </section>
+    <section class="panel" id="panel-usage" role="tabpanel" aria-labelledby="tab-usage" hidden>
+      <p class="empty">Loading&hellip;</p>
+    </section>
+    <section class="panel" id="panel-local" role="tabpanel" aria-labelledby="tab-local" hidden>
+      <p class="empty">Loading&hellip;</p>
+    </section>
+  </div>
+
+  <aside aria-labelledby="readiness-heading">
+    <header>
+      <h2 id="readiness-heading">Readiness</h2>
+      <button type="button" id="recheck">Re-check</button>
+    </header>
+    <ol id="rows" role="list"></ol>
+    <p id="rows-note" class="note">Checking&hellip;</p>
+  </aside>
+</main>
+
+<script src="/portal.js"></script>
+</body>
+</html>

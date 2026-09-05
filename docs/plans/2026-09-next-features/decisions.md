@@ -5,7 +5,7 @@
 | DEC-001 | What process owns the microphone permission? | Decided | B — a background ad-hoc-signed `.app` bundle built at install | R1 |
 | DEC-002 | Which speech-to-text engine and default model? | Decided | A — whisper.cpp via pywhispercpp, default `small.en`; turbo kept as a real option; Apple blocked | R1 |
 | DEC-003 | How does dictation coexist with a running read and the playback lock? | Decided | A, modified — stop the read, the playing process records its position, offer to continue after the dictation | R1, refined R2 |
-| DEC-004 | How does the portal page authenticate to its server? | Decided | C — one-time `#fragment` code exchanged for an in-memory session token sent in a header | R1 |
+| DEC-004 | How does the portal page authenticate to its server? | Decided | C — one-time `#fragment` code exchanged for a session token sent in a header; held per tab in `sessionStorage`, not only in memory | R1, amended R8 |
 | DEC-005 | How are concurrent writers of config.toml kept from clobbering each other? | Decided | A — compare-and-swap; refuse on change | R1 |
 | DEC-006 | The `[stt]` config table and CLI command names | Decided | A — as designed | R1 |
 | DEC-007 | What happens to audio and transcripts after a dictation? | Decided | A — never stored; clipboard/stdout only; `--cleanup` opt-in sends transcript only | R1 |
@@ -20,6 +20,7 @@
 | DEC-017 | May a run amend its own exit gate, and did run 7's amendment hold? | Decided | Yes when the check cannot pass on any commit; proved red and green before use | R6 |
 | DEC-018 | Any local process can close the portal with five `Origin`-less POSTs | Decided — accepted limitation | Accepted, not fixed: availability only, and the attacker who matters can already kill the process. A timed cooldown is the alternative, deliberately not taken | R6 |
 | DEC-019 | Run 8's gate names a branch that does not exist, and times out inside its own suite | Decided | Check the isolation criterion's substance instead of the literal name, and raise `CHECK_TIMEOUT` to 600 | R7 |
+| DEC-020 | Run 9's gate names a branch that does not exist | Decided | Check the isolation criterion's substance instead of the literal name, mirroring DEC-019's fix | R9 |
 
 ---
 
@@ -126,10 +127,13 @@
 
 **Consequences**: A `POST /api/session` route and a 60 s code lifetime; every mutating route gets a token-in-query negative test; the page cannot be deep-linked (fine).
 
+**Amended (round 8, 2026-09-04)**: the page keeps the token in `sessionStorage`, keyed by port, rather than only in a closure. Option C said "held in memory", but the reasons it was chosen are all in the two rows above it — A "lands in browser history, process argv, and `Referer`", B means "anyone who can fetch `/` on loopback gets the token" — and `sessionStorage` is in none of those places: it is same-origin only (the origin carries the random port, so no later portal can read it), per tab, and dropped when the tab closes. What the store buys is a reload that is not a dead page: the fragment is stripped and the code is spent, so a page holding the token in memory alone has no way back after F5 except a fresh `vocalize portal` — a cost the owner would feel in his UX pass, and one worth writing down either way. Two caveats, stated rather than hidden: browsers persist `sessionStorage` to disk for tab restore, so "dropped on close" has a reopen-closed-tab exception, and the token that comes back names a port the portal has left and answers 403; and `localStorage` stays refused (`test_an_api_key_has_nowhere_to_leak_to`). The strongest remaining argument for the store is one the fix round did not build: a "this code was already spent in this tab" marker would let a re-opened link refuse to POST at all instead of costing a lockout strike — but that is the exchange path, which no fix round edits.
+
 **Applied to**:
 - [design.md](./design.md) § Portal auth, § Portal routes
 - [plan.md](./plan.md) § Phase 6 (T-60)
 - [verification.md](./verification.md) § Phase 6–7 exit
+- `vocalize/assets/portal.js` (`remember`, `remembered`), as amended
 
 ---
 
@@ -706,3 +710,68 @@ watch, because it runs the same suite.
 - Deliberately not in [design.md](./design.md) or
   [verification.md](./verification.md): like DEC-017, this is a process decision
   about a run's gate script, not a decision about what vocalize does
+
+---
+
+## Round 8
+
+Run 9's fix round, before the owner's UX pass. One amendment, recorded inside the
+entry it changes rather than as a new number: DEC-004, on where the page keeps the
+session token.
+
+---
+
+## Round 9
+
+Run 9's own exit gate, on the same narrow ground DEC-017 and DEC-019 opened and no
+wider.
+
+### DEC-020: Run 9's gate names a branch that does not exist
+
+**Date**: 2026-09-05
+**Decided by**: run 9 close-out
+**Status**: Decided
+
+**Context**: [run-9-portal-page/validate-exit.sh](./run-9-portal-page/validate-exit.sh)'s
+entry check was `on branch config-portal`, matching the literal string — the same
+fault DEC-019 found and fixed in run 8's own gate, present here because run 9's
+script was generated from the same template before either fix existed. Run 9 was
+built on `portal-page`, the parent worktree's own branch name; `config-portal` is
+run 7's branch, merged and gone since before run 8 started. The check failed on
+every commit run 9 ever made, and the gate has never passed as written. The
+isolation criterion behind it was met throughout: the work sits on its own branch,
+forked from a commit that already carries run 8's merged portal-write code.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Rename the branch to `config-portal` | Makes the literal check pass without touching the script; reuses a name two runs old and already merged, inviting the confusion DEC-019 turned down for the same reason |
+| B | Delete the check | Smallest diff, but isolation is a real entry criterion for a run whose own commits write to `vocalize/assets/` and touch the sidebar's config-reading paths |
+| C | Check the substance: on a branch that is not `main`, forked from a base whose `vocalize/wizard.py` already defines `write_config_if_unchanged` (run 8's own artifact, absent before run 8 merged) | Keeps the criterion, drops the accident, and mirrors DEC-019's fix rather than inventing a new shape for the same fault |
+
+**Recommendation**: C, for DEC-019's own reason: a check that cannot pass on any
+commit as written tests nothing.
+
+**Decision**: C. The check now asserts `git branch --show-current` is neither empty
+(detached) nor `main`, and that `git merge-base main HEAD` names a commit whose
+`vocalize/wizard.py` contains `def write_config_if_unchanged`. DEC-019's own test —
+`vocalize/portal.py`'s mere presence — does not narrow enough one run later:
+`portal.py` has existed since run 7, so its presence says nothing about whether run
+8 landed. Proved four ways in a scratch repository, the same four DEC-019 used:
+green on a branch off a base carrying the run-8 artifact; red sitting on `main`; red
+on a branch off a base that predates run 8 (portal.py present, the function not);
+red on a detached HEAD.
+
+**Consequences**: The timeout default in this script is untouched. DEC-019 raised
+`CHECK_TIMEOUT` only inside run 8's own file and left the other nine scripts at
+120s for their own suites to outgrow on their own schedule; run 9's suite is one of
+those nine, and this amendment does not decide that question for it — 600 stays
+available as an override at invocation (`CHECK_TIMEOUT=600`), the way run 8's
+report used it before its own default changed. No other check in this script
+changed.
+
+**Applied to**:
+- [run-9-portal-page/validate-exit.sh](./run-9-portal-page/validate-exit.sh)
+- [run-9-portal-page/report.md](./run-9-portal-page/report.md) § Deviations
+- Deliberately not in [design.md](./design.md) or [verification.md](./verification.md):
+  like DEC-017 and DEC-019, this is a process decision about a run's gate script,
+  not a decision about what vocalize does

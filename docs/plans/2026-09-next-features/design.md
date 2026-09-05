@@ -178,6 +178,7 @@ Recorder identity: the bundle is compiled once by `local install --stt`; the sta
 | `POST /api/chain`, `POST /api/provider/<name>`, `POST /api/stt` | token header | write through validators + `_write_config` with compare-and-swap (DEC-005); the fingerprint of an absent file is the sentinel `"absent"`, and a first write then creates the file with `O_EXCL` so a file created underneath it is refused like any other change |
 | `POST /api/auth/login` | token header | `auth.login(key, provider)`; the response body never contains the key (tested); form `autocomplete="off"` |
 | `POST /api/voices/<name>/preview` | token header | a fixed short sentence through `chain.run(text, chain=[name], file_config=file_config, forced=True)` — the real signature; `run` never plays, it returns `(audio, name, ext)` and those bytes are the response — so the budget gate, ledger and cache apply exactly as in the CLI (a capped provider refuses with the CLI's message; a repeat click is a cache hit); previews are serialized on one module lock, which also keeps Kokoro's global session single-threaded; bytes for `fetch → Blob`; `Accept-Ranges: none`. The browser plays the Blob outside the machine-wide playback lock — the one accepted exception, stated in plan.md § Decisions |
+| `GET /api/voices/<name>` | token header | the provider module's own `list_voices()`, for the Providers tab's voice `<datalist>`. `<name>` goes through the same `^[a-z0-9_-]{1,32}$` route pattern and `_provider_or_404` allowlist as the preview route, so an unknown name is a 404 before any module is touched. Run through readiness' probe registry (a daemon thread joined against `probe_timeout`, one in-flight thread per name) so a hung keychain read or network call costs one timeout and a second request for the same provider joins the first call; a per-provider lock makes check-then-list atomic. The list is cached per provider for the life of the `Portal` object — a dropdown opening is never a network call, the allowlist bounds the entry count, a restart is the refresh. A failure or timeout answers `502 {"error": VOICES_FAILED}` — one fixed line, never the provider's text, which is where an SDK echoes a rejected key. Payload below |
 | `POST /api/local/install/start`, `GET /api/local/install/status` | token header | background thread + progress dict; idle timer suspended while running |
 | `GET /api/ping` | token header | keepalive; N misses → shutdown |
 
@@ -196,7 +197,7 @@ instead means special-casing four different error conventions by hand.
 | `stt` | the resolved `[stt]` settings dict, defaults filled in | **cannot fail** — see below |
 | `config_path` | string, always present | — |
 | `config_error` | string or `null` — the file would not parse, read *or validate* | non-`null` means the **whole file was discarded**; every other key then describes defaults, *except* `chain`/`chain_source` when `VOCALIZE_CHAIN` is also bad — see below |
-| `fingerprint` | `{mtime_ns, sha256}`, or the string `"absent"` for a file that is not there | `null` — the path could not be read at all; **no write can be made** until a later poll returns one |
+| `fingerprint` | `{mtime_ns, sha256}` with `mtime_ns` a **decimal string**, or the string `"absent"` for a file that is not there. Opaque to the page: it is returned verbatim on every write and never read | `null` — the path could not be read at all; **no write can be made** until a later poll returns one |
 
 **`fingerprint` is taken before every other key on this page, and that ordering is
 the contract** (DEC-005, T-62). It is what every write route hands back, and a write
@@ -208,6 +209,14 @@ fingerprint, its write would pass, and the other writer's change would be
 overwritten by a decision the user made without seeing it. A successful write
 returns the fingerprint of what it just wrote in the same key, so the page can write
 again without polling.
+
+**`mtime_ns` is a string on the wire, not a number**, because a nanosecond timestamp
+has 19 digits and JavaScript's one number type is exact only to 2^53 — sent as an
+integer it came back rounded and every write the page made was a 409. The page treats
+the whole fingerprint as an opaque value it hands back unchanged; a write carrying
+`mtime_ns` as a number, or as anything but 1–20 ASCII digits, is a 400 like any other
+malformed fingerprint. The dict of ints stays internal to `wizard.py` and its CLI
+callers.
 
 **A bad chain has two shapes, and they look nothing alike.** Run 9's page has to
 render both. Verified against a running portal:
@@ -284,6 +293,16 @@ Lockout: **every failed `POST /api/session` exchange counts** toward the five, n
 
 Every response carries `Content-Security-Policy: default-src 'self'; media-src 'self' blob:; frame-ancestors 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`. The token is accepted from the header only — never query string or body — with one negative test per mutating route. The Local tab edits the `[stt]` table (model, language, input device from `--list-devices`) through `POST /api/stt`, so the readiness rows that say "set input_device" can be acted on in the page.
 
+#### `GET /api/voices/<name>` payload
+
+| Key | Type | Notes |
+|---|---|---|
+| `voices` | list of `{id, name}`, both strings, each cut at 200 characters (the bound `POST /api/provider/<name>` accepts a voice back at) | anything the module returned that is not a dict with a non-empty string `id` is dropped; `name` falls back to `id`. Untrusted: it came from a third-party API, and the page puts each into an `<option>` through `.value` / `.label` on a created node, never through markup or an attribute string |
+| `source` | `"live"` (elevenlabs, google, polly — a network call was made), `"builtin"` (say, kokoro, openai — no network), `"cached"` (a `live` list served again from the cache), or `"unavailable"` | the page says it beside the field: "live from ElevenLabs", "built in", or the `reason` |
+| `reason` | string, only with `"unavailable"` | the module's own `ProviderUnavailableError` text, one line, provider prefix removed — no key where one is needed, no `boto3`, no AWS credentials. **A state, not an error**: `voices` is `[]`, the field stays free text, and the answer is *not* cached, so it clears once a key is stored |
+
+A listing that raises anything else, or outlives `probe_timeout`, is `502 {"error": VOICES_FAILED}` with no upstream text; the page shows "couldn't fetch the list — type a voice id" beside the field and raises no banner. The page fetches a provider's list once per page load, on the first focus of its voice field, and never in a loop.
+
 ## Decision summary
 
 | # | Decision | Where it shows up |
@@ -291,7 +310,7 @@ Every response carries `Content-Security-Policy: default-src 'self'; media-src '
 | DEC-001 | Recorder is a background ad-hoc-signed `.app` bundle | § Structure, § Recorder contract, plan Phase 3 |
 | DEC-002 | whisper.cpp via pywhispercpp, default `small.en`; turbo and base kept; Apple closed | § Whisper worker protocol, § Contracts, [spike](./spike-2026-09-01.md) |
 | DEC-003 | Dictation stops a running read; the playing process records where it stopped; dictation offers to continue; sounds through `audio.play` | § Key flows, § Interrupted-read resume, plan T-40/T-46/T-47 |
-| DEC-004 | Portal auth: fragment one-time code → in-memory session token in a header; `Host` checked | § Portal auth, § Portal routes |
+| DEC-004 | Portal auth: fragment one-time code → session token in a header, held per tab in `sessionStorage` (amended R8); `Host` checked | § Portal auth, § Portal routes |
 | DEC-005 | Config writes compare the file on disk before saving | § Portal routes, plan Phase 6 |
 | DEC-006 | `[stt]` table and `listen`/`dictate` CLI names | § Contracts |
 | DEC-007 | Transcripts are never stored; only `--cleanup` sends text (to Claude) | § Key flows, plan Phase 4 |

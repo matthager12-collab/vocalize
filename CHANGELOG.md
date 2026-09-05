@@ -5,8 +5,37 @@ All notable changes to this project are documented here. Format follows
 
 ## Unreleased
 
+### Added
+
+- **A web portal page** (`vocalize portal`) for the whole config surface: reorder
+  the provider chain; set each provider's voice, speed and monthly budget with a
+  live preview; store and check API keys (masked, `autocomplete="off"`); watch
+  usage; and drive the local Kokoro and whisper installs with progress — no more
+  hand-editing `config.toml`. Five tabs (Chain, Providers, Keys, Usage, Local)
+  plus a persistent readiness sidebar reading `/api/state`, with buttons on the
+  rows that map to a vocalize command the portal already runs. Every save goes
+  through the same compare-and-swap the CLI uses, so a change made elsewhere
+  while the page was open is refused rather than silently overwritten. Ships as
+  static HTML and JS with no framework, no inline script and no external
+  resource — the whole surface has to work with the network cable pulled — over
+  a loopback-only, one-time-code session (DEC-004).
+- **A voice picker on the Providers tab.** `GET /api/voices/<name>` returns the
+  provider's own `list_voices()`, paginated and cached for the life of the
+  portal process, so the field is a real dropdown of the account's actual
+  voices with the current value pre-selected, and `"Type a voice id…"` for an
+  id the list doesn't carry — rather than a hand-typed guess.
+
 ### Fixed
 
+- **The ElevenLabs SDK client followed a redirect and re-sent the API key
+  wherever it pointed, cross-origin, over plain http.** The SDK's httpx client
+  follows a 3xx by default; every ElevenLabs endpoint is a fixed URL, so a
+  redirect was never legitimate and the key had no business leaving the
+  original origin. Present since 0.9.0, when the ElevenLabs provider first
+  shipped. Closed by building the client with `follow_redirects=False` — the
+  same rule the urllib-based providers already held via `_http._NoRedirects` —
+  and proven on two real loopback HTTP servers: the second origin never sees
+  the request.
 - **Nothing could rewrite a config file containing an `[stt]` table** —
   which is every config a dictation user has had since 0.10.0 added the
   table. The serialiser wrote flat keys and `[providers.*]` and had no

@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from vocalize import tts
 from vocalize.config import Settings
 from vocalize.exceptions import ProviderTransientError, TTSRequestError
-from vocalize.tts import _cache_key, get_usage, list_voices, synthesize
+from vocalize.tts import _cache_key, build_client, get_usage, list_voices, synthesize
 
 
 class FakeTTSNamespace:
@@ -26,7 +27,7 @@ class FakeVoicesNamespace:
     def __init__(self, voices):
         self._voices = voices
 
-    def search(self):
+    def search(self, **_kwargs):
         return SimpleNamespace(voices=self._voices)
 
 
@@ -142,6 +143,56 @@ def test_list_voices_returns_id_and_name():
     assert result == [{"id": "abc123", "name": "Rachel"}]
 
 
+class _PagedVoices:
+    """`voices.search` over `pages`; the token is the index of the next one."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def search(self, **kwargs):
+        self.calls.append(kwargs)
+        index = int(kwargs.get("next_page_token") or 0)
+        more = index + 1 < len(self.pages)
+        return SimpleNamespace(
+            voices=self.pages[index],
+            has_more=more,
+            next_page_token=str(index + 1) if more else None,
+        )
+
+
+def test_list_voices_walks_every_page():
+    """The API pages at ten by default and says `has_more`; an account with
+    more voices than one page used to show only the first page."""
+    pages = [[SimpleNamespace(voice_id=f"v{i}", name=f"Voice {i}")] for i in range(3)]
+    client = SimpleNamespace(voices=_PagedVoices(pages))
+
+    result = list_voices(client)
+
+    assert [voice["id"] for voice in result] == ["v0", "v1", "v2"]
+    assert [call.get("next_page_token") for call in client.voices.calls] == [None, "1", "2"]
+    assert {call.get("page_size") for call in client.voices.calls} == {tts.VOICE_PAGE_SIZE}
+
+
+def test_list_voices_stops_at_the_page_ceiling_when_the_api_always_says_more():
+    calls = []
+
+    class _Endless:
+        @staticmethod
+        def search(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                voices=[SimpleNamespace(voice_id="v", name="V")],
+                has_more=True,
+                next_page_token="again",
+            )
+
+    result = list_voices(SimpleNamespace(voices=_Endless()))
+
+    assert len(calls) == tts.MAX_VOICE_PAGES == 20
+    assert len(result) == tts.MAX_VOICE_PAGES
+
+
 def test_speed_is_passed_through_as_voice_settings(tmp_path):
     client = FakeClient()
     settings = Settings(voice_id="v1", model_id="m1", speed=1.1)
@@ -199,3 +250,86 @@ def test_get_usage_wraps_sdk_errors():
 
     with pytest.raises(TTSRequestError, match="unauthorized"):
         get_usage(client)
+
+
+# --- the SDK client's transport -----------------------------------------
+
+
+def _serve(handler_class):
+    """One loopback HTTP server on a random port, on a daemon thread."""
+    import http.server
+    import threading
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler_class)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_the_sdk_client_never_follows_a_redirect_with_the_key(monkeypatch, tmp_path):
+    """APP-SECRETS / APP-TLS: the real SDK client, pointed at a loopback
+    server that answers the voices request with a 302 to a *different*
+    origin over plain http. The second origin must never hear from us —
+    stock httpx follows the redirect and re-sends `xi-api-key` to whoever
+    answers there, which is the leak `_http._NoRedirects` already closes
+    for the urllib providers.
+    """
+    import http.server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    for variable in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "ELEVENLABS_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+    key = "sk-canary-redirect-0123456789abcdef"
+    elsewhere_saw = []
+
+    class Elsewhere(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            elsewhere_saw.append((self.path, dict(self.headers)))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"voices": [], "has_more": false}')
+
+        def log_message(self, *_args):
+            pass
+
+    elsewhere = _serve(Elsewhere)
+    target = f"http://127.0.0.1:{elsewhere.server_address[1]}"
+
+    class Origin(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", target + self.path)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    origin = _serve(Origin)
+    base_url = f"http://127.0.0.1:{origin.server_address[1]}"
+
+    import elevenlabs.client as sdk
+
+    real = sdk.ElevenLabs
+    # `build_client` takes the key alone; the base URL is injected here so
+    # the client under test is otherwise exactly the one production builds.
+    monkeypatch.setattr(sdk, "ElevenLabs", lambda **kwargs: real(base_url=base_url, **kwargs))
+    try:
+        client = build_client(key)
+        try:
+            list_voices(client)
+        except TTSRequestError as exc:
+            refusal = str(exc)
+        else:
+            refusal = None
+    finally:
+        origin.shutdown()
+        origin.server_close()
+        elsewhere.shutdown()
+        elsewhere.server_close()
+
+    leaked = [headers.get("xi-api-key") for _path, headers in elsewhere_saw]
+    assert elsewhere_saw == [], f"the redirect was followed; the key went with it: {leaked}"
+    assert refusal is not None, "a redirect is refused, never served"
+    assert key not in refusal

@@ -75,8 +75,32 @@ check_output() {
 # Every path below is relative to the repository root.
 cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
+# The isolation criterion, as substance rather than as a literal name. It
+# was written `on branch config-portal` — run 7's own merged branch, long
+# gone by the time this run started — and this run is on `portal-page`, so
+# the literal check would have failed on every commit, the same fault run 8
+# found and fixed in itself. What the criterion is actually for is two
+# facts: the work is on its own branch (not on main), and that branch
+# forked from a commit that already carries run 8's merged state. Both are
+# checked; a rename cannot satisfy either. See DEC-020.
+ISOLATED='
+import subprocess, sys
+
+def git(*args):
+    return subprocess.run(("git",) + args, capture_output=True, text=True)
+
+branch = git("branch", "--show-current").stdout.strip()
+base = git("merge-base", "main", "HEAD").stdout.strip()
+wizard = git("show", base + ":vocalize/wizard.py").stdout if base else ""
+sys.exit(not (
+    branch not in ("", "main")
+    and base
+    and "def write_config_if_unchanged" in wizard
+))
+'
+
 echo "=== Entry criteria ==="
-check 'on branch config-portal' .venv/bin/python -c 'import subprocess,sys; sys.exit(subprocess.run(['"'"'git'"'"','"'"'branch'"'"','"'"'--show-current'"'"'],capture_output=True,text=True).stdout.strip()!='"'"'config-portal'"'"')'
+check "on its own branch, forked from run 8's merged state" .venv/bin/python -c "$ISOLATED"
 check 'run 8 validated' grep -q '^validate-exit: PASS' docs/plans/2026-09-next-features/run-8-portal-write/report.md
 check 'portal command present' .venv/bin/vocalize portal --help
 check 'suite green at entry' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
