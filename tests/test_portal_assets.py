@@ -272,6 +272,25 @@ def test_the_page_asks_the_server_for_voices_and_ships_no_list_of_its_own():
     assert "String(voice.name)" in script
 
 
+def test_the_keys_hint_names_the_command_that_removes_a_key():
+    """The page has no delete route and says so — but it used to send the
+    user to Keychain Access, a GUI that knows nothing about vocalize. There
+    are three `vocalize` entries in there, named only by username slug, and a
+    keychain delete that is denied shows nothing. `auth logout` reads the
+    entry back and refuses to claim a removal it cannot verify, so that is
+    the command the sentence has to name. Cross-checked against the CLI, so
+    a renamed command fails here rather than in a user's terminal."""
+    from vocalize.cli import main
+
+    script = JS.read_text(encoding="utf-8")
+    logout = main.commands["auth"].commands["logout"]
+
+    assert "Keychain Access" not in script
+    assert "vocalize auth logout --provider <name>" in script
+    assert logout.name == "logout"
+    assert "provider" in {param.name for param in logout.params}
+
+
 def test_the_sidebar_maps_a_row_to_a_button_by_name_and_never_by_its_action():
     """`ROW_ACTIONS` is keyed by the row's name; the action is shown, not read.
 

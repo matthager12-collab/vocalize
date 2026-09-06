@@ -75,6 +75,19 @@ Smoke test (also proves stdin + preprocessing):
 echo "vocalize is alive" | vocalize speak-file -
 ```
 
+### Or: finish setup in a browser
+
+Everything above — keys, the chain, the local models — can be done from one
+page instead:
+
+```bash
+vocalize portal
+```
+
+It opens a one-time link at `127.0.0.1` (valid for 60 seconds), and writes
+nothing until you save. See [README § Settings portal](../README.md#settings-portal)
+for what each tab does.
+
 ## Layer 2 — the `/speak` command in Claude Code
 
 Until the repo ships this (tracked as an open gap), create it by hand at

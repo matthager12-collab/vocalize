@@ -20,7 +20,10 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
-TIMEOUT="${CHECK_TIMEOUT:-120}"
+# 120 sat inside the band: the suite runs ~133s at 0.11.0, so "full suite
+# green" was a coin flip between PASS and a bogus timeout FAIL. Raised to
+# 300 — see DEC-022.
+TIMEOUT="${CHECK_TIMEOUT:-300}"
 
 # Portable timeout: GNU coreutils on Linux, gtimeout via brew on macOS, or none.
 # The no-timeout fallback is `env`, which just runs the command — an empty array
@@ -75,8 +78,34 @@ check_output() {
 # Every path below is relative to the repository root.
 cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
+# The isolation criterion, as substance rather than as a literal name. It
+# was written `on branch config-portal` — run 7's own merged branch, long
+# gone by the time this run started — and this run is on `release-0-11-0`,
+# so the literal check would have failed on every commit, the same fault
+# runs 8 and 9 each found and fixed in themselves (DEC-019, DEC-020). What
+# the criterion is actually for is two facts: the work is on its own branch
+# (not on main), and that branch forked from a commit that already carries
+# run 9's merged state — proved here by the merge-base tree containing
+# `vocalize/assets/portal.js`, run 9's own artifact, absent before run 9
+# merged. See DEC-022.
+ISOLATED='
+import subprocess, sys
+
+def git(*args):
+    return subprocess.run(("git",) + args, capture_output=True, text=True)
+
+branch = git("branch", "--show-current").stdout.strip()
+base = git("merge-base", "main", "HEAD").stdout.strip()
+has_portal_js = bool(base) and git("cat-file", "-e", base + ":vocalize/assets/portal.js").returncode == 0
+sys.exit(not (
+    branch not in ("", "main")
+    and base
+    and has_portal_js
+))
+'
+
 echo "=== Entry criteria ==="
-check 'on branch config-portal' .venv/bin/python -c 'import subprocess,sys; sys.exit(subprocess.run(['"'"'git'"'"','"'"'branch'"'"','"'"'--show-current'"'"'],capture_output=True,text=True).stdout.strip()!='"'"'config-portal'"'"')'
+check "on its own branch, forked from run 9's merged state" .venv/bin/python -c "$ISOLATED"
 check 'run 9 validated' grep -q '^validate-exit: PASS' docs/plans/2026-09-next-features/run-9-portal-page/report.md
 check 'assets present' test -f vocalize/assets/portal.js
 check 'suite green at entry' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider

@@ -178,7 +178,7 @@ Recorder identity: the bundle is compiled once by `local install --stt`; the sta
 | `POST /api/chain`, `POST /api/provider/<name>`, `POST /api/stt` | token header | write through validators + `_write_config` with compare-and-swap (DEC-005); the fingerprint of an absent file is the sentinel `"absent"`, and a first write then creates the file with `O_EXCL` so a file created underneath it is refused like any other change |
 | `POST /api/auth/login` | token header | `auth.login(key, provider)`; the response body never contains the key (tested); form `autocomplete="off"` |
 | `POST /api/voices/<name>/preview` | token header | a fixed short sentence through `chain.run(text, chain=[name], file_config=file_config, forced=True)` — the real signature; `run` never plays, it returns `(audio, name, ext)` and those bytes are the response — so the budget gate, ledger and cache apply exactly as in the CLI (a capped provider refuses with the CLI's message; a repeat click is a cache hit); previews are serialized on one module lock, which also keeps Kokoro's global session single-threaded; bytes for `fetch → Blob`; `Accept-Ranges: none`. The browser plays the Blob outside the machine-wide playback lock — the one accepted exception, stated in plan.md § Decisions |
-| `GET /api/voices/<name>` | token header | the provider module's own `list_voices()`, for the Providers tab's voice `<datalist>`. `<name>` goes through the same `^[a-z0-9_-]{1,32}$` route pattern and `_provider_or_404` allowlist as the preview route, so an unknown name is a 404 before any module is touched. Run through readiness' probe registry (a daemon thread joined against `probe_timeout`, one in-flight thread per name) so a hung keychain read or network call costs one timeout and a second request for the same provider joins the first call; a per-provider lock makes check-then-list atomic. The list is cached per provider for the life of the `Portal` object — a dropdown opening is never a network call, the allowlist bounds the entry count, a restart is the refresh. A failure or timeout answers `502 {"error": VOICES_FAILED}` — one fixed line, never the provider's text, which is where an SDK echoes a rejected key. Payload below |
+| `GET /api/voices/<name>` | token header | the provider module's own `list_voices()`, for the Providers tab's voice `<datalist>`. `<name>` goes through the same `^[a-z0-9_-]{1,32}$` route pattern and `_provider_or_404` allowlist as the preview route, so an unknown name is a 404 before any module is touched. Run through readiness' probe registry (a daemon thread joined against the route's budget — `probe_timeout` for a `live` list, at least `BUILTIN_VOICES_TIMEOUT` for an offline one, DEC-021 — one in-flight thread per name) so a hung keychain read or network call costs one timeout and a second request for the same provider joins the first call; a per-provider lock makes check-then-list atomic. The list is cached per provider for the life of the `Portal` object — a dropdown opening is never a network call, the allowlist bounds the entry count, a restart is the refresh. A failure or timeout answers `502 {"error": VOICES_FAILED}` — one fixed line, never the provider's text, which is where an SDK echoes a rejected key. Payload below |
 | `POST /api/local/install/start`, `GET /api/local/install/status` | token header | background thread + progress dict; idle timer suspended while running |
 | `GET /api/ping` | token header | keepalive; N misses → shutdown |
 
@@ -278,6 +278,9 @@ region, profile}` or `null`), `key` (`{source, masked}`), `error` (string or
   applicable"` (a local provider), `"checking"` (the probe thread is still
   running — poll again) and `"error"` (the probe finished by raising).
   `key.masked` is a preview, never a key, and is `null` unless there is one.
+  A key shorter than eight characters — a truncated paste, or another tool's
+  short secret in the same variable — masks to `"…"` alone, because its first
+  four characters are most of it (DEC-021).
 * `error` is that provider's alone and never the page's: a broken
   `[providers.<name>]`, ledger or budget is caught per provider. Two
   unrelated failures are joined with `"; "` rather than one silently
@@ -301,7 +304,7 @@ Every response carries `Content-Security-Policy: default-src 'self'; media-src '
 | `source` | `"live"` (elevenlabs, google, polly — a network call was made), `"builtin"` (say, kokoro, openai — no network), `"cached"` (a `live` list served again from the cache), or `"unavailable"` | the page says it beside the field: "live from ElevenLabs", "built in", or the `reason` |
 | `reason` | string, only with `"unavailable"` | the module's own `ProviderUnavailableError` text, one line, provider prefix removed — no key where one is needed, no `boto3`, no AWS credentials. **A state, not an error**: `voices` is `[]`, the field stays free text, and the answer is *not* cached, so it clears once a key is stored |
 
-A listing that raises anything else, or outlives `probe_timeout`, is `502 {"error": VOICES_FAILED}` with no upstream text; the page shows "couldn't fetch the list — type a voice id" beside the field and raises no banner. The page fetches a provider's list once per page load, on the first focus of its voice field, and never in a loop.
+A listing that raises anything else, or outlives its budget, is `502 {"error": VOICES_FAILED}` with no upstream text; the page shows "couldn't fetch the list — type a voice id" beside the field and raises no banner. The page fetches a provider's list once per page load, on the first focus of its voice field, and never in a loop.
 
 ## Decision summary
 
@@ -323,6 +326,7 @@ A listing that raises anything else, or outlives `probe_timeout`, is `502 {"erro
 | DEC-014 | The contract changes the 0.10.0 release review forced | § Key flows, § Interrupted-read resume, § Input device, § Terminal primitive |
 | DEC-015 | The lockout counts every failed `/api/session` exchange, not only a wrong code | § Portal routes |
 | DEC-016 | A present-and-wrong `Origin` is refused before the lockout counter sees it | § Portal routes |
+| DEC-021 | The contract changes the 0.11.0 release review forced | § `GET /api/state` payload, § `GET /api/voices/<name>` payload |
 
 ## Testing strategy
 

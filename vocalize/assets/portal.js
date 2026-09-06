@@ -1117,7 +1117,8 @@ renderers.keys = function (panel, data) {
       "hint",
       "A key is checked with the provider before it is stored in the system " +
         "keychain, so saving one takes a few seconds. vocalize never shows a " +
-        "stored key again, and this page cannot delete one — use Keychain Access for that."
+        "stored key again, and this page cannot delete one — run " +
+        "vocalize auth logout --provider <name> in a terminal for that."
     )
   );
   Object.keys(data.providers).forEach(function (name) {

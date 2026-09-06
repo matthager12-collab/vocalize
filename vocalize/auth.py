@@ -193,9 +193,16 @@ def key_source(explicit: str | None = None, provider: str = DEFAULT_PROVIDER) ->
     return "not found"
 
 
+#: Below this, the first four characters are most of the secret, so the
+#: preview is no preview at all. A truncated paste — or a short secret from
+#: another tool sharing the variable name — must not be reproduced whole on
+#: the portal's Keys tab or by `vocalize auth status`.
+_MASK_FLOOR = 8
+
+
 def masked(key: str) -> str:
     """A preview short enough to be safe to print or paste into a bug report."""
-    return f"{key[:4]}…"
+    return "…" if len(key) < _MASK_FLOOR else f"{key[:4]}…"
 
 
 def scrub(message: str, key: str) -> str:

@@ -209,6 +209,13 @@ PREVIEW_WAIT = 30.0
 #: its manifest, openai from a constant — and are "builtin".
 LIVE_VOICE_LISTS = frozenset({"elevenlabs", "google", "polly"})
 
+#: The budget an offline listing gets, in place of `probe_timeout`. The state
+#: probes' two seconds are a *network* budget; `say -v '?'` is a subprocess
+#: that enumerates every installed system voice and takes 2.0-2.7 s on a
+#: current Mac, so the network budget failed the one provider that needs no
+#: network at all, every first time. Kept under `_Handler.timeout` (10 s).
+BUILTIN_VOICES_TIMEOUT = 8.0
+
 #: The one line a listing that failed or timed out answers with. Fixed, never
 #: the provider's own text: `tts.list_voices` wraps the SDK's error verbatim,
 #: and an SDK that echoes a rejected header value echoes the key.
@@ -1327,8 +1334,12 @@ class Portal:
 
         The per-provider lock makes check-then-list atomic, so two requests
         cannot both find the cache empty and both start. Its wait is
-        bounded by the holder's own `probe_timeout`; the acquire timeout is
-        the belt to that pair of braces.
+        bounded by the holder's own budget; the acquire timeout is the belt
+        to that pair of braces. The budget is `probe_timeout` for a live
+        list — a network call, the same bound the state probes get — and at
+        least `BUILTIN_VOICES_TIMEOUT` for an offline one, which is a
+        subprocess or a manifest read and is slower than the network budget
+        allows (see the constant).
 
         A list, once fetched, is kept for the life of this object and a
         cache hit says "cached" where the list was "live". "unavailable" is
@@ -1336,8 +1347,11 @@ class Portal:
         clear when one is — so it is evicted before the next ask.
         """
         _provider_or_404(name)
+        budget = self.probe_timeout
+        if name not in LIVE_VOICE_LISTS:
+            budget = max(budget, BUILTIN_VOICES_TIMEOUT)
         lock = self._voice_locks[name]
-        if not lock.acquire(timeout=self.probe_timeout):
+        if not lock.acquire(timeout=budget):
             return self._reply(502, {"error": VOICES_FAILED})
         try:
             with self._lock:
@@ -1355,7 +1369,7 @@ class Portal:
                     self._voice_lists[name] = listed
                 return readiness.Row(f"voices {name}", "ok", "", "")
 
-            readiness.run_probes([(f"voices {name}", probe)], self.probe_timeout)
+            readiness.run_probes([(f"voices {name}", probe)], budget)
             with self._lock:
                 listed = self._voice_lists.get(name)
         finally:

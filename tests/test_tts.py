@@ -333,3 +333,79 @@ def test_the_sdk_client_never_follows_a_redirect_with_the_key(monkeypatch, tmp_p
     assert elsewhere_saw == [], f"the redirect was followed; the key went with it: {leaked}"
     assert refusal is not None, "a redirect is refused, never served"
     assert key not in refusal
+
+
+# --- the key never rides out on someone else's error text ----------------
+
+
+def test_build_client_stashes_the_key_for_the_scrub():
+    """`_safe` reads the key off the client. Pinned against the real SDK so
+    a version that refused the attribute fails here, not silently in the
+    error path where the miss is invisible."""
+    client = build_client("sk-canary-stash-0123456789abcdef")
+
+    assert client._vocalize_key == "sk-canary-stash-0123456789abcdef"
+
+
+def test_get_usage_does_not_echo_a_key_the_sdk_quoted_back():
+    """APP-SECRETS: `cli.usage` prints this message straight to the terminal
+    and never calls `auth.scrub` — the scrub has to happen here."""
+    key = "sk-canary-usage-0123456789abcdef"
+    client = SimpleNamespace(
+        user=FakeUserNamespace(raise_error=RuntimeError(f"401: rejected key {key}")),
+        _vocalize_key=key,
+    )
+
+    with pytest.raises(TTSRequestError) as caught:
+        get_usage(client)
+
+    assert key not in str(caught.value)
+    assert "[key]" in str(caught.value)
+
+
+def test_list_voices_does_not_echo_a_key_the_api_quoted_back(monkeypatch, tmp_path):
+    """APP-SECRETS, end to end through the real SDK: an API that quotes the
+    submitted key in its error body puts it in `ApiError.__str__`, and
+    `vocalize voices` prints that whole line to stderr. The reviewer's own
+    repro, minus the CLI."""
+    import http.server
+    import json
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    for variable in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "ELEVENLABS_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+    key = "sk-canary-echo-0123456789abcdef"
+
+    class Echoing(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(
+                {"detail": {"status": "weird", "message": f"rejected key {key}"}}
+            ).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = _serve(Echoing)
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    import elevenlabs.client as sdk
+
+    real = sdk.ElevenLabs
+    monkeypatch.setattr(sdk, "ElevenLabs", lambda **kwargs: real(base_url=base_url, **kwargs))
+    try:
+        with pytest.raises(TTSRequestError) as caught:
+            list_voices(build_client(key))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    message = str(caught.value)
+    assert key not in message, message
+    assert "[key]" in message

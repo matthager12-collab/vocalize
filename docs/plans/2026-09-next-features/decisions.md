@@ -21,6 +21,8 @@
 | DEC-018 | Any local process can close the portal with five `Origin`-less POSTs | Decided — accepted limitation | Accepted, not fixed: availability only, and the attacker who matters can already kill the process. A timed cooldown is the alternative, deliberately not taken | R6 |
 | DEC-019 | Run 8's gate names a branch that does not exist, and times out inside its own suite | Decided | Check the isolation criterion's substance instead of the literal name, and raise `CHECK_TIMEOUT` to 600 | R7 |
 | DEC-020 | Run 9's gate names a branch that does not exist | Decided | Check the isolation criterion's substance instead of the literal name, mirroring DEC-019's fix | R9 |
+| DEC-021 | The contract changes the 0.11.0 release review forced | Decided | The scrub moves under `tts`, an offline voice list gets its own budget, a key too short to preview is hidden whole, and the page names `auth logout` | R10 |
+| DEC-022 | Run 10's gate names a branch that does not exist, and its timeout sits inside the suite's own runtime | Decided | Check the isolation criterion's substance instead of the literal name, mirroring DEC-019/DEC-020's fix; raise `CHECK_TIMEOUT` to 300 | R10 |
 
 ---
 
@@ -775,3 +777,139 @@ changed.
 - Deliberately not in [design.md](./design.md) or [verification.md](./verification.md):
   like DEC-017 and DEC-019, this is a process decision about a run's gate script,
   not a decision about what vocalize does
+
+---
+
+## Round 10
+
+### DEC-021: The contract changes the 0.11.0 release review forced
+
+**Date**: 2026-09-05
+**Decided by**: run 10, T-81 (see [review-0.11.0.md](./review-0.11.0.md))
+**Status**: Decided
+
+**Context**: Four confirmed findings, three of which change something the design
+document states. Taken as one entry because they are one release's fixes, the way
+[DEC-014](#dec-014-the-contract-changes-the-0100-release-review-forced) took
+0.10.0's.
+
+**(a) Where the key is scrubbed out of someone else's error text.** `auth.scrub`
+existed and its own docstring named `tts.list_voices` as the path that needs it —
+but the scrub lived in the *callers*, and three of them never called it:
+`cli.voices`, `cli.usage` and `wizard._voice_step`. The ElevenLabs SDK's `ApiError`
+renders the whole response body and header dict, so an API that quotes a rejected
+key put it in `Error: Could not list voices: …` on stderr. Options: scrub at each of
+the three call sites (three diffs, and the next caller misses it again); pass the
+key into `list_voices`/`get_usage` (a signature change through the portal, the
+provider module and the wizard); or stash the key on the client `build_client`
+already builds and scrub once, below every caller. **Decision:** the third.
+`build_client` sets `client._vocalize_key`, and `tts._safe` renders every wrapped
+SDK exception through `auth.scrub`. The attribute is pinned by a test against the
+*real* SDK client, so a version that refused the assignment fails the suite instead
+of silently un-scrubbing.
+
+**(b) An offline voice list does not get the network budget.** `GET
+/api/voices/<name>` was bounded by `probe_timeout` (`STATE_TIMEOUT`, 2 s) whatever
+the provider. `say -v '?'` enumerates every installed system voice and measures
+2.0-2.7 s on the reference Mac, so the Providers tab answered "couldn't fetch the
+list" for the one provider that needs no key, no account and no network — reliably,
+on the first ask, with nothing broken. Options: raise `STATE_TIMEOUT` for everything
+(a hung network probe then costs every `/api/state` poll more); cache the `say` list
+eagerly at portal start (a thread and a cache warm for a tab the user may never
+open); or give the offline lists their own budget. **Decision:** the third.
+`BUILTIN_VOICES_TIMEOUT` is 8 s — under `_Handler.timeout` (10 s) — and applies to
+every provider outside `LIVE_VOICE_LISTS`; a live list still gets `probe_timeout`
+and nothing more, so a hung network call is bounded exactly as before.
+
+**(c) A key too short to preview is not previewed.** `masked()` was `key[:4] + "…"`
+with no floor, so a key of four characters or fewer was shown whole — on the
+portal's Keys tab, which masks whatever is in the environment with no validation,
+and in `vocalize auth status`. **Decision:** below eight characters the mask is `"…"`
+alone. Real keys for all three formats vocalize accepts are far longer; what this
+hides is a truncated paste or another tool's short secret sharing the variable name,
+in output the whole design treats as safe to screenshot.
+
+**(d) The page names the command that removes a key, not a GUI.** The Keys tab said
+"use Keychain Access for that". There are three `vocalize` keychain entries, named
+only by username slug; a denied delete shows nothing in that GUI; and removing the
+entry leaves an `ELEVENLABS_API_KEY` in the shell or a project `.env` still
+outranking it. `vocalize auth logout --provider <name>` already exists and reads the
+entry back before claiming the removal. **Decision:** a copy change only — no delete
+route, no new attack surface. A test cross-checks the sentence against the CLI, so a
+renamed command fails the suite rather than a user's terminal.
+
+**Consequences**: (a) is invisible to a caller and covers every future one. (b)
+means a `502 VOICES_FAILED` for `say`, `kokoro` or `openai` now takes up to 8 s
+instead of 2 — a hang the page shows a spinner for, against a failure it used to
+show for a listing that was merely slow. (c) narrows `key.masked` for short values
+only. (d) is text. The `raise … from exc` chains in `tts` still carry the *unscrubbed*
+SDK error as `__cause__`; `providers.elevenlabs.validate` classifies on that cause,
+so it stays — the shipped entry point (`cli:run`) prints the message and never a
+traceback, and this is recorded as residual risk rather than fixed.
+
+**Applied to**:
+- [`vocalize/tts.py`](../../../vocalize/tts.py) — `_safe`, and the key stashed in `build_client`
+- [`vocalize/portal.py`](../../../vocalize/portal.py) — `BUILTIN_VOICES_TIMEOUT`, `_voices`
+- [`vocalize/auth.py`](../../../vocalize/auth.py) — `_MASK_FLOOR`, `masked`
+- [`vocalize/assets/portal.js`](../../../vocalize/assets/portal.js) — the Keys tab hint
+- [design.md](./design.md) § `GET /api/state` payload, § `GET /api/voices/<name>` payload
+- [review-0.11.0.md](./review-0.11.0.md)
+
+---
+
+### DEC-022: Run 10's gate names a branch that does not exist, and its timeout sits inside the suite's own runtime
+
+**Date**: 2026-09-05
+**Decided by**: run 10 close-out
+**Status**: Decided
+
+**Context**: Two independent faults in
+[run-10-release-0-11-0/validate-exit.sh](./run-10-release-0-11-0/validate-exit.sh),
+the same shape DEC-019 found in run 8's gate and DEC-020 found in run 9's.
+
+**The branch name.** The entry check was `on branch config-portal`, matching the
+literal string — run 7's branch, merged and gone since before run 8 started. This
+run is on `release-0-11-0`, the parent worktree's own branch name, so the check
+failed on every commit and the gate has never passed as written. The isolation
+criterion behind it was met throughout: the work sits on its own branch, forked
+from a commit that already carries run 9's merged portal assets.
+
+**The timeout.** `CHECK_TIMEOUT` defaults to 120s. Two checks run the whole suite,
+which now takes about 133s at 0.11.0 — up from run 8/9's 115-121s, past the point
+DEC-019's own 120s default still covered. The default sat inside the band a
+passing suite cannot clear, so "full suite green" was not measuring whether the
+suite passed; it was measuring whether the machine finished in under 120s, which a
+green suite now cannot do.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Rename the branch to `config-portal` | Makes the literal check pass without touching the script; reuses a name three runs old and twice-merged, inviting the exact confusion DEC-019 and DEC-020 both turned down |
+| B | Delete the branch check, or raise the timeout by raising it just past 133s | Deletion drops a real entry criterion for a run that bumps the version and rewrites the release docs; a timeout raised to only just clear 133s sits back on a knife edge the next slightly-slower machine tips over |
+| C | Check the substance for the branch name (mirroring DEC-019/DEC-020); raise `CHECK_TIMEOUT` to 300 — over twice the observed 133s, the same multiple-of-runtime margin DEC-019 used (600 against a ~120s suite) | Keeps both criteria, drops the accident in one and gives the other headroom past ordinary machine variance rather than the minimum that clears today's number |
+
+**Recommendation**: C for both, for the two different reasons DEC-019 already gave:
+the branch check cannot pass on any commit as written, so it tests nothing; the
+timeout could pass — just not reliably, and a coin-flip check is worse than no
+check because it reads as a real failure.
+
+**Decision**: C. The isolation check now asserts `git branch --show-current` is
+neither empty (detached) nor `main`, and that `git merge-base main HEAD` names a
+commit whose tree contains `vocalize/assets/portal.js` — run 9's own artifact,
+absent before run 9 merged. `CHECK_TIMEOUT` defaults to 300. Proved four ways in
+this repository before use: green as committed (`release-0-11-0`, forked from
+`main` at `9742ac0`, which carries `portal.js`); red simulated on `main`; red
+simulated on a base predating `9742ac0`; red simulated on a detached HEAD.
+
+**Consequences**: The full gate run after both amendments shows every check
+passing except the PyPI digest check, which fails by design until the owner
+publishes — see [report.md](./run-10-release-0-11-0/report.md). No other check in
+this script changed, and the PyPI digest check specifically was left untouched:
+it is not a gate defect, it is the gate correctly reporting that publication has
+not happened yet.
+
+**Applied to**:
+- [run-10-release-0-11-0/validate-exit.sh](./run-10-release-0-11-0/validate-exit.sh)
+- [run-10-release-0-11-0/report.md](./run-10-release-0-11-0/report.md) § Deviations
+- Deliberately not in [design.md](./design.md) or [verification.md](./verification.md):
+  like DEC-017, DEC-019 and DEC-020, this is a process decision about a run's gate
+  script, not a decision about what vocalize does

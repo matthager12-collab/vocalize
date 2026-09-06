@@ -500,6 +500,24 @@ def test_state_reports_the_key_source_without_the_key(portal, monkeypatch, tmp_p
     assert key["masked"] == "sk-a…"
 
 
+def test_state_never_reproduces_a_short_key_whole(portal, monkeypatch, tmp_path):
+    """APP-SECRETS: the environment path is masked with no validation of what
+    is in the variable, so a truncated paste used to come back in full on the
+    Keys tab — the one screen the design treats as safe to screenshot."""
+    secret = "abc"
+    monkeypatch.setenv("ELEVENLABS_API_KEY", secret)
+    _write_config(tmp_path, 'chain = ["elevenlabs"]\n')
+    _exchange(portal)
+
+    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
+
+    assert status == 200
+    key = json.loads(raw)["providers"]["elevenlabs"]["key"]
+    assert key["source"] == "environment"
+    assert key["masked"] == "…"
+    assert secret.encode() not in raw
+
+
 def test_state_reports_no_key_mechanism_for_local_providers(portal):
     _exchange(portal)
     payload = _body(portal.route("GET", "/api/state", _authed(portal)))
@@ -3397,6 +3415,28 @@ def test_a_blocked_provider_is_502_within_the_bound_and_the_portal_still_answers
         assert headers[name] == value
     assert portal.route("GET", "/api/ping", _authed(portal))[0] == 200
     release.set()
+
+
+def test_an_offline_listing_gets_a_longer_budget_than_a_network_probe(portal, fake_provider):
+    """`say -v '?'` enumerates every installed system voice and takes over two
+    seconds on a current Mac — past `STATE_TIMEOUT`, which is a budget for
+    *network* probes. The one provider that needs no network, no key and no
+    account answered "could not fetch the list" on every first ask. A live
+    list still gets the network budget and nothing more."""
+    slow = 0.5
+    assert slow > portal.probe_timeout, "the fixture's budget must be the shorter one"
+    assert portal_module.BUILTIN_VOICES_TIMEOUT > slow
+
+    def slow_list():
+        fake_provider.listed += 1
+        time.sleep(slow)
+        return fake_provider.voices
+
+    fake_provider.list_voices = slow_list
+    _exchange(portal)
+
+    assert _voices(portal, "say")[0] == 200
+    assert _voices(portal, "elevenlabs")[0] == 502
 
 
 @pytest.mark.parametrize(

@@ -180,19 +180,8 @@ Hotkeys: `↑`/`↓` or `k`/`j` move, `Enter` selects, `p` previews the
 highlighted voice, `m` types a value by hand, `q` or `Esc` cancels without
 writing anything.
 
-There's also a settings page in the browser:
-
-```bash
-vocalize portal              # opens your browser at a one-time link
-vocalize portal --no-browser # prints the link instead (headless, SSH)
-```
-
-It serves on `127.0.0.1` only, hands out a link that works once and for 60
-seconds, and closes itself on Ctrl-C or after fifteen minutes with nothing to
-do. It assumes a single-user machine: everything that reads or changes your
-settings is behind a token, but any process on the Mac can reach the socket
-and close the portal under you. Nothing leaks if that happens — run the
-command again.
+There's also a settings page in the browser — see
+[Settings portal](#settings-portal) below.
 
 | Setting | Flag | Env var | Config file key | Default |
 |---|---|---|---|---|
@@ -272,6 +261,41 @@ configures a TTS provider — see
 [Configuration: the `[stt]` table](#configuration-the-stt-table) under
 [Dictation](#dictation-speech-to-text) below for every key and its
 allowlist.
+
+## Settings portal
+
+A page in your own browser for the whole config surface above, so you don't
+have to hand-edit `config.toml` or click through `vocalize config` one
+setting at a time.
+
+```bash
+vocalize portal              # opens your browser at a one-time link
+vocalize portal --no-browser # prints the link instead (headless, SSH)
+```
+
+Five tabs:
+
+- **Chain** — reorder providers, or add and remove one.
+- **Providers** — each provider's voice, model, speed, and monthly budget,
+  with a live preview of the voice you're looking at.
+- **Keys** — store or check an API key; the field is masked and never
+  offers to autocomplete.
+- **Usage** — this month's spend and quota per provider.
+- **Local** — install or update the on-device Kokoro and whisper models,
+  with progress.
+
+The opening link works once and for 60 seconds; after that, run the command
+again for a new one. The server only ever listens on `127.0.0.1`, and it
+closes itself on Ctrl-C or after fifteen minutes with nothing to do. Nothing
+you change on the page reaches disk until you press Save on that tab — and
+a save made against a config file that's changed on disk since the page
+loaded is refused rather than silently overwritten, the same protection
+`vocalize chain` and `vocalize config` already have.
+
+It assumes a single-user machine: everything that reads or changes your
+settings is behind that one-time token, but any other process on the Mac
+can still reach the port and close the portal under you. Nothing leaks if
+that happens — it's a shutdown, not a read — just run the command again.
 
 ## Providers and fallback
 

@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.11.0 - 2026-09-05
 
 ### Added
 
@@ -27,6 +27,27 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **`vocalize voices` and `vocalize usage` printed the ElevenLabs API key to
+  stderr when the API quoted it back.** The SDK's `ApiError` renders the whole
+  response body and header dict, and both commands printed that text verbatim —
+  so a key the API named in an error reached terminal scrollback, any session
+  log, and whatever the user pasted into a bug report. `auth.scrub` already
+  existed for exactly this, but three callers never reached it. The scrub now
+  happens inside `tts` itself, below every caller, against the key the client
+  was built with. Found by the 0.11.0 release review (DEC-021).
+- **The portal's `say` voice list failed on the first ask.** The route gave every
+  provider the two-second budget meant for network probes, and enumerating the
+  system voices takes longer than that on a current Mac — so the one provider
+  needing no key, no account and no network was the one that said "couldn't
+  fetch the list". Offline lists get their own budget now.
+- **A key of four characters or fewer was shown in full** by `vocalize auth
+  status` and on the portal's Keys tab — a truncated paste, or another tool's
+  short secret in the same environment variable, reproduced whole in output the
+  design treats as safe to screenshot. Anything under eight characters now masks
+  to `…` alone.
+- **The portal's Keys tab pointed at Keychain Access** to remove a stored key.
+  It now names `vocalize auth logout --provider <name>`, which reads the entry
+  back and refuses to claim a removal it cannot verify.
 - **The ElevenLabs SDK client followed a redirect and re-sent the API key
   wherever it pointed, cross-origin, over plain http.** The SDK's httpx client
   follows a 3xx by default; every ElevenLabs endpoint is a fixed URL, so a
@@ -66,6 +87,17 @@ All notable changes to this project are documented here. Format follows
   with `mkstemp` in the same directory, still `0600`, and still renamed
   into place atomically. The predictable name a local process could
   pre-plant as a symlink is gone with it.
+
+### Known limitation
+
+- **Any other process on the Mac can close the portal with five wrong or
+  missing-origin requests to `/api/session`**, no code and no token needed —
+  the same guard that stops a cross-origin web page from doing it has no way
+  to tell that traffic apart from a local script's. This is availability
+  only: nothing is read or changed, the portal just exits. Rerun
+  `vocalize portal` and carry on. Accepted rather than fixed, since anything
+  able to send that traffic locally could kill the process outright anyway
+  (DEC-018).
 
 ## 0.10.2 - 2026-09-02
 

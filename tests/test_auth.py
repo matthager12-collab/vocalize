@@ -198,6 +198,16 @@ def test_masked_never_shows_more_than_four_characters():
     assert SECRET not in auth.masked(SECRET)
 
 
+@pytest.mark.parametrize("key", ["a", "ab", "abc", "abcd", "abcdefg"])
+def test_masked_hides_a_key_too_short_to_preview(key):
+    """APP-SECRETS: the preview is printed by `vocalize auth status` and by
+    the portal's Keys tab, which reads whatever is in the environment with no
+    validation at all. A truncated paste — or a short secret from another
+    tool sharing the variable name — must not come back whole."""
+    assert auth.masked(key) == "…"
+    assert key not in auth.masked(key)
+
+
 def test_login_validates_before_storing(monkeypatch, fake_keychain):
     seen = _fake_tts(monkeypatch)
 

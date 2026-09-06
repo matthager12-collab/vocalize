@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import cache
+from .auth import scrub
 from .config import Settings
 from .exceptions import ProviderTransientError, TTSRequestError
 
@@ -86,6 +87,19 @@ def synthesize(
     return audio
 
 
+def _safe(client, exc: Exception) -> str:
+    """Someone else's error text, with this client's own key taken out of it.
+
+    The SDK's ApiError renders the whole response body and header dict, so
+    an API that quotes a rejected key — or an h11 that quotes the offending
+    header — puts the key in `str(exc)`. `cli.voices`, `cli.usage` and
+    `wizard._voice_step` print that straight to the terminal, and none of
+    them holds the key at the point they print. `build_client` stashes it
+    here so the scrub happens once, below every caller.
+    """
+    return scrub(str(exc), getattr(client, "_vocalize_key", "") or "")
+
+
 #: `voices.search` pages at ten by default and at most 100; the API says
 #: `has_more` and hands back `next_page_token`. Walked to the end, with a
 #: ceiling so an API that always says "more" cannot spin the CLI or the
@@ -106,7 +120,7 @@ def list_voices(client) -> list[dict]:
             if not getattr(response, "has_more", False) or not token:
                 break
     except Exception as exc:
-        raise TTSRequestError(f"Could not list voices: {exc}") from exc
+        raise TTSRequestError(f"Could not list voices: {_safe(client, exc)}") from exc
 
     return [
         {"id": getattr(v, "voice_id", getattr(v, "id", None)), "name": getattr(v, "name", "?")}
@@ -123,7 +137,7 @@ def get_usage(client) -> dict:
     try:
         subscription = client.user.subscription.get()
     except Exception as exc:
-        raise TTSRequestError(f"Could not fetch usage: {exc}") from exc
+        raise TTSRequestError(f"Could not fetch usage: {_safe(client, exc)}") from exc
 
     return {
         "tier": subscription.tier,
@@ -145,4 +159,10 @@ def build_client(api_key: str):
     # re-sends `xi-api-key` there. Every endpoint is a fixed URL, so a
     # redirect is never legitimate; refused, it surfaces as an ApiError.
     # The same rule `providers/_http._NoRedirects` keeps for urllib.
-    return ElevenLabs(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=False)
+    client = ElevenLabs(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=False)
+    # Stashed for `_safe`: the error paths below it print the SDK's own text,
+    # which can carry the key back out. Pinned by a test against the real
+    # client, so an SDK that stopped accepting the attribute fails the suite
+    # rather than silently unscrubbing.
+    client._vocalize_key = api_key
+    return client
