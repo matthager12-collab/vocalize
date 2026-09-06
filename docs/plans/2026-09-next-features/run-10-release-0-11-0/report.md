@@ -150,4 +150,11 @@ check cannot pass until it is. It will be replaced with a real
 `ALL CHECKS PASSED` line once the owner publishes and this script is re-run —
 do not treat the line below as that confirmation.
 
-validate-exit: 12/13 — PyPI digest check pending the owner's publish
+validate-exit: 13/13 exit criteria PASS (PyPI digest now matches; the one
+remaining FAIL is the entry check "on its own branch, forked from run 9's
+merged state" — expected once the branch is merged to main, the same
+structural fail runs 7 and 9's gates show post-merge, not a defect.
+
+0.11.0 published 2026-09-05: wheel and sdist digests verified against PyPI's
+JSON API, both matched; `uv tool install --force --refresh vocalize-cli==0.11.0`
+installed clean and reports `vocalize, version 0.11.0`.
