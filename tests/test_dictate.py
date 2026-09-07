@@ -87,6 +87,41 @@ def lines(path: Path) -> list[str]:
         return []
 
 
+# A fake recorder is a detached shell loop, so nothing in pytest waits
+# on it: a run killed by a timeout wrapper or a Ctrl-C left one polling a
+# stop file that was never going to arrive, and they piled up for days.
+# Three guards, because any one of them can be the one that is missed: a
+# hard cap, this very pytest still being alive, and `loop_pids` below.
+_LOOP_TICK = 0.02
+_LOOP_TICKS = 1500  # 30 s
+
+
+def wait_for_stop(ticks: int = _LOOP_TICKS) -> str:
+    """Shell for "wait for $STOP" that no interrupted run can leave behind."""
+    return (
+        "n=0\n"
+        f'while [ ! -f "$STOP" ] && [ $n -lt {ticks} ] '
+        f"&& kill -0 {os.getpid()} 2>/dev/null; do\n"
+        f"  sleep {_LOOP_TICK}; n=$((n+1))\n"
+        "done\n"
+    )
+
+
+@pytest.fixture(autouse=True)
+def loop_pids(tmp_path) -> Path:
+    """Where a fake `open` records what it launched, so teardown can kill it."""
+    path = tmp_path / "loop.pids"
+    yield path
+    for pid in lines(path):
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except (ValueError, OSError):
+            pass  # already gone, or never a pid
+        # ponytail: no `_process_name` check before the signal, unlike the
+        # production stop (DEC-014). These PIDs are seconds old and this
+        # file is inside tmp_path; add the check if that ever stops holding.
+
+
 # --- the fakes --------------------------------------------------------
 
 
@@ -175,7 +210,7 @@ def harness(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def recorder(tmp_path, monkeypatch, harness):
+def recorder(tmp_path, monkeypatch, harness, loop_pids):
     """Install a fake `open` that launches a fake recorder. Returns a setter."""
 
     def install(*, launch_rc=0, write_pid=True, take="loud", linger=0.0):
@@ -192,8 +227,7 @@ def recorder(tmp_path, monkeypatch, harness):
             'OUT="$1"; STOP="$2"\n'
             'DIR=$(dirname "$OUT")\n'
             + pid_line
-            + "n=0\n"
-            'while [ ! -f "$STOP" ] && [ $n -lt 250 ]; do sleep 0.02; n=$((n+1)); done\n'
+            + wait_for_stop(ticks=250)  # 5 s, as it has always been
             + f"sleep {linger}\n"
             + copy_line
             + 'rm -f "$DIR/rec.pid"\n',
@@ -219,6 +253,7 @@ def recorder(tmp_path, monkeypatch, harness):
                 # exactly what the real `open` does not do.
                 'if [ -n "$OUT" ]; then\n'
                 f'  /bin/sh "{loop}" "$OUT" "$STOP" >/dev/null 2>&1 </dev/null &\n'
+                f'  echo $! >> "{loop_pids}"\n'
                 "fi\n"
                 if launch_rc == 0
                 else ""
@@ -2351,7 +2386,7 @@ def test_no_credential_can_reach_the_interrupted_record(tmp_path):
 
 
 def test_the_first_press_waits_out_the_microphone_permission_dialog(
-    recorder, harness, monkeypatch, tmp_path
+    recorder, harness, monkeypatch, tmp_path, loop_pids
 ):
     """The spike measured ~150 s for that dialog; `_START_GRACE` is 5 s.
 
@@ -2368,8 +2403,9 @@ def test_the_first_press_waits_out_the_microphone_permission_dialog(
         "sleep 1.2\n"                    # longer than _START_GRACE
         'rm -f "$DIR/rec.prompt"\n'      # the user clicks Allow
         'echo $$ > "$DIR/rec.pid"\n'
-        'while [ ! -f "$2" ]; do sleep 0.02; done\n'
-        'rm -f "$DIR/rec.pid"\n',
+        'STOP="$2"\n'
+        + wait_for_stop()
+        + 'rm -f "$DIR/rec.pid"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -2382,6 +2418,7 @@ def test_the_first_press_waits_out_the_microphone_permission_dialog(
             "  shift\n"
             "done\n"
             f'/bin/sh "{loop}" "$OUT" "$STOP" >/dev/null 2>&1 </dev/null &\n'
+            f'echo $! >> "{loop_pids}"\n'
             "exit 0\n",
         )),
     )
@@ -2390,6 +2427,21 @@ def test_the_first_press_waits_out_the_microphone_permission_dialog(
 
     assert harness.played == ["Tink.aiff"]  # it started, it did not fail
     assert dictate.session_path().is_file()
+
+
+def test_a_fake_recorder_gives_up_when_no_stop_file_ever_arrives(tmp_path):
+    """No stop file used to mean a shell loop that outlived pytest for days.
+
+    The cap is 30 s in the fixtures; this builds the same loop with a
+    half-second one so the property can be proved in a test.
+    """
+    loop = script(tmp_path / "unstoppable-recorder.sh", 'STOP="$2"\n' + wait_for_stop(ticks=25))
+    never = tmp_path / "no-stop-file-here"
+
+    child = subprocess.Popen(["/bin/sh", str(loop), str(tmp_path / "out.wav"), str(never)])
+
+    assert child.wait(timeout=10) == 0  # it stopped itself
+    assert not never.exists()
 
 
 def test_a_denied_recorder_still_fails_in_the_usual_grace(
