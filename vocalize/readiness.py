@@ -81,7 +81,7 @@ def _credential_row(name: str, file_config: dict) -> Row:
 
     detail = f"key from {source}"
     budget = config.budget_for(name, file_config)
-    if budget:
+    if budget is not None:
         used, exhausted = ledger.status(name)
         detail += f"; {used:,}/{budget:,} characters this month"
         if exhausted or used >= budget:

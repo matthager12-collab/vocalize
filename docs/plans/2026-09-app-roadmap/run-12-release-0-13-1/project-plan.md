@@ -6,20 +6,20 @@ Part of [choreography.md](../choreography.md). Source plan: [plan.md](../plan.md
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| T-110 | Review of the dictation changes appended to `review-0.13.0.md` § 0.13.1 | vocalize | — | no Critical or High Open |
-| T-111 | Owner: manual checks 9–11; squash-merge; publish; digests | vocalize | T-110 | digests equal |
+| T-110 | Review of the dictation changes appended to `review-0.13.0.md` § 0.13.1 (Phases 11 and 11b) | vocalize | — | no Critical or High Open |
+| T-111 | Owner: manual checks 9–11 and 15–16; squash-merge; publish; digests | vocalize | T-110 | digests equal |
 
 ## Role and isolation
 
-- **Role:** Independent reviewer and release manager — Opus for the review (T-110, fresh agent, read-only over Phase 11's diff, appending a `§ 0.13.1` section to `review-0.13.0.md`); the owner for T-111
-- **Isolation:** branch `hold-to-talk`, off `main`, after Phase 11 merges into it; the owner merges (squash) and publishes — agents never push `main`
-- **Workload:** 0 source files, 0 test files, 1 existing review file extended in place (`review-0.13.0.md`, opened in Phase 8b's T-76, extended by Phase 10's T-91, extended again here); no code edits in this phase — CHANGELOG and the version bump to 0.13.1 are Phase 11's T-105, not this run's
+- **Role:** Independent reviewer and release manager — Opus for the review (T-110, fresh agent, read-only over Phases 11 and 11b's diff, appending a `§ 0.13.1` section to `review-0.13.0.md`); the owner for T-111
+- **Isolation:** branch `hold-to-talk`, off `main`, after Phase 11b merges into it; the owner merges (squash) and publishes — agents never push `main`
+- **Workload:** 0 source files, 0 test files, 1 existing review file extended in place (`review-0.13.0.md`, opened in Phase 8b's T-76, extended by Phase 10's T-91, extended again here for both Phase 11 and Phase 11b); no code edits in this phase — CHANGELOG and the version bump to 0.13.1 are Phase 11's T-105, not this run's
 
 ## Entry criteria
 
 - on branch `hold-to-talk`, not `main`
-- run 11 (`run-11-cue-hold-paste`) validated
-- run 11's key artifact present: `_trim_cue` (Phase 11 T-101)
+- run 11b (`run-11b-playback-pause`) validated
+- run 11b's key artifact present: `interrupted.wait_for_record` (Phase 11b T-106); run 11's `_trim_cue` is proven transitively by run 11b's own entry check
 - suite green at entry
 - ruff clean at entry
 
@@ -29,7 +29,7 @@ Checked by [validate-exit.sh](./validate-exit.sh), run from anywhere (it changes
 
 - review file `review-0.13.0.md` exists and carries a `0.13.1` section
 - no open critical/high finding in that review
-- docs match the CLI (the commands that exist at 0.13.1: `listen`, `dictate`, `resume`, `status`, `doctor`, `app install`, `app status`, `integrate claude`, `local install`, `auth login` — `notes` does not exist until 0.14.0)
+- docs match the CLI (the commands that exist at 0.13.1: `listen`, `dictate`, `pause`, `resume`, `status`, `doctor`, `app install`, `app status`, `integrate claude`, `local install`, `auth login` — `notes` does not exist until 0.14.0)
 - full suite green
 - ruff clean
 - work committed
@@ -39,7 +39,7 @@ Checked by [validate-exit.sh](./validate-exit.sh), run from anywhere (it changes
 
 ## Not machine-checkable
 
-- Owner-present manual checks 9–11 (verification.md § Manual checks): the cue spike across the built-in and Bluetooth inputs (six numbers); the cue trim itself on both inputs ("Start." followed immediately by the first word, no "Start" in the transcript); hold-to-talk end to end plus the "Copied, not pasted (window changed)" case with `paste = true`.
+- Owner-present manual checks 9–11 and 15–16 (verification.md § Manual checks): the cue spike across the built-in and Bluetooth inputs (six numbers); the cue trim itself on both inputs ("Start." followed immediately by the first word, no "Start" in the transcript); hold-to-talk end to end plus the "Copied, not pasted (window changed)" case with `paste = true`; a real Kokoro and cloud read paused and resumed; the `stop_hotkey = "pause"` chord end to end.
 - Owner squash-merges `hold-to-talk` into `main` and publishes to PyPI — agents never push `main` or publish.
 
 ## Handoff

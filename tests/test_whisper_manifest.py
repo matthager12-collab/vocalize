@@ -7,8 +7,19 @@ import pytest
 from vocalize.local import whisper_manifest as manifest
 
 
-def test_there_are_exactly_the_three_models_the_spike_measured():
-    assert set(manifest.MODELS) == {"base.en", "small.en", "large-v3-turbo-q5_0"}
+def test_there_are_exactly_the_four_pinned_models():
+    assert set(manifest.MODELS) == {
+        "base.en", "small.en", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0",
+    }
+
+
+def test_the_turbo_q8_0_row_is_pinned_from_the_run_2_download():
+    # docs/plans/2026-09-app-roadmap/spike-notes.md § turbo q8_0: size and
+    # sha256 read from the completed file on 2026-09-07, not from headers.
+    entry = manifest.file_for("large-v3-turbo-q8_0")
+    assert entry["size"] == 874188075
+    assert entry["sha256"] == "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1"
+    assert entry["url"] == f"{manifest.RELEASE_URL}/ggml-large-v3-turbo-q8_0.bin"
 
 
 def test_downloads_are_pinned_to_one_revision_over_https():
@@ -22,7 +33,7 @@ def test_downloads_are_pinned_to_one_revision_over_https():
 
 
 def test_every_file_carries_a_size_and_a_full_sha256():
-    assert len(manifest.FILES) == 3
+    assert len(manifest.FILES) == 4
     for entry in manifest.FILES:
         assert entry["size"] > 0
         assert re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]), entry["name"]
@@ -37,6 +48,10 @@ def test_hashes_match_the_spike_report():
         "ggml-small.en.bin": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
         "ggml-large-v3-turbo-q5_0.bin": (
             "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+        ),
+        # Run 2 of the 2026-09 app-roadmap plan, from a completed download.
+        "ggml-large-v3-turbo-q8_0.bin": (
+            "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1"
         ),
     }
     assert {entry["name"]: entry["sha256"] for entry in manifest.FILES} == expected
@@ -53,7 +68,7 @@ def test_every_model_name_is_safe_to_pass_as_an_argument_or_file_name():
 
 def test_the_default_model_is_one_of_them():
     assert manifest.DEFAULT_MODEL in manifest.MODELS
-    assert manifest.DEFAULT_MODEL == "small.en"
+    assert manifest.DEFAULT_MODEL == "large-v3-turbo-q5_0"
 
 
 def test_the_runtime_package_is_version_pinned():
@@ -162,4 +177,6 @@ def test_selftest_argv_uses_auto_for_a_multilingual_model():
 
 def test_selftest_argv_defaults_to_the_default_model(tmp_path):
     argv = manifest.selftest_argv(tmp_path)
-    assert argv[argv.index("--model") + 1] == str(tmp_path / "ggml-small.en.bin")
+    assert argv[argv.index("--model") + 1] == str(tmp_path / "ggml-large-v3-turbo-q5_0.bin")
+    # turbo is multilingual, so the selftest lets whisper detect the language.
+    assert argv[argv.index("--language") + 1] == "auto"

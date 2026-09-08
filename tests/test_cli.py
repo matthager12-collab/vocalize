@@ -353,6 +353,8 @@ def test_usage_command_prints_tier_used_limit_and_percent(monkeypatch, tmp_path)
     assert "100,000" in result.output
     assert "12.3%" in result.output
     assert "cache empty" in result.output
+    # The cleanup backend has a ledger row too, against its default budget.
+    assert "anthropic: 0 / 2,000,000 characters (0.0%)" in result.output
 
 
 def test_usage_command_reports_local_cache_file_count(monkeypatch, tmp_path):
@@ -383,7 +385,10 @@ def test_invalid_speed_gives_a_clean_error_not_a_traceback(monkeypatch, tmp_path
     _isolate_config(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "sys.argv",
-        ["vocalize", "speak", "hello", "--api-key", "fake-key", "--no-play", "--speed", "5"],
+        # --api-key belongs to ElevenLabs alone, so name it: the default chain
+        # starts local and would refuse the flag before ever seeing --speed.
+        ["vocalize", "speak", "hello", "--provider", "elevenlabs",
+         "--api-key", "fake-key", "--no-play", "--speed", "5"],
     )
 
     with pytest.raises(SystemExit) as excinfo:
@@ -635,9 +640,24 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert "stt.model=base.en" in result.output
     assert "stt.language=en" in result.output
-    assert "stt.cleanup=true" in result.output
+    assert "stt.cleanup=claude-cli" in result.output  # legacy `true`, coerced
+    assert "stt.verbatim=false" in result.output
     assert "stt.max_seconds=30" in result.output
     assert "stt.cues=sounds" in result.output
+    assert "notes.summarizer=local" in result.output
+    assert "notes.template=memo" in result.output
+
+
+def test_the_verbatim_flag_and_a_bare_cleanup_reach_the_stt_options(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    from vocalize.cli import _stt_options
+
+    plain = _stt_options(False, False, None)
+    assert plain["cleanup"] == "off" and plain["verbatim"] is False
+
+    flagged = _stt_options(True, True, None)
+    assert flagged["cleanup"] == "claude-cli"  # bare --cleanup keeps its 0.10 meaning
+    assert flagged["verbatim"] is True
 
 
 def test_settings_prints_defaults_when_nothing_is_configured(monkeypatch, tmp_path):
@@ -946,7 +966,7 @@ def test_no_provider_flag_leaves_the_configured_chain_alone(monkeypatch, tmp_pat
     )
 
     assert result.exit_code == 0, result.output
-    assert calls[0]["chain"] == ["elevenlabs", "say"]
+    assert calls[0]["chain"] == ["kokoro", "say"]
 
 
 def test_api_key_with_another_provider_is_a_usage_error(monkeypatch, tmp_path):
@@ -1179,6 +1199,48 @@ def test_auth_login_stores_a_key_for_openai(fake_keychain, monkeypatch):
     assert "sk-openaikeyabc1234567" not in result.output
 
 
+def test_auth_login_stores_a_key_for_anthropic(fake_keychain, monkeypatch):
+    """The slot that is not a voice: stored under its own username, checked
+    with Anthropic (stubbed here), and the key is in no line of output."""
+    import vocalize.auth as auth_module
+
+    seen = []
+    monkeypatch.setattr("vocalize.llm.validate_anthropic_key", lambda key: seen.append(key))
+
+    result = CliRunner().invoke(
+        main,
+        ["auth", "login", "--provider", "anthropic", "--stdin"],
+        input="sk-ant-anthropickey1234567\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == ["sk-ant-anthropickey1234567"]
+    assert fake_keychain[(auth_module.SERVICE, "anthropic-api-key")] == "sk-ant-anthropickey1234567"
+    assert "anthropic-api-key" in result.output
+    assert "sk-ant-anthropickey1234567" not in result.output
+    assert "anthropic" not in auth_module.PROVIDER_NAMES  # still not a voice
+
+
+def test_auth_status_and_logout_reach_the_anthropic_slot(fake_keychain, monkeypatch):
+    import vocalize.auth as auth_module
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    fake_keychain[(auth_module.SERVICE, "anthropic-api-key")] = "sk-ant-stored-0000000000"
+
+    status = CliRunner().invoke(main, ["auth", "status", "--provider", "anthropic"])
+    assert status.exit_code == 0, status.output
+    assert status.output.startswith("anthropic: keychain")
+    assert "sk-ant-stored" not in status.output
+
+    listing = CliRunner().invoke(main, ["auth", "status"])
+    assert listing.exit_code == 0, listing.output
+    assert "anthropic" in listing.output
+
+    logout = CliRunner().invoke(main, ["auth", "logout", "--provider", "anthropic"])
+    assert logout.exit_code == 0, logout.output
+    assert (auth_module.SERVICE, "anthropic-api-key") not in fake_keychain
+
+
 def test_auth_login_refuses_polly(fake_keychain):
     result = CliRunner().invoke(main, ["auth", "login", "--provider", "polly"])
 
@@ -1338,6 +1400,23 @@ def test_usage_table_shows_budget_and_marks_exhausted(monkeypatch, tmp_path):
     assert "elevenlabs: 0 characters (no monthly_chars set — unlimited)" in result.output
 
 
+def test_usage_shows_a_zero_anthropic_budget_as_a_budget(monkeypatch, tmp_path):
+    """`monthly_chars = 0` on anthropic means "send nothing" — the line must
+    say so rather than call it unlimited (and must not divide by it)."""
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    cfg = tmp_path / "cfg" / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("[providers.anthropic]\nmonthly_chars = 0\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["usage"])
+
+    assert result.exit_code == 0, result.output
+    assert "anthropic: 0 / 0 characters" in result.output
+    assert "anthropic: 0 characters (no monthly_chars set" not in result.output
+
+
 def test_usage_marks_an_exhausted_provider_without_a_budget(monkeypatch, tmp_path):
     # The common case: no monthly_chars set. A provider a real quota error
     # marked exhausted was invisible on this line.
@@ -1461,7 +1540,7 @@ def test_settings_prints_the_resolved_chain(monkeypatch, tmp_path):
     result = CliRunner().invoke(main, ["settings"])
 
     assert result.exit_code == 0, result.output
-    assert "chain=elevenlabs,say" in result.output
+    assert "chain=kokoro,say" in result.output
 
 
 # --- `vocalize chain` ---------------------------------------------------------
@@ -1474,7 +1553,7 @@ def test_chain_show_prints_order_and_source(monkeypatch, tmp_path):
     result = CliRunner().invoke(main, ["chain"])
 
     assert result.exit_code == 0, result.output
-    assert "chain=elevenlabs,say" in result.output
+    assert "chain=kokoro,say" in result.output
     assert "source=default" in result.output
 
 

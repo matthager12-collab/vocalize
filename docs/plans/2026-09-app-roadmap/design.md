@@ -141,9 +141,51 @@ A machine with no local model and `summarizer = "local"` writes transcript-only 
 
 On macOS `auth._backend()` returns a thin object with the same three methods keyring exposes, implemented over `/usr/bin/security`: writes through `security -i` with the command on stdin (the secret never in argv), reads with `find-generic-password -s vocalize -a <username> -w`, deletes with `delete-generic-password`, and a comment (`-j "validated <ISO date>"`) as the last-validated stamp. `login` migrates an existing keyring-written item by deleting and re-adding it. keyring stays the backend everywhere else. T-30 (30 minutes) proves the item is readable from a rebuilt caller without a prompt before any of this is built; a failed check keeps keyring and documents the gotcha (DEC-035).
 
+## Pause and resume
+
+Two pauses, one idea: stop cleanly, keep what was captured, carry on from there. Neither touches Swift, so neither costs a grant.
+
+### Playback pause (0.13.1)
+
+**Mechanism.** `vocalize pause` is `audio.stop_playback(remember=True)` — the same call a dictation makes (DEC-003). No new file, no new format, no new lifetime. `vocalize resume` continues it; `vocalize resume --forget` discards it.
+
+**Waiting for the record.** `dictate._wait_for_record` moves to `interrupted.wait_for_record(since)` and both callers use it. It already carries what pause needs: only a record newer than `since`, an early-out when the stop found no player, and `_RESUME_GRACE` for a cloud provider whose record lands seconds after the player died. So pause prints "Paused. Resume it within the hour with: vocalize resume" only when a record actually landed, and "Nothing is playing." otherwise.
+
+**Commands.** New: `vocalize pause`. Unchanged: `vocalize stop`, `vocalize resume`, `vocalize resume --forget`. `stop` keeps today's meaning exactly — it silences, records nothing, and leaves any saved record alone. No shipped stop test is rewritten.
+
+**Hotkey.** New `[app] stop_hotkey = "stop" | "pause"`, default `stop`, printed by `vocalize settings`. Set to `pause`, the app's existing control-option-command-X becomes play/pause: a live read pauses; nothing playing plus a record present resumes it; neither says "Nothing is playing." The chord compiled into 0.13.0 already spawns `vocalize stop`, so this is one Python branch and no re-grant. Default off, because with it on every stop press writes plaintext. The resume branch first checks `dictate._read_session()`: while a dictation is live it refuses and prints nothing, rather than resuming a paused read into a microphone that is recording it — the muscle memory 0.13.0 taught (reach for the stop chord mid-recording) must never wake a stale read instead of ending the take.
+
+**Resume overlap.** `_RESUME_REWIND = 1.0` inside `interrupted.slice_from`, clamped at zero. `offset_seconds` is wall clock since Popen, not a decoded frame position, so a continuation starts a word early rather than mid-syllable. The shipped dictation-interrupt resume gets the same overlap for free.
+
+**State on disk.** Exactly what a dictation interrupt writes: `interrupted.<ext>`, `interrupted.txt`, `interrupted.json` (version 2), all 0600 through `O_NOFOLLOW` under the 0700 cache directory, one record at a time, `MAX_AGE` one hour. The honest delta is frequency: a deliberate pause now writes `interrupted.txt` too. The docs say so (DEC-012e).
+
+**Interlock with DEC-003.** One mechanism, not two. A dictation taken while a read is paused finds no player and never offers the paused record: `wait_for_record` requires a record newer than the dictation's own start, so the dialog stays silent and the record survives untouched. `vocalize resume` is where it waits. One record at a time still holds — a later interrupt replaces a pause, last writer wins.
+
+**Interlock with run 11.** Run 11 owns the dictation state machine; run 11b touches `cli.py`, `config.py` and `interrupted.py`, plus one line of `dictate.py`. `dictate --start` and `--stop` are untouched.
+
+### Recording pause (0.14.0)
+
+**Mechanism.** `vocalize dictate --pause` stops the recorder through the existing stop file and waits for it to exit. That is the only path that finalises the WAV header; the recorder's signal handler exits without finalising, so signals are never used. Run 11's `_trim_cue` runs on the finished take, which then becomes `take.NNN.wav`. A `paused` marker holds the epoch and the seconds recorded so far. `vocalize dictate --resume` launches a fresh recorder into a new `take.wav`, waits for first growth, plays the Tink and writes that segment's own `cue` file. The recorder is never rebuilt.
+
+**Joining.** `_join_segments` runs in `_finish_take` immediately after `_trim_cue`: stdlib `wave`, segments in numeric order then the live take, 0.25 s of zero frames at each seam so whisper does not glue two half-words together, params asserted identical, written to `take.joined.wav` then `os.replace`. It keys on the glob, not the marker, so a crash between the rename and the marker still joins. The worker receives exactly one 16 kHz mono 16-bit WAV and needs no change.
+
+**Budgets.** `--max` stays per segment and still obeys the recorder's frozen 1..600 bound; each resume passes `max(1, min(max_seconds, remaining))`. New `[stt] max_take_seconds` (default 1800, bounded 60..7200) caps the whole take, and `_MAX_SEGMENTS = 20` caps the count. 1800 s is about 57 MB of WAV in the temporary workdir. Per-segment budgets are what make a take longer than ten minutes possible at all. `_TRANSCRIBE_TIMEOUT` and the `_FINISH_TIMEOUT` derived from it stay fixed at 300 s today, sized for a single ten-minute segment; once segments join into one long take, the transcription subprocess must be given a budget that scales with the joined duration (`max(300, take_seconds * k)`, `k` measured against the run-13 spike), or a real long memo is killed mid-transcription and its workdir discarded on the way out.
+
+**State on disk.** Everything sits inside the existing per-take `mkdtemp` workdir: 0700, removed by `_discard` on every exit path, swept after 24 hours. `dictate.session` gains no new state value — a paused take still reads `recording`, so the 0.13.0 Swift app's vocabulary is untouched and nothing is owed a re-grant.
+
+**Never wedged, never lost.** A plain toggle press while paused is a stop: `_second_press` branches on the marker and calls `_stop` with `pid None`. Without that branch the shipped code finds no usable `take.wav`, falls to `_fail`, discards the workdir and says the recorder failed — the whole memo gone, with a misleading notification. `--cancel` while paused removes every segment.
+
+**Hotkey.** With `[app] stop_hotkey = "pause"` (shipped in 0.13.1), the stop chord gains two branches ahead of the playback ones: a live session reading `recording` pauses, one holding the marker resumes. The state word is untrusted input, so anything unrecognised falls through to playback. DEC-003 keeps a read and a recording from ever both being live, so the two can never collide.
+
+**Interlock with run 15.** `vocalize notes` never opens a microphone — it transcribes files that already exist. So `notes.py` is not touched, `[notes] keep_audio` governs a different directory, and no byte reaches the notes folder. Recording pause makes dictation takes pausable, and claims nothing more.
+
+### Out of scope
+
+`SIGSTOP` on the player: it holds the machine-wide `play.lock` for the whole pause, so every other read on the Mac blocks silently. A pause verb in either Swift source: each costs a grant. Sub-second offset precision, more than one paused read, a pause queue. A live memo recorder: that is a separate `vocalize record` command with its own session, budget and disk story, and its own run.
+
 ## Contracts
 
-### `[stt]` additions (0.12.0, 0.13.1)
+### `[stt]` additions (0.12.0, 0.13.1, 0.14.0)
 
 ```toml
 [stt]
@@ -151,6 +193,7 @@ beam_size = 5        # 1–8; 1 is greedy (0.10 behaviour); the escape hatch if 
 cleanup = "off"      # off | local | claude-cli | anthropic  (legacy true → "claude-cli", false → "off")
 verbatim = false     # skip the restatement/filler pass; the spoken first word "verbatim" does the same for one take
 paste = false        # 0.13.1: paste after copying, only into the window the dictation started in
+max_take_seconds = 1800  # 0.14.0: 60–7200; caps the whole paused-and-resumed take — --max (max_seconds) stays per segment
 ```
 
 `vocalize settings` prints `stt.cleanup=<word>`, `stt.verbatim=…`, `stt.paste=…`. `listen`/`dictate` gain `--verbatim`; `--cleanup` keeps its meaning.
@@ -176,9 +219,10 @@ dictate = "ctrl+alt+cmd+d"
 dictate_mode = "toggle"   # toggle | hold; 0.13.0 accepts "hold" but treats it as toggle with one warning until 0.13.1 (a rollback never bricks the CLI)
 speak = "ctrl+alt+cmd+s"
 stop = "ctrl+alt+cmd+x"
+stop_hotkey = "stop"      # 0.13.1: stop | pause; the app never reads this key itself (see note below), it only changes what `vocalize stop` does
 ```
 
-Chord grammar: tokens split on `+`; modifiers `ctrl|alt|cmd|shift` (aliases control, option, command); key `a–z`, `0–9`, `f1–f12`; must include `ctrl` or `cmd` (macOS refuses otherwise, error -9868); `""` disables a chord; chords pairwise distinct. `_validate_app_table`, `resolve_app`, rendered by the wizard, printed by `vocalize settings` as `app.<key>=…`. A test asserts the Python allowlist equals the key names in the Swift keycode table. The app runs `vocalize settings` at launch and on a vnode event on `~/.config/vocalize` (the directory, because `_write_config` replaces the file) and parses only the `app.*` and `stt.paste` lines.
+Chord grammar: tokens split on `+`; modifiers `ctrl|alt|cmd|shift` (aliases control, option, command); key `a–z`, `0–9`, `f1–f12`; must include `ctrl` or `cmd` (macOS refuses otherwise, error -9868); `""` disables a chord; chords pairwise distinct. `_validate_app_table`, `resolve_app`, rendered by the wizard, printed by `vocalize settings` as `app.<key>=…`. A test asserts the Python allowlist equals the key names in the Swift keycode table. The app runs `vocalize settings` at launch and on a vnode event on `~/.config/vocalize` (the directory, because `_write_config` replaces the file) and parses only the `app.*` and `stt.paste` lines. The four chord names (`dictate`, `dictate_mode`, `speak`, `stop`) are registered explicitly; any other `app.*` key the parser does not recognise is ignored rather than treated as a chord, so a later release can add an `app.*` key (`stop_hotkey` included) without costing every user a rebuild and an Accessibility re-grant.
 
 ### App spawn contract and binary discovery
 

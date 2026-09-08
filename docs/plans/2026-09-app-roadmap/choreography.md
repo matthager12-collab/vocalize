@@ -1,6 +1,6 @@
 # Choreography: local-first defaults, the menu-bar app, and recorded notes
 
-Eighteen runs, four releases. Each run is executed with `implement-spec`, one task at a time, and hands over through its `report.md` and a green `validate-exit.sh`. Sequencing is the harness's job (branches, agent runs, hooks as gates); this document is the contract and the audit trail, not a script to hand-walk. The owner asked for the smallest chunks possible: no run exceeds about 20 hours, and eight of them are under six.
+Twenty runs, four releases. Each run is executed with `implement-spec`, one task at a time, and hands over through its `report.md` and a green `validate-exit.sh`. Sequencing is the harness's job (branches, agent runs, hooks as gates); this document is the contract and the audit trail, not a script to hand-walk. The owner asked for the smallest chunks possible: no run exceeds about 20 hours, and nine of them are under six.
 
 ## Order
 
@@ -8,8 +8,8 @@ Eighteen runs, four releases. Each run is executed with `implement-spec`, one ta
 graph LR
   R1[run-1 defaults] --> R2[run-2 decoding] --> R3[run-3 llm.py] --> R4[run-4 keychain] --> R5[run-5 keys tab] --> R6[run-6 release 0.12.0]
   R6 --> R7[run-7 spike + builder] --> R8A[run-8a app Swift] --> R8B[run-8b app Python] --> R9[run-9 doctor/integrate/setup] --> R10[run-10 release 0.13.0]
-  R10 --> R11[run-11 cue/hold/paste] --> R12[run-12 release 0.13.1]
-  R12 --> R13[run-13 spikes] --> R14[run-14 local model] --> R15[run-15 notes] --> R16[run-16 release 0.14.0]
+  R10 --> R11[run-11 cue/hold/paste] --> R11B[run-11b playback pause] --> R12[run-12 release 0.13.1]
+  R12 --> R13[run-13 spikes] --> R14[run-14 local model] --> R15[run-15 notes] --> R15B[run-15b recording pause] --> R16[run-16 release 0.14.0]
   R17[run-17 optional spikes<br/>any time, no release path]
 ```
 
@@ -27,14 +27,16 @@ graph LR
 | 9 | [run-9-doctor-integrate-setup](./run-9-doctor-integrate-setup/project-plan.md) | T-80…T-84 | `app`, after 8b | Sonnet | no |
 | 10 | [run-10-release-0-13-0](./run-10-release-0-13-0/project-plan.md) | T-90…T-92 | `app`; owner merges and publishes | Opus review, Sonnet docs | yes: manual checks 4–8, merge, publish |
 | 11 | [run-11-cue-hold-paste](./run-11-cue-hold-paste/project-plan.md) | T-100…T-105 | `hold-to-talk` off `main` after 0.13.0; `vocalize/menubar/` read-only | Opus (a state machine and a trim on real audio timing) | yes: the Bluetooth input for T-100 |
-| 12 | [run-12-release-0-13-1](./run-12-release-0-13-1/project-plan.md) | T-110…T-111 | `hold-to-talk`; owner merges and publishes | Opus review | yes: manual checks 9–11, merge, publish |
+| 11b | [run-11b-playback-pause](./run-11b-playback-pause/project-plan.md) | T-106…T-109 | `hold-to-talk`, after 11; `vocalize/menubar/` read-only | Sonnet; Opus reviews the `stop` routing branch before commit | yes: manual checks 15 and 16 |
+| 12 | [run-12-release-0-13-1](./run-12-release-0-13-1/project-plan.md) | T-110…T-111 | `hold-to-talk`; owner merges and publishes | Opus review | yes: manual checks 9–11 and 15–16, merge, publish |
 | 13 | [run-13-spikes](./run-13-spikes/project-plan.md) | T-120…T-122 | `notes` off `main` after 0.13.1; spikes in scratch environments | Opus (the numbers become DEC-034) | yes: the owner reads the jargon clip |
 | 14 | [run-14-local-llm](./run-14-local-llm/project-plan.md) | T-130…T-135 | `notes` | Opus (token-id prompt building, manifest hardening) | a 3 GB verified download on the owner's Mac |
 | 15 | [run-15-notes](./run-15-notes/project-plan.md) | T-140…T-146 | `notes`, after 14 | Sonnet for the module and tests; Opus reviews the untrusted-input paths | yes: the 3-hour real-audio pass |
-| 16 | [run-16-release-0-14-0](./run-16-release-0-14-0/project-plan.md) | T-150…T-152 | `notes`; owner merges and publishes | Opus review, Sonnet docs | yes: manual checks 12–14, merge, publish |
+| 15b | [run-15b-recording-pause](./run-15b-recording-pause/project-plan.md) | T-147…T-149 | `notes`, after 15; `vocalize/recorder/` and `vocalize/menubar/` read-only | Opus (segment joining, the budget arithmetic, and the `_second_press` branch a paused take falls into) | yes: manual checks 17 and 18 |
+| 16 | [run-16-release-0-14-0](./run-16-release-0-14-0/project-plan.md) | T-150…T-152 | `notes`; owner merges and publishes | Opus review, Sonnet docs | yes: manual checks 12–14 and 17–18, merge, publish |
 | 17 | [run-17-optional-spikes](./run-17-optional-spikes/project-plan.md) | T-160…T-162 | scratch, outside the repo; nothing under `vocalize/` changes | Opus, owner present | yes, for every spike |
 
-Runs 1 and 2 are each under four hours and may run back to back in one session; so may 12 and 13. An executor may step a tier up after a failed retry and must say so in `report.md`.
+Runs 1 and 2 are each under four hours and may run back to back in one session; so may 12 and 13, and so may 11b and 12. An executor may step a tier up after a failed retry and must say so in `report.md`.
 
 ## Artifact dependencies
 
@@ -51,11 +53,13 @@ Runs 1 and 2 are each under four hours and may run back to back in one session; 
 | run 8b | `vocalize/app.py`, the `app` command group, the LaunchAgent, `dictate.session` state and nonce, `clip` exit 3, readiness app rows, `/api/state["app"]` | run 9 (doctor rows, Setup tab), run 11 (nonce, hold dispatch) |
 | run 9 | `readiness.doctor_rows()`, `vocalize doctor`, `vocalize integrate claude`, the Setup tab | run 10 |
 | run 10 | 0.13.0 on PyPI, `review-0.13.0.md` | run 11 entry |
-| run 11 | the cue trim, `dictate --start/--stop`, the `dictate.copied` marker, `spike-notes.md` § Cue | run 12 |
+| run 11 | the cue trim, `dictate --start/--stop`, the `dictate.copied` marker, `spike-notes.md` § Cue | run 11b |
+| run 11b | `vocalize pause`, `interrupted.wait_for_record`, `[app] stop_hotkey`, `_RESUME_REWIND` | run 12; run 15b (the stop precedence branches) |
 | run 12 | 0.13.1 on PyPI | run 13 entry |
 | run 13 | DEC-034 decided, `spike-notes.md` § LLM, the Parakeet engine if go | run 14 (manifest pin, residency call), run 15 (`--segments` engine) |
 | run 14 | `llm_manifest.py`, `llm_worker.py`, `local install/uninstall --llm`, `llm._local` | run 15 (`summarize` via `local`) |
-| run 15 | `vocalize/notes.py`, `--segments`, the templates, `docs/notes.md`, `spike-notes.md` § Notes | run 16 |
+| run 15 | `vocalize/notes.py`, `--segments`, the templates, `docs/notes.md`, `spike-notes.md` § Notes | run 15b |
+| run 15b | `_join_segments`, `dictate --pause/--resume`, `[stt] max_take_seconds`, `spike-notes.md` § Pause | run 16 |
 | run 16 | 0.14.0 on PyPI, `review-0.14.0.md` | — |
 | run 17 | `spike-notes.md` § Foundation Models, § SpeechAnalyzer, § Voice Memos; possibly `notes.embedded_transcript()` | a later plan |
 
@@ -65,14 +69,14 @@ Runs 1 and 2 are each under four hours and may run back to back in one session; 
 2. **Commit.** Every working state is committed on the run's branch (`wip:` is fine); feature branches may be pushed; `main` is never pushed by an agent. The diff is scanned for secrets before staging.
 3. **Entry.** The next run's script checks the previous `report.md` for `validate-exit: PASS`, the previous run's key artifact, a branch that is not `main`, and a green suite before any edit. A red entry stops the run; it does not "fix forward".
 4. **Branches.** One branch per release (`local-first`, `app`, `hold-to-talk`, `notes`), each forked from `main` after the previous publish. The entry check verifies "not main", not the literal name, so a rename cannot break a run (the DEC-017 and DEC-019 lesson).
-5. **Owner gates.** Runs 6, 10, 12 and 16 end with the owner's squash-merge and publish; agents prepare the release, verify the PyPI digests after the owner publishes, and never publish themselves. Runs 2, 4, 7, 8b, 11, 13, 14, 15 and 17 need the owner at one named moment each (see the table).
-6. **Security gate.** Every run's exit criteria include the negative tests from its acceptance criteria; the release runs add the adversarial review whose findings table (Severity, Status) is what the exit check greps. Runs 3, 5, 8b and 15 add an Opus review of the named files before commit.
-7. **Swift freeze.** Run 11's script refuses any diff under `vocalize/menubar/`; a Swift defect after 0.13.0 is an out-of-band patch release and a re-grant (DEC-032).
+5. **Owner gates.** Runs 6, 10, 12 and 16 end with the owner's squash-merge and publish; agents prepare the release, verify the PyPI digests after the owner publishes, and never publish themselves. Runs 2, 4, 7, 8b, 11, 11b, 13, 14, 15, 15b and 17 need the owner at one named moment each (see the table).
+6. **Security gate.** Every run's exit criteria include the negative tests from its acceptance criteria; the release runs add the adversarial review whose findings table (Severity, Status) is what the exit check greps. Runs 3, 5, 8b, 15 and 11b add an Opus review of the named files before commit (11b's project-plan requires an Opus review of the stop routing branch).
+7. **Swift freeze.** Runs 11 and 11b refuse any diff under `vocalize/menubar/`; run 15b refuses a diff under `vocalize/recorder/` as well, because a rebuild there is a microphone re-grant (DEC-010); a Swift defect after 0.13.0 is an out-of-band patch release and a re-grant (DEC-032).
 8. **Concurrent sessions.** Other sessions may be in this repository. Fetch before trusting `main`; re-read a file before editing it. Reviewer and fixer probes never touch the real config, ledger, keychain or LaunchAgents (`XDG_CONFIG_HOME`, `HOME`, the launchctl seam and the keychain fake isolate them).
 
 ## Pre-build validation
 
-Every `validate-exit.sh` was executed on 2026-09-06 before any run started, by the Sonnet agent that wrote it (run 10's agent wrote the files but returned no counts; its script was executed by the planning session on 2026-09-07 with `CHECK_TIMEOUT=600`), and audited: every check for a not-yet-built artifact must fail, every pass must be an entry precondition or a regression check. Scripts carry `CHECK_TIMEOUT` 300 by default because a full-suite run took 140–285 s on this machine under the load described below (about 100 s idle).
+Every `validate-exit.sh` was executed on 2026-09-06 before any run started, by the Sonnet agent that wrote it (run 10's agent wrote the files but returned no counts; its script was executed by the planning session on 2026-09-07 with `CHECK_TIMEOUT=600`), and audited: every check for a not-yet-built artifact must fail, every pass must be an entry precondition or a regression check. The two pause runs' scripts (11b, 15b) were written on 2026-09-07 alongside DEC-036/DEC-037 and executed the same day, by the session that fixed the findings against the pause synthesis, with `CHECK_TIMEOUT=600`; both hold to the same rule (every artifact check fails, only branch state, ruff, suite-green and the Swift/recorder-freeze checks pass — "work committed" fails at this pre-build point, since the plan edits it checks for are not yet committed). Scripts carry `CHECK_TIMEOUT` 300 by default because a full-suite run took 140–285 s on this machine under the load described below (about 100 s idle).
 
 | Run | Checks | Passed (entry preconditions + regressions) | Failed (artifacts not built yet) | Vacuous passes pinned | Script exit |
 |---|---|---|---|---|---|
@@ -88,10 +92,12 @@ Every `validate-exit.sh` was executed on 2026-09-06 before any run started, by t
 | 9 doctor/integrate/setup | 14 | 6 | 8 | 2 | 1 |
 | 10 release 0.13.0 | 16 | 4 | 12 | 0 | 1 |
 | 11 cue/hold/paste | 13 | 5 | 8 | 3 | 1 |
+| 11b playback pause | 22 | 9 | 13 | 0 | 1 |
 | 12 release 0.13.1 | 14 | 4 | 10 | 1 | 1 |
 | 13 spikes | 11 | 4 | 7 | 0 | 1 |
 | 14 local model | 13 | 4 | 9 | 0 | 1 |
 | 15 notes | 11 | 4 | 7 | 0 | 1 |
+| 15b recording pause | 25 | 9 | 16 | 0 | 1 |
 | 16 release 0.14.0 | 16 | 4 | 12 | 0 | 1 |
 | 17 optional spikes | 6 | 2 | 4 | 0 | 1 |
 

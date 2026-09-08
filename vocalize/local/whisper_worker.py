@@ -93,10 +93,45 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--model", required=True, help="Path to a ggml .bin model file")
     parser.add_argument("--language", default="en")
+    parser.add_argument(
+        "--beam-size", type=int, default=5, choices=range(1, 9), metavar="N",
+        help="1 keeps whisper.cpp's greedy decoder; 2-8 turns on beam search with N beams",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--transcribe", metavar="WAV", help="Path to a 16 kHz mono 16-bit WAV")
     mode.add_argument("--selftest", action="store_true", help="Load the model and say one word")
     return parser.parse_args(argv)
+
+
+def _model_kwargs(beam_size: int) -> dict:
+    """The decode strategy, as pywhispercpp Model kwargs.
+
+    Greedy (0.10.x's default, `beam_size` 1) ran words together on fast
+    speech ("toget" for "to get", issue #4); beam search with five beams is
+    whisper.cpp's own default for the beam strategy and is the fix. The
+    kwargs follow pywhispercpp 1.5.1's public API: a strategy selector plus
+    a `beam_search` dict forwarded to `whisper_full_params`. The dict must
+    carry both of whisper.cpp's beam fields — the binding indexes `patience`
+    unconditionally and a dict without it fails with KeyError before the
+    model loads; -1.0 is whisper.cpp's "no patience factor" default.
+    """
+    if beam_size <= 1:
+        return {}
+    return {
+        "params_sampling_strategy": 1,
+        "beam_search": {"beam_size": beam_size, "patience": -1.0},
+    }
+
+
+def _join_segments(texts) -> str:
+    """Segment texts joined with exactly one space between them.
+
+    `small.en` emits every segment with a leading space, so a plain
+    `"".join` looked right; the turbo models emit none, and sentences ran
+    together ("working.I want"). Stripping each segment and joining with
+    one space gives the same text for both model families.
+    """
+    return " ".join(part for part in (text.strip() for text in texts) if part)
 
 
 def transcribe(model, wav_path: str, language: str) -> dict:
@@ -106,7 +141,7 @@ def transcribe(model, wav_path: str, language: str) -> dict:
         return {"ok": False, "error": error}
     try:
         segments = model.transcribe(wav_path, language=language)
-        text = "".join(segment.text for segment in segments).strip()
+        text = _join_segments(segment.text for segment in segments)
     except Exception as exc:  # noqa: BLE001 -- whisper.cpp can raise anything; report, don't crash
         return {"ok": False, "error": _one_line(exc)}
     return {"ok": True, "text": text}
@@ -130,7 +165,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     try:
-        model = _model_class()(args.model, n_threads=_N_THREADS)
+        model = _model_class()(
+            args.model, n_threads=_N_THREADS, **_model_kwargs(args.beam_size)
+        )
     except Exception as exc:  # noqa: BLE001 -- pywhispercpp can raise anything
         if args.selftest:
             print(f"whisper: could not load the model: {_one_line(exc)}", file=sys.stderr)

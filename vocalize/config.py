@@ -30,8 +30,13 @@ SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
 KNOWN_CONFIG_KEYS = (
-    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt",
+    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt", "notes",
 )
+
+# Keys inside a [providers.<name>] table that become a request field or an
+# argument: short printable strings, or the file is refused (issue #5).
+PROVIDER_TEXT_KEYS = ("voice", "model", "engine", "language", "region", "profile")
+PROVIDER_TEXT_MAX_CHARS = 128
 
 # Keys allowed inside a [providers.<name>] table.
 KNOWN_PROVIDER_KEYS = (
@@ -58,27 +63,48 @@ KNOWN_STT_KEYS = (
     "max_seconds",
     "sounds",
     "cues",
+    "beam_size",
+    "verbatim",
 )
+
+# Where a dictation's cleanup pass runs. `off` is the default: a press must
+# never surprise with a pause or reworded text. `local` is accepted from
+# 0.12.0 so a 0.14 config never breaks an older binary; llm.py refuses it
+# at run time until the model ships. A legacy bool is coerced: true was
+# `claude -p`, false was off.
+STT_CLEANUP_BACKENDS = ("off", "local", "claude-cli", "anthropic")
 
 # What `cues` may be: the fixed system sounds, spoken words instead, or both.
 STT_CUE_MODES = ("sounds", "words", "both")
 
 # `paste` is reserved by DEC-006 and deliberately does nothing in 0.10.0.
 STT_DEFAULTS = {
-    "model": "small.en",
+    # turbo q5_0: the first model that kept "the merge" as two words on the
+    # owner's voice (issue #4), no slower than small.en on an M4 and only
+    # ~90 MB more resident. small.en stays the lighter choice for a slow Mac.
+    "model": "large-v3-turbo-q5_0",
     "language": "en",
     "input_device": "",
-    "cleanup": False,
+    "cleanup": "off",
+    "verbatim": False,
     "paste": False,
     "max_seconds": 120,
     "sounds": True,
     "cues": "sounds",
+    "beam_size": 5,
 }
 
 # The recorder self-stops at max_seconds and `dictate` backstops it, so this
 # is a real resource bound, not a cosmetic one.
 STT_MAX_SECONDS_MIN = 1
 STT_MAX_SECONDS_MAX = 600
+
+# `beam_size` becomes the worker's `--beam-size`: 1 is whisper.cpp's greedy
+# decoder (0.10.x behaviour), 5 is whisper.cpp's own beam default and the
+# fix for words run together on fast speech (issue #4). Capped at 8 because
+# every extra beam is decode time on the stop press.
+STT_BEAM_SIZE_MIN = 1
+STT_BEAM_SIZE_MAX = 8
 
 # `input_device` is passed to the recorder as one argv entry. It is a device
 # name a human copied out of `vocalize listen --list-devices`, so the shape
@@ -87,9 +113,10 @@ STT_MAX_SECONDS_MAX = 600
 # '-' would turn a config value into a recorder flag.
 STT_DEVICE_MAX_CHARS = 128
 
-# chain = ["elevenlabs", "say"]: ElevenLabs today, degrading to the always-
-# free `say` on failure instead of erroring.
-DEFAULT_CHAIN = ("elevenlabs", "say")
+# chain = ["kokoro", "say"]: the on-device voice first, degrading to the
+# always-present `say` instead of erroring — so a keyless fresh Mac still
+# speaks, and the fallback line names the install that is missing (DEC-022).
+DEFAULT_CHAIN = ("kokoro", "say")
 
 
 def _load_dotenv_if_present() -> None:
@@ -194,6 +221,8 @@ def load_config_file() -> dict:
         _validate_providers_table(data["providers"], path)
     if "stt" in data:
         _validate_stt_table(data["stt"], path)
+    if "notes" in data:
+        _validate_notes_table(data["notes"], path)
 
     return data
 
@@ -233,10 +262,10 @@ def _validate_providers_table(value, path: Path) -> None:
         raise ConfigError("config key 'providers' must be a table of provider tables")
 
     for name, table in value.items():
-        if name not in auth.PROVIDER_NAMES:
+        if name not in auth.PROVIDER_NAMES and name not in auth.KEY_SLOTS:
             _warn(
                 f"vocalize: unknown provider {name!r} under 'providers' in {path}. "
-                f"Known: {', '.join(auth.PROVIDER_NAMES)}"
+                f"Known: {', '.join(auth.PROVIDER_NAMES + ('anthropic',))}"
             )
         for key, val in table.items():
             if key not in KNOWN_PROVIDER_KEYS:
@@ -245,6 +274,25 @@ def _validate_providers_table(value, path: Path) -> None:
                 )
             if key == "monthly_chars":
                 _validate_monthly_chars(val, name, path)
+            elif key in PROVIDER_TEXT_KEYS:
+                _validate_provider_text(key, val, name, path)
+
+
+def _validate_provider_text(key: str, val, name: str, path: Path) -> None:
+    """A provider's voice, model, engine, language, region or profile is a
+    short printable string: it becomes a request field or an argument, so
+    an int, a table or a flag-shaped value is refused, not passed along."""
+    if (
+        not isinstance(val, str)
+        or not val.strip()
+        or len(val) > PROVIDER_TEXT_MAX_CHARS
+        or not val.isprintable()
+        or val.startswith("-")
+    ):
+        raise ConfigError(
+            f"Invalid {key} {val!r} in [providers.{name}] in {path}: expected a short "
+            f"printable string (at most {PROVIDER_TEXT_MAX_CHARS} characters, not starting with '-')."
+        )
 
 
 def _validate_stt_table(value, path: Path) -> None:
@@ -301,11 +349,29 @@ def _validate_stt_table(value, path: Path) -> None:
             f"between {STT_MAX_SECONDS_MIN} and {STT_MAX_SECONDS_MAX}."
         )
 
+    beams = value.get("beam_size")
+    if beams is not None and (
+        isinstance(beams, bool)
+        or not isinstance(beams, int)
+        or not STT_BEAM_SIZE_MIN <= beams <= STT_BEAM_SIZE_MAX
+    ):
+        raise ConfigError(
+            f"Invalid stt.beam_size {beams!r} in {path}: expected an integer "
+            f"between {STT_BEAM_SIZE_MIN} and {STT_BEAM_SIZE_MAX}."
+        )
+
     device = value.get("input_device")
     if device is not None:
         _validate_input_device(device, path)
 
-    for key in ("cleanup", "paste", "sounds"):
+    cleanup = value.get("cleanup")
+    if cleanup is not None and not isinstance(cleanup, bool) and cleanup not in STT_CLEANUP_BACKENDS:
+        raise ConfigError(
+            f"Invalid stt.cleanup {cleanup!r} in {path}: expected one of "
+            f"{', '.join(STT_CLEANUP_BACKENDS)} (or true/false from older configs)."
+        )
+
+    for key in ("paste", "sounds", "verbatim"):
         flag = value.get(key)
         if flag is not None and not isinstance(flag, bool):
             raise ConfigError(f"Invalid stt.{key} {flag!r} in {path}: expected true or false.")
@@ -354,6 +420,91 @@ def resolve_stt(file_config: dict | None = None) -> dict:
     _validate_stt_table(table, config_path())
     resolved = dict(STT_DEFAULTS)
     resolved.update({key: table[key] for key in KNOWN_STT_KEYS if key in table})
+    if isinstance(resolved["cleanup"], bool):  # 0.10.x wrote true/false
+        resolved["cleanup"] = "claude-cli" if resolved["cleanup"] else "off"
+    return resolved
+
+
+# --- [notes] --------------------------------------------------------------
+#
+# Parsed, validated and rendered from 0.12.0; honoured by `vocalize notes`
+# from 0.14.0. Kept here so a config written for 0.14 round-trips through
+# every earlier writer of the file.
+
+KNOWN_NOTES_KEYS = ("folder", "template", "summarizer", "keep_audio", "model")
+NOTES_SUMMARIZERS = ("local", "claude-cli", "anthropic", "off")
+NOTES_TEMPLATES = ("memo", "meeting", "lecture", "journal")
+NOTES_DEFAULTS = {
+    "folder": "~/Documents/Vocalize Notes",
+    "template": "memo",
+    "summarizer": "local",  # only claude-cli and anthropic leave the machine
+    "keep_audio": False,
+    "model": "",  # "" = the [stt] model; else one of whisper_manifest.MODELS
+}
+NOTES_FOLDER_MAX_CHARS = 512
+
+
+def _validate_notes_table(value, path: Path) -> None:
+    """Check the `[notes]` table. Unknown keys warn; bad values raise."""
+    if not isinstance(value, dict):
+        raise ConfigError(f"config key 'notes' in {path} must be a table")
+    for key in value:
+        if key not in KNOWN_NOTES_KEYS:
+            _warn(f"vocalize: unknown config key {key!r} in [notes] in {path}")
+
+    folder = value.get("folder")
+    if folder is not None and (
+        not isinstance(folder, str)
+        or not folder.strip()
+        or len(folder) > NOTES_FOLDER_MAX_CHARS
+        or not folder.isprintable()
+    ):
+        raise ConfigError(
+            f"Invalid notes.folder {folder!r} in {path}: expected a non-empty path."
+        )
+
+    template = value.get("template")
+    if template is not None and (
+        not isinstance(template, str)
+        or not template.isprintable()
+        or (template not in NOTES_TEMPLATES and not template.endswith(".md"))
+        or template.startswith("-")  # a file name that reads as a flag
+    ):
+        raise ConfigError(
+            f"Invalid notes.template {template!r} in {path}: expected one of "
+            f"{', '.join(NOTES_TEMPLATES)} or a path to a .md prompt file."
+        )
+
+    summarizer = value.get("summarizer")
+    if summarizer is not None and summarizer not in NOTES_SUMMARIZERS:
+        raise ConfigError(
+            f"Invalid notes.summarizer {summarizer!r} in {path}: expected one of "
+            f"{', '.join(NOTES_SUMMARIZERS)}."
+        )
+
+    keep = value.get("keep_audio")
+    if keep is not None and not isinstance(keep, bool):
+        raise ConfigError(f"Invalid notes.keep_audio {keep!r} in {path}: expected true or false.")
+
+    model = value.get("model")
+    if model is not None:
+        from .local import whisper_manifest
+
+        if not isinstance(model, str) or (model != "" and model not in whisper_manifest.MODELS):
+            raise ConfigError(
+                f"Invalid notes.model {model!r} in {path}: expected \"\" (the [stt] model) "
+                f"or one of {', '.join(whisper_manifest.MODELS)}."
+            )
+
+
+def resolve_notes(file_config: dict | None = None) -> dict:
+    """The `[notes]` settings with defaults filled in, re-validated."""
+    if file_config is None:
+        file_config = load_config_file()
+    table = file_config.get("notes") or {}
+    _validate_notes_table(table, config_path())
+    resolved = dict(NOTES_DEFAULTS)
+    resolved.update({key: table[key] for key in KNOWN_NOTES_KEYS if key in table})
     return resolved
 
 
@@ -511,9 +662,19 @@ def provider_table(name: str, file_config: dict | None = None) -> dict:
     return (file_config.get("providers") or {}).get(name) or {}
 
 
+# Anthropic is the one budget that is never unlimited by default: a cleanup on
+# every press adds up, and nothing else in the config would say so.
+ANTHROPIC_DEFAULT_BUDGET = 2_000_000
+
+
 def budget_for(name: str, file_config: dict | None = None) -> int | None:
     """The provider's local monthly character budget, or None for unlimited."""
-    return provider_table(name, file_config).get("monthly_chars") or None
+    # Presence, not truthiness: an explicit 0 is "spend nothing" on anthropic
+    # and "unlimited" everywhere else, and both are the user's to write.
+    budget = provider_table(name, file_config).get("monthly_chars")
+    if name == "anthropic":
+        return ANTHROPIC_DEFAULT_BUDGET if budget is None else budget
+    return budget or None
 
 
 def _first(*values):

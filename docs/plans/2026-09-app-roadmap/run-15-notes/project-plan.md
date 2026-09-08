@@ -45,4 +45,4 @@ Checked by [validate-exit.sh](./validate-exit.sh), run from anywhere (it changes
 
 ## Handoff
 
-On exit, the executor writes `report.md` in this directory: one line per task (`T-nn: done | partial | skipped — reason`), the security-gate result (the negative tests named in the acceptance criteria, listed with their test ids), anything deferred, and the final line `validate-exit: PASS` copied from a real run of the script. Run 16 (`run-16-release-0-14-0`) reads that report as its entry criterion.
+On exit, the executor writes `report.md` in this directory: one line per task (`T-nn: done | partial | skipped — reason`), the security-gate result (the negative tests named in the acceptance criteria, listed with their test ids), anything deferred, and the final line `validate-exit: PASS` copied from a real run of the script. Run 15b (`run-15b-recording-pause`) reads that report as its entry criterion.

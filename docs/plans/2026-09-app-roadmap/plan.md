@@ -2,11 +2,11 @@
 
 ## Overview
 
-Four releases of vocalize, each a small chunk that can be executed and shipped on its own: 0.12.0 local-first, 0.13.0 app, 0.13.1 hold-to-talk and cue, 0.14.0 notes. Architecture and contracts are in [design.md](./design.md); every phase exit maps to a command in [verification.md](./verification.md); one-way doors are in [decisions.md](./decisions.md). Honest total after the design critiques: **140–185 hours**, more than the analysis's first estimate, because the app slice and the language-model seam were under-counted there.
+Four releases of vocalize, each a small chunk that can be executed and shipped on its own: 0.12.0 local-first, 0.13.0 app, 0.13.1 hold-to-talk and cue, 0.14.0 notes. Architecture and contracts are in [design.md](./design.md); every phase exit maps to a command in [verification.md](./verification.md); one-way doors are in [decisions.md](./decisions.md). Honest total after the design critiques: **150–196 hours**, more than the analysis's first estimate, because the app slice and the language-model seam were under-counted there.
 
 ## Scope
 
-**In:** the chain flip with its fallback note; beam search and the turbo q8_0 row; the cloud opt-in enums, `llm.py` and the egress line; the `[notes]` table; the keychain backend through `security`; the finished Keys tab and the Anthropic key slot; the locally compiled menu-bar app with toggle dictation, speak-the-selection, stop, indicator, login item; `app install/uninstall/status/restart`; `doctor`; `integrate claude`; the portal Setup tab; the cue trim (issue #2); hold-to-talk; auto-paste (default off); the Parakeet spike as a gate; the local language model; cleanup with the spoken `verbatim` keyword (issue #3); `vocalize notes`; provider settings validation (issue #5).
+**In:** the chain flip with its fallback note; beam search and the turbo q8_0 row; the cloud opt-in enums, `llm.py` and the egress line; the `[notes]` table; the keychain backend through `security`; the finished Keys tab and the Anthropic key slot; the locally compiled menu-bar app with toggle dictation, speak-the-selection, stop, indicator, login item; `app install/uninstall/status/restart`; `doctor`; `integrate claude`; the portal Setup tab; the cue trim (issue #2); hold-to-talk; auto-paste (default off); the Parakeet spike as a gate; the local language model; cleanup with the spoken `verbatim` keyword (issue #3); `vocalize notes`; provider settings validation (issue #5); playback pause and resume with an opt-in hotkey; recording pause and resume across joined segments.
 
 **Out:** Developer ID, notarization, a prebuilt binary, Homebrew cask; Hammerspoon as a dependency; a global cloud kill switch; a watch-folder daemon; a portal Notes tab and diarization (later); MLX for Kokoro; Ollama, gpt-oss, llama-cpp-python; a resident language-model session (marked in code, lifted only on a measured need); modifier-only chords.
 
@@ -41,6 +41,7 @@ Task ids are unique across the plan. Each phase is meant to be one run (see § S
 |---|---|---|---|---|
 | T-10 | `whisper_worker.py` constructs the model with the beam-search strategy; `[stt] beam_size` (1–8, default 5, 1 = greedy) is the escape hatch, validated like every `[stt]` key and passed through `worker_argv`; time the 30 s spike clip cold and warm at beam 1 and beam 5 and record the numbers in `spike-notes.md` § Beam; if beam 5 more than doubles the time, re-derive `_TRANSCRIBE_TIMEOUT` with headroom in the same task | vocalize | — | the stub-Model test asserts the strategy kwargs and that `beam_size=1` yields greedy; four timings in `spike-notes.md`; `vocalize listen --wav <spike clip>` no longer merges "to get" in the owner's clip (manual check 1) |
 | T-11 | `whisper_manifest.py` gains `large-v3-turbo-q8_0` (874 MB) at the same pinned revision, size and sha256 from a verified download; `[stt] model` allowlist and docs table updated | vocalize | — | `pytest tests/test_whisper_manifest.py -q` green; the sha256 in the manifest equals `shasum -a 256` of the downloaded file (recorded in `spike-notes.md`) |
+| T-13 | Default model becomes `large-v3-turbo-q5_0` (`config.STT_DEFAULTS`, `whisper_manifest.DEFAULT_MODEL`, the portal's initial choice, docs, CHANGELOG upgrade note). Added on 2026-09-07 after manual check 1: beam search did not keep "the merge" as two words on the owner's voice and turbo did, at no speed cost on the M4 | vocalize | T-11 | `resolve_stt({})["model"] == "large-v3-turbo-q5_0"`; the manifest test pins the default; a non-English language with no model line is accepted; docs say 547 MB |
 | T-12 | CoreML measured, not built: run `ONNX_PROVIDER=CoreMLExecutionProvider vocalize speak "<fixed sentence>"` and the CPU default three times each, cold and warm, with peak RSS of the worker for each path; record the numbers in `spike-notes.md`; correct the Kokoro RAM figure in the provider docstring and docs to the measured value; add a `[providers.kokoro] provider` knob **only** if CoreML wins by more than 20 % | vocalize | — | `spike-notes.md` § CoreML holds six timings, two RSS figures and a verdict line; the docs figure matches; no code change unless the verdict is "wins" |
 
 **Exit criteria**: verification.md § Phase 2.
@@ -119,7 +120,7 @@ Task ids are unique across the plan. Each phase is meant to be one run (see § S
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| T-70 | `vocalize/menubar/VocalizeApp.swift` + `Info.plist.in`, **complete**: status item with the four SF Symbol states, both hotkey backends (selected per DEC-033 at build time), the dispatch table incl. hold (down → `dictate --start`, up → `dictate --stop`) and toggle, speak-the-selection with the Accessibility prompt and `changeCount` check, stop on the concurrent queue, the spawn contract, binary discovery with the `UserDefaults` override, the `~/.config/vocalize` directory watcher and `settings` re-read, the `~/.cache/vocalize` watcher reading `dictate.session` state and nonce, `app.status` and the `app.log` size cap on every dispatch, the `dictate.copied` watcher with the nonce and frontmost checks, the override checked like every candidate, fixed-string notifications, the menu (Dictate, Speak selection, Stop, Cancel dictation, Open portal, Reload settings, Quit) | vocalize | T-60, T-62 | `xcrun swiftc -parse` clean; `plutil -lint` clean; the source contains no string that could carry pasteboard or transcript text into a notification (grep for `NSPasteboard.string` = 0); the override check and the nonce check are visible in source as named functions |
+| T-70 | `vocalize/menubar/VocalizeApp.swift` + `Info.plist.in`, **complete**: status item with the four SF Symbol states, both hotkey backends (selected per DEC-033 at build time), the dispatch table incl. hold (down → `dictate --start`, up → `dictate --stop`) and toggle, speak-the-selection with the Accessibility prompt and `changeCount` check, stop on the concurrent queue, the spawn contract, binary discovery with the `UserDefaults` override, the `~/.config/vocalize` directory watcher and `settings` re-read, the `~/.cache/vocalize` watcher reading `dictate.session` state and nonce, `app.status` and the `app.log` size cap on every dispatch, the `dictate.copied` watcher with the nonce and frontmost checks, the override checked like every candidate, fixed-string notifications, the menu (Dictate, Speak selection, Stop, Cancel dictation, Open portal, Reload settings, Quit) | vocalize | T-60, T-62 | `xcrun swiftc -parse` clean; `plutil -lint` clean; the source contains no string that could carry pasteboard or transcript text into a notification (grep for `NSPasteboard.string` = 0); the override check and the nonce check are visible in source as named functions; the settings parser ignores any `app.*` key it does not register as one of the four chord names, so a later `app.*` key needs no rebuild; an unrecognised `dictate.session` state maps to a distinct attention icon rather than the recording icon, visible in source as a named default branch (DEC-036, owner question 3) |
 
 **Exit criteria**: verification.md § Phase 8a.
 
@@ -179,12 +180,25 @@ Task ids are unique across the plan. Each phase is meant to be one run (see § S
 
 **Exit criteria**: verification.md § Phase 11.
 
+### Phase 11b: Playback pause and resume (0.13.1, Python only)
+
+**Entry criteria**: Phase 11 done on `hold-to-talk`; DEC-036 Decided; `VocalizeApp.swift` unchanged in this phase (any edit is a re-grant and must be refused).
+
+| # | Task | Repo | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| T-106 | Move `_wait_for_record` out of `dictate.py` into `interrupted.wait_for_record(since)` (both callers use it); `vocalize pause` calls `audio.stop_playback(remember=True)` then waits, printing "Paused. Resume it within the hour with: vocalize resume" when a record landed and "Nothing is playing." otherwise | vocalize | — | `tests/test_cli.py::test_pause_saves_the_record_like_a_dictation`, `::test_pause_with_nothing_playing_reports_it`, `::test_pause_in_the_chunk_gap_records_the_queued_piece` green; `grep -q 'interrupted.wait_for_record' vocalize/dictate.py` |
+| T-107 | `[app] stop_hotkey = "stop"\|"pause"` in `config.py` (default `stop`, an unknown word refused with the key named, printed by `vocalize settings`); in `"pause"` mode `vocalize stop` pauses a live read and, when nothing was playing and a record is present, resumes it — but the resume branch first checks `dictate._read_session()` and refuses silently (prints nothing) while a dictation is live, so the stop chord reached for mid-recording never wakes a stale paused read into the open microphone instead of ending the take; plain `stop` keeps today's meaning exactly and still records nothing | vocalize | T-106 | `tests/test_config.py::test_stop_hotkey_rejects_an_unknown_word`, `tests/test_cli.py::test_stop_hotkey_pause_pauses_then_resumes`, `::test_stop_hotkey_pause_never_resumes_while_a_dictation_is_live`, `::test_settings_prints_stop_hotkey` and `tests/test_cli.py::test_plain_stop_records_nothing_and_never_resumes` green |
+| T-108 | `_RESUME_REWIND = 1.0` applied inside `interrupted.slice_from` and clamped at zero, so a continuation overlaps the last word; plus the three named failure modes — a dictation while a read is paused never offers or destroys the record, a resume whose provider is installed but has no usable key (no key, no model) reports the failure and leaves the record in place, two resumes on one record leave it uncorrupted. `load()`'s existing deletion of a record naming a provider this build does not know at all is a separate, correct, unchanged guard — not what this test covers | vocalize | T-107 | `tests/test_dictate.py::test_resume_rewinds_one_second_before_the_pause_point`, `::test_dictation_while_paused_never_offers_the_paused_read`, `::test_resume_with_an_installed_but_unusable_provider_reports_and_keeps_the_record` and `tests/test_cli.py::test_two_resumes_do_not_corrupt_the_record` green; `grep -q '_RESUME_REWIND' vocalize/interrupted.py` exits 0 |
+| T-109 | Docs: `docs/dictation.md` pause and resume section naming the hour and the plaintext `interrupted.txt`, `[app] stop_hotkey` as the only zero-re-grant hotkey pause; README command list; CHANGELOG 0.13.1 | vocalize | T-108 | `grep -q 'vocalize pause' README.md && grep -q 'vocalize pause' docs/dictation.md && grep -q 'vocalize pause' CHANGELOG.md` (one grep per file); docs-match-CLI exits 0 with `pause` |
+
+**Exit criteria**: verification.md § Phase 11b.
+
 ### Phase 12: Release 0.13.1
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| T-110 | Review of the dictation changes appended to `review-0.13.0.md` § 0.13.1 | vocalize | — | no Critical or High Open |
-| T-111 | Owner: manual checks 9–11; squash-merge; publish; digests | vocalize | T-110 | digests equal |
+| T-110 | Review of the dictation changes appended to `review-0.13.0.md` § 0.13.1 (Phases 11 and 11b) | vocalize | — | no Critical or High Open |
+| T-111 | Owner: manual checks 9–11 and 15–16; squash-merge; publish; digests | vocalize | T-110 | digests equal |
 
 **Exit criteria**: verification.md § Phase 12.
 
@@ -231,13 +245,25 @@ Task ids are unique across the plan. Each phase is meant to be one run (see § S
 
 **Exit criteria**: verification.md § Phase 15.
 
+### Phase 15b: Recording pause and resume (0.14.0)
+
+**Entry criteria**: Phase 15 done on `notes`; DEC-037 Decided; `VocalizeRecorder.swift` and `VocalizeApp.swift` unchanged in this phase (each edit is a grant and must be refused).
+
+| # | Task | Repo | Depends on | Acceptance criteria |
+|---|---|---|---|---|
+| T-147 | `dictate --pause`: `_stop_file`, `_wait_for_exit` timed from *this segment's* own start, not the take's (the backstop is `segment_start + max_seconds + _BACKSTOP_GRACE`; timed from the take's start it goes negative past `max_seconds` and SIGTERMs a live recorder before its WAV is finalised), run 11's `_trim_cue` on the finished take if run 11 shipped it, else the finished take as-is under run 11's fallback cue order (T-100/T-101 may have taken either branch), `os.replace` to `take.NNN.wav`, then a 0600 `paused` marker holding the epoch and the cumulative seconds recorded across the whole take so far; `dictate --resume`: read the marker as untrusted input first — a non-finite, negative or unparsable value means no usable pause and takes the same branch as a missing marker — then refuse past `_MAX_SEGMENTS = 20` or past the new `[stt] max_take_seconds` (default 1800, bounded 60..7200) via `remaining = max_take_seconds - cumulative_seconds`, launch a fresh recorder with `--max = max(1, min(max_seconds, remaining))`, `_wait_for_audio`, the Tink, this segment's own `cue` file, then unlink the marker and roll the cumulative total forward into the next pause's marker. A segment that self-stops at its own `--max` with no explicit pause plays the stop cue and notifies that the microphone closed, rather than recording into a closed mic in silence. `dictate.session` keeps saying `recording` throughout | vocalize | — | `tests/test_dictate.py::test_pause_finalises_a_segment_and_leaves_the_session_claimed`, `::test_session_state_stays_recording_while_paused`, `::test_resume_launches_a_second_recorder_with_the_remaining_budget`, `::test_resume_max_never_falls_below_one_second`, `::test_resume_refuses_past_the_take_budget`, `::test_resume_refuses_a_twenty_first_segment`, `::test_wait_for_exit_backstop_uses_the_segment_start_not_the_take_start`, `::test_resume_treats_a_corrupt_paused_marker_as_no_pause`, `::test_segment_self_stop_at_max_notifies_before_the_mic_closes` and `tests/test_config.py::test_max_take_seconds_bounds` green |
+| T-148 | `_join_segments`: stdlib `wave`, segments in numeric order then the live `take.wav`, 0.25 s of zero frames at each seam, params asserted identical, written to `take.joined.wav` then `os.replace`; called from `_finish_take` immediately after `_trim_cue` and only when a segment exists, keying on the glob rather than the marker. `_TRANSCRIBE_TIMEOUT` and `_FINISH_TIMEOUT` scale with the joined take's duration (`max(300, take_seconds * k)`, `k` measured in the run-13 spike) instead of the fixed 300 s, so a long joined memo is not killed mid-transcription with its workdir discarded. Plus the two survival branches: a plain toggle press while paused routes to `_stop` with `pid None`, and `--cancel` while paused discards every segment | vocalize | T-147 | `tests/test_dictate.py::test_join_segments_frames_and_silence`, `::test_joined_wav_keeps_16k_mono_16bit`, `::test_cue_trimmed_per_segment_never_reaches_the_worker`, `::test_toggle_while_paused_stops_and_transcribes`, `::test_cancel_while_paused_removes_every_segment`, `::test_paused_workdir_younger_than_24h_is_not_swept`, `::test_transcribe_timeout_scales_with_take_length` green |
+| T-149 | Stop-chord precedence and docs: with `[app] stop_hotkey = "pause"` (shipped in 0.13.1), `vocalize stop` first pauses a live session reading `recording` and resumes one holding the `paused` marker, both ahead of the playback branches, with the state word read as untrusted input so anything unrecognised falls through; `docs/dictation.md` pause section (the seam gap, the per-segment and total budgets, that segments never leave the temporary workdir and never reach the notes folder), `[stt] max_take_seconds` in the settings table, CHANGELOG 0.14.0 | vocalize | T-148 | `tests/test_cli.py::test_stop_pauses_a_live_recording_before_playback`, `::test_stop_resumes_a_paused_recording`, `::test_unknown_session_state_falls_through_to_playback` green; `grep -q 'dictate --pause' docs/dictation.md`, `grep -q 'dictate --pause' CHANGELOG.md` (one grep per file) and `grep -q 'max_take_seconds' docs/dictation.md` exit 0 |
+
+**Exit criteria**: verification.md § Phase 15b.
+
 ### Phase 16: Release 0.14.0
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
 | T-150 | CHANGELOG 0.14.0; version bump; docs cross-check | vocalize | — | docs-match-CLI exits 0 |
-| T-151 | Adversarial review (untrusted-input tracing: audio file → transcript → prompt → note; the worker; the manifest) in `review-0.14.0.md` | vocalize | T-150 | no Critical or High Open |
-| T-152 | Owner: manual checks 12–14; squash-merge; publish; digests | vocalize | T-151 | digests equal |
+| T-151 | Adversarial review (untrusted-input tracing: audio file → transcript → prompt → note; the worker; the manifest; the joined multi-segment take from run 15b) in `review-0.14.0.md` | vocalize | T-150 | no Critical or High Open |
+| T-152 | Owner: manual checks 12–14 and 17–18; squash-merge; publish; digests | vocalize | T-151 | digests equal |
 
 **Exit criteria**: verification.md § Phase 16.
 
@@ -257,8 +283,8 @@ Each is optional, throwaway, and recorded in `spike-notes.md`. None blocks a rel
 graph LR
   P1[Phase 1 defaults] --> P2[Phase 2 decoding] --> P3[Phase 3 llm.py + enums] --> P4[Phase 4 keychain] --> P5[Phase 5 keys tab] --> P6[Release 0.12.0]
   P6 --> P7[Phase 7 spike + builder] --> P8A[Phase 8a app Swift] --> P8B[Phase 8b app Python] --> P9[Phase 9 doctor/integrate/setup] --> P10[Release 0.13.0]
-  P10 --> P11[Phase 11 cue/hold/paste] --> P12[Release 0.13.1]
-  P12 --> P13[Phase 13 spikes] --> P14[Phase 14 local LLM] --> P15[Phase 15 notes] --> P16[Release 0.14.0]
+  P10 --> P11[Phase 11 cue/hold/paste] --> P11B[Phase 11b playback pause] --> P12[Release 0.13.1]
+  P12 --> P13[Phase 13 spikes] --> P14[Phase 14 local LLM] --> P15[Phase 15 notes] --> P15B[Phase 15b recording pause] --> P16[Release 0.14.0]
   P13 -. go .-> T122[T-122 Parakeet engine] --> P15
 ```
 
@@ -273,7 +299,7 @@ Phase 3 depends on Phase 2 only for branch order; T-23 and T-25 could run beside
 | Swift app engineer (Phases 7, 8a) | `vocalize/menubar/`, `local/install.py` | branch `app` |
 | App lifecycle, Python (Phase 8b) | `app.py`, `cli.py`, `dictate.py`, `readiness.py`, `portal.py` | branch `app`, after Phase 8a |
 | Readiness and portal (Phase 9) | `readiness.py`, `portal.py`, `assets/` | branch `app`, after Phase 8 |
-| Dictation core (Phase 11) | `dictate.py`, `cli.py` | branch `hold-to-talk`; Swift source read-only |
+| Dictation core (Phases 11, 11b, 15b) | `dictate.py`, `cli.py`, `interrupted.py`, `config.py` | branches `hold-to-talk` then `notes`; both Swift sources read-only |
 | Runtime plumbing (Phases 13–14) | `local/`, `llm.py` | branch `notes` |
 | Notes (Phase 15) | `notes.py`, `assets/notes/`, `whisper_worker.py` | branch `notes`, after Phase 14 |
 | Independent reviewer (T-51, T-76, T-91, T-110, T-151) | read-only | fresh agent per review |
@@ -281,13 +307,15 @@ Phase 3 depends on Phase 2 only for branch order; T-23 and T-25 could run beside
 
 ## Decisions
 
-One-way doors: see [decisions.md](./decisions.md) (DEC-020 to DEC-035).
+One-way doors: see [decisions.md](./decisions.md) (DEC-020 to DEC-037).
 
 Two-way doors, decided here in one line each:
 
 - **Cleanup default stays `off`** after the local model installs; the user turns it on. A press should never surprise with a pause or reworded text.
 - **Notes defaults** `~/Documents/Vocalize Notes`, `memo`, `keep_audio = false`, `summarizer = "local"` (cloud off because only `claude-cli` and `anthropic` leave the machine).
 - **Auto-paste default off**, `[stt] paste = true` turns it on; pastes only into the window the dictation started in.
+- **`vocalize stop` keeps its meaning.** Pause is its own verb; `[app] stop_hotkey = "pause"` is opt-in and default off, because with it on every stop press writes plaintext (DEC-036).
+- **Recording pause serves dictation takes.** `vocalize notes` never opens a microphone; a live memo recorder is a separate `vocalize record` command and its own run (DEC-037).
 - **Apple Foundation Models stays a spike** (T-160); the owner will turn Apple Intelligence on for it.
 - **`ANTHROPIC_MODEL = "claude-haiku-4-5"`**, one constant, cost not capability.
 - **CoreML for Kokoro is measured (T-12) and only built if it wins.**
@@ -300,4 +328,4 @@ Two-way doors, decided here in one line each:
 
 ## Suggested run boundaries
 
-One run per phase, eighteen runs, so usage can be spread out and any run can be the last one for a while: 1 defaults, 2 decoding, 3 llm.py and enums, 4 keychain, 5 keys tab, 6 release 0.12.0 (owner), 7 spike and builder, 8a app Swift, 8b app Python, 9 doctor and setup, 10 release 0.13.0 (owner), 11 cue and hold, 12 release 0.13.1 (owner), 13 spikes (owner voice), 14 local model, 15 notes, 16 release 0.14.0 (owner), 17 optional spikes. No run exceeds about 20 hours. `split-plan` writes the run directories and their exit scripts.
+One run per phase, twenty runs, so usage can be spread out and any run can be the last one for a while: 1 defaults, 2 decoding, 3 llm.py and enums, 4 keychain, 5 keys tab, 6 release 0.12.0 (owner), 7 spike and builder, 8a app Swift, 8b app Python, 9 doctor and setup, 10 release 0.13.0 (owner), 11 cue and hold, 11b playback pause, 12 release 0.13.1 (owner), 13 spikes (owner voice), 14 local model, 15 notes, 15b recording pause, 16 release 0.14.0 (owner), 17 optional spikes. No run exceeds about 20 hours. `split-plan` writes the run directories and their exit scripts.

@@ -49,4 +49,4 @@ Checked by [validate-exit.sh](./validate-exit.sh), run from anywhere (it changes
 
 ## Handoff
 
-On exit, the executor writes `report.md` in this directory: one line per task (`T-100`–`T-105`: done | partial | skipped — reason), the security-gate result (the nonce check and the 0600/`O_NOFOLLOW` marker discipline named in T-103's acceptance criteria, listed with their test ids), anything deferred, and the final line `validate-exit: PASS` copied from a real run of the script. Run `run-12-release-0-13-1` reads that report as its entry criterion.
+On exit, the executor writes `report.md` in this directory: one line per task (`T-100`–`T-105`: done | partial | skipped — reason), the security-gate result (the nonce check and the 0600/`O_NOFOLLOW` marker discipline named in T-103's acceptance criteria, listed with their test ids), anything deferred, and the final line `validate-exit: PASS` copied from a real run of the script. Run `run-11b-playback-pause` reads that report as its entry criterion.

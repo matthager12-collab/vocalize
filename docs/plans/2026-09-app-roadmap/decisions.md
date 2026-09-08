@@ -19,7 +19,9 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 | DEC-032 | How many releases, and where does the Swift source freeze? | Decided | B — four releases; the Swift source ships complete in 0.13.0 so 0.13.1 is Python only | R2 |
 | DEC-033 | Which hotkey backend? | Deferred | to the spike T-60; both branches planned | R2 |
 | DEC-034 | Parakeet or whisper for 0.14? | Deferred | to the spike T-120; both branches planned | R2 |
-| DEC-035 | Does the `security` backend hold across rebuilt callers? | Deferred | to the check T-30; both branches planned | R2 |
+| DEC-035 | Does the `security` backend hold across rebuilt callers? | Decided | A — it holds; the backend is built (run 4, 2026-09-07) | R2 |
+| DEC-036 | How does a read pause, and how is it reached? | Decided | C — `vocalize pause` on the remembered stop, plus opt-in `[app] stop_hotkey = "pause"`; `stop` and the one-hour life unchanged | R3 |
+| DEC-037 | How does a recording pause without touching the frozen recorder? | Decided | C — stop, segment, relaunch, join in Python; `--max` per segment under a new `[stt] max_take_seconds` | R3 |
 
 ---
 
@@ -347,7 +349,7 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 **Recommendation**: B.
 
-**Decision**: B, and one run per phase throughout (seventeen runs).
+**Decision**: B, and one run per phase throughout (twenty runs, after the two pause runs were inserted on 2026-09-07).
 
 **Consequences**: The 0.13.0 Swift source must be complete at ship time (both hotkey backends selected at build time per DEC-033, hold dispatch, the paste watcher); the 0.13.1 exit gate refuses any diff under `vocalize/menubar/`. A Swift defect found after 0.13.0 ships as an out-of-band patch release that costs one Accessibility re-grant; that is the accepted price of a locally compiled app, not a process failure. Phase 8 runs as two chunks (Swift, then Python) so no run exceeds about 20 hours.
 
@@ -409,9 +411,9 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 ### DEC-035: Does the `security` backend hold across rebuilt callers?
 
-**Date**: 2026-09-06
-**Decided by**: deferred to the owner after T-30
-**Status**: Deferred
+**Date**: 2026-09-07
+**Decided by**: Mat (the check's result accepted)
+**Status**: Decided
 
 **Context**: DEC-025 set the direction. The claim that an item written through `/usr/bin/security` is readable from any later Python without a prompt is plausible and unverified.
 
@@ -422,10 +424,86 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 **Recommendation**: Run the check first; do not build on the claim.
 
-**Decision**: Pending the 30-minute check.
+**Decision**: A. The check ran on 2026-09-07 on the reference Mac (macOS 26.5.1) against throwaway items, every command under a 25 s timeout so a dialog would have shown as exit 124:
 
-**Consequences**: Recorded with the commands and exit codes when decided.
+```
+printf 'add-generic-password -a probe -s vocalize-check -j "validated …" -w … -U\n' | security -i     # rc 0
+security find-generic-password -s vocalize-check -a probe -w   spawned from:
+    the worktree Python (uv CPython 3.12)                       # rc 0, value correct
+    the uv-tool vocalize's Python (~/.local/share/uv/tools)     # rc 0, value correct
+    /usr/bin/python3 (Apple)                                    # rc 0, value correct
+    a freshly compiled, ad-hoc signed Swift binary              # rc 0, value correct
+security find-generic-password -s vocalize-check -a probe      # "icmt"<blob>="validated …", no -w needed
+python -c 'keyring.set_password("vocalize-check2", …)'          # an item keyring wrote
+security delete-generic-password -s vocalize-check2 -a probe2  # rc 0, no dialog
+printf 'add-generic-password … -U' | security -i               # rc 0, no dialog; read-back is the new value
+security delete-generic-password … (both items)                # rc 0
+```
+
+No dialog appeared at any step.
+
+**Consequences**: `auth._backend()` returns a `_SecurityKeychain` on macOS (keyring elsewhere); the secret travels on stdin; the comment attribute carries the validation date; `login` replaces an older keyring-written item in one `-U` write. Keys containing a double quote or a backslash are refused before they reach the tool. The `security` tool's own exit codes (44 = not found) are the contract.
 
 **Applied to**:
 - [plan.md](./plan.md) T-30, T-31
 - [verification.md](./verification.md) § Phase 4 exit
+- [design.md](./design.md) § Keychain through security
+- `vocalize/auth.py` (`_SecurityKeychain`, `_default_backend`, `store_key`, `validated_on`), run 4 commit on `local-first`
+
+---
+
+### DEC-036: How does a read pause, and how is it reached?
+
+**Date**: 2026-09-07
+**Decided by**: Mat (all five owner questions answered "as recommended", 2026-09-07)
+**Status**: Decided
+
+**Context**: "The ability to pause and resume" was missed in every requirement. Playback already stops and remembers: a dictation calls `audio.stop_playback(remember=True)`, the playing process saves an interrupt record, and `vocalize resume` continues it (DEC-003, DEC-012, DEC-014). What is missing is a verb, a way to reach it from the keyboard, and an answer on how long a deliberate pause may sit. `VocalizeApp.swift` ships complete in 0.13.0 and every later edit is an Accessibility re-grant (DEC-032), so a new chord is off the table.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | `SIGSTOP` the live player, `SIGCONT` on resume | True pause in place, no offset maths — but `play()` holds the machine-wide `play.lock` until the player exits, so a suspended player blocks every later read on the Mac, the `/speak` hook included; and the PID identity re-check has to survive an open-ended suspension |
+| B | `vocalize pause` = the remembered stop that already ships, continued by `vocalize resume`; terminal only | No new file, format or lifetime; every path already tested. But a pause you have to type is not a pause a listener takes mid-sentence |
+| C | B, plus `[app] stop_hotkey = "stop"\|"pause"` (default `stop`) so the existing stop chord becomes play/pause | One config key and one branch, Python only, no re-grant; opt-in, so scripts and the hook keep today's meaning. Cost: with it on, every stop press writes `interrupted.txt` |
+| D | Make `vocalize stop` a play/pause toggle by default, with `stop --forget` as the hard stop | Best reach, no config key — but it rewrites shipped `stop` tests and turns the one "make it stop" command into one that can start speaking |
+
+**Recommendation**: C, default `stop`. Keep `MAX_AGE` at one hour, and leave `vocalize stop` alone.
+
+**Decision**: C. `vocalize pause` is the verb; `interrupted.wait_for_record(since)` (moved out of `dictate.py`, one mechanism for both callers) decides what the message says; `[app] stop_hotkey = "pause"` gives the owner a chord that pauses and resumes without a rebuild. `vocalize stop` keeps today's meaning exactly — it silences, records nothing, and leaves a saved record alone — so no shipped test is rewritten and `resume --forget` stays the explicit discard. The paused read lives one hour, the same as an interrupt: that hour is the privacy budget `interrupted.txt` depends on (DEC-012e), and a deliberate pause makes that file more frequent, not less sensitive. `_RESUME_REWIND = 1.0` inside `slice_from` so a continuation overlaps the last word.
+
+**Consequences**: `vocalize pause` writes a read's words in plaintext at `~/.cache/vocalize/interrupted.txt`, 0600, for up to an hour; the docs must say so. The hour is a real cliff — pause, go to lunch, and the read is gone with no warning beyond the message printed at pause time. Two resumes race harmlessly but audibly (the read plays twice, back to back on the lock); documented, not fixed. The `/speak` hook's timeout `killpg` never goes through `stop_playback`, so a read killed that way still leaves no record and cannot be resumed; that is a docs line, not a fix. Saying no to the hotkey key drops run 11b to about 3.5 hours.
+
+**Applied to**:
+- [design.md](./design.md) § Pause and resume
+- [plan.md](./plan.md) § Phase 11b, T-106–T-109
+- [verification.md](./verification.md) § Phase 11b exit, manual checks 15 and 16
+- [run-11b-playback-pause/project-plan.md](./run-11b-playback-pause/project-plan.md)
+
+---
+
+### DEC-037: How does a recording pause without touching the frozen recorder?
+
+**Date**: 2026-09-07
+**Decided by**: Mat (all five owner questions answered "as recommended", 2026-09-07)
+**Status**: Decided
+
+**Context**: Recording has no pause at all. `dictate.py` runs one take through the Swift recorder and then the whisper worker. The recorder's source is frozen: every rebuild costs each user a new microphone grant (DEC-010), which is exactly why DEC-031 solved the cue trim in `dictate.py` rather than with a recorder flag. The recorder also bounds `--max` to 1..600 seconds in its own parser and again in `config.py`, so how the budget is spent decides whether a paused memo can run past ten minutes. Separately, `vocalize notes` as run 15 scopes it never opens a microphone.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Add a pause verb to `VocalizeRecorder.swift` | Instant, no seam — and a new microphone grant for every user, plus a second frozen source unfrozen |
+| B | `SIGSTOP` the recorder process | Untested against `AVAudioEngine` mid-I/O; the recorder's own handler treats every trapped signal as finalise-and-exit, and `SIGSTOP` is not trapped at all. Needs its own spike |
+| C | Stop the recorder cleanly, keep the finished WAV as a segment, relaunch on resume, join the segments with stdlib `wave` before transcription | Reuses only proven paths (`_stop_file`, `_wait_for_exit`, `_launch_recorder`) and the recorder's fixed 16 kHz mono 16-bit output makes the join lossless. Cost: a real gap in captured audio at each seam |
+| D | C, but with `max_seconds` as one budget for the whole take | No new config key — and the take is still capped at the recorder's frozen 600 s, so pause buys nothing for long memos |
+
+**Recommendation**: C, with `--max` per segment and a new `[stt] max_take_seconds` bounding the whole take.
+
+**Decision**: C. Pause stops the recorder through its own stop file, trims the cue from that segment, files it as `take.NNN.wav` and writes a `paused` marker; resume launches a fresh recorder with `--max = max(1, min(max_seconds, remaining))`, waits for first growth and plays the Tink. `_join_segments` runs in `_finish_take` right after `_trim_cue`, with 0.25 s of silence at each seam. `[stt] max_take_seconds` (default 1800, bounded 60..7200) and `_MAX_SEGMENTS = 20` are the only new ceilings. `dictate.session` gains no new state word: a paused take still reads `recording`, so the frozen 0.13.0 app needs nothing. Scope is stated out loud: recording pause makes **dictation takes** pausable. `vocalize notes` never records, so a Plaud-style live memo recorder is a separate `vocalize record` command with its own run, not a flag on this one.
+
+**Consequences**: Speech is lost at each seam — the milliseconds before the recorder finalises plus the whole relaunch. The 0.25 s of silence keeps whisper from gluing two half-words together but recovers nothing; manual check 17 measures the gap on the built-in and a Bluetooth input, and that number decides whether pause is usable for memos. Per-segment budgets mean `[stt] max_take_seconds` is now the only thing bounding recorded audio: 1800 s is about 57 MB of WAV in the temporary workdir. `_second_press` must branch on the marker — unpatched, a paused take reaches `_fail`, the workdir is discarded and the user is told the recorder broke. A crash while paused still loses the take; the 24-hour sweep is the backstop.
+
+**Applied to**:
+- [design.md](./design.md) § Pause and resume
+- [plan.md](./plan.md) § Phase 15b, T-147–T-149
+- [verification.md](./verification.md) § Phase 15b exit, manual checks 17 and 18
+- [run-15b-recording-pause/project-plan.md](./run-15b-recording-pause/project-plan.md)

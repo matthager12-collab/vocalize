@@ -94,6 +94,7 @@ from .exceptions import (
     ConfigChangedError,
     MissingAPIKeyError,
     ProviderError,
+    ProviderTransientError,
     ProviderUnavailableError,
     VocalizeError,
 )
@@ -247,6 +248,8 @@ _PLACEHOLDER_JS = "// The vocalize config portal script is not built yet.\n"
 # path separator, a traversal sequence or a control character.
 _PARAMETERIZED = (
     (re.compile(r"^/api/provider/([a-z0-9_-]{1,32})$"), "/api/provider/*"),
+    (re.compile(r"^/api/auth/remove/([a-z0-9_-]{1,32})$"), "/api/auth/remove/*"),
+    (re.compile(r"^/api/auth/test/([a-z0-9_-]{1,32})$"), "/api/auth/test/*"),
     (re.compile(r"^/api/voices/([a-z0-9_-]{1,32})/preview$"), "/api/voices/*/preview"),
     (re.compile(r"^/api/voices/([a-z0-9_-]{1,32})$"), "/api/voices/*"),
 )
@@ -282,6 +285,8 @@ ROUTES: tuple[tuple[str, str, str], ...] = (
     ("POST", "/api/provider/elevenlabs", "token"),
     ("POST", "/api/stt", "token"),
     ("POST", "/api/auth/login", "token"),
+    ("POST", "/api/auth/remove/anthropic", "token"),
+    ("POST", "/api/auth/test/anthropic", "token"),
     ("GET", "/api/voices/kokoro", "token"),
     ("POST", "/api/voices/kokoro/preview", "token"),
     ("POST", "/api/local/install/start", "token"),
@@ -325,6 +330,12 @@ def _key_row(name: str) -> readiness.Row:
     `key_source` word and `detail` the masked preview.
     """
     source = auth.key_source(None, name)
+    if source == "not found":
+        # key_source flattens "could not look" into "not found"; a locked
+        # keychain must not render every stored key as absent.
+        status, _reason = auth.probe_keychain(name)
+        if status == "error":
+            return readiness.Row(f"key {name}", "error", "keychain unavailable", "")
     if source == "keychain":
         key = auth.stored_key(name) or ""
     elif source in ("environment", ".env file"):
@@ -333,19 +344,23 @@ def _key_row(name: str) -> readiness.Row:
         # "flag" cannot happen here (no flag reaches the portal) and
         # "not found" has nothing to preview.
         key = ""
-    return readiness.Row(f"key {name}", source, auth.masked(key) if key else "", "")
+    # The validation stamp rides in `action`: this is a probe row, never a
+    # status row, and the stamp is read from the item's comment, not its
+    # secret (0.12.0, macOS only; empty elsewhere).
+    stamp = (auth.validated_on(name) or "") if source == "keychain" else ""
+    return readiness.Row(f"key {name}", source, auth.masked(key) if key else "", stamp)
 
 
 def _key_info(row: readiness.Row) -> dict:
-    """`{"source", "masked"}` from one key probe's row."""
+    """`{"source", "masked", "validated"}` from one key probe's row."""
     if row.state in _KEY_SOURCES:
-        return {"source": row.state, "masked": row.detail or None}
+        return {"source": row.state, "masked": row.detail or None, "validated": row.action or None}
     # `_join_probe`'s own row: still-checking means the probe thread is alive
     # and the next poll may answer. Anything else is a probe that finished
     # by raising, and a page that renders that as "checking" spins forever.
     if row.detail == readiness.STILL_CHECKING:
-        return {"source": "checking", "masked": None}
-    return {"source": "error", "masked": None}
+        return {"source": "checking", "masked": None, "validated": None}
+    return {"source": "error", "masked": None, "validated": None}
 
 
 def _key_states(timeout: float) -> dict[str, dict]:
@@ -362,12 +377,22 @@ def _key_states(timeout: float) -> dict[str, dict]:
         for name in auth.PROVIDER_NAMES
         if name in auth.PROVIDER_ENV_VARS or name in auth.PROVIDER_USERNAMES
     ]
+    # The Anthropic slot holds a key without being a voice (auth.KEY_SLOTS).
+    names += [slot for slot in auth.KEY_SLOTS if slot not in names]
     rows = readiness.run_probes(
         [(f"key {name}", lambda n=name: _key_row(n)) for name in names], timeout
     )
-    states = {name: {"source": "not applicable", "masked": None} for name in auth.PROVIDER_NAMES}
+    states = {
+        name: {"source": "not applicable", "masked": None, "validated": None}
+        for name in auth.PROVIDER_NAMES
+    }
     states.update(zip(names, (_key_info(row) for row in rows)))
     return states
+
+
+def _key_public(state: dict) -> dict:
+    """The `providers.<name>.key` shape the page has always rendered."""
+    return {"source": state["source"], "masked": state["masked"]}
 
 
 def _fault(exc: BaseException) -> str:
@@ -456,6 +481,22 @@ def _payload(body: bytes) -> dict:
     if not isinstance(parsed, dict):
         raise _Refused(400, "That request body is not a JSON object.")
     return parsed
+
+
+def _slot_or_404(name) -> str:
+    """`name` if it is a slot that stores a key (auth.PROVIDER_USERNAMES: the
+    key-holding voices plus Anthropic), else 404. Never echoed."""
+    if name not in auth.PROVIDER_USERNAMES:
+        raise _Refused(404, f"Unknown key slot. Known: {', '.join(auth.KEY_SLOTS)}")
+    return name
+
+
+def _login_target_or_404(name) -> str:
+    """The login route's allowlist: a chain provider (the local ones and
+    Polly answer with their own refusals below) or the Anthropic slot."""
+    if name not in auth.PROVIDER_NAMES and name not in auth.KEY_SLOTS:
+        raise _Refused(404, f"Unknown provider. Known: {', '.join(auth.CREDENTIAL_CHOICES)}")
+    return name
 
 
 def _provider_or_404(name) -> str:
@@ -968,6 +1009,10 @@ class Portal:
             return self._answer(lambda: self._stt(body))
         if route_path == "/api/auth/login":
             return self._answer(lambda: self._login(body))
+        if route_path == "/api/auth/remove/*":
+            return self._answer(lambda: self._remove(name, body))
+        if route_path == "/api/auth/test/*":
+            return self._answer(lambda: self._test_key(name, body))
         if route_path == "/api/voices/*/preview":
             return self._answer(lambda: self._preview(name))
         if route_path == "/api/voices/*":
@@ -1096,8 +1141,14 @@ class Portal:
                 "chain": chain,
                 "chain_source": chain_source,
                 "providers": {
-                    name: _provider_state(name, file_config, chain, keys[name])
+                    name: _provider_state(name, file_config, chain, _key_public(keys[name]))
                     for name in auth.PROVIDER_NAMES
+                },
+                # The Keys tab's own listing: every slot that stores a key,
+                # the Anthropic slot included, with the validation stamp.
+                "keys": {
+                    slot: {"label": auth.PROVIDER_LABELS.get(slot, slot), **keys[slot]}
+                    for slot in auth.KEY_SLOTS
                 },
                 "stt": stt,
                 "config_path": str(config.config_path()),
@@ -1230,7 +1281,7 @@ class Portal:
         and so takes no fingerprint.
         """
         payload = _payload(body)
-        name = _provider_or_404(payload.get("provider"))
+        name = _login_target_or_404(payload.get("provider"))
         key = payload.get("key")
         if not isinstance(key, str) or not key:
             raise _Refused(400, "No API key given — nothing was stored.")
@@ -1257,6 +1308,67 @@ class Portal:
         with self._lock:
             self._voice_lists.pop(name, None)
         return self._reply(200, {"ok": True, "message": auth.scrub(message, key)})
+
+    def _remove(self, name: str | None, body: bytes):
+        """Forget a stored key. `delete_key` reads the entry back, so the
+        answer is a fact: a denied or locked keychain is a 400, not a claim.
+        The body carries nothing, but it is parsed like every other write's:
+        a request that is not a JSON object is refused before anything moves."""
+        name = _slot_or_404(name)
+        _payload(body)
+        status, value = auth.probe_keychain(name)  # not stored_key: that flattens "could not look"
+        if status == "error":
+            raise _Refused(
+                400,
+                f"Could not read the keychain ({value}); nothing was removed. Check it "
+                "manually, and rotate the key if you were revoking a leak.",
+            )
+        if value is None:
+            return self._reply(
+                200, {"ok": True, "removed": False, "message": "No key is stored in the keychain for this provider."}
+            )
+        try:
+            auth.delete_key(name)
+        except VocalizeError as exc:
+            raise _Refused(400, str(exc)) from None
+        with self._lock:
+            self._voice_lists.pop(name, None)
+        return self._reply(
+            200, {"ok": True, "removed": True, "message": "Removed the stored API key from the system keychain."}
+        )
+
+    def _test_key(self, name: str | None, body: bytes):
+        """Check a key with the provider and store nothing.
+
+        The same shape check `login` makes runs first, so a control
+        character never reaches a header; every message going back is
+        scrubbed, because the ones we did not write quote what they were
+        given. `valid` is the only verdict; the key is in nothing returned.
+        """
+        name = _slot_or_404(name)
+        payload = _payload(body)
+        key = payload.get("key")
+        if not isinstance(key, str) or not key:
+            raise _Refused(400, "No API key given — nothing was tested.")
+        try:
+            auth._check_shape(key)
+        except VocalizeError as exc:
+            raise _Refused(400, auth.scrub(str(exc), key)) from None
+        label = auth.PROVIDER_LABELS.get(name, name)
+        try:
+            auth.validate_key(key, name)
+        except (ProviderTransientError, ProviderUnavailableError) as exc:
+            # The check did not happen: not a verdict on the key.
+            raise _Refused(
+                502, auth.scrub(f"Could not reach {label} to check the key: {exc}", key)
+            ) from None
+        except VocalizeError as exc:
+            return self._reply(
+                200, {"ok": True, "valid": False, "message": auth.scrub(str(exc), key)}
+            )
+        return self._reply(
+            200, {"ok": True, "valid": True, "message": f"{label} accepted the key. Nothing was stored."}
+        )
 
     # --- preview ------------------------------------------------------
 

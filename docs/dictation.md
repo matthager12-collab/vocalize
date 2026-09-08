@@ -60,8 +60,9 @@ Model choices, by `--model`:
 | Model | Download size | Notes |
 |---|---|---|
 | `base.en` | ~141 MB | fastest, least accurate |
-| `small.en` (default) | ~465 MB | the balance the spike settled on |
-| `large-v3-turbo-q5_0` | ~547 MB | most accurate, still fast |
+| `small.en` | ~465 MB | the lighter choice for a slow Mac; mishears more jargon |
+| `large-v3-turbo-q5_0` (default) | ~547 MB | the most accurate at this size and the first model to keep "the merge" as two words on the owner's voice ([#4](https://github.com/matthager12-collab/vocalize/issues/4)); no slower than `small.en` on an M4 |
+| `large-v3-turbo-q8_0` | ~834 MB | the same turbo model with 8-bit weights: the least-lossy turbo, for machines with 16 GB or more |
 
 ```bash
 vocalize local install --stt --model base.en
@@ -219,25 +220,29 @@ invocation.
 
 ```toml
 [stt]
-model = "small.en"
+model = "large-v3-turbo-q5_0"
 language = "en"
 input_device = ""
-cleanup = false
+cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local" (local arrives in 0.14.0)
+verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
 paste = false
 max_seconds = 120
 sounds = true
 cues = "sounds"  # "sounds" | "words" | "both"
+beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that many beams
 ```
 
 | Key | Type / allowlist | Default | Notes |
 |---|---|---|---|
-| `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0` | `small.en` | must already be installed (`vocalize local install --stt --model …`) |
+| `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` | must already be installed (`vocalize local install --stt --model …`) |
 | `language` | a whisper.cpp language code (`en`, `es`, `fr`, `de`, …) | `en` | an `.en` model (both `base.en` and `small.en`) is English-only regardless of this setting — pairing one with a non-`en` language is a `ConfigError` |
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable only, can't start with `-` | `""` | see [The input-device gotcha](#the-input-device-gotcha) |
-| `cleanup` | `true` / `false` | `false` | see `--cleanup` above |
+| `cleanup` | `off`, `claude-cli`, `anthropic`, `local` | `off` | where the cleanup pass runs. `claude-cli` is `claude -p` on your Claude Code subscription (shares its usage pool, and Claude Code logs the run); `anthropic` is the Messages API with a stored key and a monthly character budget; `local` is accepted now and honoured from 0.14.0. Older configs' `true` / `false` still work: `true` means `claude-cli` |
+| `verbatim` | `true` / `false` | `false` | keep every word; the default pass also drops restatements, false starts and filler ([#3](https://github.com/matthager12-collab/vocalize/issues/3)). Saying "verbatim" as the first word of a take does the same for that take |
 | `paste` | reserved | `false` | not implemented in 0.10.0 — setting it does nothing |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
+| `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
 | `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
 
 Every value here eventually becomes a subprocess argument — the recorder's
@@ -251,9 +256,11 @@ naming the file, the key, and what was expected.
 everything else:
 
 ```
-stt.model=small.en
+stt.model=large-v3-turbo-q5_0
 stt.language=en
-stt.cleanup=false
+stt.beam_size=5
+stt.cleanup=off
+stt.verbatim=false
 stt.max_seconds=120
 stt.cues=sounds
 ```
@@ -393,12 +400,19 @@ under Privacy & Security › Microphone if you want it gone too.
   cancel, or failure. A sweep on the next `listen`/`dictate` clears
   anything a hard kill (`kill -9`, a lost-power crash) left behind after
   24 hours.
-- **`--cleanup` is the one opt-in exception**, and it sends text only: the
-  transcript goes to `claude -p` with every tool denied by a wildcard and
-  no MCP server started, so nothing a dictated sentence could ask for has
-  anything to act with. It runs from the system temporary directory, so
-  the session never adopts whatever project you happen to be standing in.
-  The audio is never part of that call.
+- **The cleanup pass is the one opt-in exception**, and it sends text only.
+  With `claude-cli` the transcript goes to `claude -p` with every tool
+  denied by a wildcard, no MCP server started, and none of your own hooks,
+  skills or `CLAUDE.md` loaded (`--setting-sources ""`), so nothing a
+  dictated sentence could ask for has anything to act with; it runs from
+  the system temporary directory, so the session never adopts whatever
+  project you happen to be standing in, and any stored Anthropic key is
+  removed from its environment so the subscription is what pays. With
+  `anthropic` the transcript is the body of one Messages API call with a
+  stored key. Either way one line lands on stderr the moment text leaves
+  — `vocalize: sent to claude-cli` or `vocalize: sent to anthropic` — and
+  the clipboard notification says "cleaned up by Claude — sent off this
+  Mac". The audio is never part of any call.
 - **`--cleanup` also writes the transcript to Claude Code's own session
   log**, in full and in plaintext, under
   `~/.claude/projects/<slug>/<uuid>.jsonl` — Claude Code records the

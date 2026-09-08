@@ -412,7 +412,7 @@ def _toml_value(key: str, value) -> str:
 
 #: Keys whose value is a table, and which are therefore rendered as their
 #: own `[section]` after every flat key rather than as `key = …`.
-_TABLE_KEYS = ("providers", "stt")
+_TABLE_KEYS = ("providers", "stt", "notes")
 
 
 def _table_lines(header: str, table, what: str) -> list[str]:
@@ -455,6 +455,12 @@ def _render_config_text(data: dict) -> str:
 
     if "stt" in data:
         lines.extend(_table_lines("stt", data["stt"], "'stt'"))
+
+    # `_TABLE_KEYS` is an exclusion list for the flat pass, not a render
+    # list: a table it names still has to be written out here by name, or
+    # the next rewrite silently drops it (the [notes] table, 0.12.0).
+    if "notes" in data:
+        lines.extend(_table_lines("notes", data["notes"], "'notes'"))
 
     providers = data.get("providers")
     if providers is not None:

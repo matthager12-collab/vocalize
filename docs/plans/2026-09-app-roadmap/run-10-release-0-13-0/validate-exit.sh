@@ -94,12 +94,12 @@ check "docs match the CLI (0.13.0 commands)" .venv/bin/python -c 'import subproc
 check "full suite green" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check "ruff clean" .venv/bin/python -m ruff check vocalize hooks tests
 check "work committed" git diff --quiet HEAD
-check "package builds the 0.13.0 wheel" bash -c 'rm -f dist/vocalize_cli-0.13.0*; .venv/bin/python -m build >/dev/null 2>&1; ls dist/vocalize_cli-0.13.0*.whl >/dev/null 2>&1'
+check "package builds the 0.13.0 wheel" bash -c 'rm -rf /tmp/vocalize-0-13-0-build; .venv/bin/python -m build --outdir /tmp/vocalize-0-13-0-build >/dev/null 2>&1; ls /tmp/vocalize-0-13-0-build/vocalize_cli-0.13.0*.whl >/dev/null 2>&1'  # a scratch dir: dist/ holds the published files the digest row compares
 check "clean-venv install has no leaked ML runtime" bash -c '
   set -e
   rm -rf /tmp/vocalize-0-13-0-cleanvenv
   python3 -m venv /tmp/vocalize-0-13-0-cleanvenv
-  /tmp/vocalize-0-13-0-cleanvenv/bin/pip install -q --no-cache-dir dist/vocalize_cli-0.13.0*.whl
+  /tmp/vocalize-0-13-0-cleanvenv/bin/pip install -q --no-cache-dir /tmp/vocalize-0-13-0-build/vocalize_cli-0.13.0*.whl
   ! /tmp/vocalize-0-13-0-cleanvenv/bin/pip list | grep -iE "pywhispercpp|onnxruntime|mlx|sherpa|numpy|torch|boto3"
 '
 check "PyPI 0.13.0 published with matching digest (after the owner publishes)" .venv/bin/python -c 'import json,urllib.request,hashlib,glob,sys; local={hashlib.sha256(open(f,"rb").read()).hexdigest() for f in glob.glob("dist/vocalize_cli-0.13.0*")}; data=json.load(urllib.request.urlopen("https://pypi.org/pypi/vocalize-cli/0.13.0/json", timeout=20)); remote={u["digests"]["sha256"] for u in data["urls"]}; assert local and local==remote, (local, remote)'

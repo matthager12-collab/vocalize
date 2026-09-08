@@ -86,7 +86,7 @@ check "ruff clean at entry" .venv/bin/python -m ruff check vocalize hooks tests
 
 echo ""
 echo "=== Exit criteria ==="
-check "hotkey backend decided (DEC-033)" bash -c "grep -A3 '^### DEC-033' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
+check "hotkey backend decided (DEC-033)" bash -c "grep -A5 '^### DEC-033' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
 check "recorder build unchanged (golden test)" .venv/bin/python -m pytest tests/test_recorder_build.py tests/test_app_build.py -q -k golden -p no:cacheprovider
 check "[app] table and chord grammar" .venv/bin/python -m pytest tests/test_config.py -q -k "app_table or chord or dictate_mode or resolve_app" -p no:cacheprovider
 check "full suite green" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider

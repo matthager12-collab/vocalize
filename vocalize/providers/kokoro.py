@@ -9,7 +9,8 @@ both arrive only when the user runs `vocalize local install`.
 Until then `check()` fails with the command to run, and the chain treats
 that as "try the next provider" — the same as a missing API key.
 
-The model takes ~0.8 s to load and 326 MB of RAM, so the worker is
+The model takes ~0.8 s to load and the worker peaks around 760 MB of RAM
+(measured on an M4, 2026-09-07; the ONNX file itself is 326 MB), so the worker is
 resident: one subprocess per (voice, speed, language), reused for every
 chunk of a read, torn down at exit. Text reaches it as a JSON line on
 stdin, never as an argument.

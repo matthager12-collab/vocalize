@@ -565,7 +565,7 @@ def test_the_selftest_forwards_manifest_kwargs_to_a_second_manifests_argv(tmp_pa
     assert argv == ["/uv", *stt_manifest.selftest_argv(tmp_path, model="base.en")]
     assert "--no-project" in argv
     assert "base.en" in " ".join(argv)
-    assert "small.en" not in " ".join(argv)  # the manifest default, not what was asked for
+    assert "large-v3-turbo-q5_0" not in " ".join(argv)  # the manifest default, not what was asked for
     assert kwargs["cwd"] == tempfile.gettempdir()
 
 
@@ -751,6 +751,9 @@ STT_PAYLOAD_BY_MODEL = {
     "base.en": b"base-tiny-weights" * 5,
     "small.en": b"small-tiny-weights" * 5,
     "large-v3-turbo-q5_0": b"turbo-tiny-weights" * 5,
+    # Run 2 added the 8-bit turbo; the fake manifest must carry every real name
+    # or `local status` (which walks MODELS) raises KeyError on the missing one.
+    "large-v3-turbo-q8_0": b"ggml turbo eight bit weights, pretend",
 }
 
 

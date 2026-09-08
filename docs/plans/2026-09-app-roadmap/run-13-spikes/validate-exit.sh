@@ -87,7 +87,7 @@ check "ruff clean at entry" .venv/bin/python -m ruff check vocalize hooks tests
 
 echo ""
 echo "=== Exit criteria ==="
-check "Parakeet decided (DEC-034)" bash -c "grep -A3 '^### DEC-034' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
+check "Parakeet decided (DEC-034)" bash -c "grep -A5 '^### DEC-034' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
 check_output "mlx-lm spike answered (spike-notes.md § LLM)" "7" bash -c "test -f '$SPIKE_NOTES' && grep -A12 '^## LLM' '$SPIKE_NOTES' | grep -cE '^(signatures|offline|model_type|template|shards|cold|warm):'"
 check "Parakeet engine tests green (go only)" .venv/bin/python -m pytest tests/ -q -k parakeet -p no:cacheprovider
 check "full suite green" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider

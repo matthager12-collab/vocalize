@@ -264,6 +264,7 @@ def run(
         )
 
     failures: list[tuple[str, str]] = []
+    kokoro_missing = False
     for index, name in enumerate(chain):
         primary = index == 0
         provider = providers.get(name)
@@ -288,11 +289,13 @@ def run(
             failures.append((name, _reason(exc, name)))
             echo(_skip_message(exc, chain, index))
         except _SKIPPABLE as exc:
+            if primary and name == "kokoro" and isinstance(exc, ProviderUnavailableError):
+                kokoro_missing = True
             failures.append((name, _reason(exc, name)))
             echo(_skip_message(exc, chain, index))
         else:
             if not primary:
-                echo(f"Spoke via {name} (fallback).")
+                echo(_fallback_message(name, kokoro_missing))
             return audio, name, provider.AUDIO_EXT
 
     if forced:
@@ -308,6 +311,23 @@ def run(
         + "\n".join(f"  {name}: {why}" for name, why in failures)
         + hint
     )
+
+
+_KOKORO_MISSING_NOTE = "Kokoro is not installed; run: vocalize local install"
+
+
+def _fallback_message(name: str, kokoro_missing: bool) -> str:
+    """The line printed when a non-primary provider spoke.
+
+    With the default chain a fresh machine speaks through `say` because
+    Kokoro's model was never installed; that fallback must say so and name
+    the fix, once, rather than leaving the wrong voice as the only clue
+    (DEC-022). `uv` missing counts too: `vocalize local install` is still
+    the command that explains it.
+    """
+    if kokoro_missing:
+        return f"Spoke via {name} (fallback) — {_KOKORO_MISSING_NOTE}"
+    return f"Spoke via {name} (fallback)."
 
 
 def _skip_message(exc: ProviderError, chain: list[str], index: int) -> str:

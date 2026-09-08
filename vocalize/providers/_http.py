@@ -109,3 +109,12 @@ def request(
         raise ProviderTransientError(
             provider, f"network error: {exc.__class__.__name__}"
         ) from exc
+    # A header value http.client cannot send (a stray newline, a non-latin-1
+    # character) raises ValueError — UnicodeEncodeError included — with the
+    # whole offending value quoted into the message. That value is the API
+    # key, so neither the message nor the traceback may carry it: only the
+    # class name goes out, and `from None` drops the chained original.
+    except ValueError as exc:
+        raise ProviderTransientError(
+            provider, f"unsendable request header ({exc.__class__.__name__})"
+        ) from None

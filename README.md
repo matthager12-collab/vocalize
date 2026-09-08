@@ -3,9 +3,10 @@
 [![CI](https://github.com/matthager12-collab/vocalize/actions/workflows/ci.yml/badge.svg)](https://github.com/matthager12-collab/vocalize/actions/workflows/ci.yml)
 
 A command-line tool that turns text, markdown files, or piped stdin into
-natural-sounding speech using the [ElevenLabs](https://elevenlabs.io) API —
-plus a hook that wires it directly into [Claude Code](https://claude.com/claude-code),
-so Claude's responses get read aloud automatically in your terminal or IDE.
+natural-sounding speech on your own machine by default, with cloud voices as
+an option — plus a hook that wires it directly into
+[Claude Code](https://claude.com/claude-code), so Claude's responses get read
+aloud in your terminal or IDE.
 
 ## Quickstart
 
@@ -14,17 +15,19 @@ pipx install vocalize-cli
 ```
 
 ```bash
-vocalize config
+vocalize local install
 ```
 
-Walks you through your API key, a voice, and a speed, and saves it all.
+Downloads the on-device Kokoro voice once (about 350 MB; needs
+[`uv`](https://docs.astral.sh/uv/)). Skip it and `vocalize` speaks through
+macOS `say` until you come back to it — the fallback line tells you so.
 
 ```bash
 vocalize speak "hello"
 ```
 
-To set up just the key, skip the wizard and run `vocalize auth login` — it
-stores the key in your OS keychain.
+Prefer a cloud voice? See [Providers and fallback](#providers-and-fallback):
+`vocalize config` walks you through a key, a voice and a speed.
 
 ## Why this exists
 
@@ -62,33 +65,8 @@ cd vocalize
 pip install -e .
 ```
 
-Get a free ElevenLabs API key at
-[elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)
-(free tier: 10,000 characters/month, API access included, no commercial
-license). Then, recommended, store it in your OS keychain:
-
-```bash
-vocalize auth login
-```
-
-This prompts for the key (input hidden), validates it against the
-ElevenLabs API, and stores it via your OS's own keychain (macOS Keychain,
-Windows Credential Locker, Linux Secret Service) — no plaintext file to
-manage. Piping it in from a secret manager works too:
-
-```bash
-op read op://vault/elevenlabs/key | vocalize auth login --stdin
-```
-
-An environment variable or `.env` file work as well, and take priority over
-the keychain if both are set:
-
-```bash
-export ELEVENLABS_API_KEY=your-key-here
-```
-
-or copy `.env.example` to `.env` and fill it in (requires the optional
-`python-dotenv` extra: `pip install -e ".[dotenv]"`).
+Cloud voices need an API key; storing one is covered under
+[Providers and fallback](#providers-and-fallback).
 
 ## Usage
 
@@ -206,7 +184,8 @@ back to `~/.config/vocalize/config.toml`. Flat keys, no sections:
 ```toml
 chain = ["elevenlabs", "google", "say"]
 
-# Flat keys = ElevenLabs, unchanged since before there was a chain.
+# Flat keys are the original cloud voice's settings, unchanged since
+# before there was a chain; see Providers and fallback.
 voice = "21m00Tcm4TlvDq8ikWAM"
 model = "eleven_flash_v2_5"
 speed = 0.95
@@ -278,8 +257,10 @@ Five tabs:
 - **Chain** — reorder providers, or add and remove one.
 - **Providers** — each provider's voice, model, speed, and monthly budget,
   with a live preview of the voice you're looking at.
-- **Keys** — store or check an API key; the field is masked and never
-  offers to autocomplete.
+- **Keys** — store, test or remove an API key for each provider and for
+  Anthropic (the dictation cleanup backend, not a voice); the field is
+  masked and never offers to autocomplete, a stored key is never shown
+  again, and each card says when the key was last checked.
 - **Usage** — this month's spend and quota per provider.
 - **Local** — install or update the on-device Kokoro and whisper models,
   with progress.
@@ -358,6 +339,41 @@ For the click-by-click setup of each provider — where to go, what to click,
 the one command that stores the credential, the one command that proves it
 works — see [docs/provider-credentials.md](docs/provider-credentials.md).
 
+### Storing a cloud API key
+
+For ElevenLabs, get a free API key at
+[elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)
+(free tier: 10,000 characters/month, API access included, no commercial
+license). Then, recommended, store it in your OS keychain:
+
+```bash
+vocalize auth login
+```
+
+This prompts for the key (input hidden), validates it against the
+ElevenLabs API, and stores it via your OS's own keychain (macOS Keychain,
+Windows Credential Locker, Linux Secret Service) — no plaintext file to
+manage. On macOS the item is written and read through Apple's own
+`security` tool, so the same key is readable from every Python and app
+that runs vocalize — your terminal, Claude Code's shell, the portal —
+with no keychain dialog, and `vocalize auth status` shows the date it was
+last validated. Piping it in from a secret manager works too:
+
+```bash
+op read op://vault/elevenlabs/key | vocalize auth login --stdin
+```
+
+An environment variable or `.env` file work as well, and take priority over
+the keychain if both are set:
+
+```bash
+export ELEVENLABS_API_KEY=your-key-here
+```
+
+or copy `.env.example` to `.env` and fill it in (requires the optional
+`python-dotenv` extra: `pip install -e ".[dotenv]"`).
+
+
 ## Budgets and the usage ledger
 
 Cloud providers don't stop at their free tier — they bill past it. vocalize
@@ -421,7 +437,8 @@ Use it for one read with `--provider kokoro`, or add it to your chain in
 Long text streams: it's broken into ~400-character pieces, and playback
 starts after the first one is ready — roughly 20–25 seconds of speech —
 instead of waiting for the whole thing to render. Measured on this Mac
-(M3): about 5x faster than real time, peaking around 870 MB of RAM while
+(M3): about 5x faster than real time, peaking around 760 MB of RAM (measured
+on an M4 on 2026-09-07; the M3 spike saw 870 MB) while
 rendering. `vocalize stop`, run from any terminal, halts a Kokoro read
 mid-sentence the same as any other provider.
 
@@ -443,7 +460,7 @@ vocalize local install --stt
 A separate opt-in from Kokoro's `vocalize local install` — nothing here is
 downloaded or built until you run this. It:
 
-1. Downloads one whisper.cpp model (`small.en` by default, ~465 MB) from a
+1. Downloads one whisper.cpp model (`large-v3-turbo-q5_0` by default, ~547 MB) from a
    pinned Hugging Face revision, verified against a pinned sha256 before
    it's kept.
 2. Compiles and ad-hoc signs a small Swift recorder bundle, **Vocalize
@@ -517,10 +534,12 @@ overrides `[stt] max_seconds` for one invocation.
 
 ```toml
 [stt]
-model = "small.en"     # base.en | small.en | large-v3-turbo-q5_0
-language = "en"        # a whisper.cpp language code
+model = "large-v3-turbo-q5_0"  # base.en | small.en | large-v3-turbo-q5_0 | large-v3-turbo-q8_0
+language = "en"        # a whisper.cpp language code ("auto" to detect)
 input_device = ""      # "" = system default; else an exact name from --list-devices
-cleanup = false        # send the transcript (never audio) to Claude first
+cleanup = "off"        # off | local | claude-cli | anthropic — what tidies the transcript (never audio)
+verbatim = false       # true keeps every word even when cleanup is on
+beam_size = 5          # 1-8 whisper.cpp beams; 1 is the greedy decoder
 max_seconds = 120      # 1-600; the recorder self-stops here, dictate backstops it
 sounds = true          # the Tink/Pop/Glass feedback sounds
 cues = "sounds"        # "sounds" | "words" | "both" — speak "Start."/"Stopped."/"Ready." instead
@@ -528,10 +547,12 @@ cues = "sounds"        # "sounds" | "words" | "both" — speak "Start."/"Stopped
 
 | Key | Allowed values | Default |
 |---|---|---|
-| `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0` | `small.en` |
+| `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` |
 | `language` | a whisper.cpp language code (`en`, `es`, `fr`, …); an `.en` model must stay `en` | `en` |
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable, can't start with `-` | `""` |
-| `cleanup` | `true` / `false` | `false` |
+| `cleanup` | `off`, `local` (0.13), `claude-cli`, `anthropic`; an old `true`/`false` reads as `claude-cli`/`off` | `off` |
+| `verbatim` | `true` / `false` — keep every word even when cleanup is on | `false` |
+| `beam_size` | integer, 1–8 | `5` |
 | `paste` | reserved — not implemented in 0.10.0 | `false` |
 | `max_seconds` | integer, 1–600 | `120` |
 | `sounds` | `true` / `false` | `true` |
@@ -908,9 +929,11 @@ model.
   re-approve it in System Settings › Privacy & Security › Microphone. An
   install that doesn't change the source never re-signs, so this isn't
   every upgrade — only ones that touch the recorder.
-- **`small.en` mishears jargon.** The default model does fine on ordinary
-  speech but can mangle project-specific words (`pyproject`, a function
-  name) — pick `large-v3-turbo-q5_0` for better accuracy, or turn on
+- **The smaller models mishear jargon.** `large-v3-turbo-q5_0` is the
+  default because it was the first model to keep "the merge" as two words
+  on the owner's own voice; `small.en` (465 MB) is the lighter choice for a
+  slow Mac but can mangle project-specific words (`pyproject`, a function
+  name) — stay on the default for accuracy, or turn on
   `[stt] cleanup` so Claude fixes obvious transcription noise before it
   reaches your clipboard (it still can't guess a word it never heard
   correctly).

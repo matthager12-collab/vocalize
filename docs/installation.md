@@ -234,7 +234,7 @@ install-layer summary in the same shape as layers 0–4.
 vocalize local install --stt
 ```
 
-Downloads one whisper.cpp model (~465 MB for the default `small.en`),
+Downloads one whisper.cpp model (~547 MB for the default `large-v3-turbo-q5_0`),
 verifies it against a pinned sha256, compiles and ad-hoc signs the
 **Vocalize Recorder** bundle (the thing that actually holds the microphone
 permission — `xcrun swiftc`, a few seconds, not a download), then warms the

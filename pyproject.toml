@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "vocalize-cli"
 dynamic = ["version"]
-description = "A CLI that turns text, markdown, or piped stdin into speech via the ElevenLabs API, with markdown-table-aware preprocessing."
+description = "A local-first CLI that turns text, markdown, or piped stdin into speech: the on-device Kokoro voice by default, cloud voices optional, with markdown-table-aware preprocessing and Claude Code hooks."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Mat" }]
-keywords = ["text-to-speech", "elevenlabs", "cli", "claude-code", "markdown"]
+keywords = ["text-to-speech", "local", "kokoro", "cli", "claude-code", "markdown", "elevenlabs"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",

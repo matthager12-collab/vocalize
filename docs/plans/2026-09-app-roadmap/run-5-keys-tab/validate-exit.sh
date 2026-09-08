@@ -84,7 +84,7 @@ cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 echo "=== Entry criteria ==="
 check 'on its own branch (not main)' bash -c 'test "$(git branch --show-current)" != main'
 check 'run 4 (keychain) validated' grep -q '^validate-exit: PASS' docs/plans/2026-09-app-roadmap/run-4-keychain/report.md
-check 'run 4 key artifact: keychain backend decided (DEC-035)' bash -c "grep -A3 '^### DEC-035' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
+check 'run 4 key artifact: keychain backend decided (DEC-035)' bash -c "grep -A5 '^### DEC-035' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
 check 'suite green at entry' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check 'ruff clean at entry' .venv/bin/python -m ruff check vocalize hooks tests
 

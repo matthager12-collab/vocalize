@@ -245,6 +245,15 @@ def test_the_page_offers_the_models_the_cli_knows():
     assert _js_list(script, "var STT_MODELS = [") == whisper_manifest.MODELS
 
 
+def test_the_page_offers_the_cleanup_backends_the_config_knows():
+    """Same drift for the cleanup select on the Local tab."""
+    from vocalize import config
+
+    script = JS.read_text(encoding="utf-8")
+
+    assert _js_list(script, "var STT_CLEANUP = [") == config.STT_CLEANUP_BACKENDS
+
+
 def test_the_page_asks_the_server_for_voices_and_ships_no_list_of_its_own():
     """`GET /api/voices/<name>` is where a voice list comes from — the server
     holds the keys and the page stays offline-clean. A copy of a list in the
@@ -273,9 +282,10 @@ def test_the_page_asks_the_server_for_voices_and_ships_no_list_of_its_own():
 
 
 def test_the_keys_hint_names_the_command_that_removes_a_key():
-    """The page has no delete route and says so — but it used to send the
-    user to Keychain Access, a GUI that knows nothing about vocalize. There
-    are three `vocalize` entries in there, named only by username slug, and a
+    """The page can remove a key since 0.12.0, and the hint still names the
+    terminal command that does the same — it used to send the user to
+    Keychain Access, a GUI that knows nothing about vocalize. There are
+    four `vocalize` entries in there, named only by username slug, and a
     keychain delete that is denied shows nothing. `auth logout` reads the
     entry back and refuses to claim a removal it cannot verify, so that is
     the command the sentence has to name. Cross-checked against the CLI, so
@@ -334,7 +344,9 @@ def test_an_api_key_has_nowhere_to_leak_to():
     assert 'el("form"' not in script
     assert "localStorage" not in script
     assert 'keyBox.type = "password"' in script
-    assert 'keyBox.autocomplete = "off"' in script
+    # "off" is the value Safari and Chrome ignore on a password field.
+    assert 'keyBox.autocomplete = "new-password"' in script
+    assert 'autocomplete = "off"' not in script.split("function keyCard")[1].split("\n}\n")[0]
 
 
 def test_the_readiness_list_keeps_its_role_under_list_style_none():
@@ -348,7 +360,7 @@ def test_the_readiness_list_keeps_its_role_under_list_style_none():
 
 
 @pytest.mark.parametrize(
-    "scenario", ["race", "keys", "fatal", "lists", "voices", "keystate", "sidebar"]
+    "scenario", ["race", "keys", "fatal", "lists", "voices", "keystate", "keyslots", "sidebar"]
 )
 def test_the_page_behaves_when_driven(scenario):
     """`portal.js` under node, over a stub DOM and a hand-answered `fetch`.

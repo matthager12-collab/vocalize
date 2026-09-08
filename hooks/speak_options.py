@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 _SETTINGS_TIMEOUT = 10
 _PICKER_TIMEOUT = 40  # choose-from-list has NO "giving up after"; this is the only enforcement
@@ -161,9 +162,11 @@ def _summarize(claude_bin: str, text: str, target_chars: int):
     try:
         result = subprocess.run(
             [claude_bin, "-p", prompt, "--model", "haiku",
-             "--disallowedTools", *_DENY_TOOLS],
+             "--disallowedTools", *_DENY_TOOLS,
+             "--strict-mcp-config"],  # no MCP server for selected text (DEC-014)
             input=text, capture_output=True, text=True,
             timeout=_CLAUDE_TIMEOUT, env=_claude_env(), check=False,
+            cwd=tempfile.gettempdir(),  # never the project the Service was invoked in
         )
     except (OSError, subprocess.SubprocessError):
         return None

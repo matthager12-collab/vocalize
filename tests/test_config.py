@@ -286,9 +286,10 @@ def _stub_providers(monkeypatch, **stubs):
     monkeypatch.setattr("vocalize.providers.get", fake_get)
 
 
-def test_chain_defaults_to_elevenlabs_then_say(monkeypatch, tmp_path):
+def test_default_chain_is_kokoro_then_say(monkeypatch, tmp_path):
+    # Local first, degrading to the always-present `say` (DEC-022).
     _isolate_chain(monkeypatch, tmp_path)
-    assert resolve_chain() == list(DEFAULT_CHAIN) == ["elevenlabs", "say"]
+    assert resolve_chain() == list(DEFAULT_CHAIN) == ["kokoro", "say"]
 
 
 def test_chain_file_beats_default(monkeypatch, tmp_path):
@@ -585,7 +586,7 @@ def test_stt_table_loads_with_valid_values(monkeypatch, tmp_path):
 
     resolved = resolve_stt(data)
     assert resolved["model"] == "base.en"
-    assert resolved["cleanup"] is True
+    assert resolved["cleanup"] == "claude-cli"  # 0.10.x `true`, coerced to the backend it meant
     assert resolved["max_seconds"] == 30
     assert resolved["input_device"] == "Built-in Microphone"
     # Untouched keys still come from the defaults.
@@ -634,10 +635,14 @@ def test_an_english_only_stt_model_with_another_language_is_refused(monkeypatch,
     assert "English-only" in str(excinfo.value)
 
 
-def test_the_english_only_stt_rule_also_catches_the_default_model(monkeypatch, tmp_path):
-    # No model line at all: the default is small.en, which is still .en.
-    with pytest.raises(ConfigError):
-        _load_stt(monkeypatch, tmp_path, '[stt]\nlanguage = "de"\n')
+def test_the_default_stt_model_is_multilingual_so_any_language_loads(monkeypatch, tmp_path):
+    # No model line at all: the default is turbo q5_0, which is not an .en
+    # model, so a non-English language is accepted (it was refused while
+    # small.en was the default).
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, '[stt]\nlanguage = "de"\n')
+    assert resolve_stt(data)["language"] == "de"
 
 
 def test_a_multilingual_stt_model_accepts_another_language(monkeypatch, tmp_path):
@@ -663,6 +668,152 @@ def test_stt_max_seconds_at_the_edges_is_accepted(monkeypatch, tmp_path, value):
 
     data = _load_stt(monkeypatch, tmp_path, f"[stt]\nmax_seconds = {value}\n")
     assert resolve_stt(data)["max_seconds"] == int(value)
+
+
+@pytest.mark.parametrize("value", ["0", "9", "-1", '"5"', "2.5", "true"])
+def test_an_out_of_range_stt_beam_size_is_refused(monkeypatch, tmp_path, value):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\nbeam_size = {value}\n")
+
+    assert "stt.beam_size" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["1", "8", "5"])
+def test_stt_beam_size_at_the_edges_is_accepted(monkeypatch, tmp_path, value):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, f"[stt]\nbeam_size = {value}\n")
+    assert resolve_stt(data)["beam_size"] == int(value)
+
+
+@pytest.mark.parametrize("literal, expected", [("true", "claude-cli"), ("false", "off"),
+                                               ('"off"', "off"), ('"claude-cli"', "claude-cli"),
+                                               ('"anthropic"', "anthropic"), ('"local"', "local")])
+def test_stt_cleanup_accepts_the_enum_and_coerces_legacy_bools(monkeypatch, tmp_path, literal, expected):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, f"[stt]\ncleanup = {literal}\n")
+    assert resolve_stt(data)["cleanup"] == expected
+
+
+@pytest.mark.parametrize("literal", ['"claude"', '"yes"', "1", '"ON"'])
+def test_an_stt_cleanup_off_the_enum_is_refused(monkeypatch, tmp_path, literal):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[stt]\ncleanup = {literal}\n")
+
+    assert "stt.cleanup" in str(excinfo.value)
+
+
+def test_stt_cleanup_defaults_to_off_and_verbatim_to_false(monkeypatch, tmp_path):
+    from vocalize.config import resolve_stt
+
+    resolved = resolve_stt(_load_stt(monkeypatch, tmp_path, "[stt]\nmodel = \"small.en\"\n"))
+    assert resolved["cleanup"] == "off" and resolved["verbatim"] is False
+
+
+def test_an_stt_verbatim_that_is_not_a_bool_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError):
+        _load_stt(monkeypatch, tmp_path, '[stt]\nverbatim = "yes"\n')
+
+
+# --- [notes] (parsed and rendered from 0.12.0, honoured from 0.14.0) -----------
+
+
+def test_notes_defaults_apply_with_no_table_at_all(monkeypatch, tmp_path):
+    from vocalize.config import NOTES_DEFAULTS, resolve_notes
+
+    assert resolve_notes(_load_stt(monkeypatch, tmp_path, "")) == NOTES_DEFAULTS
+
+
+def test_notes_table_loads_with_valid_values(monkeypatch, tmp_path):
+    from vocalize.config import resolve_notes
+
+    data = _load_stt(
+        monkeypatch, tmp_path,
+        '[notes]\nfolder = "~/Notes"\ntemplate = "meeting"\nsummarizer = "claude-cli"\n'
+        'keep_audio = true\nmodel = "small.en"\n',
+    )
+    resolved = resolve_notes(data)
+    assert resolved == {"folder": "~/Notes", "template": "meeting", "summarizer": "claude-cli",
+                        "keep_audio": True, "model": "small.en"}
+
+
+def test_a_custom_notes_template_path_is_accepted(monkeypatch, tmp_path):
+    from vocalize.config import resolve_notes
+
+    data = _load_stt(monkeypatch, tmp_path, '[notes]\ntemplate = "/Users/me/prompts/standup.md"\n')
+    assert resolve_notes(data)["template"] == "/Users/me/prompts/standup.md"
+
+
+@pytest.mark.parametrize("body", [
+    '[notes]\nsummarizer = "openai"\n',
+    '[notes]\ntemplate = "haiku"\n',
+    '[notes]\ntemplate = 3\n',
+    '[notes]\nkeep_audio = "no"\n',
+    '[notes]\nfolder = ""\n',
+    '[notes]\nmodel = "nope"\n',
+    'notes = "keep me"\n',
+])
+def test_a_bad_notes_value_is_refused(monkeypatch, tmp_path, body):
+    with pytest.raises(ConfigError):
+        _load_stt(monkeypatch, tmp_path, body)
+
+
+def test_an_unknown_notes_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
+    data = _load_stt(monkeypatch, tmp_path, '[notes]\ncolour = "blue"\n')
+
+    assert data["notes"] == {"colour": "blue"}
+    assert "unknown config key 'colour' in [notes]" in capsys.readouterr().err
+
+
+# --- provider values are short strings (issue #5) -----------------------------
+
+
+@pytest.mark.parametrize("key", ["voice", "model", "engine", "language", "region", "profile"])
+def test_a_provider_voice_type_that_is_not_a_string_is_refused(monkeypatch, tmp_path, key):
+    with pytest.raises(ConfigError) as excinfo:
+        _load_stt(monkeypatch, tmp_path, f"[providers.elevenlabs]\n{key} = 12345\n")
+
+    message = str(excinfo.value)
+    assert key in message and "[providers.elevenlabs]" in message
+
+
+@pytest.mark.parametrize("literal", ['"-flag"', '""', '"' + "x" * 129 + '"', '"a\u0007b"'])
+def test_a_provider_voice_type_that_is_flag_shaped_empty_or_long_is_refused(monkeypatch, tmp_path, literal):
+    with pytest.raises(ConfigError):
+        _load_stt(monkeypatch, tmp_path, f"[providers.google]\nvoice = {literal}\n")
+
+
+def test_a_plain_provider_voice_string_still_loads(monkeypatch, tmp_path):
+    data = _load_stt(monkeypatch, tmp_path, '[providers.google]\nvoice = "en-GB-Neural2-A"\n')
+    assert data["providers"]["google"]["voice"] == "en-GB-Neural2-A"
+
+
+def test_an_anthropic_providers_table_is_known_and_budgeted(monkeypatch, tmp_path, capsys):
+    from vocalize.config import ANTHROPIC_DEFAULT_BUDGET, budget_for
+
+    data = _load_stt(monkeypatch, tmp_path, "[providers.anthropic]\nmonthly_chars = 500000\n")
+    assert "unknown provider" not in capsys.readouterr().err
+    assert budget_for("anthropic", data) == 500000
+    assert budget_for("anthropic", {}) == ANTHROPIC_DEFAULT_BUDGET
+    assert budget_for("elevenlabs", {}) is None
+
+
+def test_an_anthropic_budget_of_zero_means_zero_not_the_default(monkeypatch, tmp_path):
+    """`monthly_chars = 0` is the only way to say "spend nothing" on the one
+    provider that is never unlimited. Read as falsy it became the largest
+    budget in the file."""
+    from vocalize.config import budget_for
+
+    data = _load_stt(monkeypatch, tmp_path, "[providers.anthropic]\nmonthly_chars = 0\n")
+    assert budget_for("anthropic", data) == 0
+
+
+def test_stt_beam_size_defaults_to_five(monkeypatch, tmp_path):
+    from vocalize.config import resolve_stt
+
+    data = _load_stt(monkeypatch, tmp_path, "[stt]\nmodel = \"small.en\"\n")
+    assert resolve_stt(data)["beam_size"] == 5
 
 
 @pytest.mark.parametrize(
@@ -755,3 +906,10 @@ def test_an_unknown_key_warns_once_however_often_the_file_is_read(
 
     config_module.load_config_file()
     assert capsys.readouterr().err == ""
+
+
+def test_a_notes_template_may_not_look_like_a_flag(monkeypatch, tmp_path):
+    """A `.md` name that starts with a dash would read as an option to
+    whatever later opens it; refused like every other provider text."""
+    with pytest.raises(ConfigError, match="notes.template"):
+        _load_stt(monkeypatch, tmp_path, '[notes]\ntemplate = "-rf.md"\n')

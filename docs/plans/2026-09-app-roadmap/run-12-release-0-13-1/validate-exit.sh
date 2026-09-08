@@ -79,8 +79,8 @@ cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
 echo "=== Entry criteria ==="
 check "on its own branch (not main)" bash -c 'test "$(git branch --show-current)" != main'
-check "run 11 (cue, hold-to-talk, paste) validated" grep -q '^validate-exit: PASS' docs/plans/2026-09-app-roadmap/run-11-cue-hold-paste/report.md
-check "run 11's key artifact present (_trim_cue)" grep -q "_trim_cue" vocalize/dictate.py
+check "run 11b (playback pause) validated" grep -q '^validate-exit: PASS' docs/plans/2026-09-app-roadmap/run-11b-playback-pause/report.md
+check "run 11b's key artifact present (interrupted.wait_for_record)" bash -c "grep -qE '^def wait_for_record\(' vocalize/interrupted.py"
 check "suite green at entry" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check "ruff clean at entry" .venv/bin/python -m ruff check vocalize hooks tests
 
@@ -88,16 +88,16 @@ echo ""
 echo "=== Exit criteria ==="
 check "review file has a 0.13.1 section" bash -c 'test -f docs/plans/2026-09-app-roadmap/review-0.13.0.md && grep -qE "0\.13\.1" docs/plans/2026-09-app-roadmap/review-0.13.0.md'
 check "no open critical/high finding" .venv/bin/python -c 'import re,pathlib; t=pathlib.Path("docs/plans/2026-09-app-roadmap/review-0.13.0.md").read_text(); assert not re.search(r"^\| *(critical|high) *\|.*\| *open *\|", t, re.I|re.M), "open critical/high finding"'
-check "docs match the CLI (0.13.1 commands)" .venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "status", "doctor", "app install", "app status", "integrate claude", "local install", "auth login")]'
+check "docs match the CLI (0.13.1 commands)" .venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "pause", "status", "doctor", "app install", "app status", "integrate claude", "local install", "auth login")]'
 check "full suite green" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check "ruff clean" .venv/bin/python -m ruff check vocalize hooks tests
 check "work committed" git diff --quiet HEAD
-check "package builds the 0.13.1 wheel" bash -c 'rm -f dist/vocalize_cli-0.13.1*; .venv/bin/python -m build >/dev/null 2>&1; ls dist/vocalize_cli-0.13.1*.whl >/dev/null 2>&1'
+check "package builds the 0.13.1 wheel" bash -c 'rm -rf /tmp/vocalize-0-13-1-build; .venv/bin/python -m build --outdir /tmp/vocalize-0-13-1-build >/dev/null 2>&1; ls /tmp/vocalize-0-13-1-build/vocalize_cli-0.13.1*.whl >/dev/null 2>&1'  # a scratch dir: dist/ holds the published files the digest row compares
 check "clean-venv install has no leaked ML runtime" bash -c '
   set -e
   rm -rf /tmp/vocalize-0-13-1-cleanvenv
   python3 -m venv /tmp/vocalize-0-13-1-cleanvenv
-  /tmp/vocalize-0-13-1-cleanvenv/bin/pip install -q --no-cache-dir dist/vocalize_cli-0.13.1*.whl
+  /tmp/vocalize-0-13-1-cleanvenv/bin/pip install -q --no-cache-dir /tmp/vocalize-0-13-1-build/vocalize_cli-0.13.1*.whl
   ! /tmp/vocalize-0-13-1-cleanvenv/bin/pip list | grep -iE "pywhispercpp|onnxruntime|mlx|sherpa|numpy|torch|boto3"
 '
 check "PyPI 0.13.1 published with matching digest (after the owner publishes)" .venv/bin/python -c 'import json,urllib.request,hashlib,glob,sys; local={hashlib.sha256(open(f,"rb").read()).hexdigest() for f in glob.glob("dist/vocalize_cli-0.13.1*")}; data=json.load(urllib.request.urlopen("https://pypi.org/pypi/vocalize-cli/0.13.1/json", timeout=20)); remote={u["digests"]["sha256"] for u in data["urls"]}; assert local and local==remote, (local, remote)'

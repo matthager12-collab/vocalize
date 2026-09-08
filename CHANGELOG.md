@@ -3,6 +3,108 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+Nothing yet.
+
+## 0.12.0 - 2026-09-07
+
+### Changed
+
+- **The default chain is now `kokoro`, then `say`.** A config with no
+  `chain` used to try ElevenLabs first; it now tries the on-device voice
+  first and falls back to macOS `say`. When `say` speaks because the Kokoro
+  model was never installed, the fallback line says so once and names the
+  fix: `vocalize local install`. Users who never set a chain hear `say`
+  after upgrading until they run that install; anyone with an explicit
+  `chain` sees no change. `vocalize usage`, `vocalize status` and the portal
+  now list the local providers first.
+- **Dictation decodes with beam search.** whisper.cpp ran with its greedy
+  decoder, which merged words on fast speech ("toget" for "to get",
+  [#4](https://github.com/matthager12-collab/vocalize/issues/4)). The worker
+  now uses beam search with five beams, whisper.cpp's own default for that
+  strategy. `[stt] beam_size` (1–8) is the escape hatch: `1` restores the
+  greedy decoder if a take is slow to land on your machine. Honest result:
+  on the owner's own voice both decoders still produced "themerge" for
+  "the merge", so beam search improves decoding but does not close #4;
+  that issue stays open. The cost was measured on a 43 s synthetic clip
+  and recorded in `docs/plans/2026-09-app-roadmap/spike-notes.md`.
+
+- **The default dictation model is now `large-v3-turbo-q5_0`.** On the
+  owner's own voice it was the first model to keep "the merge" as two
+  words ([#4](https://github.com/matthager12-collab/vocalize/issues/4));
+  beam search alone did not. It is no slower than `small.en` on an M4 and
+  uses about 90 MB more. **Upgrade note:** if your `[stt]` table sets no
+  `model`, dictation looks for the new default — run
+  `vocalize local install --stt` once (547 MB), or set
+  `model = "small.en"` to keep the lighter model.
+- **`[stt] cleanup` names where the cleanup pass runs.** It was `true` or
+  `false`; it is now `off`, `claude-cli`, `anthropic` or `local` (`local`
+  is accepted today and honoured from 0.14.0). Older `true` / `false`
+  values keep working. The pass lives in a new `vocalize/llm.py`, one seam
+  for every language-model call, and the default prompt now also drops
+  restatements, false starts and filler
+  ([#3](https://github.com/matthager12-collab/vocalize/issues/3)); say
+  "verbatim" as the first word of a take, pass `--verbatim`, or set
+  `[stt] verbatim = true` to keep every word.
+- **Every cloud send is visible.** One stderr line, `vocalize: sent to
+  <backend>`, prints immediately before text leaves the machine and never
+  otherwise; the clipboard notification for a cleaned take says "cleaned
+  up by Claude — sent off this Mac".
+- **`claude -p` sessions are tighter.** The cleanup pass and the plan-
+  speaking hook now pass `--strict-mcp-config`, run from the system
+  temporary directory, and the cleanup pass excludes your own hooks,
+  skills and `CLAUDE.md` (`--setting-sources ""`) and strips any stored
+  Anthropic key from the child's environment.
+- **Provider settings are type-checked** (issue
+  [#5](https://github.com/matthager12-collab/vocalize/issues/5)): a
+  `voice`, `model`, `engine`, `language`, `region` or `profile` that is not
+  a short printable string is refused with a message naming the file and
+  the key, in the CLI and the portal alike.
+- **Sentences no longer run together with the turbo models.** Their
+  segments arrive without a leading space and the worker joined them with
+  nothing ("working.I want"); segments are now joined with one space.
+
+### Fixed
+
+- **A stored key is readable from every Python on the Mac.** macOS pins a
+  keychain item to the binary that created it, so a key stored from the
+  terminal could be invisible, or behind an "Allow" dialog, when Claude
+  Code's shell or an upgraded vocalize asked for it. Keys are now written
+  and read through Apple's own `security` tool (secret on stdin, never on a
+  command line), which is the same accessing application whatever spawned
+  it; the item also records the date the key was last validated, shown by
+  `vocalize auth status`. An older item is replaced in place on the next
+  `vocalize auth login`.
+
+### Added
+
+- **An Anthropic key slot, and a Keys tab that can test and remove.**
+  `vocalize auth login --provider anthropic` stores the key the `anthropic`
+  cleanup backend uses, under its own keychain item; `auth status`,
+  `auth logout` and `vocalize usage` know the slot too. It is a key, not a
+  voice: the chain does not accept it. On the portal's Keys tab every slot
+  (the three voice providers and Anthropic) gets **Test without storing**,
+  which checks a key and keeps nothing, and **Remove stored key**, which
+  reads the keychain back before it says the key is gone; each card shows
+  when its key was last checked. The key field is `autocomplete=
+  "new-password"`, the value Safari and Chrome honour on a password field.
+  The Local tab gained a select for the cleanup backend.
+
+- **An Anthropic API backend for the cleanup pass** (`[stt] cleanup =
+  "anthropic"`): one Messages API call with a key from `ANTHROPIC_API_KEY`
+  or the keychain slot `anthropic-api-key`, under a monthly character
+  budget (`[providers.anthropic] monthly_chars`, 2,000,000 when unset)
+  counted in the usage ledger. The key is stored from the CLI or the
+  portal's Keys tab, as described above.
+- **A `[notes]` config table** (`folder`, `template`, `summarizer`,
+  `keep_audio`, `model`) is parsed, validated and preserved by every writer
+  of the config file. `vocalize notes` itself arrives in 0.14.0.
+- **`large-v3-turbo-q8_0`** joins the dictation models: the same turbo model
+  as `q5_0` with 8-bit weights (834 MB on disk), for machines with 16 GB or
+  more. `vocalize local install --stt --model large-v3-turbo-q8_0`. Pinned
+  from a completed download like the other three.
+
 ## 0.11.0 - 2026-09-05
 
 ### Added

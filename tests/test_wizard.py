@@ -208,11 +208,12 @@ def test_manual_speed_reprompts_until_it_is_in_range(monkeypatch, tmp_path, caps
 def test_unknown_keys_in_an_existing_file_survive(monkeypatch, tmp_path):
     ctx = _setup(monkeypatch, tmp_path, [DOWN, ENTER, UP, ENTER, ENTER])
     ctx.path.parent.mkdir(parents=True)
-    ctx.path.write_text('voice = "old-voice"\nnotes = "keep me"\n')
+    # `notes` became a reserved table in 0.12.0; any other unknown key still rides through.
+    ctx.path.write_text('voice = "old-voice"\nmemo = "keep me"\n')
 
     wizard.run_wizard()
 
-    assert ctx.path.read_text() == 'voice = "abc123"\nnotes = "keep me"\n'
+    assert ctx.path.read_text() == 'voice = "abc123"\nmemo = "keep me"\n'
 
 
 def test_keyless_mode_falls_back_to_manual_entry(monkeypatch, tmp_path, capsys):
@@ -664,6 +665,27 @@ def test_an_stt_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
 
     assert "[stt]" in once  # not "unchanged" by being silently dropped
     assert load_config_file()["stt"] == {"model": "base.en", "cleanup": True}
+    assert wizard._render_config_text(load_config_file()) == once
+
+
+def test_a_notes_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
+    """`_TABLE_KEYS` excludes a table from the flat pass; only an explicit
+    block writes it back. Without one, `vocalize chain` would drop [notes]."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    path = tmp_path / "vocalize" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        'chain = ["say"]\n\n[notes]\nfolder = "~/Notes"\nsummarizer = "claude-cli"\n\n'
+        '[stt]\nmodel = "base.en"\n',
+        encoding="utf-8",
+    )
+
+    once = wizard._render_config_text(load_config_file())
+    path.write_text(once, encoding="utf-8")
+
+    assert "[notes]" in once
+    assert load_config_file()["notes"] == {"folder": "~/Notes", "summarizer": "claude-cli"}
+    assert load_config_file()["stt"] == {"model": "base.en"}
     assert wizard._render_config_text(load_config_file()) == once
 
 

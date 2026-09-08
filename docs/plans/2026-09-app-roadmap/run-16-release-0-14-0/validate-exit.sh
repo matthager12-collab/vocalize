@@ -79,8 +79,8 @@ cd "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 1
 
 echo "=== Entry criteria ==="
 check "on its own branch (not main)" bash -c 'test "$(git branch --show-current)" != main'
-check "run 15 (notes) validated" grep -q '^validate-exit: PASS' docs/plans/2026-09-app-roadmap/run-15-notes/report.md
-check "run 15's key artifact present (notes._done)" grep -q "_done" vocalize/notes.py
+check "run 15b (recording pause) validated" grep -q '^validate-exit: PASS' docs/plans/2026-09-app-roadmap/run-15b-recording-pause/report.md
+check "run 15b's key artifact present (_join_segments)" bash -c "grep -qE '^def _join_segments\(' vocalize/dictate.py"
 check "suite green at entry" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check "ruff clean at entry" .venv/bin/python -m ruff check vocalize hooks tests
 
@@ -90,16 +90,16 @@ check "review findings file exists" test -f docs/plans/2026-09-app-roadmap/revie
 check "no open critical/high finding" .venv/bin/python -c 'import re,pathlib; t=pathlib.Path("docs/plans/2026-09-app-roadmap/review-0.14.0.md").read_text(); assert not re.search(r"^\| *(critical|high) *\|.*\| *open *\|", t, re.I|re.M), "open critical/high finding"'
 check "CHANGELOG has 0.14.0" grep -qE '^## .*0\.14\.0' CHANGELOG.md
 check "version bumped to 0.14.0" grep -qE '^__version__ = "0\.14\.0"' vocalize/__init__.py
-check "docs match the CLI (0.14.0 commands)" .venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "status", "doctor", "notes", "app install", "app status", "integrate claude", "local install", "auth login")]'
+check "docs match the CLI (0.14.0 commands)" .venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "pause", "status", "doctor", "notes", "app install", "app status", "integrate claude", "local install", "auth login")]'
 check "full suite green" .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check "ruff clean" .venv/bin/python -m ruff check vocalize hooks tests
 check "work committed" git diff --quiet HEAD
-check "package builds the 0.14.0 wheel" bash -c 'rm -f dist/vocalize_cli-0.14.0*; .venv/bin/python -m build >/dev/null 2>&1; ls dist/vocalize_cli-0.14.0*.whl >/dev/null 2>&1'
+check "package builds the 0.14.0 wheel" bash -c 'rm -rf /tmp/vocalize-0-14-0-build; .venv/bin/python -m build --outdir /tmp/vocalize-0-14-0-build >/dev/null 2>&1; ls /tmp/vocalize-0-14-0-build/vocalize_cli-0.14.0*.whl >/dev/null 2>&1'  # a scratch dir: dist/ holds the published files the digest row compares
 check "clean-venv install has no leaked ML runtime" bash -c '
   set -e
   rm -rf /tmp/vocalize-0-14-0-cleanvenv
   python3 -m venv /tmp/vocalize-0-14-0-cleanvenv
-  /tmp/vocalize-0-14-0-cleanvenv/bin/pip install -q --no-cache-dir dist/vocalize_cli-0.14.0*.whl
+  /tmp/vocalize-0-14-0-cleanvenv/bin/pip install -q --no-cache-dir /tmp/vocalize-0-14-0-build/vocalize_cli-0.14.0*.whl
   ! /tmp/vocalize-0-14-0-cleanvenv/bin/pip list | grep -iE "pywhispercpp|onnxruntime|mlx|sherpa|numpy|torch|boto3"
 '
 check "PyPI 0.14.0 published with matching digest (after the owner publishes)" .venv/bin/python -c 'import json,urllib.request,hashlib,glob,sys; local={hashlib.sha256(open(f,"rb").read()).hexdigest() for f in glob.glob("dist/vocalize_cli-0.14.0*")}; data=json.load(urllib.request.urlopen("https://pypi.org/pypi/vocalize-cli/0.14.0/json", timeout=20)); remote={u["digests"]["sha256"] for u in data["urls"]}; assert local and local==remote, (local, remote)'

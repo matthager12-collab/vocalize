@@ -8,7 +8,7 @@ docs/plans/2026-09-next-features/spike-2026-09-01.md.
 
 Only ggml model files are fetched, and only one of them is ever
 downloaded per install (the `--model` the user picked, default
-`small.en`) — unlike Kokoro, which always needs both of its files.
+`large-v3-turbo-q5_0`) — unlike Kokoro, which always needs both of its files.
 Nothing downloaded here is code: pywhispercpp reads these as whisper.cpp
 model weights inside the uv worker, never unpickled, never executed.
 """
@@ -48,6 +48,15 @@ FILES = [
         "size": 574041195,
         "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
     },
+    # The 8-bit turbo: 300 MB more than q5_0 for the least-lossy turbo
+    # weights, for machines with 16 GB. Pinned from a completed download on
+    # 2026-09-07 (docs/plans/2026-09-app-roadmap/spike-notes.md § turbo q8_0).
+    {
+        "name": "ggml-large-v3-turbo-q8_0.bin",
+        "url": f"{RELEASE_URL}/ggml-large-v3-turbo-q8_0.bin",
+        "size": 874188075,
+        "sha256": "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
+    },
 ]
 
 # The allowlist a `--model`/`[stt] model` value is checked against before
@@ -55,7 +64,7 @@ FILES = [
 # "../etc/passwd" or "--serve".
 MODELS = tuple(entry["name"][len("ggml-") : -len(".bin")] for entry in FILES)
 
-DEFAULT_MODEL = "small.en"
+DEFAULT_MODEL = "large-v3-turbo-q5_0"
 
 # Pinned exactly, same reasoning as kokoro_manifest.RUNTIME_PACKAGE: the
 # worker runs under uv's own Python, and an unpinned `--with` would

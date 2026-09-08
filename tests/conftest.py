@@ -32,6 +32,7 @@ class _FakeKeychain(dict):
     """The stored entries, plus the switches a test needs to break them."""
 
     deny_delete = False
+    deny_read = False  # a locked keychain: every read raises, nothing is absent
 
 
 class _FakeKeyring:
@@ -41,6 +42,10 @@ class _FakeKeyring:
         self._store = store
 
     def get_password(self, service, username):
+        if self._store.deny_read:
+            from keyring.errors import KeyringError
+
+            raise KeyringError("User interaction is not allowed.")
         return self._store.get((service, username))
 
     def set_password(self, service, username, password):

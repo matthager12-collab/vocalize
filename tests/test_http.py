@@ -1,4 +1,5 @@
 import io
+import traceback
 import urllib.error
 from pathlib import Path
 from urllib.request import Request
@@ -215,3 +216,21 @@ def test_errors_are_attributed_to_the_calling_provider(monkeypatch):
         _http.request("GET", "https://x.test/v1", headers={}, provider="openai")
 
     assert excinfo.value.provider == "openai"
+
+
+@pytest.mark.parametrize("key", ["sk-CANARY-abc123\ndef456", "sk-CANARY-abc—123"])
+def test_a_header_the_transport_refuses_never_quotes_the_key(key):
+    """http.client rejects an unsendable header value by quoting the whole
+    value — an API key — into a ValueError, which is neither an OSError nor
+    an HTTPException. It must not escape, and it must not carry the key.
+
+    No socket: putheader raises before the connection is made.
+    """
+    with pytest.raises(ProviderTransientError) as excinfo:
+        _http.request(
+            "POST", "https://127.0.0.1:9/v1", headers={"x-api-key": key},
+            body=b"{}", timeout=1, provider="anthropic",
+        )
+
+    trace = "".join(traceback.format_exception(excinfo.value))
+    assert "CANARY" not in str(excinfo.value) and "CANARY" not in trace

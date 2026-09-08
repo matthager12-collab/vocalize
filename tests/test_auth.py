@@ -4,7 +4,7 @@ from click.testing import CliRunner
 from vocalize import auth
 from vocalize.cli import main
 from vocalize.config import _load_dotenv_if_present
-from vocalize.exceptions import AuthError, TTSRequestError
+from vocalize.exceptions import AuthError, ProviderTransientError, TTSRequestError
 
 # Bound at import time on purpose: conftest's autouse fixture replaces the
 # module attribute, so this reference is the only way to reach the real one.
@@ -382,6 +382,22 @@ def test_key_source_per_provider_env_var(monkeypatch, provider, env_var):
     assert auth.key_source(None, provider) == "environment"
 
 
+def test_an_elevenlabs_outage_is_not_a_verdict_on_the_key(monkeypatch):
+    """`tts.list_voices` wraps a refused connection in the parent
+    TTSRequestError, which callers read as "the key is invalid". The
+    provider's own validate() classifies it as transient instead, so the
+    portal answers 502 rather than wiping a good key the user pasted."""
+    def down(client):
+        raise TTSRequestError("Could not list voices: [Errno 61] Connection refused") from OSError(61, "refused")
+
+    monkeypatch.setattr("vocalize.tts.build_client", lambda key: object())
+    monkeypatch.setattr("vocalize.tts.list_voices", down)
+
+    with pytest.raises(ProviderTransientError) as excinfo:
+        auth.validate_key("sk_" + "a" * 40, "elevenlabs")
+    assert "sk_" not in str(excinfo.value)
+
+
 def test_validate_key_dispatches_to_the_provider_module(monkeypatch):
     seen = []
 
@@ -422,3 +438,192 @@ def test_polly_credential_status_reports_not_configured(monkeypatch, tmp_path):
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "missing"))
 
     assert auth.polly_credential_status("default") == "not configured"
+
+
+# --- the macOS backend: Apple's `security` tool (DEC-035) ----------------------
+
+
+@pytest.fixture
+def security(tmp_path):
+    """A fake `security` tool: stateful, logs argv and stdin, speaks the real
+    tool's exit codes (44 = not found). `deny` makes every call fail like a
+    locked keychain."""
+    state = tmp_path / "keychain"
+    state.mkdir()
+    script = tmp_path / "security"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'STATE="{state}"\n'
+        'for a in "$@"; do printf "%s\\n" "$a"; done >> "$STATE/argv"\n'
+        'if [ -e "$STATE/deny" ]; then echo "security: SecKeychainSearchCopyNext: User interaction is not allowed." >&2; exit 36; fi\n'
+        'case "$1" in\n'
+        '  -i)\n'
+        '    cat > "$STATE/stdin"\n'
+        '    sed -n \'s/.*-j "\\([^"]*\\)".*/\\1/p\' "$STATE/stdin" > "$STATE/comment"\n'
+        '    sed -n \'s/.*-w "\\([^"]*\\)".*/\\1/p\' "$STATE/stdin" > "$STATE/value"\n'
+        '    exit 0;;\n'
+        '  find-generic-password)\n'
+        '    [ -s "$STATE/value" ] || exit 44\n'
+        '    for a in "$@"; do [ "$a" = "-w" ] && { cat "$STATE/value"; exit 0; }; done\n'
+        '    printf \'    "acct"<blob>="x"\\n    "icmt"<blob>="%s"\\n    "svce"<blob>="vocalize"\\n\' "$(cat "$STATE/comment")"\n'
+        '    exit 0;;\n'
+        '  delete-generic-password)\n'
+        '    [ -s "$STATE/value" ] || exit 44\n'
+        '    rm -f "$STATE/value" "$STATE/comment"; exit 0;;\n'
+        'esac\n'
+        'exit 1\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    backend = auth._SecurityKeychain(binary=str(script))
+    backend.state = state
+    return backend
+
+
+def _argv(backend):
+    path = backend.state / "argv"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def test_security_stores_the_key_on_stdin_never_in_argv(security):
+    security.set_password("vocalize", "elevenlabs-api-key", "sk-secret-canary", comment="validated 2026-09-07")
+
+    argv = _argv(security)
+    assert "-i" in argv
+    assert not any("sk-secret-canary" in entry for entry in argv)
+    stdin = (security.state / "stdin").read_text(encoding="utf-8")
+    assert stdin.startswith('add-generic-password -a "elevenlabs-api-key" -s "vocalize" -U ')
+    assert '-j "validated 2026-09-07"' in stdin and '-w "sk-secret-canary"' in stdin
+    assert security.get_password("vocalize", "elevenlabs-api-key") == "sk-secret-canary"
+
+
+def test_security_reads_with_dash_w_and_reports_absence_as_none(security):
+    assert security.get_password("vocalize", "elevenlabs-api-key") is None
+    argv = _argv(security)
+    assert argv[:5] == ["find-generic-password", "-s", "vocalize", "-a", "elevenlabs-api-key"] and argv[5] == "-w"
+
+
+def test_security_get_raises_on_any_other_failure(security):
+    (security.state / "deny").touch()
+
+    with pytest.raises(auth.SecurityKeychainError):
+        security.get_password("vocalize", "elevenlabs-api-key")
+
+
+def test_security_refuses_a_key_with_a_quote_or_backslash(security):
+    for bad in ('sk-"quoted"', "sk-back\\slash"):
+        with pytest.raises(auth.SecurityKeychainError):
+            security.set_password("vocalize", "elevenlabs-api-key", bad)
+    assert not (security.state / "stdin").exists()  # nothing reached the tool
+
+
+def test_security_store_verifies_the_read_back(security, monkeypatch):
+    original = security.get_password
+    monkeypatch.setattr(security, "get_password", lambda service, username: "something else")
+
+    with pytest.raises(auth.SecurityKeychainError):
+        security.set_password("vocalize", "elevenlabs-api-key", "sk-key")
+    monkeypatch.setattr(security, "get_password", original)
+
+
+def test_security_store_deletes_the_old_item_instead_of_updating_it(security):
+    """macOS pins an item to the binary that created it, and `-U` keeps that
+    list. An item written by an older vocalize (keyring, another Python) is
+    therefore unreadable by `security` until it is deleted and recreated —
+    which is the migration `login` is documented to perform."""
+    security.set_password("vocalize", "elevenlabs-api-key", "sk-old")
+    (security.state / "argv").unlink()
+
+    security.set_password("vocalize", "elevenlabs-api-key", "sk-new")
+
+    argv = _argv(security)
+    assert argv.index("delete-generic-password") < argv.index("-i")
+    assert security.get_password("vocalize", "elevenlabs-api-key") == "sk-new"
+
+
+def test_security_delete_speaks_password_delete_error(security):
+    from keyring.errors import PasswordDeleteError
+
+    with pytest.raises(PasswordDeleteError):
+        security.delete_password("vocalize", "elevenlabs-api-key")  # 44: nothing there
+
+    security.set_password("vocalize", "elevenlabs-api-key", "sk-key")
+    security.delete_password("vocalize", "elevenlabs-api-key")
+    assert security.get_password("vocalize", "elevenlabs-api-key") is None
+
+
+def test_security_comment_is_read_without_the_secret(security):
+    security.set_password("vocalize", "openai-api-key", "sk-key", comment="validated 2026-09-07")
+    (security.state / "argv").unlink()
+
+    assert security.comment("vocalize", "openai-api-key") == "validated 2026-09-07"
+    assert "-w" not in _argv(security)
+
+
+def test_security_backend_stamps_the_date_and_status_shows_it(security, monkeypatch, no_env_key):
+    monkeypatch.setattr(auth, "_backend", lambda: security)
+    monkeypatch.setattr(auth, "_today", lambda: "2026-09-07")
+
+    auth.store_key("sk-el-abcdefgh1234", "elevenlabs")
+    auth.store_key("sk-oa-abcdefgh1234", "openai")
+
+    assert auth.validated_on("elevenlabs") == "2026-09-07"
+    result = CliRunner().invoke(main, ["auth", "status"])
+    assert result.exit_code == 0, result.output
+    assert "Validated: 2026-09-07" in result.output
+    assert "openai: keychain (sk-o…, validated 2026-09-07)" in result.output
+    assert "sk-el-abcdefgh1234" not in result.output and "sk-oa-abcdefgh1234" not in result.output
+
+
+def test_security_validated_on_is_none_without_a_stamp(fake_keychain):
+    fake_keychain[("vocalize", "elevenlabs-api-key")] = "sk-x"
+
+    assert auth.validated_on("elevenlabs") is None  # the keyring fake keeps no comment
+
+
+def test_security_is_the_backend_on_macos_and_keyring_elsewhere(monkeypatch):
+    # conftest replaces `_backend` for every test; the platform choice lives
+    # one function down so it can be checked without touching a real keychain.
+    monkeypatch.setattr(auth.sys, "platform", "darwin")
+    monkeypatch.setattr(auth.os.path, "exists", lambda path: path == auth._SECURITY)
+    assert isinstance(auth._default_backend(), auth._SecurityKeychain)
+
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    assert auth._default_backend().__name__ == "keyring"
+
+
+# --- the Anthropic slot ----------------------------------------------------
+
+
+def test_anthropic_is_a_credential_choice_and_a_slot_but_not_a_provider():
+    assert auth.CREDENTIAL_CHOICES == auth.PROVIDER_NAMES + ("anthropic",)
+    assert "anthropic" not in auth.PROVIDER_NAMES
+    assert "anthropic" in auth.KEY_SLOTS
+    assert auth.PROVIDER_USERNAMES["anthropic"] == "anthropic-api-key"
+    assert auth.PROVIDER_ENV_VARS["anthropic"] == "ANTHROPIC_API_KEY"
+
+
+def test_anthropic_key_reaches_the_security_tool_on_stdin_never_in_argv(security, monkeypatch):
+    """T-43: the slot goes through the same door as every other key — the
+    tool's stdin — so `ps` never shows it and no shell log holds it."""
+    monkeypatch.setattr(auth, "_backend", lambda: security)
+
+    auth.store_key("sk-ant-secret-canary", "anthropic")
+
+    argv = _argv(security)
+    assert not any("sk-ant-secret-canary" in entry for entry in argv)
+    stdin = (security.state / "stdin").read_text(encoding="utf-8")
+    assert '-a "anthropic-api-key"' in stdin and '-w "sk-ant-secret-canary"' in stdin
+    assert auth.stored_key("anthropic") == "sk-ant-secret-canary"
+    assert auth.validated_on("anthropic") == auth._today()
+
+
+def test_a_key_longer_than_any_provider_issues_is_refused_before_any_request(monkeypatch, fake_keychain):
+    called = []
+    monkeypatch.setattr(auth, "validate_key", lambda *a, **k: called.append(a))
+
+    with pytest.raises(auth.AuthError, match="longer than any provider"):
+        auth.login("k" * (auth.KEY_MAX_CHARS + 1), "anthropic")
+
+    assert called == []
+    assert not fake_keychain

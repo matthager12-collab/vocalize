@@ -278,6 +278,9 @@ def test_process_exits_promptly_with_a_probe_still_blocked():
 
 def test_status_json_has_row_shape(monkeypatch, tmp_path, fake_keychain):
     _isolate_config(monkeypatch, tmp_path)
+    # An all-ok chain, named explicitly: the default now starts with Kokoro,
+    # which is a warn row on a machine with no model and would exit 1.
+    monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
     runner = CliRunner()
     result = runner.invoke(main, ["status", "--json"])
@@ -306,6 +309,7 @@ def test_status_never_prints_the_api_key_value(monkeypatch, tmp_path, fake_keych
 
 def test_status_exit_code_zero_when_all_ok(monkeypatch, tmp_path, fake_keychain):
     _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")  # an all-ok chain, named
     monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
@@ -322,6 +326,7 @@ def test_status_exit_code_one_when_a_row_fails(monkeypatch, tmp_path, fake_keych
 
 def test_status_plain_output_names_each_provider(monkeypatch, tmp_path, fake_keychain):
     _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")  # an all-ok chain, named
     monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
     runner = CliRunner()
     result = runner.invoke(main, ["status"])

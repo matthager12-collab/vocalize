@@ -8,6 +8,78 @@ Check everything at once with:
 vocalize auth status
 ```
 
+## The keychain on macOS
+
+Every stored key lives in your login keychain under the service name
+`vocalize`. Since 0.12.0 vocalize writes and reads those items through
+Apple's own `/usr/bin/security` tool rather than from its Python process.
+The difference matters: macOS pins a keychain item to the binary that
+created it, so a key stored from your terminal used to be invisible, or
+behind an "Allow" dialog, when a different Python asked for it — the one
+inside Claude Code's shell, or the one left by `uv tool upgrade`. With the
+tool doing the reading, the accessing application is always the same
+Apple-signed binary, whatever spawned it, and the dialog never comes for
+an item vocalize 0.12.0 or later stored. An item an older vocalize left
+behind is still pinned to whichever Python wrote it, so the first read
+after upgrading may raise one "Allow" dialog until you re-run
+`vocalize auth login`.
+
+- The secret never appears on a command line: the tool reads its command
+  from stdin.
+- Each item carries the date the key was last validated, shown by
+  `vocalize auth status` as `validated YYYY-MM-DD`.
+- A key stored by an older vocalize is deleted and re-stored the next time
+  you run `vocalize auth login`, which is what clears the older pinning; no
+  manual step.
+- If a key contains a double quote or a backslash, vocalize refuses to
+  store it rather than risk the tool misreading the line.
+
+## Anthropic (dictation cleanup and notes — not a voice)
+
+The one key that is not a voice. It powers the `anthropic` backend of
+`[stt] cleanup` and, from 0.14, the notes summariser. It never appears in
+the chain, and `vocalize chain` does not accept it. If you already use
+Claude Code, the `claude-cli` backend does the same job through the
+`claude` binary with no key at all; this slot is for a Mac without it.
+
+1. Sign in at the Anthropic Console and create an API key (Settings →
+   API keys). Copy it once — the console never shows it again either.
+2. Store it. The key is checked with Anthropic before it is written:
+
+   ```bash
+   vocalize auth login --provider anthropic
+   ```
+
+3. Prove it:
+
+   ```bash
+   vocalize auth status --provider anthropic
+   ```
+
+4. Turn it on — in `~/.config/vocalize/config.toml`:
+
+   ```toml
+   [stt]
+   cleanup = "anthropic"
+   ```
+
+   or pick it in the Cleanup select on the Local tab of `vocalize portal`.
+
+Or do steps 2 and 3 on the Keys tab of `vocalize portal`: **Test without
+storing** checks a key and keeps nothing; **Store this key** checks it and
+writes it to the keychain; **Remove stored key** forgets it, and reads the
+keychain back before saying so.
+
+**The budget.** `[providers.anthropic] monthly_chars` defaults to
+2,000,000 characters a month — a few hundred dictated takes — and vocalize
+stops sending when the ledger reaches it. The ledger is this Mac's own
+count, not the account's: two Macs with the same key each get the full
+budget, and nothing here reads Anthropic's billing.
+
+**What leaves the machine.** Every take sent for cleanup prints one line
+on stderr, `vocalize: sent to anthropic`, and the notification names it
+too. Nothing is sent when `cleanup` is `off` or `local`.
+
 Set the order providers are tried in (first is primary, the rest are fallbacks):
 
 ```bash

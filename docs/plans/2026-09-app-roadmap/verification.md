@@ -12,7 +12,7 @@ All commands run from the repository root with the project's own tooling. Any fa
 | Plists | `plutil -lint vocalize/menubar/Info.plist.in hooks/quick_actions/*/Contents/Info.plist` |
 | Build artifacts | `.venv/bin/python -m build` |
 | Clean-venv acceptance | `python3 -m venv /tmp/v && /tmp/v/bin/pip install -q --no-cache-dir dist/vocalize_cli-*.whl && /tmp/v/bin/pip list \| grep -iE "pywhispercpp\|onnxruntime\|mlx\|sherpa\|numpy\|torch\|boto3"; test $? -eq 1` |
-| Docs match the CLI | `.venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "status", "doctor", "notes", "app install", "app status", "integrate claude", "local install", "auth login")]'` (trim to the commands that exist at each release) |
+| Docs match the CLI | `.venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "pause", "status", "doctor", "notes", "app install", "app status", "integrate claude", "local install", "auth login")]'` (trim to the commands that exist at each release) |
 | Review closed | `test -f <review file> && ! grep -iE '^\| *(critical\|high) *\|.*\| *open *\|' <review file>` |
 | Digests | PyPI JSON `digests.sha256` for each file equals `shasum -a 256 dist/*` |
 
@@ -86,6 +86,7 @@ All commands run from the repository root with the project's own tooling. Any fa
 | Swift parses, plist lints | Swift parse and plist commands | exit 0 |
 | No text can reach a notification | `! grep -n "NSPasteboard.string\|readObjects" vocalize/menubar/VocalizeApp.swift` | exit 0 |
 | Override and nonce checks exist | `grep -c "func checkedBinary\|func pasteIfNonceMatches" vocalize/menubar/VocalizeApp.swift` | prints 2 |
+| Unknown `app.*` keys are ignored, not treated as a chord | inspect the settings parser: only the four chord names (`dictate`, `dictate_mode`, `speak`, `stop`) are registered, and an unmatched `app.*` line falls through | true (so a later `app.*` key such as `stop_hotkey` needs no rebuild) |
 | Source committed | `git diff --quiet HEAD -- vocalize/menubar/` | exit 0 |
 
 ## Phase 8b exit (app, Python)
@@ -121,6 +122,21 @@ Same three rows as Phase 6 against `review-0.13.0.md`.
 | Hold-to-talk | `pytest tests/test_dictate.py tests/test_cli.py -q -k "start or stop_hold"` | exit 0 |
 | Paste marker carries the nonce | `pytest tests/test_dictate.py -q -k copied` | exit 0 (marker holds the session's nonce; none on nothing-heard) |
 
+## Phase 11b exit (playback pause)
+
+| Criterion | How it is proven | Passing when |
+|---|---|---|
+| The verb exists | `.venv/bin/vocalize pause --help` | exit 0 (only when the command is registered) |
+| Pause saves what a dictation would | `pytest tests/test_cli.py::test_pause_saves_the_record_like_a_dictation tests/test_cli.py::test_pause_with_nothing_playing_reports_it tests/test_cli.py::test_pause_in_the_chunk_gap_records_the_queued_piece -q` | exit 0 (a version-2 record with the playing piece, the unspoken text and the four settings; no traceback with nothing playing; the PID 0 marker path covered) |
+| One record wait, not two | `grep -qE '^def wait_for_record\(' vocalize/interrupted.py && grep -q 'interrupted.wait_for_record' vocalize/dictate.py` | exit 0 |
+| The chord can pause, opt-in | `pytest tests/test_config.py::test_stop_hotkey_rejects_an_unknown_word tests/test_cli.py::test_stop_hotkey_pause_pauses_then_resumes tests/test_cli.py::test_stop_hotkey_pause_never_resumes_while_a_dictation_is_live tests/test_cli.py::test_settings_prints_stop_hotkey -q` | exit 0 |
+| Plain `stop` is unchanged | `pytest tests/test_cli.py::test_plain_stop_records_nothing_and_never_resumes -q` | exit 0 (with the default `stop_hotkey`, stop writes no record and never speaks) |
+| Resume overlaps the last word | `grep -q '_RESUME_REWIND' vocalize/interrupted.py && pytest tests/test_dictate.py::test_resume_rewinds_one_second_before_the_pause_point -q` | exit 0 (the slice equals offset minus one second at 1.0 s, and the whole file at 0.4 s) |
+| Failure modes pinned | `pytest tests/test_dictate.py::test_dictation_while_paused_never_offers_the_paused_read tests/test_dictate.py::test_resume_with_an_installed_but_unusable_provider_reports_and_keeps_the_record tests/test_cli.py::test_two_resumes_do_not_corrupt_the_record -q` | exit 0 |
+| Swift untouched | `git diff --quiet main -- vocalize/menubar/ && git diff --quiet main -- vocalize/recorder/` | exit 0 |
+| Docs name the verb | `grep -q 'vocalize pause' README.md && grep -q 'vocalize pause' docs/dictation.md && grep -q 'vocalize pause' CHANGELOG.md` | exit 0 |
+| Suite intact | unit tests + lint | exit 0 |
+
 ## Phase 12 exit (release 0.13.1)
 
 Review section closed in `review-0.13.0.md`; docs match; digests equal.
@@ -153,6 +169,25 @@ Review section closed in `review-0.13.0.md`; docs match; digests equal.
 | Threads clean | `pytest tests/test_notes.py -q -k threads` | exit 0 |
 | Real audio | manual check 13 | note written; constants match the verdict |
 
+## Phase 15b exit (recording pause)
+
+| Criterion | How it is proven | Passing when |
+|---|---|---|
+| The flags exist | `.venv/bin/vocalize dictate --help \| grep -q -- '--pause' && .venv/bin/vocalize dictate --help \| grep -q -- '--resume'` | exit 0 |
+| Pause and resume mechanics | `pytest tests/test_dictate.py::test_pause_finalises_a_segment_and_leaves_the_session_claimed tests/test_dictate.py::test_resume_launches_a_second_recorder_with_the_remaining_budget tests/test_dictate.py::test_resume_max_never_falls_below_one_second -q` | exit 0 (the segment is readable by `wave`, the marker is 0600, the fake recorder's argv carries the remaining seconds and never zero) |
+| The frozen app learns nothing new | `pytest tests/test_dictate.py::test_session_state_stays_recording_while_paused -q` | exit 0 (the session JSON never contains "paused") |
+| Both budgets bound the take | `grep -q 'max_take_seconds' vocalize/config.py && pytest tests/test_dictate.py::test_resume_refuses_a_twenty_first_segment tests/test_dictate.py::test_resume_refuses_past_the_take_budget tests/test_config.py::test_max_take_seconds_bounds -q` | exit 0 |
+| Backstop and marker are safe against a stale or corrupt take | `pytest tests/test_dictate.py::test_wait_for_exit_backstop_uses_the_segment_start_not_the_take_start tests/test_dictate.py::test_resume_treats_a_corrupt_paused_marker_as_no_pause -q` | exit 0 (a segment older than `max_seconds` is never SIGTERMed mid-write; a NaN, negative or unparsable marker is treated as no pause) |
+| A self-stopped segment tells the user | `pytest tests/test_dictate.py::test_segment_self_stop_at_max_notifies_before_the_mic_closes -q` | exit 0 (stop cue plus a notification, never a silently closed mic) |
+| Transcription budget scales with the take | `pytest tests/test_dictate.py::test_transcribe_timeout_scales_with_take_length -q` | exit 0 |
+| One WAV reaches the worker | `pytest tests/test_dictate.py::test_join_segments_frames_and_silence tests/test_dictate.py::test_joined_wav_keeps_16k_mono_16bit tests/test_dictate.py::test_cue_trimmed_per_segment_never_reaches_the_worker -q` | exit 0 (frames equal the sum of the segments plus 0.25 s × 16000 × (n−1); 16 kHz mono 16-bit; no cue frames from any segment) |
+| A forgotten pause loses nothing | `pytest tests/test_dictate.py::test_toggle_while_paused_stops_and_transcribes tests/test_dictate.py::test_cancel_while_paused_removes_every_segment tests/test_dictate.py::test_paused_workdir_younger_than_24h_is_not_swept -q` | exit 0 (never the dead-recorder failure path, never the 2 s cancel window; a workdir under 24 h with a marker keeps its segments) |
+| Stop precedence | `pytest tests/test_cli.py::test_stop_pauses_a_live_recording_before_playback tests/test_cli.py::test_stop_resumes_a_paused_recording tests/test_cli.py::test_unknown_session_state_falls_through_to_playback -q` | exit 0 |
+| Neither Swift source touched | `git diff --quiet main -- vocalize/recorder/ && git diff --quiet main -- vocalize/menubar/` | exit 0 |
+| Docs carry the flag and the budget | `grep -q 'dictate --pause' docs/dictation.md && grep -q 'max_take_seconds' docs/dictation.md && grep -q 'dictate --pause' CHANGELOG.md` | exit 0 |
+| Real audio | manual checks 17 and 18 | both halves in the transcript; six seam numbers in `spike-notes.md` § Pause |
+| Suite intact | unit tests + lint | exit 0 |
+
 ## Phase 16 exit (release 0.14.0)
 
 Same three rows as Phase 6 against `review-0.14.0.md`.
@@ -175,3 +210,7 @@ Only what cannot be automated; performed with the owner present on the reference
 12. **Parakeet spike (0.14.0, T-120).** The owner reads the jargon clip; numbers as specified.
 13. **Real audio (0.14.0, T-146).** A 60-minute recording through `vocalize notes`; note the wall time, memory, any looping; one note written; the summary reads sensibly for the template. During the summary, start a Kokoro read and record the peak combined RSS with Claude Code and a browser open.
 14. **Cloud paths (0.14.0).** `--summarizer claude-cli` and `--summarizer anthropic` on a 5-minute file: one egress line each; `left_machine: true` in both notes; the transcript-only note when the model is uninstalled.
+15. **Playback pause (0.13.1, T-106, T-108).** Start a long Kokoro read. Run `vocalize pause` mid-sentence from a second terminal: silence within a second. `vocalize resume`: the read continues about a word before where it stopped, in the same voice and speed. Repeat with an ElevenLabs read, pausing in the gap between two spoken pieces, and confirm the continuation starts at the piece that was never heard. Then pause, dictate with the hotkey, and confirm no "Continue the read?" dialog appears and `vocalize resume` still works afterwards.
+16. **Pause on the chord (0.13.1, T-107, only if DEC-036 ships the hotkey key).** Set `[app] stop_hotkey = "pause"`. Press control-option-command-X during a `/speak` read: it pauses. Press again: it continues. Confirm no rebuild and no permission prompt. Pause a read, start a dictation with the hotkey, then press the stop chord mid-recording: confirm it ends the recording and does not resume the paused read into the open microphone. Set the key back to `"stop"` and confirm the same chord silences a read and leaves nothing to resume.
+17. **Recording pause (0.14.0, T-147, T-148).** Start a dictation, speak, `vocalize dictate --pause`, wait 30 s, resume, speak, stop. The transcript carries both halves in order with no repeated or dropped word at the seam. With a stopwatch, measure resume-command to Tink three times on the built-in microphone and three times on a Bluetooth input; record the six numbers in `spike-notes.md` § Pause. If the Bluetooth gap is over two seconds, say so in `report.md` — it decides whether pause is usable for memos.
+18. **A long take (0.14.0, T-147, T-149).** First raise `[stt] max_seconds` to 600 — at the default 120 s, three pauses is only four segments (eight minutes), never ten; the check is unreachable at the default. A take over ten minutes across three pauses: it transcribes as one continuous transcript, `[stt] max_take_seconds` stops it at the cap, and the temporary directory is gone afterwards (`ls` under `$TMPDIR`). Note what the menu-bar icon does while paused — it still says recording by design, so record whether that misled you. Also let one segment self-stop at `--max` while still talking (no explicit pause): confirm the stop cue plays and a notification says the microphone closed, rather than the mic staying shut in silence.

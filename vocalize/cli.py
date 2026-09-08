@@ -36,6 +36,7 @@ from .audio import play as play_audio
 from .audio import play_sequence, stop_playback, take_gap_stop
 from .audio import save as save_audio
 from .auth import (
+    CREDENTIAL_CHOICES,
     PROVIDER_LABELS,
     PROVIDER_NAMES,
     PROVIDER_USERNAMES,
@@ -47,6 +48,7 @@ from .auth import (
     probe_keychain,
     prompt_for_key,
     stored_key,
+    validated_on,
 )
 from .chain import run as chain_run
 from .chain import unheard_text as chain_unheard
@@ -61,6 +63,7 @@ from .config import (
     load_config_file,
     resolve_api_key,
     resolve_chain,
+    resolve_notes,
     resolve_overflow,
     resolve_provider_settings,
     resolve_settings,
@@ -488,9 +491,14 @@ def settings() -> None:
     stt = resolve_stt(file_config)
     click.echo(f"stt.model={stt['model']}")
     click.echo(f"stt.language={stt['language']}")
-    click.echo(f"stt.cleanup={'true' if stt['cleanup'] else 'false'}")
+    click.echo(f"stt.beam_size={stt['beam_size']}")
+    click.echo(f"stt.cleanup={stt['cleanup']}")
+    click.echo(f"stt.verbatim={'true' if stt['verbatim'] else 'false'}")
     click.echo(f"stt.max_seconds={stt['max_seconds']}")
     click.echo(f"stt.cues={stt['cues']}")
+    notes = resolve_notes(file_config)
+    click.echo(f"notes.summarizer={notes['summarizer']}")
+    click.echo(f"notes.template={notes['template']}")
 
 
 @main.command()
@@ -666,8 +674,8 @@ def _ledger_line(name: str, file_config: dict) -> str:
     # A provider a real quota error marked exhausted has to say so whether
     # or not a local budget was ever set — the no-budget line is the common
     # case, and used to hide it.
-    if budget:
-        percent = used / budget * 100
+    if budget is not None:
+        percent = used / budget * 100 if budget else 100.0
         flag = " EXHAUSTED" if exhausted or used >= budget else ""
         return f"{name}: {used:,} / {budget:,} {unit} ({percent:.1f}%){flag}"
     flag = " EXHAUSTED" if exhausted else ""
@@ -679,7 +687,7 @@ def _ledger_line(name: str, file_config: dict) -> str:
 def usage(api_key) -> None:
     """Show per-provider budget usage, ElevenLabs quota, and local cache stats."""
     file_config = load_config_file()
-    for name in PROVIDER_NAMES:
+    for name in PROVIDER_NAMES + ("anthropic",):  # the cleanup backend has a budget too
         click.echo(_ledger_line(name, file_config))
     click.echo("")
 
@@ -988,16 +996,20 @@ def _listen_list_devices() -> None:
             )
 
 
-def _stt_options(cleanup: bool, max_seconds: int | None) -> dict:
+def _stt_options(cleanup: bool, verbatim: bool, max_seconds: int | None) -> dict:
     """The `[stt]` table with this invocation's overrides applied.
 
     `--max-seconds` is range-checked by click, so both routes into these
     values — the config file and the flag — are validated before any of
-    them can become a recorder argument.
+    them can become a recorder argument. A bare `--cleanup` keeps its
+    0.10 meaning: the configured backend, else `claude -p`.
     """
     stt = resolve_stt(load_config_file())
-    if cleanup:
-        stt["cleanup"] = True
+    if cleanup and stt["cleanup"] == "off":
+        # ponytail: 0.14.0 prefers an installed local model here.
+        stt["cleanup"] = "claude-cli"
+    if verbatim:
+        stt["verbatim"] = True
     if max_seconds is not None:
         stt["max_seconds"] = max_seconds
     return stt
@@ -1044,10 +1056,13 @@ def _print_transcript(text: str | None) -> None:
 @click.option("--wav", type=click.Path(path_type=Path), default=None,
               help="Transcribe an existing 16 kHz mono 16-bit WAV instead of recording.")
 @click.option("--cleanup", is_flag=True,
-              help="Tidy the transcript with Claude before delivering it.")
+              help="Tidy the transcript with a language model before delivering it "
+                   "(the configured [stt] cleanup backend, else claude -p).")
+@click.option("--verbatim", is_flag=True,
+              help="Keep every word: fix punctuation and casing only, no dropped restatements.")
 @click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
               help="Stop recording after this many seconds (default: [stt] max_seconds).")
-def listen(check_only, list_devices, toggle, cancel, wav, cleanup, max_seconds) -> None:
+def listen(check_only, list_devices, toggle, cancel, wav, cleanup, verbatim, max_seconds) -> None:
     """Record from the microphone and print what was said.
 
     \b
@@ -1071,7 +1086,7 @@ def listen(check_only, list_devices, toggle, cancel, wav, cleanup, max_seconds) 
     if len(modes) > 1:
         raise click.UsageError(f"Use only one of {', '.join(modes)}.")
 
-    stt = _stt_options(cleanup, max_seconds)
+    stt = _stt_options(cleanup, verbatim, max_seconds)
     try:
         if cancel:
             sys.exit(dictate.cancel(stt))
@@ -1089,10 +1104,12 @@ def listen(check_only, list_devices, toggle, cancel, wav, cleanup, max_seconds) 
 
 @main.command("dictate")
 @click.option("--cleanup", is_flag=True,
-              help="Tidy the transcript with Claude before copying it.")
+              help="Tidy the transcript with a language model before copying it.")
+@click.option("--verbatim", is_flag=True,
+              help="Keep every word: fix punctuation and casing only.")
 @click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
               help="Stop recording after this many seconds (default: [stt] max_seconds).")
-def dictate_cmd(cleanup, max_seconds) -> None:
+def dictate_cmd(cleanup, verbatim, max_seconds) -> None:
     """Start a dictation, or stop the one already running.
 
     The same thing as `vocalize listen --toggle`, under the name the
@@ -1100,7 +1117,7 @@ def dictate_cmd(cleanup, max_seconds) -> None:
     copy what you said to the clipboard.
     """
     try:
-        sys.exit(dictate.toggle(_stt_options(cleanup, max_seconds)))
+        sys.exit(dictate.toggle(_stt_options(cleanup, verbatim, max_seconds)))
     except DictationError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1119,8 +1136,9 @@ def auth() -> None:
 @auth.command("login")
 @click.option("--stdin", "from_stdin", is_flag=True,
               help="Read the key from stdin instead of prompting, for piping from a secret manager.")
-@click.option("--provider", type=click.Choice(PROVIDER_NAMES), default="elevenlabs",
-              help="Provider to store a key for (default: elevenlabs).")
+@click.option("--provider", type=click.Choice(CREDENTIAL_CHOICES), default="elevenlabs",
+              help="Provider to store a key for (default: elevenlabs; anthropic is the "
+                   "cleanup and notes backend, not a voice).")
 def auth_login(from_stdin, provider) -> None:
     """Validate an API key and save it in the system keychain."""
     if provider == "polly":
@@ -1155,6 +1173,9 @@ def _print_elevenlabs_status() -> None:
     if source != "not found":
         click.echo(f"API key source: {source}")
         click.echo(f"Key: {masked(resolve_api_key())}")
+        stamp = validated_on() if source == "keychain" else None
+        if stamp:
+            click.echo(f"Validated: {stamp}")
         return
 
     # key_source flattens an unreadable keychain into "not found" so that
@@ -1170,7 +1191,7 @@ def _print_elevenlabs_status() -> None:
 
 def _provider_status_line(name: str, file_config: dict | None = None) -> str:
     """One-line credential status for any provider other than ElevenLabs."""
-    if name in ("openai", "google"):
+    if name in ("openai", "google", "anthropic"):
         source = key_source(None, name)
         if source == "not found":
             # key_source flattens an unreadable keychain into "not found";
@@ -1180,7 +1201,9 @@ def _provider_status_line(name: str, file_config: dict | None = None) -> str:
                 return f"{name}: keychain unavailable ({reason})"
             return f"{name}: not configured"
         if source == "keychain":
-            return f"{name}: keychain ({masked(stored_key(name))})"
+            stamp = validated_on(name)
+            suffix = f", validated {stamp}" if stamp else ""
+            return f"{name}: keychain ({masked(stored_key(name))}{suffix})"
         return f"{name}: {source}"
     if name == "polly":
         if file_config is None:
@@ -1194,7 +1217,7 @@ def _provider_status_line(name: str, file_config: dict | None = None) -> str:
 
 
 @auth.command("status")
-@click.option("--provider", type=click.Choice(PROVIDER_NAMES), default=None,
+@click.option("--provider", type=click.Choice(CREDENTIAL_CHOICES), default=None,
               help="Show only this provider's status (default: ElevenLabs, "
               "plus one line per other provider in the resolved chain).")
 def auth_status(provider) -> None:
@@ -1209,7 +1232,7 @@ def auth_status(provider) -> None:
 
     file_config = load_config_file()
     others = [p for p in resolve_chain(None, file_config) if p != "elevenlabs"]
-    for p in ("openai", "google"):
+    for p in ("openai", "google", "anthropic"):
         if p not in others and stored_key(p):
             others.append(p)
     for p in others:
@@ -1217,7 +1240,7 @@ def auth_status(provider) -> None:
 
 
 @auth.command("logout")
-@click.option("--provider", type=click.Choice(PROVIDER_NAMES), default="elevenlabs",
+@click.option("--provider", type=click.Choice(CREDENTIAL_CHOICES), default="elevenlabs",
               help="Provider to remove a stored key for (default: elevenlabs).")
 def auth_logout(provider) -> None:
     """Remove a stored API key from the system keychain."""
@@ -1343,7 +1366,7 @@ def _require_uv(uv: str | None) -> str:
 )
 @click.option(
     "--model", "model_name", default=None, metavar="NAME",
-    help="Which speech-to-text model to install (--stt only; default: small.en).",
+    help="Which speech-to-text model to install (--stt only; default: large-v3-turbo-q5_0).",
 )
 def local_install(yes, stt, model_name) -> None:
     """Download and verify a local runtime's model files, then warm it."""

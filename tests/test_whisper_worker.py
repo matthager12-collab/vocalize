@@ -99,6 +99,7 @@ class StubModel:
     def __init__(self, model_path, n_threads=None, **kwargs):
         self.model_path = model_path
         self.n_threads = n_threads
+        self.kwargs = kwargs
         self.calls = []
         StubModel.instances.append(self)
 
@@ -107,6 +108,14 @@ class StubModel:
         if "boom" in media:
             raise RuntimeError("whisper\nfell over\nmid-decode")
         return [StubSegment(" hello"), StubSegment(" there")]
+
+
+class NoLeadingSpaceModel(StubModel):
+    """The turbo models: segments arrive without a leading space."""
+
+    def transcribe(self, media, language=None, **params):
+        self.calls.append((media, language))
+        return [StubSegment("Working."), StubSegment("I want the fix in."), StubSegment("  ")]
 
 
 class BrokenModel:
@@ -130,9 +139,71 @@ def write_wav(path, frames=b"\x00\x00" * 8000, channels=1, width=2, rate=16000):
         writer.writeframes(frames)
 
 
-def run_transcribe(worker, wav, language="en"):
-    code = worker.main(["--model", "m.bin", "--language", language, "--transcribe", str(wav)])
+def run_transcribe(worker, wav, language="en", beam_size=None):
+    argv = ["--model", "m.bin", "--language", language, "--transcribe", str(wav)]
+    if beam_size is not None:
+        argv += ["--beam-size", str(beam_size)]
+    code = worker.main(argv)
     return code
+
+
+def test_segments_without_a_leading_space_are_still_joined_by_one(worker, monkeypatch, tmp_path, capsys):
+    # small.en segments start with a space; turbo's do not. Either way the
+    # sentences must not run together, and an all-blank segment adds nothing.
+    monkeypatch.setattr(worker, "_model_class", lambda: NoLeadingSpaceModel)
+    wav = tmp_path / "take.wav"
+    write_wav(wav)
+
+    run_transcribe(worker, wav)
+
+    reply = json.loads(capsys.readouterr().out.strip())
+    assert reply == {"ok": True, "text": "Working. I want the fix in."}
+
+
+# --- decoding strategy (issue #4) --------------------------------------
+
+
+def test_beam_search_with_five_beams_is_the_default(worker, tmp_path):
+    wav = tmp_path / "take.wav"
+    write_wav(wav)
+
+    run_transcribe(worker, wav)
+
+    assert StubModel.instances[0].kwargs == {
+        "params_sampling_strategy": 1,
+        "beam_search": {"beam_size": 5, "patience": -1.0},
+    }
+
+
+def test_beam_size_one_keeps_the_greedy_decoder(worker, tmp_path):
+    # The 0.10.x behaviour, kept as the escape hatch: no strategy kwargs at
+    # all, so pywhispercpp's own greedy default applies.
+    wav = tmp_path / "take.wav"
+    write_wav(wav)
+
+    run_transcribe(worker, wav, beam_size=1)
+
+    assert StubModel.instances[0].kwargs == {}
+
+
+def test_a_larger_beam_size_reaches_the_model(worker, tmp_path):
+    wav = tmp_path / "take.wav"
+    write_wav(wav)
+
+    run_transcribe(worker, wav, beam_size=8)
+
+    assert StubModel.instances[0].kwargs["beam_search"] == {"beam_size": 8, "patience": -1.0}
+
+
+@pytest.mark.parametrize("beam_size", [0, 9, -1])
+def test_a_beam_size_off_the_range_is_refused_by_the_parser(worker, tmp_path, beam_size):
+    wav = tmp_path / "take.wav"
+    write_wav(wav)
+
+    with pytest.raises(SystemExit):
+        run_transcribe(worker, wav, beam_size=beam_size)
+
+    assert StubModel.instances == []
 
 
 def test_a_good_transcription_prints_exactly_one_ok_line(worker, tmp_path, capsys):

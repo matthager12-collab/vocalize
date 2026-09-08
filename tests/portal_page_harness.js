@@ -305,6 +305,107 @@ const scenarios = {
     assert.strictEqual(alert.hidden, true, "the next keystroke clears the banner");
   },
 
+  /* The Keys tab lists the slots the server names in `keys` — the Anthropic
+   * one among them, a key without a voice — with the validation stamp, a
+   * test that stores nothing, and a two-click remove. A typed key never
+   * lands in any text. */
+  async keyslots(portal) {
+    const data = statePayload("f0", ["elevenlabs"], {
+      elevenlabs: providerEntry("ElevenLabs", { source: "keychain", masked: "sk-a…" })
+    });
+    data.keys = {
+      elevenlabs: { label: "ElevenLabs", source: "keychain", masked: "sk-a…", validated: "2026-09-07" },
+      openai: { label: "OpenAI", source: "not found", masked: null, validated: null },
+      google: { label: "Google Cloud", source: "environment", masked: "AIza…", validated: null },
+      anthropic: { label: "Anthropic", source: "not found", masked: null, validated: null }
+    };
+    const panel = new Node("section");
+    portal.renderers.keys(panel, data);
+    assert.strictEqual(panel.find((node) => node.className === "summary").textContent, "2 keys stored: ElevenLabs, Google Cloud");
+    const cards = panel.findAll((node) => node.className === "card");
+    assert.strictEqual(cards.length, 4, "one card per key slot, none for say, kokoro or polly");
+    assert.ok(cards[3].find((node) => node.textContent === "Anthropic"), "the fourth card is the Anthropic slot");
+    const stamps = panel.findAll((node) => node.className === "hint stamp");
+    assert.strictEqual(stamps.length, 1, "a stamp only where the server gave a date");
+    assert.strictEqual(stamps[0].textContent, "Last checked with ElevenLabs on 2026-09-07.");
+    assert.strictEqual(cards[0].children.indexOf(stamps[0]), 3, "right under the key line and its source");
+    panel.findAll((node) => node.type === "password").forEach((box) => {
+      assert.strictEqual(box.autocomplete, "new-password");
+    });
+
+    // Test without storing, on the Anthropic card: a refused key is cleared,
+    // an accepted one stays put so "Store this key" is the next click.
+    const TYPED = "sk-ant-typed-secret-4242";
+    const anthropic = cards[3];
+    const box = anthropic.find((node) => node.type === "password");
+    const test = anthropic.find((node) => node.textContent === "Test without storing");
+    const status = anthropic.find((node) => node.className === "status");
+    const texts = (root) => root.findAll((node) => node.textContent.indexOf(TYPED) !== -1);
+    box.value = TYPED;
+    test.fire("click");
+    await settle();
+    assert.strictEqual(box.disabled, true, "the field is locked while the check runs");
+    const first = take("POST /api/auth/test/anthropic");
+    assert.deepStrictEqual(sent(first), { key: TYPED }, "the key goes in the body, under no other name");
+    first.resolve(answer({ ok: true, valid: false, message: "Anthropic refused that key." }));
+    await settle();
+    assert.strictEqual(box.value, "", "a refused key is not left in the field");
+    assert.strictEqual(status.textContent, "Anthropic refused that key.");
+    assert.deepStrictEqual(texts(panel), [], "the typed key is in no text");
+    box.value = TYPED;
+    test.fire("click");
+    await settle();
+    take("POST /api/auth/test/anthropic").resolve(answer({ ok: true, valid: true, message: "Anthropic accepted the key. Nothing was stored." }));
+    await settle();
+    assert.strictEqual(box.value, TYPED, "an accepted key stays for Store this key");
+    assert.strictEqual(box.disabled, false);
+    assert.deepStrictEqual(texts(panel), [], "still in no text");
+    assert.deepStrictEqual(pending, [], "a test fetches nothing else: no state, no voices");
+    noBanner();
+    // A check that could not happen is not a verdict: the key stays, the
+    // banner says why, and the next keystroke clears it.
+    test.fire("click");
+    await settle();
+    take("POST /api/auth/test/anthropic").resolve(refusal(502, "Could not reach Anthropic to check the key: HTTP 503."));
+    await settle();
+    assert.strictEqual(box.value, TYPED, "an unreachable provider does not cost the key");
+    assert.strictEqual(document.getElementById("alert").hidden, false, "the failure is shown");
+    assert.deepStrictEqual(texts(document.getElementById("alert")), [], "and does not quote the key");
+    box.fire("input");
+    noBanner();
+
+    // Storing the Anthropic key refreshes no voice list: it is not a voice.
+    anthropic.find((node) => node.textContent === "Store this key").fire("click");
+    await settle();
+    take("POST /api/auth/login").resolve(answer({ ok: true, message: "Stored." }));
+    await settle();
+    take("GET /api/state").resolve(answer(data));
+    await settle();
+    assert.deepStrictEqual(pending, [], "no GET /api/voices/anthropic: the slot has no voices to ask for");
+    assert.strictEqual(box.value, "", "the stored key does not stay in the field");
+
+    // Remove: only where the key is in the keychain, and armed by a first click.
+    assert.strictEqual(anthropic.find((node) => node.textContent === "Remove stored key"), null, "nothing stored, nothing to remove");
+    assert.strictEqual(cards[2].find((node) => node.textContent === "Remove stored key"), null, "an environment key is the shell's");
+    const drop = cards[0].find((node) => node.textContent === "Remove stored key");
+    assert.ok(drop, "a keychain key can be forgotten from here");
+    drop.fire("click");
+    await settle();
+    assert.strictEqual(drop.textContent, "Really remove it?");
+    assert.deepStrictEqual(pending, [], "the first click only arms the button");
+    drop.fire("click");
+    await settle();
+    take("POST /api/auth/remove/elevenlabs").resolve(answer({ ok: true, removed: true, message: "Removed." }));
+    await settle();
+    take("GET /api/state").resolve(answer(data));
+    await settle();
+    assert.strictEqual(document.getElementById("panel-keys").hidden, false);
+    take("GET /api/voices/elevenlabs").resolve(answer({ voices: [], source: "none" }));
+    await settle();
+    assert.deepStrictEqual(pending, [], "then the state and that provider's voices, nothing else");
+    noBanner();
+  },
+
   /* The error banner is a live region: shown first, then filled, so it is
    * announced. A dead page is out of the tab order, not only out of the
    * mouse's reach. */
@@ -647,7 +748,7 @@ const scenarios = {
     assert.strictEqual(stt.textContent, "Install speech to text");
     stt.fire("click");
     await settle();
-    assert.deepStrictEqual(sent(take("POST /api/local/install/start")), { target: "stt", model: "small.en" });
+    assert.deepStrictEqual(sent(take("POST /api/local/install/start")), { target: "stt", model: "large-v3-turbo-q5_0" });
 
     // A key row: Open Keys switches tabs. The budget row has the same name
     // and another state, and stays a line of text.

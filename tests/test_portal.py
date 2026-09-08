@@ -592,8 +592,8 @@ def test_state_blocked_key_probe_reports_checking_and_returns(portal, monkeypatc
             "source": "checking",
             "masked": None,
         }
-        # One thread per key-carrying provider, however often the page polls.
-        assert sorted(started) == ["elevenlabs", "google", "openai"]
+        # One thread per key slot, however often the page polls.
+        assert sorted(started) == ["anthropic", "elevenlabs", "google", "openai"]
     finally:
         release.set()
 
@@ -1268,8 +1268,37 @@ def test_state_renders_a_config_value_json_cannot_serialize(portal, tmp_path):
 
     status, _, raw = portal.route("GET", "/api/state", _authed(portal))
 
+    # Since 0.12.0 a non-string voice is refused when the file is read
+    # (issue #5), so the page gets a config_error naming it instead of a
+    # date object it cannot serialize — and stays up either way.
     assert status == 200
-    assert json.loads(raw)["providers"]["say"]["settings"]["voice"] == "1979-05-27"
+    body = json.loads(raw)
+    assert "voice" in body["config_error"] and "[providers.say]" in body["config_error"]
+
+
+def test_state_reports_a_wrong_provider_voice_type_in_config_error(portal, tmp_path):
+    _write_config(tmp_path, 'chain = ["say"]\n[providers.elevenlabs]\nvoice = 12345\n')
+    _exchange(portal)
+
+    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
+
+    assert status == 200
+    body = json.loads(raw)
+    assert "voice" in body["config_error"] and "12345" in body["config_error"]
+
+
+def test_writing_a_provider_voice_type_that_is_not_a_string_is_400(portal, tmp_path):
+    _write_config(tmp_path, 'chain = ["say"]\n')
+    _exchange(portal)
+    fingerprint = json.loads(portal.route("GET", "/api/state", _authed(portal))[2])["fingerprint"]
+
+    status, _, raw = portal.route(
+        "POST", "/api/provider/elevenlabs", _authed(portal),
+        json.dumps({"settings": {"voice": 12345}, "fingerprint": fingerprint}).encode(),
+    )
+
+    assert status == 400
+    assert "voice" in json.loads(raw)["error"]
 
 
 def test_a_bug_in_route_is_a_500_not_a_dropped_connection(monkeypatch):
@@ -2055,6 +2084,8 @@ _WRITE_ROUTES = (
     ("/api/provider/elevenlabs", {"settings": {"voice": "abc"}}),
     ("/api/stt", {"settings": {"model": "base.en"}}),
     ("/api/auth/login", {"provider": "elevenlabs", "key": CANARY}),
+    ("/api/auth/test/anthropic", {"key": CANARY}),
+    ("/api/auth/remove/anthropic", {}),
 )
 
 
@@ -3833,3 +3864,256 @@ def test_a_refused_key_leaves_the_remembered_list_alone(
 
     assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "cached"
     assert fake_provider.listed == 1
+
+
+# --- the Anthropic key slot: state, login, test, remove ------------------
+
+
+ANTHROPIC_USERNAME = "anthropic-api-key"
+
+
+def test_anthropic_state_lists_every_key_slot_without_a_key(portal, fake_keychain):
+    """`keys` is the Keys tab's listing: one entry per slot that stores a
+    key, the Anthropic one included, with the stamp and never the key.
+    `providers` stays the chain's set, so the other tabs see no new voice."""
+    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
+    _exchange(portal)
+    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
+
+    assert status == 200
+    assert CANARY.encode() not in raw
+    payload = json.loads(raw)
+    assert tuple(payload["keys"]) == portal_module.auth.KEY_SLOTS
+    assert "anthropic" not in payload["providers"]
+    slot = payload["keys"]["anthropic"]
+    assert slot == {"label": "Anthropic", "source": "keychain", "masked": "sk-c…", "validated": None}
+    assert payload["keys"]["elevenlabs"]["source"] == "not found"
+    assert set(payload["providers"]["elevenlabs"]["key"]) == {"source", "masked"}
+
+
+def test_anthropic_login_stores_under_its_own_username(portal, fake_keychain, no_network_validate):
+    _exchange(portal)
+    status, headers, body = portal.route(
+        "POST",
+        "/api/auth/login",
+        _authed(portal),
+        json.dumps({"provider": "anthropic", "key": CANARY}).encode(),
+    )
+
+    assert status == 200
+    assert CANARY.encode() not in body
+    assert CANARY not in json.dumps(headers)
+    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
+    assert len(fake_keychain) == 1
+
+
+def test_anthropic_test_without_storing_leaves_the_keychain_untouched(
+    portal, fake_keychain, no_network_validate
+):
+    _exchange(portal)
+    status, headers, body = portal.route(
+        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": CANARY}).encode()
+    )
+
+    assert status == 200
+    assert CANARY.encode() not in body
+    assert CANARY not in json.dumps(headers)
+    assert json.loads(body) == {
+        "ok": True,
+        "valid": True,
+        "message": "Anthropic accepted the key. Nothing was stored.",
+    }
+    assert not fake_keychain
+
+
+def test_anthropic_test_without_storing_reports_a_bad_key_without_it(portal, fake_keychain, monkeypatch):
+    def leaky(key, provider):
+        raise portal_module.VocalizeError(f"HTTP 401 for key {key}")
+
+    monkeypatch.setattr(portal_module.auth, "validate_key", leaky)
+    _exchange(portal)
+    status, _, body = portal.route(
+        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": CANARY}).encode()
+    )
+
+    assert status == 200
+    assert CANARY.encode() not in body
+    payload = json.loads(body)
+    assert payload["valid"] is False
+    assert "[key]" in payload["message"]
+    assert not fake_keychain
+
+
+@pytest.mark.parametrize("key", ["sk-ant-abc\x00def", "sk-ant-abc def", "sk-ant-\u00a0"])
+def test_anthropic_test_refuses_a_control_character_key_before_any_request(
+    portal, fake_keychain, monkeypatch, key
+):
+    def never(*_a, **_k):
+        raise AssertionError("the provider was called with a malformed key")
+
+    monkeypatch.setattr(portal_module.auth, "validate_key", never)
+    _exchange(portal)
+    status, _, body = portal.route(
+        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": key}).encode()
+    )
+
+    assert status == 400
+    assert key.encode() not in body
+    assert b"control characters" in body
+    assert not fake_keychain
+
+
+@pytest.mark.parametrize("payload", [{}, {"key": ""}, {"key": 7}, {"key": None}])
+def test_anthropic_test_without_a_key_is_400(portal, no_network_validate, payload):
+    _exchange(portal)
+    status, body = _post(portal, "/api/auth/test/anthropic", payload)
+
+    assert status == 400
+    assert "nothing was tested" in body["error"]
+
+
+def test_anthropic_remove_reports_the_read_back(portal, fake_keychain):
+    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
+    fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] = "sk-other-0000000000000000"
+    _exchange(portal)
+    status, _, body = portal.route("POST", "/api/auth/remove/anthropic", _authed(portal), b"{}")
+
+    assert status == 200
+    assert CANARY.encode() not in body
+    assert json.loads(body)["removed"] is True
+    assert (portal_module.auth.SERVICE, ANTHROPIC_USERNAME) not in fake_keychain
+    assert fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")].startswith("sk-other")
+
+    status, body = _post(portal, "/api/auth/remove/anthropic", {})
+    assert status == 200
+    assert body["removed"] is False
+
+
+def test_anthropic_remove_that_is_denied_is_a_400_not_a_claim(portal, fake_keychain):
+    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
+    fake_keychain.deny_delete = True
+    _exchange(portal)
+    status, _, body = portal.route("POST", "/api/auth/remove/anthropic", _authed(portal), b"{}")
+
+    assert status == 400
+    assert CANARY.encode() not in body
+    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
+
+
+@pytest.mark.parametrize("path", ["/api/auth/remove/say", "/api/auth/remove/polly", "/api/auth/remove/nope"])
+def test_remove_of_an_unknown_slot_is_404_without_reflecting_it(portal, fake_keychain, path):
+    fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] = CANARY
+    _exchange(portal)
+    status, _, body = portal.route("POST", path, _authed(portal), b"{}")
+
+    assert status == 404
+    assert b"nope" not in body
+    assert fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] == CANARY
+
+
+@pytest.mark.parametrize("path", ["/api/auth/test/say", "/api/auth/test/kokoro", "/api/auth/test/nope"])
+def test_anthropic_test_of_an_unknown_slot_is_404(portal, fake_keychain, monkeypatch, path):
+    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: pytest.fail("called"))
+    _exchange(portal)
+    status, _, body = portal.route("POST", path, _authed(portal), json.dumps({"key": CANARY}).encode())
+
+    assert status == 404
+    assert CANARY.encode() not in body
+    assert b"nope" not in body
+
+
+@pytest.mark.parametrize("path", ["/api/auth/remove/anthropic", "/api/auth/test/anthropic"])
+def test_anthropic_routes_need_the_session_token(portal, fake_keychain, path):
+    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
+    status, _, body = portal.route("POST", path, _headers(), json.dumps({"key": CANARY}).encode())
+
+    assert status == 403  # the portal's answer to a missing token
+    assert CANARY.encode() not in body
+    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
+
+
+def test_anthropic_test_route_never_logs_the_key(capsys, fake_keychain, monkeypatch):
+    """Over a real socket, like the login route: http.server's own logging."""
+    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: None)
+    served = Portal(idle_timeout=300)
+    served.start()
+    try:
+        body = json.dumps({"key": CANARY}).encode()
+        raw = _raw(
+            served.port,
+            b"POST /api/auth/test/anthropic HTTP/1.1\r\nHost: "
+            + served.origin.encode()
+            + b"\r\n"
+            + TOKEN_HEADER.encode()
+            + b": "
+            + served._token.encode()
+            + b"\r\nContent-Length: "
+            + str(len(body)).encode()
+            + b"\r\n\r\n"
+            + body,
+        )
+        assert b" 200 " in raw
+        assert b"sk-canary" not in raw
+        captured = capsys.readouterr()
+        assert "sk-canary" not in captured.out
+        assert "sk-canary" not in captured.err
+        assert not fake_keychain
+    finally:
+        served.stop()
+
+
+def test_anthropic_remove_with_an_unreadable_keychain_is_a_400_not_nothing_stored(portal, fake_keychain):
+    """`stored_key` flattens a locked keychain into None; a user revoking a
+    leaked key must not be told nothing is stored while it still is."""
+    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
+    fake_keychain.deny_read = True
+    _exchange(portal)
+    status, _, body = portal.route("POST", "/api/auth/remove/anthropic", _authed(portal), b"{}")
+
+    assert status == 400
+    assert CANARY.encode() not in body
+    assert b"Could not read the keychain" in body
+    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
+
+
+def test_anthropic_test_reports_an_unreachable_provider_as_502_not_a_refusal(
+    portal, fake_keychain, monkeypatch
+):
+    def down(key, provider):
+        raise portal_module.ProviderTransientError("anthropic", f"HTTP 503 checking {key}")
+
+    monkeypatch.setattr(portal_module.auth, "validate_key", down)
+    _exchange(portal)
+    status, _, body = portal.route(
+        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": CANARY}).encode()
+    )
+
+    assert status == 502
+    assert CANARY.encode() not in body
+    assert b"[key]" in body and b"Could not reach Anthropic" in body
+    assert not fake_keychain
+
+
+def test_anthropic_test_refuses_an_oversized_key_before_any_request(portal, fake_keychain, monkeypatch):
+    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: pytest.fail("called"))
+    _exchange(portal)
+    status, body = _post(portal, "/api/auth/test/anthropic", {"key": "k" * 513})
+
+    assert status == 400
+    assert "longer than any provider" in body["error"]
+    assert not fake_keychain
+
+
+def test_state_reports_an_unreadable_keychain_as_error_not_missing(portal, fake_keychain, monkeypatch):
+    for name in portal_module.auth.PROVIDER_ENV_VARS.values():
+        monkeypatch.delenv(name, raising=False)
+    fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] = CANARY
+    fake_keychain.deny_read = True
+    _exchange(portal)
+    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
+
+    assert status == 200
+    assert CANARY.encode() not in raw
+    payload = json.loads(raw)
+    assert payload["providers"]["elevenlabs"]["key"] == {"source": "error", "masked": None}
+    assert payload["keys"]["anthropic"]["source"] == "error"

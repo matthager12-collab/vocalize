@@ -6,8 +6,8 @@ Date 2026-09-06. Plan: [plan.md](./plan.md). Execution: agent runs via `implemen
 
 | Factor | Comfortable | Consider splitting | This plan | Verdict |
 |---|---|---|---|---|
-| Total tasks | 1–25 | 25+ | 75 | over |
-| Phases with sequential dependencies | 1–3 | 4+ | 17 in one chain (Phase 17 hangs off nothing) | over |
+| Total tasks | 1–25 | 25+ | 82 | over |
+| Phases with sequential dependencies | 1–3 | 4+ | 19 in one chain (Phase 17 hangs off nothing) | over |
 | Distinct roles needed | 1–4 | 5+ | 9 (config and chain, keychain, Swift app, app lifecycle, readiness and portal, dictation core, runtime plumbing, notes, reviewers) | over |
 | Working directories / worktrees | 1 | 2+ | 4 branches in sequence off `main` plus scratch environments for the spikes; one checkout at a time | over |
 | Cross-cutting handoffs or gates | 0–2 | 3+ | 15 (four releases, five adversarial reviews, six owner-present spikes or checks) | over |
@@ -35,10 +35,12 @@ Date 2026-09-06. Plan: [plan.md](./plan.md). Execution: agent runs via `implemen
 | 9 doctor, integrate, setup | 3 edited + assets + 3 test | mechanical, ×1 |
 | 10 release 0.13.0 | docs + review | owner-gated |
 | 11 cue, hold, paste | 2 edited + 2 test | timing on real audio, ×3 |
+| 11b playback pause | 4 edited + 3 test | reuses a shipped mechanism, ×1 |
 | 12 release 0.13.1 | docs + review | owner-gated |
 | 13 spikes | scratch + decisions | interpreted, owner voice |
 | 14 local model | 2 new + 4 edited + 4 test | token-id prompt, manifest hardening, ×3 |
 | 15 notes | 1 new module + 4 assets + 2 edited + 3 test | untrusted-input paths, ×2 |
+| 15b recording pause | 3 edited + 3 test | segment joining and a survival branch, ×3 |
 | 16 release 0.14.0 | docs + review | owner-gated |
 | 17 optional spikes | scratch | owner present |
 
@@ -46,10 +48,10 @@ No single file approaches 1,000 lines after the split: `cli.py` (1,702 today) gr
 
 ## Recommendation
 
-**Split into eighteen runs**, one per phase with Phase 8 halved (Swift, then Python), exactly as [plan.md](./plan.md) § Suggested run boundaries proposes. Every run is sequential; there is no parallel branch this time, because each release is a hard stop and the four branches fork from `main` after the previous publish. No run exceeds about 20 hours; runs 1, 2, 4, 6, 10, 12, 13 and 16 are under 6 hours each, so a session with little usage left can still finish one. Sequence, tiers and handoffs are in [choreography.md](./choreography.md); each run's tasks, entry and exit criteria are in `run-N-*/project-plan.md` with a `validate-exit.sh` executed pre-build (artifact checks fail, regression checks pass; see the log summary in the choreography).
+**Split into twenty runs**, one per phase with Phase 8 halved (Swift, then Python) and pause inserted as Phases 11b and 15b, exactly as [plan.md](./plan.md) § Suggested run boundaries proposes. Every run is sequential; there is no parallel branch this time, because each release is a hard stop and the four branches fork from `main` after the previous publish. No run exceeds about 20 hours; runs 1, 2, 4, 6, 10, 11b, 12, 13 and 16 are under 6 hours each, so a session with little usage left can still finish one. Run 15b carries the same ×3 weighting as runs 11 and 14 (segment joining, budget arithmetic, a survival branch) and is not on that list, even though its estimate lands just under 6 hours — if it runs long the owner should let it spill into a second session rather than force it. Sequence, tiers and handoffs are in [choreography.md](./choreography.md); each run's tasks, entry and exit criteria are in `run-N-*/project-plan.md` with a `validate-exit.sh` executed pre-build (artifact checks fail, regression checks pass; see the log summary in the choreography).
 
 ## Open questions
 
-1. **Owner windows.** Runs 2 (two timing measurements), 4 (a possible keychain prompt), 6, 7 (three presses), 8b (the Accessibility click), 10, 11 (a Bluetooth input), 12, 13 (the jargon clip), 14 (a 3 GB download), 15 (a 60-minute recording), 16 and 17 need the owner at some point. Runs 1, 3, 5, 8a and 9 do not.
-2. **Merging small runs.** Runs 1 and 2 are each under four hours and may be executed back to back in one session without changing any document; the same holds for runs 12 and 13.
+1. **Owner windows.** Runs 2 (two timing measurements), 4 (a possible keychain prompt), 6, 7 (three presses), 8b (the Accessibility click), 10, 11 (a Bluetooth input), 11b (a real read and the chord), 12, 13 (the jargon clip), 14 (a 3 GB download), 15 (a 60-minute recording), 15b (a Bluetooth input and a long take), 16 and 17 need the owner at some point. Runs 1, 3, 5, 8a and 9 do not.
+2. **Merging small runs.** Runs 1 and 2 are each under four hours and may be executed back to back in one session without changing any document; the same holds for runs 12 and 13, and for runs 11b and 12.
 3. **Model tiers** are named per run in the choreography per the machine-wide rule (Sonnet for mechanical work, Opus only where judgement matters); an executor may step a tier up after a failed retry and must say so in `report.md`.

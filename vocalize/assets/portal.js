@@ -508,7 +508,11 @@ var COST = {
 };
 
 /** The speech-to-text models, allowlisted by the server too. */
-var STT_MODELS = ["base.en", "small.en", "large-v3-turbo-q5_0"];
+// `config.STT_CLEANUP_BACKENDS`, in its order. "local" is not built yet
+// (0.13); the two cloud ones send the transcript off this Mac.
+var STT_CLEANUP = ["off", "local", "claude-cli", "anthropic"];
+
+var STT_MODELS = ["base.en", "small.en", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0"];
 
 /** Where a stored API key was found. Eight values, not five: "checking"
  *  means the probe thread is still going and a later poll may answer,
@@ -1091,10 +1095,33 @@ function providerCard(data, name, entry) {
 
 // --- Keys -------------------------------------------------------------
 
+/* The slots this tab lists: `data.keys` (every slot that stores a key —
+ * the Anthropic one is a key without being a voice), each reshaped to the
+ * card's `{label, key}` form; a server without it falls back to the
+ * provider entries, which carry the same `key` object. */
+function keySlots(data) {
+  var slots = {};
+  if (data.keys) {
+    Object.keys(data.keys).forEach(function (name) {
+      var slot = data.keys[name];
+      slots[name] = {
+        label: slot.label,
+        key: { source: slot.source, masked: slot.masked, validated: slot.validated || null },
+        // A slot that is also a voice provider has a voice list to refresh
+        // after its key changes; the Anthropic slot has none to ask for.
+        voice: !!(data.providers && data.providers[name])
+      };
+    });
+    return slots;
+  }
+  return data.providers;
+}
+
 renderers.keys = function (panel, data) {
   panel.replaceChildren(el("h2", null, "API keys"));
-  var stored = Object.keys(data.providers).filter(function (name) {
-    return hasKey(data.providers[name]);
+  var slots = keySlots(data);
+  var stored = Object.keys(slots).filter(function (name) {
+    return hasKey(slots[name]);
   });
   panel.appendChild(
     el(
@@ -1105,7 +1132,7 @@ renderers.keys = function (panel, data) {
             (stored.length === 1 ? " key stored: " : " keys stored: ") +
             stored
               .map(function (name) {
-                return data.providers[name].label;
+                return slots[name].label;
               })
               .join(", ")
         : "No keys stored yet"
@@ -1117,12 +1144,13 @@ renderers.keys = function (panel, data) {
       "hint",
       "A key is checked with the provider before it is stored in the system " +
         "keychain, so saving one takes a few seconds. vocalize never shows a " +
-        "stored key again, and this page cannot delete one — run " +
-        "vocalize auth logout --provider <name> in a terminal for that."
+        "stored key again. Remove forgets one here; " +
+        "vocalize auth logout --provider <name> does the same from a terminal. " +
+        "Anthropic is the dictation cleanup and notes backend, not a voice."
     )
   );
-  Object.keys(data.providers).forEach(function (name) {
-    panel.appendChild(keyCard(name, data.providers[name]));
+  Object.keys(slots).forEach(function (name) {
+    panel.appendChild(keyCard(name, slots[name]));
   });
 };
 
@@ -1131,6 +1159,11 @@ function keyCard(name, entry) {
   var source = entry.key.source;
   box.appendChild(keyStatus(name, entry, false));
   if (hasKey(entry)) box.appendChild(el("p", "hint", KEY_SOURCE[source]));
+  // The stamp is the keychain item's comment, written when the key was
+  // last checked with the provider (macOS only) — a date, never the key.
+  if (entry.key.validated) {
+    box.appendChild(el("p", "hint stamp", "Last checked with " + entry.label + " on " + entry.key.validated + "."));
+  }
 
   if (source === "not applicable") return box;
 
@@ -1140,17 +1173,52 @@ function keyCard(name, entry) {
   // in history, and in the one place the server refuses to read a secret.
   var keyBox = el("input");
   keyBox.type = "password";
-  keyBox.autocomplete = "off";
+  // "new-password", not "off": Safari and Chrome ignore "off" on a password
+  // field and offer to save what was typed; "new-password" is the value
+  // both honour, and neither fills it from the browser's store.
+  keyBox.autocomplete = "new-password";
   keyBox.spellcheck = false;
   box.appendChild(
     field(
       entry.label + " API key",
       keyBox,
-      "Pasted here, checked with " + entry.label + ", then stored in the keychain."
+      "Paste it here (copy from the provider's console, then Cmd-V). It is " +
+        "checked with " + entry.label + " and stored in the keychain, or " +
+        "only checked. Clear your clipboard afterwards: copy something else."
     )
   );
 
   var actions = el("div", "actions");
+  // Check a key without storing it — the answer is a verdict, and the
+  // server keeps nothing. A good key stays in the field so "Store this
+  // key" is the next click; a refused one is cleared like a refused store.
+  var test = button("Test without storing", async function () {
+    var key = keyBox.value;
+    if (!key) {
+      status.textContent = "Paste the key first.";
+      return;
+    }
+    test.disabled = true;
+    keyBox.disabled = true;
+    status.textContent = "Checking the key with " + entry.label + "…";
+    var result = await api("POST", "/api/auth/test/" + name, { key: key });
+    key = null;
+    test.disabled = false;
+    keyBox.disabled = false;
+    if (!result.ok) {
+      // A refusal from this portal (a malformed key, 4xx) clears the field;
+      // a check that could not happen (the provider unreachable, 502)
+      // keeps it, so the retry is one click.
+      if (result.status < 500) keyBox.value = "";
+      status.textContent = "";
+      if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
+      return;
+    }
+    if (!result.data.valid) keyBox.value = "";
+    status.textContent = result.data.message;
+  });
+  test.disabled = dead;
+  actions.appendChild(test);
   var keep = button("Store this key", async function () {
     var key = keyBox.value;
     if (!key) {
@@ -1172,13 +1240,41 @@ function keyCard(name, entry) {
       if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
       return;
     }
-    askVoices(name); // the list on file was fetched without this key, or with another
+    if (entry.voice !== false) askVoices(name); // the list on file was fetched without this key, or with another
     await poll(); // the masked state and the readiness rows both move, and an older poll shows neither
     setFlash("keys", result.data.message);
     renderPanel("keys");
   });
   keep.disabled = dead;
   actions.appendChild(keep);
+  // Only a key in the keychain can be forgotten from here; one from the
+  // environment or a .env file is the shell's to remove. Two clicks: the
+  // first arms the button, so a slip does not cost a key.
+  if (source === "keychain") {
+    var armed = false;
+    var drop = button("Remove stored key", async function () {
+      if (!armed) {
+        armed = true;
+        drop.textContent = "Really remove it?";
+        return;
+      }
+      drop.disabled = true;
+      status.textContent = "Removing…";
+      var result = await api("POST", "/api/auth/remove/" + name, {});
+      drop.disabled = false;
+      if (!result.ok) {
+        status.textContent = "";
+        if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
+        return;
+      }
+      if (entry.voice !== false) askVoices(name); // the list on file was fetched with the key just removed
+      await poll();
+      setFlash("keys", result.data.message);
+      renderPanel("keys");
+    });
+    drop.disabled = dead;
+    actions.appendChild(drop);
+  }
   box.appendChild(actions);
   box.appendChild(status);
   return box;
@@ -1247,7 +1343,7 @@ var installMine = false;
 /* The speech-to-text model picked on the Local tab. Held here so the
  * sidebar's Install button installs what the tab shows, and so the choice
  * survives the tab being rebuilt. */
-var sttChoice = "small.en";
+var sttChoice = "large-v3-turbo-q5_0";
 
 function megabytes(bytes) {
   return (bytes / 1048576).toFixed(1) + " MB";
@@ -1339,7 +1435,7 @@ renderers.local = function (panel, data) {
     field(
       "Speech-to-text model to install",
       model,
-      "base.en is the smallest and quickest; large-v3-turbo-q5_0 is the most accurate."
+      "base.en is the smallest and quickest; the large-v3-turbo models are the most accurate, q8_0 the least lossy for 16 GB machines."
     )
   );
   var stt = button("Install speech to text", function () {
@@ -1456,6 +1552,19 @@ function sttCard(data) {
     )
   );
   fields.push({ key: "language", box: language, initial: asText(data.stt.language) });
+
+  var cleanup = selectBox(STT_CLEANUP, data.stt.cleanup);
+  box.appendChild(
+    field(
+      "Cleanup",
+      cleanup,
+      "What tidies a dictated take after transcription. off keeps the words " +
+        "as spoken; local runs on this Mac (not built yet — it is skipped " +
+        "with a note); claude-cli and anthropic send the transcript off this " +
+        "Mac and say so on stderr. The anthropic one needs a key on the Keys tab."
+    )
+  );
+  fields.push({ key: "cleanup", box: cleanup, initial: asText(data.stt.cleanup) });
 
   var device = textBox(data.stt.input_device);
   box.appendChild(

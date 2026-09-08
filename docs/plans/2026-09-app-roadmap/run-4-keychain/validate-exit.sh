@@ -89,7 +89,7 @@ echo "=== Exit criteria ==="
 # Phase 4 exit row: "Check recorded" — DEC-035 must carry Status: Decided.
 # Pre-build the entry reads "**Status**: Deferred", so this fails.
 check "DEC-035 recorded as Decided" bash -c \
-  "grep -A3 '^### DEC-035' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
+  "grep -A5 '^### DEC-035' docs/plans/2026-09-app-roadmap/decisions.md | grep -q 'Status.*Decided'"
 
 # Phase 4 exit rows: "Backend (branch A)" and "Docs (branch B)" are the same
 # underlying criterion — the keychain backend matches whichever branch

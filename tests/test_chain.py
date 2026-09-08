@@ -265,6 +265,45 @@ def test_the_primary_speaking_is_not_announced_as_a_fallback(registry):
     assert not any("fallback" in line for line in lines)
 
 
+_KOKORO_MISSING = ProviderUnavailableError("kokoro", "not installed — run: vocalize local install")
+_KOKORO_NOTE = "Spoke via say (fallback) — Kokoro is not installed; run: vocalize local install"
+
+
+def test_fallback_note_names_the_kokoro_install_when_the_primary_is_missing(registry):
+    # The default chain on a fresh machine: Kokoro's model was never
+    # installed, `say` speaks, and the line says why — once (DEC-022).
+    registry["kokoro"] = FakeProvider("kokoro", check_error=_KOKORO_MISSING)
+    registry["say"] = FakeProvider("say")
+    lines, echo = _echoes()
+
+    _run(registry, echo=echo)
+
+    assert [line for line in lines if "Kokoro is not installed" in line] == [_KOKORO_NOTE]
+
+
+def test_fallback_note_is_not_added_when_the_primary_was_a_cloud_provider(registry):
+    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+    registry["say"] = FakeProvider("say")
+    lines, echo = _echoes()
+
+    _run(registry, echo=echo)
+
+    assert "Spoke via say (fallback)." in lines
+    assert not any("Kokoro is not installed" in line for line in lines)
+
+
+def test_fallback_note_is_not_added_when_kokoro_was_not_the_primary(registry):
+    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+    registry["kokoro"] = FakeProvider("kokoro", check_error=_KOKORO_MISSING)
+    registry["say"] = FakeProvider("say")
+    lines, echo = _echoes()
+
+    _run(registry, echo=echo)
+
+    assert "Spoke via say (fallback)." in lines
+    assert not any("Kokoro is not installed" in line for line in lines)
+
+
 def test_every_failure_is_listed_when_the_whole_chain_fails(registry):
     registry["openai"] = FakeProvider("openai", error=ProviderQuotaError("openai", "out of credit"))
     registry["google"] = FakeProvider(

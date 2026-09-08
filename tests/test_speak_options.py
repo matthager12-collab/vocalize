@@ -329,6 +329,18 @@ def test_summarize_passes_text_via_stdin_not_argv(monkeypatch, rec):
     assert argv[argv.index("--disallowedTools") + 1] == "*"
 
 
+def test_summarize_uses_strict_mcp_config_and_a_temp_cwd(monkeypatch, rec):
+    """Selected text is untrusted like a transcript: no MCP server may start
+    for it, and the session must not adopt the project the Service ran in."""
+    rec.osascript_stdout = "Light summary (~25 sec)"
+    _run(monkeypatch, rec, "y" * 2000)
+    claude = next(c for c in rec.calls
+                  if c["argv"][0].endswith("claude") or c["argv"][0] == "claude")
+    assert "--strict-mcp-config" in claude["argv"]
+    import tempfile
+    assert claude["kwargs"]["cwd"] == tempfile.gettempdir()
+
+
 def test_summarize_prepends_extra_path(monkeypatch, rec):
     monkeypatch.setenv("CLAUDE_EXTRA_PATH", "/opt/node/bin")
     rec.osascript_stdout = "Light summary (~25 sec)"
