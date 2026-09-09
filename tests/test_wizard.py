@@ -1012,3 +1012,23 @@ def test_the_wizard_refuses_to_write_over_a_file_that_changed_while_it_asked(
         wizard.run_wizard()
 
     assert ctx.path.read_text() == 'voice = "somebody-else"\n'
+
+
+def test_an_app_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
+    """The same rule as [notes]: `_TABLE_KEYS` only excludes; an explicit
+    block writes [app] back, or `vocalize chain` would drop it."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    path = tmp_path / "vocalize" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        'chain = ["say"]\n\n[app]\ndictate = "ctrl+cmd+d"\ndictate_mode = "hold"\n\n'
+        '[stt]\nmodel = "base.en"\n',
+        encoding="utf-8",
+    )
+
+    once = wizard._render_config_text(load_config_file())
+    path.write_text(once, encoding="utf-8")
+
+    assert "[app]" in once
+    assert load_config_file()["app"] == {"dictate": "ctrl+cmd+d", "dictate_mode": "hold"}
+    assert wizard._render_config_text(load_config_file()) == once

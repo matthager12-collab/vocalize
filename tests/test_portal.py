@@ -30,6 +30,7 @@ from typing import ClassVar
 import pytest
 
 import vocalize.readiness as readiness_module
+from vocalize import app as app_module
 from vocalize import portal as portal_module
 from vocalize import wizard
 from vocalize.exceptions import (
@@ -523,6 +524,51 @@ def test_state_reports_no_key_mechanism_for_local_providers(portal):
     payload = _body(portal.route("GET", "/api/state", _authed(portal)))
     assert payload["providers"]["say"]["key"] == {"source": "not applicable", "masked": None}
     assert payload["providers"]["kokoro"]["key"]["source"] == "not applicable"
+
+
+def test_state_reports_the_app_key_from_status_dict(portal, monkeypatch):
+    """/api/state's `app` key is app.status_dict() verbatim (design §
+    Readiness, doctor and the Setup tab) — stubbed here so the test asserts
+    the wiring, not the real machine's launchctl/app.status.
+    """
+    stubbed = {
+        "bundle": "current",
+        "agent": "loaded",
+        "accessibility": "granted",
+        "hotkeys": "ok",
+        "hotkey_backend": "carbon",
+        "vocalize": "/opt/homebrew/bin/vocalize",
+    }
+    monkeypatch.setattr(app_module, "status_dict", lambda: stubbed)
+    _exchange(portal)
+    payload = _body(portal.route("GET", "/api/state", _authed(portal)))
+    assert payload["app"] == stubbed
+
+
+def test_state_never_reproduces_a_hostile_app_status_word_unfiltered(portal, monkeypatch):
+    """`app` on the wire is whatever app.status_dict() returns; app.py's own
+    read_status() is what sanitizes it (DEC-028) — this pins that a hostile
+    word making it past that guard would still not corrupt the response
+    shape, since the key is passed through as a plain dict.
+    """
+    hostile = "unknown"  # what a hostile word must already have become
+    monkeypatch.setattr(
+        app_module,
+        "status_dict",
+        lambda: {
+            "bundle": "not built",
+            "agent": "unknown",
+            "accessibility": hostile,
+            "hotkeys": "unknown",
+            "hotkey_backend": "unknown",
+            "vocalize": "unknown",
+        },
+    )
+    _exchange(portal)
+    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
+    assert status == 200
+    payload = json.loads(raw)
+    assert payload["app"]["accessibility"] == "unknown"
 
 
 def test_state_hanging_probe_yields_a_warn_row_and_the_response_returns(portal):
@@ -3072,6 +3118,113 @@ def test_every_manifest_model_is_accepted(portal, fake_install):
     for model in manifest.MODELS:
         assert _start_install(portal, {"target": "stt", "model": model})[0] == 200
         _wait_for_install(portal)
+
+
+# --- the Setup tab's install target: "app" ------------------------------
+
+
+def _fake_app_install(monkeypatch, calls, *, bundle_status="current", bootstrap_rc=0):
+    """Fake every `app` function the "app" install target calls, recording
+    the order they run in. Never touches a real path: `build`/`write_plist`
+    return placeholder strings the worker discards, same as the CLI does."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app_module, "build", lambda: (calls.append("build"), (bundle_status, "bundle"))[1])
+    monkeypatch.setattr(app_module, "reset_accessibility", lambda: calls.append("reset_accessibility"))
+    monkeypatch.setattr(app_module, "write_plist", lambda: (calls.append("write_plist"), "plist")[1])
+    monkeypatch.setattr(app_module, "bootout", lambda: calls.append("bootout"))
+    monkeypatch.setattr(
+        app_module,
+        "bootstrap",
+        lambda: (calls.append("bootstrap"), SimpleNamespace(returncode=bootstrap_rc))[1],
+    )
+
+
+def test_setup_install_accepts_target_app_and_runs_the_calls_in_order(portal, monkeypatch):
+    calls: list[str] = []
+    _fake_app_install(monkeypatch, calls)
+    _exchange(portal)
+
+    status, _headers, body = _start_install(portal, {"target": "app"})
+
+    assert status == 200
+    assert json.loads(body)["target"] == "app"
+    final = _wait_for_install(portal)
+    assert final["error"] is None
+    assert final["step"] == "installed"
+    # build, then load — and no accessibility reset for a "current" bundle.
+    assert calls == ["build", "write_plist", "bootout", "bootstrap"]
+
+
+def test_setup_install_app_resets_accessibility_and_notes_the_regrant_on_rebuilt(
+    portal, monkeypatch
+):
+    calls: list[str] = []
+    _fake_app_install(monkeypatch, calls, bundle_status="rebuilt")
+    _exchange(portal)
+
+    assert _start_install(portal, {"target": "app"})[0] == 200
+    final = _wait_for_install(portal)
+
+    assert final["error"] is None
+    assert calls == ["build", "reset_accessibility", "write_plist", "bootout", "bootstrap"]
+    assert final["note"] == app_module.APP_REGRANT_WARNING
+
+
+def test_setup_install_app_never_resets_accessibility_when_not_rebuilt(portal, monkeypatch):
+    calls: list[str] = []
+    _fake_app_install(monkeypatch, calls, bundle_status="stale")
+    _exchange(portal)
+
+    assert _start_install(portal, {"target": "app"})[0] == 200
+    final = _wait_for_install(portal)
+
+    assert "reset_accessibility" not in calls
+    assert final["note"] is None
+
+
+def test_setup_install_app_reports_a_fixed_message_when_bootstrap_fails(portal, monkeypatch):
+    """`launchctl`'s own stderr never reaches the page — one fixed sentence."""
+    calls: list[str] = []
+    _fake_app_install(monkeypatch, calls, bootstrap_rc=1)
+    _exchange(portal)
+
+    assert _start_install(portal, {"target": "app"})[0] == 200
+    final = _wait_for_install(portal)
+
+    assert final["step"] == "failed"
+    assert final["error"] == "Could not load the app with launchctl."
+
+
+def test_setup_tab_reads_the_app_key_already_on_api_state(portal, monkeypatch):
+    """The Setup tab's step 3/4 read `data.app` — already `/api/state`'s
+    `app` key (see test_state_reports_the_app_key_from_status_dict); this
+    just ties that wiring to the Setup tab explicitly."""
+    stubbed = {
+        "bundle": "current",
+        "agent": "loaded",
+        "accessibility": "granted",
+        "hotkeys": "ok",
+        "hotkey_backend": "carbon",
+        "vocalize": "/opt/homebrew/bin/vocalize",
+    }
+    monkeypatch.setattr(app_module, "status_dict", lambda: stubbed)
+    _exchange(portal)
+    payload = _body(portal.route("GET", "/api/state", _authed(portal)))
+    assert payload["app"] == stubbed
+
+
+def test_setup_install_refuses_a_model_for_target_app(portal, monkeypatch):
+    calls: list[str] = []
+    _fake_app_install(monkeypatch, calls)
+    _exchange(portal)
+
+    status, _headers, body = _start_install(portal, {"target": "app", "model": "base.en"})
+
+    assert status == 400
+    assert "only applies to the 'stt' target" in json.loads(body)["error"]
+    assert calls == []  # refused before anything was claimed or built
+    assert portal._install_thread is None
 
 
 def test_an_install_never_touches_the_lockout_counter(portal, fake_install):

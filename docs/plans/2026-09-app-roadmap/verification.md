@@ -8,8 +8,8 @@ All commands run from the repository root with the project's own tooling. Any fa
 |---|---|
 | Unit tests | `.venv/bin/python -m pytest tests/ -q` |
 | Lint | `.venv/bin/python -m ruff check vocalize hooks tests` |
-| Swift parse (recorder, app) | `xcrun swiftc -parse vocalize/recorder/VocalizeRecorder.swift vocalize/menubar/VocalizeApp.swift` |
-| Plists | `plutil -lint vocalize/menubar/Info.plist.in hooks/quick_actions/*/Contents/Info.plist` |
+| Swift parse (recorder, app) | `xcrun swiftc -parse vocalize/menubar/VocalizeApp.swift` and `xcrun swiftc -parse vocalize/recorder/VocalizeRecorder.swift`, one file per invocation: both are single-file programs with top-level code, which swiftc rejects when parsed together (found in run 8a) |
+| Plists | `plutil -lint vocalize/menubar/Info.plist.in vocalize/assets/quick_actions/*/Contents/Info.plist` |
 | Build artifacts | `.venv/bin/python -m build` |
 | Clean-venv acceptance | `python3 -m venv /tmp/v && /tmp/v/bin/pip install -q --no-cache-dir dist/vocalize_cli-*.whl && /tmp/v/bin/pip list \| grep -iE "pywhispercpp\|onnxruntime\|mlx\|sherpa\|numpy\|torch\|boto3"; test $? -eq 1` |
 | Docs match the CLI | `.venv/bin/python -c 'import subprocess; [subprocess.run([".venv/bin/vocalize", *c.split(), "--help"], check=True, capture_output=True) for c in ("listen", "dictate", "resume", "pause", "status", "doctor", "notes", "app install", "app status", "integrate claude", "local install", "auth login")]'` (trim to the commands that exist at each release) |

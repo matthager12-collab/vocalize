@@ -7,6 +7,76 @@ All notable changes to this project are documented here. Format follows
 
 Nothing yet.
 
+## 0.13.0 - 2026-09-08
+
+### Added
+
+- **The `[app]` config table** for the menu-bar app that arrives in 0.13.0:
+  `dictate`, `speak` and `stop` chords (`ctrl+alt+cmd+d`, `+s`, `+x` by
+  default; tokens joined by `+`, modifiers ctrl/alt/cmd/shift with their
+  long-form aliases, a key of a–z, 0–9 or f1–f12, ctrl or cmd required,
+  `""` disables) and `dictate_mode` (`toggle`; `hold` parses and resolves
+  to toggle with one warning until 0.13.1). The wizard renders it and
+  `vocalize settings` prints `app.<key>=…` in one canonical spelling.
+- **`vocalize app install / uninstall / status [--json] / restart`** —
+  a menu-bar app (`Vocalize.app`) that owns the dictation, speak and stop
+  hotkeys system-wide, as a LaunchAgent, so a hotkey works from any app
+  with no Services menu and no per-app shortcut assignment. `install`
+  builds the bundle, warns about a running Hammerspoon or a Services
+  shortcut assigned to the "Dictate with Vocalize" Quick Action, resets
+  the Accessibility grant
+  only on a rebuild, and loads the LaunchAgent; `status` reports what's
+  built, whether the agent is loaded, and the app's own hotkey and
+  Accessibility state; `restart` kicks the running app without touching
+  the LaunchAgent; `uninstall` removes everything `install` put down
+  and leaves the Accessibility entry in System Settings alone. See
+  [docs/app.md](docs/app.md).
+- **`dictate.session` gains a `state` and a per-dictation `nonce`.**
+  `state` moves through `starting` → `recording` → `transcribing` as a
+  dictation runs, so anything reading the session file (the app included)
+  knows which stage it's watching, not just that one is in progress.
+  `nonce` ties one dictation's session to its eventual `dictate.copied`
+  write. Unknown keys in the file are still ignored.
+- **`vocalize doctor [--json]`** — every readiness row plus the toolchain
+  and environment checks `status` doesn't cover: `cli path`, `uv`,
+  `swiftc`, `claude` on PATH, the running console script's shebang
+  (brew rot), a Hammerspoon or old Quick Action conflict, `vocalize
+  --version` cold-start time, app bundle state with its repair command,
+  and the notes folder's size on disk. Exits 1 only on a failing row;
+  warn rows print but don't fail a script.
+- **`vocalize integrate claude [--yes]`** — one command in place of the
+  hand-rolled `/speak` skill and the standalone Quick Action installer.
+  Checks `vocalize`, `claude`, `node`, and `python3` on PATH, installs
+  `~/.claude/skills/speak/SKILL.md` from the package (kept unless
+  `--yes`), installs the four Quick Actions into `~/Library/Services`,
+  and prints the GUI-only hotkey and Accessibility steps. The Quick
+  Action installer and its `.workflow` bundles moved into the package
+  (`vocalize/assets/quick_actions/`); `hooks/install_quick_action.py` is
+  now a thin wrapper around it. The baked `claude` path is the stable
+  symlink, not `.resolve()`'s version-pinned Caskroom target, so a
+  `brew upgrade claude-code` no longer silently breaks the summary
+  picker.
+- **The Setup tab** in `vocalize portal` — a nine-step checklist
+  (toolchain, both bundles, login item, chords, model download,
+  microphone, `/speak` and Quick Actions, Accessibility, self-test)
+  built from the readiness rows the sidebar shows; its first step points at
+  `vocalize doctor`. Its install
+  buttons drive the existing `/api/local/install` routes, now including
+  target `app`. See [docs/app.md](docs/app.md#the-setup-tab).
+
+### Changed
+
+- **The recorder is built by a general bundle builder.** `build_bundle(BundleSpec)`
+  replaces the recorder-only code path; `build_recorder` is the recorder's
+  door onto it and its build is unchanged byte for byte (a golden test pins
+  the `swiftc` and `codesign` argv, because any drift is a new ad-hoc
+  signature and a microphone re-grant). `vocalize local uninstall --stt`
+  now removes only the recorder bundle and its stamp, never the whole
+  `~/.cache/vocalize/bin`.
+- **`vocalize clip` exits 3, not 1, when it refuses a credential-shaped
+  clipboard.** A script that already treats exit 1 as "something went
+  wrong, try again" can now tell that refusal apart from a real failure.
+
 ## 0.12.0 - 2026-09-07
 
 ### Changed

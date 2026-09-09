@@ -477,13 +477,24 @@ more accurate) or `--model base.en` (~141 MB, fastest, least accurate).
 ### The hotkey
 
 ```bash
-python3 hooks/install_quick_action.py
+vocalize app install
+```
+
+installs and starts **Vocalize.app**, a menu-bar app that owns the
+dictation hotkey (and speak/stop) system-wide, no Services menu or
+per-app shortcut assignment needed — see [docs/app.md](docs/app.md) for
+install, uninstall, status and restart. `vocalize dictate` is the same
+command from a terminal, if you'd rather trigger it that way.
+
+Prefer a Quick Action instead? That still works:
+
+```bash
+vocalize integrate claude
 ```
 
 then assign a shortcut under **System Settings › Keyboard › Keyboard
 Shortcuts › Services › Text › "Dictate with Vocalize"** — ⌃⌥⌘D is free by
-default and a sensible pick. `vocalize dictate` is the same command from a
-terminal, if you'd rather trigger it that way.
+default and a sensible pick.
 
 ### How a dictation works
 
@@ -573,6 +584,37 @@ set it:
 input_device = "MacBook Pro Microphone"
 ```
 
+### Configuration: the `[app]` table
+
+The chords the menu-bar app owns, system-wide. A change needs
+`vocalize app restart` before the app picks it up.
+
+```toml
+[app]
+dictate = "ctrl+alt+cmd+d"   # start/stop dictation
+dictate_mode = "toggle"      # toggle | hold ("hold" arrives in 0.13.1)
+speak = "ctrl+alt+cmd+s"     # speak the selection
+stop = "ctrl+alt+cmd+x"      # stop whatever is playing
+```
+
+| Key | Allowed values | Default |
+|---|---|---|
+| `dictate` | a chord, or `""` to disable | `ctrl+alt+cmd+d` |
+| `dictate_mode` | `toggle`, `hold` | `toggle` |
+| `speak` | a chord, or `""` to disable | `ctrl+alt+cmd+s` |
+| `stop` | a chord, or `""` to disable | `ctrl+alt+cmd+x` |
+
+**Chord grammar:** tokens joined by `+`. Modifiers are `ctrl`, `alt`,
+`cmd`, `shift` (long spellings `control`, `option`, `command` also work);
+the key is one of `a`-`z`, `0`-`9`, `f1`-`f12`. A chord must include
+`ctrl` or `cmd` — macOS refuses to register the rest. The three chords
+must differ from each other, and `""` disables one.
+
+A bad chord is a `ConfigError` naming the key, the value and the legal
+keys — and, like any bad config value, it stops the command you ran, so
+fix it before anything else works. `vocalize settings` prints the four
+`app.*` values in their canonical spelling.
+
 ### `vocalize status`
 
 ```bash
@@ -594,6 +636,17 @@ get four permanent red rows for a feature nobody asked for):
 `--json` prints the same rows as a list. Exit code is 0 when every row —
 providers and dictation both — is `ok`, 1 otherwise, so it composes with
 `&&` in a script.
+
+### `vocalize doctor`
+
+Everything `status` checks plus the machine itself: the CLI's own path and
+start-up time, `uv`, `swiftc`, `claude`, the console script's interpreter,
+Hammerspoon, the app bundle and the notes folder. Every row regardless of the
+chain, exit 1 when any row fails. `--json` for scripts.
+
+```bash
+vocalize doctor
+```
 
 ### Continuing an interrupted read
 
@@ -668,15 +721,16 @@ Four Services let you use vocalize from any app without a terminal:
 Install all four:
 
 ```bash
-python3 hooks/install_quick_action.py
+vocalize integrate claude
 ```
 
-This copies the bundles from `hooks/quick_actions/` into
-`~/Library/Services/` with this machine's absolute `vocalize`, `claude`,
-and helper paths baked in, then refreshes the Services registry. Run it
-from a normal terminal — its PATH is what gets captured. To trigger the
-actions from the keyboard, assign shortcuts under System Settings →
-Keyboard → Keyboard Shortcuts → Services (Stop Vocalize is worth a
+This installs the `/speak` skill plus the four Quick Action bundles into
+`~/Library/Services/`, with this machine's `vocalize`, `claude`, and
+helper paths baked in (the stable symlinks, not their resolved targets —
+survives a `brew upgrade claude-code`), then refreshes the Services
+registry. Run it from a normal terminal — its PATH is what gets captured.
+To trigger the actions from the keyboard, assign shortcuts under System
+Settings → Keyboard → Keyboard Shortcuts → Services (Stop Vocalize is worth a
 shortcut of its own so you can silence a read from anywhere).
 
 Some Electron apps (Claude Code desktop among them) don't expose the
@@ -888,9 +942,10 @@ model.
   there. Use `--no-play` and open the saved file with whatever's on hand.
 - **The disk cache under `~/.cache/vocalize` grows unbounded.** It's
   content-addressed (keyed by a hash of text, voice, model, format, and
-  speed),
-  so it's always safe to delete some or all of it — nothing will break,
-  you'll just re-pay for a re-synthesized clip.
+  speed), so it's always safe to delete — except `bin/`, which holds
+  Vocalize Recorder and is tied to your microphone grant; deleting that
+  forces a rebuild and a re-grant. Delete anything else and nothing will
+  break, you'll just re-pay for a re-synthesized clip.
 - **`--api-key` on the command line is visible to other local processes**
   (anything that can run `ps`). Prefer `vocalize auth login`, the
   `ELEVENLABS_API_KEY` environment variable, or a `.env` file instead.

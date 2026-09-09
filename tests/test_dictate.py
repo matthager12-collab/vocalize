@@ -735,6 +735,25 @@ def test_a_truncated_session_file_is_cleared_by_a_cancel(harness, monkeypatch):
     assert any(dictate._NOTIFY_CANCELLED in line for line in harness.notifications())
 
 
+@pytest.mark.parametrize("payload", ["[]", "null", "0", '"x"'])
+def test_session_json_that_is_not_an_object_never_raises(tmp_path, payload):
+    """The session file is untrusted: JSON that parses to a non-object used
+    to make `.get` raise AttributeError, which no caller catches. The raise
+    landed in `_mark_finishing` — the statement before `_stop`/`_cancel`'s
+    `try:` — so `_discard` never ran and the recorder kept the microphone.
+    """
+    dictate.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dictate.session_path().write_text(payload, encoding="utf-8")
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    dictate._write_session(workdir, "recording")
+    dictate._release_session(workdir)
+    dictate._mark_finishing(workdir)
+
+    assert dictate.session_path().read_text(encoding="utf-8") == payload
+
+
 def test_a_press_while_transcribing_is_refused(recorder, transcriber, harness):
     recorder()
     transcriber()
@@ -2396,3 +2415,115 @@ def test_a_symlinked_working_directory_is_never_ours(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_tmp_roots", lambda: {root.resolve()})
 
     assert not dictate._is_workdir(root / "vocalize-dictate-abc")
+
+
+# --- the session state and nonce (T-71) -------------------------------
+
+
+def session_data() -> dict:
+    return json.loads(dictate.session_path().read_text(encoding="utf-8"))
+
+
+def test_the_session_state_reads_starting_then_recording_then_transcribing(
+    recorder, transcriber, monkeypatch
+):
+    """The three words, in order, through one whole toggle dictation.
+
+    Read from inside the two functions the transitions bracket, because
+    every one of them is over by the time a press returns.
+    """
+    recorder()
+    transcriber()
+    seen = []
+    real_launch, real_finish = dictate._launch_recorder, dictate._mark_finishing
+
+    def launch(workdir, settings):
+        seen.append(session_data()["state"])  # claimed, not recording yet
+        return real_launch(workdir, settings)
+
+    def finish(workdir):
+        seen.append(session_data()["state"])  # the recorder was running
+        real_finish(workdir)
+        seen.append(session_data()["state"])  # the take is being finished
+
+    monkeypatch.setattr(dictate, "_launch_recorder", launch)
+    monkeypatch.setattr(dictate, "_mark_finishing", finish)
+
+    assert start() == 0
+    assert press_again(monkeypatch) == 0
+
+    assert seen == ["starting", "recording", "transcribing"]
+
+
+def test_every_claim_mints_a_fresh_nonce(recorder, transcriber, monkeypatch):
+    recorder()
+    transcriber()
+    start()
+    first = session_data()["nonce"]
+    press_again(monkeypatch)
+    start()
+    second = session_data()["nonce"]
+
+    assert first != second
+    for nonce in (first, second):
+        assert len(nonce) == 16 and all(c in "0123456789abcdef" for c in nonce)
+
+
+@pytest.mark.parametrize(
+    "exit_path", ["stop", "recorder failure", "cancel", "second press failure"]
+)
+def test_no_session_state_survives_any_exit_path(
+    exit_path, recorder, transcriber, monkeypatch
+):
+    """Whatever the state said, the file itself goes on every path out."""
+    if exit_path == "recorder failure":
+        monkeypatch.setattr(dictate, "_START_GRACE", 0.3)
+        recorder(write_pid=False, take="none")
+        assert start() == 1
+    else:
+        recorder()
+        transcriber(rc=1, stdout="") if exit_path == "second press failure" else transcriber()
+        assert start() == 0
+        if exit_path == "cancel":
+            assert dictate.cancel(stt()) == 0
+        else:
+            press_again(monkeypatch)
+
+    assert not dictate.session_path().exists()
+
+
+def test_a_session_carrying_state_and_unknown_keys_still_reads(recorder):
+    """`_read_session` takes the two keys it needs and ignores the rest.
+
+    That is what lets a newer vocalize add keys — `state`, `nonce` — to a
+    session an older press may still have to read.
+    """
+    recorder()
+    start()
+    data = session_data()
+    data["a_key_from_some_later_version"] = {"anything": [1, 2]}
+    dictate.session_path().write_text(json.dumps(data), encoding="utf-8")
+
+    session = dictate._read_session()
+
+    assert session is not None
+    assert session[0] == Path(data["dir"])
+    assert session_data()["state"] == "recording"
+
+
+def test_a_session_a_later_press_owns_keeps_its_state(recorder, tmp_path):
+    """Same defence as `_release_session`: never write another take's record."""
+    recorder()
+    start()
+    ours = Path(session_data()["dir"])
+    theirs = {
+        "dir": str(tmp_path / "someone-elses-workdir"),
+        "started": 1.0,
+        "nonce": "0123456789abcdef",
+        "state": "recording",
+    }
+    dictate.session_path().write_text(json.dumps(theirs), encoding="utf-8")
+
+    dictate._mark_finishing(ours)  # this take finishing must not touch theirs
+
+    assert session_data() == theirs

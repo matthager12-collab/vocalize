@@ -2,7 +2,8 @@ import io
 import subprocess
 
 import pytest
-import speak_options
+
+from vocalize import speak_options
 
 # --- test doubles -----------------------------------------------------------
 

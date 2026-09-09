@@ -93,7 +93,7 @@ const main = new Node("main");
 // The five tabs, as portal.html declares them: Chain selected, each
 // controlling its panel. `selectTab` flips these and hides the panels.
 const tabs = {};
-["chain", "providers", "keys", "usage", "local"].forEach((name) => {
+["chain", "providers", "keys", "usage", "local", "setup"].forEach((name) => {
   const tab = new Node("button");
   tab.id = "tab-" + name;
   tab.attrs["aria-controls"] = "panel-" + name;
@@ -188,6 +188,7 @@ function statePayload(fingerprint, chain, providers) {
     chain_source: "config file",
     providers: providers || {},
     stt: {},
+    app: {},
     config_path: "/tmp/config.toml",
     config_error: null,
     fingerprint: fingerprint
@@ -781,6 +782,124 @@ const scenarios = {
       const wire = request.key + " " + (request.options.body || "");
       actions.forEach((action) => assert.strictEqual(wire.indexOf(action), -1, "an action string reached the wire: " + action));
     });
+    assert.deepStrictEqual(pending, [], "nothing else is in flight");
+  },
+
+  /* The Setup tab: its two buttons post the routes the Local tab already
+   * uses (target "stt" for dictation, the new target "app"), and a hostile
+   * row action reaches the page only inside a <code> node's text — the
+   * same guarantee `sidebar` pins, proven again through this tab's own
+   * lookup-by-name. */
+  async setup(portal) {
+    const HOSTILE = '<img onerror="alert(1)"> ; rm -rf /';
+    const rows = [
+      { name: "recorder", state: "ok", detail: "Vocalize Recorder is built", action: "" },
+      { name: "app", state: "warn", detail: "stale — run: vocalize app install", action: HOSTILE },
+      { name: "app agent", state: "fail", detail: "not running", action: "vocalize app install" },
+      { name: "stt model", state: "fail", detail: "no speech-to-text model installed", action: "vocalize local install --stt" },
+      { name: "microphone", state: "warn", detail: "macOS has not asked for it yet", action: "run: vocalize listen --check" },
+      { name: "accessibility", state: "warn", detail: "not granted", action: "grant Accessibility to Vocalize in System Settings" }
+    ];
+    const data = statePayload("f0", ["say"], { say: providerEntry("macOS say") });
+    data.rows = rows;
+    data.app = {
+      bundle: "stale",
+      agent: "not running",
+      accessibility: "not granted",
+      hotkeys: "control-option-command-D/V",
+      hotkey_backend: "carbon",
+      vocalize: "/opt/homebrew/bin/vocalize"
+    };
+
+    const panel = new Node("section");
+    portal.renderers.setup(panel, data);
+
+    const buttons = panel.findAll((node) => node.tag === "button");
+    const dictate = buttons.find((b) => b.textContent === "Install dictation");
+    const installApp = buttons.find((b) => b.textContent === "Install the app");
+    assert.ok(dictate, "step 2 offers to install dictation");
+    assert.ok(installApp, "step 2 offers to install the app");
+
+    dictate.fire("click");
+    await settle();
+    assert.deepStrictEqual(sent(take("POST /api/local/install/start")), {
+      target: "stt",
+      model: "large-v3-turbo-q5_0"
+    });
+
+    installApp.fire("click");
+    await settle();
+    assert.deepStrictEqual(sent(take("POST /api/local/install/start")), { target: "app" });
+
+    // The "app" row's hostile action reached only a <code> node's text.
+    const codeNodes = panel.findAll((node) => node.tag === "code");
+    assert.ok(
+      codeNodes.some((node) => node.textContent === HOSTILE),
+      "the hostile action reached a <code> node as text"
+    );
+    assert.strictEqual(panel.find((node) => node.tag === "img"), null, "never parsed as markup");
+
+    take("GET /api/local/install/status"); // the poll the render arms, so an
+    // install already running when the tab opens paints here
+    assert.deepStrictEqual(pending, [], "nothing else is in flight");
+  },
+
+  /* An install started from the Setup tab paints where the user is
+   * looking. The worker's step, its `note` — the Accessibility re-grant
+   * warning after a rebuild drops the grant — and any `error` all reach
+   * the Setup panel, and the "app" target is named as itself, not as
+   * Kokoro. */
+  async setup_progress(portal) {
+    const NOTE = "Vocalize.app was rebuilt — re-grant it Accessibility in System Settings.";
+    const data = statePayload("f0", ["say"], { say: providerEntry("macOS say") });
+    data.rows = [{ name: "app", state: "warn", detail: "stale", action: "vocalize app install" }];
+
+    const panel = new Node("section");
+    portal.renderers.setup(panel, data);
+
+    const installApp = panel.find((node) => node.tag === "button" && node.textContent === "Install the app");
+    installApp.fire("click");
+    await settle();
+    const started = take("POST /api/local/install/start");
+    assert.deepStrictEqual(sent(started), { target: "app" });
+    started.resolve(
+      answer({
+        running: true,
+        target: "app",
+        step: "building the app",
+        downloaded: 0,
+        total: 0,
+        done: false,
+        error: "",
+        note: NOTE
+      })
+    );
+    await settle();
+
+    const texts = panel.findAll(() => true).map((node) => node.textContent);
+    assert.ok(texts.includes("The app: building the app"), "the step shows in the Setup panel: " + texts.join(" | "));
+    assert.ok(texts.includes(NOTE), "the re-grant note shows in the Setup panel");
+
+    // The poll the render armed: a failure reaches the same panel.
+    take("GET /api/local/install/status").resolve(
+      answer({
+        running: false,
+        target: "app",
+        step: "failed",
+        downloaded: 0,
+        total: 0,
+        done: false,
+        error: "xcodebuild exited 65",
+        note: ""
+      })
+    );
+    await settle();
+    assert.ok(
+      panel.findAll(() => true).some((node) => node.textContent === "xcodebuild exited 65"),
+      "the failure shows in the Setup panel"
+    );
+
+    take("GET /api/state"); // the refresh the finished install triggers
     assert.deepStrictEqual(pending, [], "nothing else is in flight");
   },
 

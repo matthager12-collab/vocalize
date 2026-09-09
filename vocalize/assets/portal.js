@@ -292,21 +292,28 @@ function render() {
   renderPanel(currentTab());
 }
 
+/** One readiness row, as the sidebar's `<li>` — shared with the Setup tab,
+ *  which shows the same rows again grouped by wizard step instead of by
+ *  provider chain. */
+function rowItem(row) {
+  var known = row.state === "ok" || row.state === "warn" || row.state === "fail";
+  var item = el("li", known ? row.state : "warn");
+  var head = el("div", "row-head");
+  head.appendChild(el("span", "dot"));
+  head.appendChild(el("span", "row-name", row.name));
+  head.appendChild(el("span", "row-state", row.state));
+  item.appendChild(head);
+  if (row.detail) item.appendChild(el("p", "row-detail", row.detail));
+  if (row.action) item.appendChild(rowAction(row));
+  return item;
+}
+
 function renderRows() {
   var list = $("rows");
   var rows = state.rows || [];
   list.replaceChildren();
   rows.forEach(function (row) {
-    var known = row.state === "ok" || row.state === "warn" || row.state === "fail";
-    var item = el("li", known ? row.state : "warn");
-    var head = el("div", "row-head");
-    head.appendChild(el("span", "dot"));
-    head.appendChild(el("span", "row-name", row.name));
-    head.appendChild(el("span", "row-state", row.state));
-    item.appendChild(head);
-    if (row.detail) item.appendChild(el("p", "row-detail", row.detail));
-    if (row.action) item.appendChild(rowAction(row));
-    list.appendChild(item);
+    list.appendChild(rowItem(row));
   });
 
   var note = "";
@@ -1370,9 +1377,21 @@ function pollInstall() {
   if (installTimer === null && !installPolling) installTimer = setTimeout(watchInstall, 0);
 }
 
+/* The node install progress is painted into. Both the Local tab and the
+ * Setup tab can start an install, so whichever panel rendered last owns
+ * it — a stale copy behind a hidden panel is simply never repainted. */
+var installBox = null;
+
+function progressBox() {
+  installBox = el("div");
+  return installBox;
+}
+
+var TARGET_LABELS = { stt: "Speech to text", kokoro: "Kokoro", app: "The app" };
+
 function paintInstall() {
-  var node = $("install-progress");
-  if (!node) return; // the user is on another tab; the download carries on
+  var node = installBox;
+  if (!node) return; // no panel that shows progress is up; the install carries on
   node.replaceChildren();
   var progress = installProgress;
   if (progress === null) {
@@ -1384,7 +1403,7 @@ function paintInstall() {
     return;
   }
 
-  var what = progress.target === "stt" ? "Speech to text" : "Kokoro";
+  var what = TARGET_LABELS[progress.target] || progress.target;
   node.appendChild(el("p", "row-name", what + ": " + progress.step));
   if (progress.total > 0) {
     var bar = el("progress");
@@ -1446,9 +1465,7 @@ renderers.local = function (panel, data) {
   sttRow.appendChild(stt);
   installs.appendChild(sttRow);
 
-  var progress = el("div");
-  progress.id = "install-progress";
-  installs.appendChild(progress);
+  installs.appendChild(progressBox());
   panel.appendChild(installs);
 
   panel.appendChild(sttCard(data));
@@ -1593,3 +1610,113 @@ function sttCard(data) {
   box.appendChild(status);
   return box;
 }
+
+// --- Setup --------------------------------------------------------------
+
+/* The nine wizard steps of the analysis doc, over rows and routes this
+ * page already has: nothing here is a new probe or a new route. Each step
+ * looks up the readiness rows it cares about by name and shows them with
+ * the same `rowItem`/`rowAction` the sidebar uses — so a hostile row action
+ * still lands only in a `<code>` node's text, never as markup. A name this
+ * poll never reports (most machines never populate "uv" or "swiftc" here —
+ * those are `vocalize doctor`'s own rows, not readiness') falls back to
+ * fixed text naming the command that does. */
+
+renderers.setup = function (panel, data) {
+  panel.replaceChildren(el("h2", null, "Setup"));
+
+  var rows = data.rows || [];
+  function findRow(name) {
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].name === name) return rows[i];
+    }
+    return null;
+  }
+
+  function stepCard(title, names, fallback) {
+    var box = card(title);
+    var list = el("ul", "setup-rows");
+    list.setAttribute("role", "list");
+    var any = false;
+    names.forEach(function (name) {
+      var row = findRow(name);
+      if (row) {
+        list.appendChild(rowItem(row));
+        any = true;
+      }
+    });
+    if (any) box.appendChild(list);
+    if (fallback) box.appendChild(el("p", "hint", fallback));
+    return box;
+  }
+
+  panel.appendChild(stepCard("1. Toolchain", ["uv", "swiftc"], "run: vocalize doctor"));
+
+  var running = installProgress !== null && installProgress.running;
+  var build = stepCard("2. Build both bundles", ["recorder", "app"], null);
+  var buildActions = el("div", "actions");
+  var dictate = button("Install dictation", function () {
+    startInstall({ target: "stt", model: sttChoice }, dictate);
+  });
+  dictate.disabled = running || dead;
+  var installApp = button("Install the app", function () {
+    startInstall({ target: "app" }, installApp);
+  });
+  installApp.disabled = running || dead;
+  buildActions.appendChild(dictate);
+  buildActions.appendChild(installApp);
+  build.appendChild(buildActions);
+  build.appendChild(progressBox());
+  panel.appendChild(build);
+
+  panel.appendChild(
+    stepCard("3. Login item", ["app agent"], "Install the app above to load it at login.")
+  );
+
+  var chords = card("4. Chords");
+  var appInfo = data.app || {};
+  chords.appendChild(
+    el(
+      "p",
+      "hint",
+      "Hotkeys: " + asText(appInfo.hotkeys) + " (backend: " + asText(appInfo.hotkey_backend) + ")"
+    )
+  );
+  chords.appendChild(el("p", "hint", "Edit [app] in the config file to change them."));
+  panel.appendChild(chords);
+
+  var download = stepCard("5. Model download", ["stt model"], null);
+  var getModel = button("Install speech to text", function () {
+    startInstall({ target: "stt", model: sttChoice }, getModel);
+  });
+  getModel.disabled = running || dead;
+  var downloadActions = el("div", "actions");
+  downloadActions.appendChild(getModel);
+  download.appendChild(downloadActions);
+  panel.appendChild(download);
+
+  panel.appendChild(stepCard("6. Microphone", ["microphone"], "run: vocalize listen --check"));
+
+  var speak = card("7. The /speak skill and Quick Actions");
+  speak.appendChild(el("code", "row-action", "vocalize integrate claude"));
+  panel.appendChild(speak);
+
+  panel.appendChild(
+    stepCard(
+      "8. Accessibility",
+      ["accessibility"],
+      "Grant Accessibility to Vocalize in System Settings › Privacy & Security › Accessibility."
+    )
+  );
+
+  var failing = rows.filter(function (row) {
+    return row.state === "fail";
+  }).length;
+  var selftest = card("9. Self-test");
+  selftest.appendChild(el("code", "row-action", "vocalize doctor"));
+  selftest.appendChild(el("p", "hint", failing + (failing === 1 ? " failing row." : " failing rows.")));
+  panel.appendChild(selftest);
+
+  paintInstall();
+  pollInstall();
+};

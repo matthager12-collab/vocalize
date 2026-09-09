@@ -86,14 +86,23 @@ check 'ruff clean at entry' .venv/bin/python -m ruff check vocalize hooks tests
 echo ""
 echo "=== Exit criteria ==="
 check 'menubar source files exist' bash -c 'test -f vocalize/menubar/VocalizeApp.swift && test -f vocalize/menubar/Info.plist.in'
-check 'Swift parses, plist lints' xcrun swiftc -parse vocalize/recorder/VocalizeRecorder.swift vocalize/menubar/VocalizeApp.swift
+# One file per invocation: swiftc allows top-level code only in a single-file
+# compilation, and both of these are single-file programs — parsed together,
+# every top-level statement in both is an error, including the frozen
+# recorder's. The real build compiles them one at a time (install.py).
+check 'app parses' xcrun swiftc -parse vocalize/menubar/VocalizeApp.swift
+check 'recorder still parses' xcrun swiftc -parse vocalize/recorder/VocalizeRecorder.swift
 check 'plist lints' plutil -lint vocalize/menubar/Info.plist.in
 check 'no text can reach a notification' bash -c 'test -f vocalize/menubar/VocalizeApp.swift && ! grep -n "NSPasteboard\.string\|readObjects" vocalize/menubar/VocalizeApp.swift'
 check 'override and nonce checks exist (2)' bash -c 'test -f vocalize/menubar/VocalizeApp.swift && test "$(grep -c "func checkedBinary\|func pasteIfNonceMatches" vocalize/menubar/VocalizeApp.swift)" = "2"'
-check 'source committed' bash -c 'test -d vocalize/menubar && git diff --quiet HEAD -- vocalize/menubar/'
+# `git diff HEAD` says nothing about a file git has never seen, and this whole
+# directory is new — so the check has to be that both files are tracked and
+# unmodified, not that the diff is empty.
+check 'source committed' bash -c 'git ls-files --error-unmatch vocalize/menubar/VocalizeApp.swift vocalize/menubar/Info.plist.in >/dev/null && git diff --quiet HEAD -- vocalize/menubar/'
 check 'full suite green' .venv/bin/python -m pytest tests/ -q -x -p no:cacheprovider
 check 'ruff clean' .venv/bin/python -m ruff check vocalize hooks tests
-check 'work committed' git diff --quiet HEAD
+# Untracked files included: an uncommitted new file is uncommitted work.
+check 'work committed' bash -c 'git diff --quiet HEAD && test -z "$(git status --porcelain)"'
 
 echo ""
 echo "=== Summary ==="

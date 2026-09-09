@@ -21,13 +21,16 @@ thread total, never one per poll.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import NamedTuple
 
-from . import auth, config, ledger
+from . import app, auth, config, ledger
 from .exceptions import VocalizeError
 
 # Providers authenticated by a single stored/env API key — see
@@ -38,7 +41,7 @@ _CREDENTIAL_PROVIDERS = ("elevenlabs", "openai", "google")
 #: The detail on the row a probe that is still running gets. Named because
 #: callers have to tell "no answer yet" from "the probe raised" — see
 #: portal._key_info.
-STILL_CHECKING = "still checking — a keychain dialog may be waiting"
+STILL_CHECKING = "still checking — a slow probe, or a keychain dialog, may be waiting"
 
 
 class Row(NamedTuple):
@@ -272,6 +275,187 @@ def _input_device_row(file_config: dict) -> Row:
     )
 
 
+# --- app rows -----------------------------------------------------------
+#
+# The menu-bar app (`vocalize/app.py`) reports on itself: whether the
+# bundle is built and current, whether launchd has it loaded, and whether
+# it holds the Accessibility grant. All three read `app.status_dict()`,
+# which never runs a build or launches anything — a status screen (and
+# the portal polling one) may not have side effects.
+
+APP_ROW_NAMES = ("app", "app agent", "accessibility")
+
+
+def _app_row() -> Row:
+    bundle = app.status_dict()["bundle"]
+    if bundle == "current":
+        return Row("app", "ok", "Vocalize.app is built", "")
+    if bundle == "stale":
+        return Row("app", "warn", "stale — run: vocalize app install", "")
+    return Row("app", "fail", "not built", "vocalize app install")
+
+
+def _app_agent_row() -> Row:
+    status = app.status_dict()
+    agent = status["agent"]
+    if agent == "loaded":
+        return Row("app agent", "ok", "loaded", "")
+    if agent == "not running":
+        # Not current: a plain restart won't fix a stale/missing bundle,
+        # so point at the fuller repair. Current: the bundle is fine, a
+        # restart is the narrower fix.
+        action = "vocalize app install" if status["bundle"] != "current" else "vocalize app restart"
+        return Row("app agent", "fail", "not running", action)
+    return Row("app agent", "warn", "unknown", "")
+
+
+def _accessibility_row() -> Row:
+    value = app.status_dict()["accessibility"]
+    if value == "granted":
+        return Row("accessibility", "ok", "granted", "")
+    if value == "not granted":
+        return Row(
+            "accessibility", "warn", "not granted",
+            "grant Accessibility to Vocalize in System Settings",
+        )
+    return Row("accessibility", "warn", "unknown", "")
+
+
+# --- doctor-only probes -------------------------------------------------
+#
+# `vocalize doctor` reports on the machine, not just the configured chain:
+# the toolchain, the console script itself, and two things known to fight
+# the app for a hotkey. None of these are polled by the portal, so — unlike
+# the provider/stt/app rows above — they carry no chain-membership pruning;
+# `doctor_rows` below always asks for all of them.
+
+_XCRUN_TIMEOUT = 10
+_STARTUP_TIMEOUT = 10
+_STARTUP_WARN_MS = 400.0
+_UV_INSTALL_HINT = "install it from https://docs.astral.sh/uv/"
+
+
+def _cli_path_row() -> Row:
+    found = shutil.which("vocalize")
+    if found is None:
+        return Row("cli path", "warn", "vocalize not found on PATH", "")
+    path = Path(found)
+    if path in app.BINARY_CANDIDATES:
+        return Row("cli path", "ok", str(path), "")
+    return Row("cli path", "warn", str(path), app.override_command(path))
+
+
+def _uv_row() -> Row:
+    if shutil.which("uv"):
+        return Row("uv", "ok", "uv on PATH", "")
+    return Row("uv", "fail", "uv not found", _UV_INSTALL_HINT)
+
+
+def _swiftc_row() -> Row:
+    try:
+        result = subprocess.run(
+            ["xcrun", "--find", "swiftc"], capture_output=True, text=True,
+            timeout=_XCRUN_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return Row("swiftc", "fail", "xcrun not found", "xcode-select --install")
+    if result.returncode == 0:
+        return Row("swiftc", "ok", (result.stdout or "swiftc found").strip(), "")
+    return Row("swiftc", "fail", "swiftc not found", "xcode-select --install")
+
+
+def _claude_row() -> Row:
+    if shutil.which("claude"):
+        return Row("claude", "ok", "claude on PATH", "")
+    return Row(
+        "claude", "warn",
+        "not on PATH; /speak summaries and claude-cli cleanup unavailable", "",
+    )
+
+
+def _shebang_row() -> Row:
+    """Does the running console script's interpreter still exist.
+
+    `uv tool install` bakes an absolute interpreter path into the script's
+    `#!` line; a Python upgrade or a pruned toolchain can delete it out
+    from under an already-installed script ("brew rot"). Anything that
+    isn't a plain `#!/path ...` script — `python -m vocalize`, a frozen
+    build, an unreadable file — has no such risk and reads as ok.
+    """
+    script = Path(sys.argv[0])
+    try:
+        with open(script, encoding="utf-8", errors="replace") as handle:
+            first_line = handle.readline()
+    except OSError:
+        return Row("shebang", "ok", "not a console script", "")
+    if not first_line.startswith("#!"):
+        return Row("shebang", "ok", "not a console script", "")
+    parts = first_line[2:].strip().split()
+    interpreter = parts[0] if parts else ""
+    if interpreter and Path(interpreter).exists():
+        return Row("shebang", "ok", interpreter, "")
+    return Row(
+        "shebang", "fail", f"interpreter not found: {interpreter or first_line.strip()}",
+        "brew rot: reinstall with uv tool install --reinstall vocalize-cli",
+    )
+
+
+def _hammerspoon_row() -> Row:
+    if app.hammerspoon_running():
+        return Row(
+            "hammerspoon", "warn",
+            "Hammerspoon is running — its own hotkeys may conflict",
+            "remove any conflicting hs.hotkey.bind(...) call from ~/.hammerspoon/init.lua",
+        )
+    return Row("hammerspoon", "ok", "not running", "")
+
+
+def _cli_startup_row() -> Row:
+    start = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["vocalize", "--version"], capture_output=True, text=True,
+            timeout=_STARTUP_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return Row("cli start-up", "warn", "could not run: vocalize --version", "")
+    elapsed_ms = (time.monotonic() - start) * 1000
+    detail = f"{elapsed_ms:.0f} ms"
+    if result.returncode != 0:
+        return Row("cli start-up", "warn", f"vocalize --version exited {result.returncode}", "")
+    if elapsed_ms > _STARTUP_WARN_MS:
+        return Row("cli start-up", "warn", detail, "")
+    return Row("cli start-up", "ok", detail, "")
+
+
+def _app_bundle_row() -> Row:
+    # Same verdict as the "app" row (bundle_state() has one owner), under
+    # the name the doctor's toolchain section reports it by.
+    row = _app_row()
+    return Row("app bundle", row.state, row.detail, row.action)
+
+
+_ICLOUD_CAVEAT = "notes would sync off this machine via iCloud Drive; keep the notes folder outside it"
+
+
+def _notes_folder_row(file_config: dict) -> Row:
+    folder = Path(config.resolve_notes(file_config)["folder"]).expanduser()
+    if folder.exists():
+        try:
+            total_bytes = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+        except OSError:
+            total_bytes = 0
+        detail = f"{total_bytes / (1024 * 1024):.1f} MB on disk"
+    else:
+        detail = "not created yet"
+
+    mobile_documents = Path.home() / "Library" / "Mobile Documents"
+    under_icloud = folder == mobile_documents or mobile_documents in folder.parents
+    if under_icloud:
+        return Row("notes folder", "warn", f"{detail} — {_ICLOUD_CAVEAT}", "")
+    return Row("notes folder", "ok", detail, "")
+
+
 def _make_probe(name: str, file_config: dict) -> Callable[[], Row]:
     if name in _CREDENTIAL_PROVIDERS:
         return lambda: _credential_row(name, file_config)
@@ -400,6 +584,51 @@ def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
                 _PROBES.pop(name, None)
                 _drop_inflight(name)
 
+        if app.bundle_state() != "not built":
+            _PROBES["app"] = _app_row
+            _PROBES["app agent"] = _app_agent_row
+            _PROBES["accessibility"] = _accessibility_row
+        else:
+            # No bundle installed: nothing to report on, and a machine
+            # that uninstalled the app must not keep showing its rows.
+            for name in APP_ROW_NAMES:
+                _PROBES.pop(name, None)
+                _drop_inflight(name)
+
         probes = list(_PROBES.items())
 
+    return run_probes(probes, timeout)
+
+
+def doctor_rows(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
+    """Every row `vocalize doctor` prints: a full machine check, not just
+    the configured chain.
+
+    Unlike `readiness()`, nothing here is pruned by what is configured —
+    every provider in `auth.PROVIDER_NAMES`, every dictation row and every
+    app row is asked for regardless, plus the ten toolchain/environment
+    checks `status` has no reason to run. Same never-raises, never-hangs-
+    past-`timeout` contract, via the same `run_probes`.
+    """
+    probes: list[tuple[str, Callable[[], Row]]] = [
+        (name, _make_probe(name, file_config)) for name in auth.PROVIDER_NAMES
+    ]
+    probes += [
+        ("stt model", _stt_model_row),
+        ("recorder", _recorder_row),
+        ("microphone", _microphone_row),
+        ("input device", lambda: _input_device_row(file_config)),
+        ("app", _app_row),
+        ("app agent", _app_agent_row),
+        ("accessibility", _accessibility_row),
+        ("cli path", _cli_path_row),
+        ("uv", _uv_row),
+        ("swiftc", _swiftc_row),
+        ("claude", _claude_row),
+        ("shebang", _shebang_row),
+        ("hammerspoon", _hammerspoon_row),
+        ("cli start-up", _cli_startup_row),
+        ("app bundle", _app_bundle_row),
+        ("notes folder", lambda: _notes_folder_row(file_config)),
+    ]
     return run_probes(probes, timeout)

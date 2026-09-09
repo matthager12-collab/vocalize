@@ -59,22 +59,26 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string># Selected text arrives on stdin. Interpolated values (vocalize/claude
-# paths, helper location) are baked in by hooks/install_quick_action.py.
+					<string># No input: speak the newest Claude Code plan file on demand.
 BIN="__VOCALIZE_BIN__"
 if [[ ! -x "$BIN" ]]; then
-  /usr/bin/osascript -e 'display notification "vocalize not found — re-run hooks/install_quick_action.py" with title "Vocalize"'
+  /usr/bin/osascript -e 'display notification "vocalize not found — re-run: vocalize integrate claude" with title "Vocalize"'
   exit 1
+fi
+PLAN=$(ls -t "$HOME/.claude/plans"/*.md 2&gt;/dev/null | head -1)
+if [[ -z "$PLAN" ]]; then
+  /usr/bin/osascript -e 'display notification "No plan files found in ~/.claude/plans." with title "Vocalize"'
+  exit 0
 fi
 "$BIN" stop &gt;/dev/null 2&gt;&amp;1
 export VOCALIZE_BIN="$BIN"
 export CLAUDE_BIN="__CLAUDE_BIN__"
 export CLAUDE_EXTRA_PATH="__CLAUDE_EXTRA_PATH__"
-exec /usr/bin/python3 "__HELPER__"</string>
+exec /usr/bin/python3 "__HELPER__" &lt; "$PLAN"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<false/>
 					<key>inputMethod</key>
-					<integer>0</integer>
+					<integer>1</integer>
 					<key>shell</key>
 					<string>/bin/zsh</string>
 					<key>source</key>
@@ -95,7 +99,7 @@ exec /usr/bin/python3 "__HELPER__"</string>
 				<key>Class Name</key>
 				<string>RunShellScriptAction</string>
 				<key>InputUUID</key>
-				<string>8A4A21F5-3C6E-4F58-9C1D-2B7E6A90D101</string>
+				<string>2C7F9E10-55D2-4B31-9A6E-8E0D4C71F301</string>
 				<key>Keywords</key>
 				<array>
 					<string>Shell</string>
@@ -105,9 +109,9 @@ exec /usr/bin/python3 "__HELPER__"</string>
 					<string>Unix</string>
 				</array>
 				<key>OutputUUID</key>
-				<string>8A4A21F5-3C6E-4F58-9C1D-2B7E6A90D102</string>
+				<string>2C7F9E10-55D2-4B31-9A6E-8E0D4C71F302</string>
 				<key>UUID</key>
-				<string>8A4A21F5-3C6E-4F58-9C1D-2B7E6A90D103</string>
+				<string>2C7F9E10-55D2-4B31-9A6E-8E0D4C71F303</string>
 				<key>UnlocalizedApplications</key>
 				<array>
 					<string>Automator</string>
@@ -196,11 +200,11 @@ exec /usr/bin/python3 "__HELPER__"</string>
 		<key>serviceApplicationPath</key>
 		<string></string>
 		<key>serviceInputTypeIdentifier</key>
-		<string>com.apple.Automator.text</string>
+		<string>com.apple.Automator.nothing</string>
 		<key>serviceOutputTypeIdentifier</key>
 		<string>com.apple.Automator.nothing</string>
 		<key>serviceProcessesInput</key>
-		<integer>1</integer>
+		<integer>0</integer>
 		<key>workflowTypeIdentifier</key>
 		<string>com.apple.Automator.servicesMenu</string>
 	</dict>

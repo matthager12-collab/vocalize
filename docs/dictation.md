@@ -91,6 +91,19 @@ recorder did not start."
 ## The hotkey
 
 ```bash
+vocalize app install
+```
+
+builds and loads **Vocalize.app**, a menu-bar app that owns the dictation
+hotkey system-wide — no Services menu, no shortcut assignment, no
+per-app Electron gap. It starts at login and stays running; see
+[docs/app.md](app.md) for install, uninstall, status and restart, and
+`vocalize app status` for whether it's currently loaded and which chord
+(if any) failed to register.
+
+Prefer the Quick Action instead?
+
+```bash
 python3 hooks/install_quick_action.py
 ```
 
@@ -107,7 +120,7 @@ project was built and tested around, but any unused combination works.
 
 From a terminal, the identical command is `vocalize dictate` (an alias for
 `vocalize listen --toggle`) — useful for testing the toggle without
-touching System Settings at all.
+touching System Settings at all, whichever way you trigger it.
 
 ## Using it
 
@@ -514,7 +527,30 @@ unconditionally and is always safe to run.
 
 ### The hotkey does nothing
 
+**If you installed the app** (`vocalize app install`), start with:
+
+```bash
+vocalize app status
+```
+
 In rough order of likelihood:
+
+1. **`agent: not running`.** The LaunchAgent isn't loaded. Run
+   `vocalize app install` again, or `vocalize app restart` if it was
+   loaded a moment ago.
+2. **`accessibility: not granted`.** Grant it in System Settings ›
+   Privacy & Security › Accessibility. A rebuild resets this grant — see
+   [docs/app.md](app.md#the-re-grant-rule).
+3. **`hotkeys: failed:<name>`.** That chord is already claimed by
+   another app — Hammerspoon and the old Quick Action are the two this
+   project itself might have left behind; see
+   [docs/app.md](app.md#conflicts-hammerspoon-and-the-old-quick-action).
+4. **`bundle: stale` or `not built`.** Run `vocalize app install`.
+5. **Speech-to-text was never installed.** `vocalize listen --check` will
+   say so plainly (exit 1).
+
+**If you installed the Quick Action** (`hooks/install_quick_action.py`)
+instead:
 
 1. **No shortcut is assigned yet**, or it's assigned to something else.
    Check System Settings › Keyboard › Keyboard Shortcuts › Services ›
@@ -533,7 +569,7 @@ In rough order of likelihood:
    cause for a no-input Service like this one.
 
 `vocalize dictate` from a plain terminal isolates whether the problem is
-the hotkey/Service layer or dictation itself — if that works, the Quick
+the hotkey layer or dictation itself — if that works, the app or Quick
 Action installation is where to look next.
 
 ### Rebuilds and re-granting the microphone

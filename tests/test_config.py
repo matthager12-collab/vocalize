@@ -913,3 +913,119 @@ def test_a_notes_template_may_not_look_like_a_flag(monkeypatch, tmp_path):
     whatever later opens it; refused like every other provider text."""
     with pytest.raises(ConfigError, match="notes.template"):
         _load_stt(monkeypatch, tmp_path, '[notes]\ntemplate = "-rf.md"\n')
+
+
+# --- the [app] table (run 7, T-62) -------------------------------------------
+
+
+def test_app_table_defaults_apply_with_no_table_at_all(monkeypatch, tmp_path):
+    from vocalize.config import APP_DEFAULTS, resolve_app
+
+    assert resolve_app(_load_stt(monkeypatch, tmp_path, "")) == APP_DEFAULTS
+
+
+def test_app_table_loads_with_valid_values_and_canonical_chords(monkeypatch, tmp_path):
+    """Aliases and order are the user's; what resolves is one spelling, the
+    one the menu-bar app parses from `vocalize settings`."""
+    from vocalize.config import resolve_app
+
+    data = _load_stt(
+        monkeypatch, tmp_path,
+        '[app]\ndictate = "Command+Control+Option+D"\nspeak = "cmd+shift+f5"\nstop = ""\n'
+        'dictate_mode = "toggle"\n',
+    )
+    assert resolve_app(data) == {
+        "dictate": "ctrl+alt+cmd+d", "dictate_mode": "toggle", "speak": "cmd+shift+f5", "stop": "",
+    }
+
+
+@pytest.mark.parametrize("chord", [
+    "ctrl+alt",  # modifier-only
+    "alt+shift+d",  # neither ctrl nor cmd
+    "ctrl+cmd+enter",  # not a key the grammar knows
+    "ctrl+ctrl+d",  # a repeated modifier
+    "ctrl + alt + d",  # spaces
+    "ctrl+alt+",  # an empty token
+    "hyper+d",  # an unknown modifier
+])
+def test_a_bad_app_chord_is_refused(monkeypatch, tmp_path, chord):
+    with pytest.raises(ConfigError, match="Invalid app.dictate"):
+        _load_stt(monkeypatch, tmp_path, f'[app]\ndictate = "{chord}"\n')
+
+
+@pytest.mark.parametrize("body", [
+    '[app]\ndictate = 3\n',
+    '[app]\ndictate_mode = "sticky"\n',
+    'app = "keep me"\n',
+])
+def test_a_bad_app_table_value_is_refused(monkeypatch, tmp_path, body):
+    with pytest.raises(ConfigError):
+        _load_stt(monkeypatch, tmp_path, body)
+
+
+def test_duplicate_app_chords_are_refused_against_the_defaults_too(monkeypatch, tmp_path):
+    """Only `speak` is set, to the default dictate chord: still a clash."""
+    with pytest.raises(ConfigError, match="app.dictate and app.speak .* are the same chord"):
+        _load_stt(monkeypatch, tmp_path, '[app]\nspeak = "command+option+control+d"\n')
+
+
+def test_two_disabled_app_chords_do_not_count_as_a_clash(monkeypatch, tmp_path):
+    from vocalize.config import resolve_app
+
+    data = _load_stt(monkeypatch, tmp_path, '[app]\nspeak = ""\nstop = ""\n')
+    assert resolve_app(data)["speak"] == "" and resolve_app(data)["stop"] == ""
+
+
+def test_an_unknown_app_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
+    """`stop_hotkey` arrives in 0.13.1; a file written for it must load here."""
+    data = _load_stt(monkeypatch, tmp_path, '[app]\nstop_hotkey = "pause"\n')
+
+    assert data["app"] == {"stop_hotkey": "pause"}
+    assert "unknown config key 'stop_hotkey' in [app]" in capsys.readouterr().err
+
+
+def test_dictate_mode_hold_resolves_to_toggle_with_one_warning(monkeypatch, tmp_path, capsys):
+    """A config from 0.13.1 must not brick a rolled-back 0.13.0 (DEC-032)."""
+    from vocalize import config
+    from vocalize.config import resolve_app
+
+    monkeypatch.setattr(config, "_warned", set())  # once per process: start this one clean
+    data = _load_stt(monkeypatch, tmp_path, '[app]\ndictate_mode = "hold"\n')
+    resolved = resolve_app(data)
+    resolve_app(data)  # a second resolve in the same process does not repeat it
+
+    assert resolved["dictate_mode"] == "toggle"
+    err = capsys.readouterr().err
+    assert err.count("arrives in 0.13.1") == 1
+
+
+def test_resolve_app_chord_grammar_accepts_every_key_it_lists():
+    from vocalize.config import CHORD_KEYS, chord_text, parse_chord
+
+    assert len(CHORD_KEYS) == 26 + 10 + 12
+    for key in CHORD_KEYS:
+        assert chord_text(parse_chord(f"ctrl+{key}")) == f"ctrl+{key}"
+    assert parse_chord("") is None and chord_text(None) == ""
+
+
+def test_the_chord_key_allowlist_matches_the_swift_keycode_table():
+    """The app's Swift source (run 8a) carries a `keyCodes` dictionary keyed
+    by the same names; the two must never drift. Until that file exists
+    the comparison has nothing to read, so it skips rather than passes."""
+    import re
+    from pathlib import Path
+
+    from vocalize.config import CHORD_KEYS
+
+    swift = Path(__file__).resolve().parent.parent / "vocalize" / "menubar" / "VocalizeApp.swift"
+    if not swift.is_file():
+        pytest.skip("vocalize/menubar/VocalizeApp.swift arrives in run 8a")
+    text = swift.read_text(encoding="utf-8")
+    # `let keyCodes: [String: UInt32] = [ "a": UInt32(kVK_ANSI_A), ... ]`:
+    # the literal starts after the `=`, so the type annotation's brackets
+    # are skipped, and it holds no nested bracket.
+    start = text.index("keyCodes")
+    opening = text.index("[", text.index("=", start))
+    block = text[opening:text.index("]", opening)]
+    names = set(re.findall(r'"([a-z0-9]+)"\s*:', block))
+    assert names == set(CHORD_KEYS), sorted(names ^ set(CHORD_KEYS))

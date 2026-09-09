@@ -412,7 +412,7 @@ def _toml_value(key: str, value) -> str:
 
 #: Keys whose value is a table, and which are therefore rendered as their
 #: own `[section]` after every flat key rather than as `key = …`.
-_TABLE_KEYS = ("providers", "stt", "notes")
+_TABLE_KEYS = ("providers", "stt", "notes", "app")
 
 
 def _table_lines(header: str, table, what: str) -> list[str]:
@@ -461,6 +461,8 @@ def _render_config_text(data: dict) -> str:
     # the next rewrite silently drops it (the [notes] table, 0.12.0).
     if "notes" in data:
         lines.extend(_table_lines("notes", data["notes"], "'notes'"))
+    if "app" in data:
+        lines.extend(_table_lines("app", data["app"], "'app'"))
 
     providers = data.get("providers")
     if providers is not None:

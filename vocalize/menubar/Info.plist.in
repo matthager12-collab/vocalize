@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- `vocalize app install` copies this file to Contents/Info.plist inside
+	     the bundle it builds. Nothing is substituted: every byte here is part
+	     of the TCC identity the user grants, and a plist that moved with the
+	     vocalize version would change the ad-hoc signature — and so cost an
+	     Accessibility re-grant — on every release (DEC-021, DEC-032). The
+	     bundle version below is the app's own and changes only when
+	     VocalizeApp.swift does, which after 0.13.0 means never without a
+	     re-grant. -->
+	<key>CFBundleIdentifier</key>
+	<string>cards.arda.vocalize.app</string>
+	<key>CFBundleName</key>
+	<string>Vocalize</string>
+	<key>CFBundleDisplayName</key>
+	<string>Vocalize</string>
+	<key>CFBundleExecutable</key>
+	<string>vocalize-app</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- Never in the Dock, never takes focus: the app is a status item and
+	     three hotkeys, pressed while the user is typing somewhere else.
+	     LSUIElement alone gives that, and the process asks for the matching
+	     .accessory activation policy at launch. LSBackgroundOnly, the stronger
+	     Apple-discouraged key, declares an app that can never come to the
+	     foreground — which would also mean no status item, and no way for the
+	     Accessibility prompt to name something the user recognises. -->
+	<key>LSUIElement</key>
+	<true/>
+	<!-- No NSMicrophoneUsageDescription, and no usage string of any kind: this
+	     app never opens an input. Recording belongs to Vocalize Recorder.app,
+	     which holds the microphone grant under its own identity (DEC-010).
+	     Accessibility, the one permission this bundle does take, has no
+	     usage-string key at all — it is granted in System Settings, keyed by
+	     this identifier and this signature. -->
+</dict>
+</plist>

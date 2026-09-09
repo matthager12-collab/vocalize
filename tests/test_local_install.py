@@ -1069,24 +1069,44 @@ def test_uninstall_whisper_a_second_run_says_nothing_to_remove(fake_stt_install)
     assert result.output.strip() == "Nothing to remove."
 
 
-def test_uninstall_whisper_removes_both_the_model_dir_and_the_recorder_bin_dir(fake_stt_install):
-    # T-25's acceptance is "--yes removes both". Both targets must exist
+def test_uninstall_whisper_removes_the_model_dir_the_recorder_bundle_and_its_stamp(fake_stt_install, monkeypatch):
+    # T-25's acceptance is "--yes removes both". Every target must exist
     # going in, or a regression that removes only targets[0] (or stops
-    # after the first rmtree) would still pass this test.
+    # after the first rmtree) would still pass this test. Since run 7 the
+    # command removes what it built by name (the bundle, its stamp, and a
+    # crash-era `.recorder-build-*` / `.recorder-old-*` leftover), never
+    # the bin dir wholesale, so a stray neighbour survives (T-61). The
+    # menu-bar app itself lives under ~/Library/Application Support, not
+    # here (design.md § LaunchAgent and bundle identity).
     CliRunner().invoke(main, ["local", "install", "--stt", "--yes"])
     bin_dir = stt_manifest.MODEL_DIR.parent.parent / "bin"
-    bin_dir.mkdir(parents=True)
-    (bin_dir / "placeholder").write_text("x")
+    monkeypatch.setattr(install_module, "BIN_DIR", bin_dir)
+    bundle = install_module.recorder_bundle()
+    (bundle / "Contents" / "MacOS").mkdir(parents=True)
+    (bundle / "Contents" / "MacOS" / "recorder").write_text("x")
+    stamp = install_module.recorder_stamp_path()
+    stamp.write_text("{}")
+    neighbour = bin_dir / "Something Else.app"
+    neighbour.mkdir()
+    (bin_dir / ".else").write_text("{}")
+    leftover = bin_dir / ".recorder-old-4242.app"
+    leftover.mkdir()
 
     plan = CliRunner().invoke(main, ["local", "uninstall", "--stt"], input="n\n")
     assert str(stt_manifest.MODEL_DIR) in plan.output
-    assert str(bin_dir) in plan.output
+    assert str(bundle) in plan.output
+    assert str(stamp) in plan.output
+    assert str(leftover) in plan.output
+    assert str(neighbour) not in plan.output
 
     result = CliRunner().invoke(main, ["local", "uninstall", "--stt", "--yes"])
 
     assert result.exit_code == 0
-    assert not bin_dir.exists()
+    assert not bundle.exists()
+    assert not stamp.exists()
     assert not stt_manifest.MODEL_DIR.exists()
+    assert not leftover.exists()
+    assert neighbour.is_dir() and (bin_dir / ".else").is_file()
 
 
 def test_uninstall_whisper_reports_a_symlinked_target_instead_of_crashing(fake_stt_install):

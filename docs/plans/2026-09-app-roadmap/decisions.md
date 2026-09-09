@@ -17,7 +17,7 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 | DEC-030 | How do cleanup and summaries reach three backends? | Decided | A — one `llm.py` with `_complete`; enum `off\|local\|claude-cli\|anthropic` | R2 |
 | DEC-031 | How is the cue kept out of the recording? | Decided | B — trim the take in dictate.py after the first growth of `take.wav`; the recorder stays frozen | R2 |
 | DEC-032 | How many releases, and where does the Swift source freeze? | Decided | B — four releases; the Swift source ships complete in 0.13.0 so 0.13.1 is Python only | R2 |
-| DEC-033 | Which hotkey backend? | Deferred | to the spike T-60; both branches planned | R2 |
+| DEC-033 | Which hotkey backend? | Decided | A — Carbon; the T-60 spike passed with Claude desktop, Ghostty and full-screen Claude in front | R2, decided run 7 |
 | DEC-034 | Parakeet or whisper for 0.14? | Deferred | to the spike T-120; both branches planned | R2 |
 | DEC-035 | Does the `security` backend hold across rebuilt callers? | Decided | A — it holds; the backend is built (run 4, 2026-09-07) | R2 |
 | DEC-036 | How does a read pause, and how is it reached? | Decided | C — `vocalize pause` on the remembered stop, plus opt-in `[app] stop_hotkey = "pause"`; `stop` and the one-hour life unchanged | R3 |
@@ -345,7 +345,7 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 | Option | Description | Trade-offs |
 |---|---|---|
 | A | One 0.13.0 at 55–70 h | One long run |
-| B | 0.13.0 (app, doctor, integrate, setup) then 0.13.1 (cue trim, hold-to-talk, paste), with the Swift dispatch for hold and the paste watcher already compiled into 0.13.0 | 0.13.1 is Python only, no re-grant; `dictate_mode = "hold"` is refused by the 0.13.0 validator until 0.13.1 |
+| B | 0.13.0 (app, doctor, integrate, setup) then 0.13.1 (cue trim, hold-to-talk, paste), with the Swift dispatch for hold and the paste watcher already compiled into 0.13.0 | 0.13.1 is Python only, no re-grant; `dictate_mode = "hold"` is parsed by the 0.13.0 validator and resolved to toggle with one warning until 0.13.1 (run 7 chose accept-and-warn over refuse, so a rollback from 0.13.1 never bricks the CLI) |
 
 **Recommendation**: B.
 
@@ -361,9 +361,9 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 ### DEC-033: Which hotkey backend?
 
-**Date**: 2026-09-06
-**Decided by**: deferred to the owner after T-60
-**Status**: Deferred
+**Date**: 2026-09-06; decided 2026-09-07
+**Decided by**: Mat, on the T-60 spike's three results
+**Status**: Decided
 
 **Context**: Carbon `RegisterEventHotKey` needs no permission and delivers key-up, but a report says self-drawn apps (Claude Code desktop is Electron) can swallow Carbon hotkeys. The alternative is an `NSEvent` global monitor, which needs the Accessibility grant the app already takes (DEC-021).
 
@@ -374,7 +374,7 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 **Recommendation**: A if the spike passes in all three frontmost cases; otherwise B, and this entry gains a sentence amending DEC-021's "dictation needs none".
 
-**Decision**: Pending the 30-minute spike (T-60). Both backends are compiled into the app; the choice is a build-time constant.
+**Decision**: A, Carbon. The T-60 spike (2026-09-07, a throwaway Swift probe registering control-option-command-D through `RegisterEventHotKey`, run with `NSApplication` in accessory mode) delivered one key-down and one key-up in all three frontmost cases: Claude desktop in a normal window (held 2 s), Ghostty, a self-drawn terminal (held 3 s), and Claude desktop full-screen (held 3 s). Register status 0 with Hammerspoon running on S and X. Both backends are still compiled into the app; the build-time constant selects Carbon. Results in [spike-notes.md](./spike-notes.md) § Hotkeys.
 
 **Consequences**: Either way the Swift source is complete in 0.13.0. The backend is a build-time constant with no runtime fallback: a later macOS regression of the chosen backend shows as `hotkeys: failed` in `app.status` and a doctor row, and switching costs a rebuild and a re-grant. Accepted as a one-way door; a self-firing hotkey test at launch was considered and rejected as more code than the failure warrants.
 

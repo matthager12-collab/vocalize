@@ -138,6 +138,11 @@ aside button[disabled] { opacity: 0.5; cursor: default; }
 #rows { list-style: none; margin: 0.75rem 0 0; padding: 0; }
 #rows li { padding: 0.6rem 0; border-top: 1px solid var(--line); }
 #rows li:first-child { border-top: none; }
+
+/* The Setup tab's per-step rows: the same row markup as the sidebar. */
+ul.setup-rows { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+ul.setup-rows li { padding: 0.4rem 0; border-top: 1px solid var(--line); }
+ul.setup-rows li:first-child { border-top: none; }
 .row-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
 .row-name { font-weight: 600; }
 .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; flex: none; align-self: center; }
@@ -261,6 +266,7 @@ body.dead main { opacity: 0.5; pointer-events: none; }
       <button type="button" role="tab" id="tab-keys" aria-controls="panel-keys" aria-selected="false">Keys</button>
       <button type="button" role="tab" id="tab-usage" aria-controls="panel-usage" aria-selected="false">Usage</button>
       <button type="button" role="tab" id="tab-local" aria-controls="panel-local" aria-selected="false">Local</button>
+      <button type="button" role="tab" id="tab-setup" aria-controls="panel-setup" aria-selected="false">Setup</button>
     </div>
 
     <section class="panel" id="panel-chain" role="tabpanel" aria-labelledby="tab-chain">
@@ -276,6 +282,9 @@ body.dead main { opacity: 0.5; pointer-events: none; }
       <p class="empty">Loading&hellip;</p>
     </section>
     <section class="panel" id="panel-local" role="tabpanel" aria-labelledby="tab-local" hidden>
+      <p class="empty">Loading&hellip;</p>
+    </section>
+    <section class="panel" id="panel-setup" role="tabpanel" aria-labelledby="tab-setup" hidden>
       <p class="empty">Loading&hellip;</p>
     </section>
   </div>

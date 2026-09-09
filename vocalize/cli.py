@@ -56,12 +56,14 @@ from .clipboard import read_clipboard
 from .config import (
     DEFAULT_MODEL,
     DEFAULT_VOICE,
+    KNOWN_APP_KEYS,
     OVERFLOW_MODES,
     budget_for,
     chain_source,
     config_path,
     load_config_file,
     resolve_api_key,
+    resolve_app,
     resolve_chain,
     resolve_notes,
     resolve_overflow,
@@ -71,6 +73,7 @@ from .config import (
 )
 from .exceptions import (
     AudioPlaybackError,
+    ConfigError,
     DictationError,
     MissingAPIKeyError,
     PlaybackStopped,
@@ -82,7 +85,7 @@ from .preprocess import (
     flatten_markdown,
     truncate_for_budget,
 )
-from .readiness import readiness
+from .readiness import Row, doctor_rows, readiness
 from .tts import DEFAULT_CACHE_DIR, build_client, get_usage, list_voices
 from .wizard import run_wizard
 
@@ -456,11 +459,15 @@ def clip(allow_secret, api_key, provider, voice_id, model_id, speed, output_path
         raise TTSRequestError("Clipboard is empty; nothing to speak.")
     if not allow_secret and _looks_like_credential(text):
         # Deliberately does not echo any part of the clipboard.
-        raise click.ClickException(
+        refusal = click.ClickException(
             "Refusing to speak: the clipboard looks like a secret or credential "
             "(a single high-entropy token). It was not shown or sent anywhere. "
             "If you are sure it is safe, re-run with --allow-secret."
         )
+        # Its own exit code, so a caller can tell "I refused to read this"
+        # from any other failure without matching on the message.
+        refusal.exit_code = 3
+        raise refusal
     if play:
         stop_playback()  # fresh content replaces whatever is mid-playback
     _run_tts(text, api_key=api_key, voice_id=voice_id, model_id=model_id, speed=speed,
@@ -499,6 +506,11 @@ def settings() -> None:
     notes = resolve_notes(file_config)
     click.echo(f"notes.summarizer={notes['summarizer']}")
     click.echo(f"notes.template={notes['template']}")
+    # The menu-bar app reads these lines (0.13.0): canonical chords, and
+    # dictate_mode as this release honours it.
+    app = resolve_app(file_config)
+    for key in KNOWN_APP_KEYS:
+        click.echo(f"app.{key}={app[key]}")
 
 
 @main.command()
@@ -752,6 +764,41 @@ def status(as_json) -> None:
             click.echo(line)
 
     if any(row.state != "ok" for row in rows):
+        sys.exit(1)
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True,
+              help="Print the rows as a JSON list instead of the formatted screen.")
+def doctor(as_json) -> None:
+    """Full machine check: every provider, every dictation and app row,
+    plus the toolchain and environment checks `status` does not cover.
+
+    Exits 1 only when a row fails outright — a warn row (Hammerspoon
+    running, claude not on PATH, a slow cold start) is worth reading but
+    is not a reason to fail a script.
+    """
+    # doctor is the command a broken config file is meant to be diagnosed
+    # with, so a ConfigError becomes one failed row instead of killing the
+    # other twenty. Every other command still refuses outright.
+    try:
+        file_config = load_config_file()
+        rows = doctor_rows(file_config)
+    except ConfigError as exc:
+        rows = [Row("config file", "fail", str(exc), "fix it and rerun")]
+        rows += doctor_rows({})
+
+    if as_json:
+        click.echo(json.dumps([row._asdict() for row in rows]))
+    else:
+        for row in rows:
+            label = click.style(f"[{row.state.upper()}]", fg=_STATE_COLORS.get(row.state), bold=True)
+            line = f"{label} {row.name}: {row.detail}"
+            if row.action:
+                line += f" — {row.action}"
+            click.echo(line)
+
+    if any(row.state == "fail" for row in rows):
         sys.exit(1)
 
 
@@ -1318,6 +1365,217 @@ if __name__ == "__main__":
     run()
 
 
+# --- the menu-bar app -------------------------------------------------
+# The only commands that write outside ~/.cache/vocalize: the bundle
+# under ~/Library/Application Support and its LaunchAgent. Everything
+# they know about launchctl, tccutil and the bundle lives in app.py; this
+# is the wording and the exit codes.
+
+_HAMMERSPOON_WARNING = (
+    "Hammerspoon is running. If it has bound the same chords, the app's hotkeys "
+    "register as taken and pressing them does nothing.\n"
+    "Remove the ctrl-alt-cmd-S and ctrl-alt-cmd-X hs.hotkey.bind lines from "
+    "~/.hammerspoon/init.lua, then reload Hammerspoon from its menu-bar icon."
+)
+# `vocalize integrate claude` installs this Quick Action on purpose, as an
+# unbound Services-menu entry, so its presence is not the conflict — an
+# assigned shortcut on the app's own chord is.
+_SERVICES_WARNING = (
+    "The 'Dictate with Vocalize' Quick Action is installed at ~/Library/Services. "
+    "If you assigned ctrl-alt-cmd-D (or -X) to it in System Settings, that "
+    "shortcut owns the chord and the app's hotkey never fires.\n"
+    "Unassign it under Keyboard › Keyboard Shortcuts › Services; the Quick "
+    "Action itself is fine to keep, from the Services menu."
+)
+
+
+@main.group("app")
+def app_group() -> None:
+    """Install and manage the menu-bar app that owns the hotkeys."""
+
+
+def _app_modules():
+    """Imported inside the commands, like the local group's: `vocalize
+    speak` must never pay for the bundle builder."""
+    from . import app as app_module
+    from .local import install as install_module
+
+    return app_module, install_module
+
+
+def _tool_failed(result, command: str) -> click.ClickException:
+    detail = (result.stderr or result.stdout or "").strip() if result is not None else ""
+    return click.ClickException(f"{command} failed: {detail or 'no output'}")
+
+
+@app_group.command("install")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def app_install(yes) -> None:
+    """Build Vocalize.app and load it, so the hotkeys work everywhere."""
+    app, install_module = _app_modules()
+
+    # First, because it is the one failure the install cannot fix for the
+    # user: the app looks in three fixed places, and a vocalize somewhere
+    # else is an app that starts and can never spawn anything.
+    resolved = app.cli_path()
+    if not app.discoverable(resolved):
+        click.echo(app.override_command(resolved))
+        click.echo(
+            "The app only looks in ~/.local/bin, /opt/homebrew/bin and "
+            "/usr/local/bin, so without that line it will not find this vocalize."
+        )
+        if not yes:
+            sys.exit(1)
+
+    if app.hammerspoon_running():
+        click.echo(_HAMMERSPOON_WARNING, err=True)
+    if app.SERVICES_WORKFLOW.exists():
+        click.echo(_SERVICES_WARNING, err=True)
+
+    click.echo("This will write:")
+    click.echo(f"  {app.bundle_path()}")
+    click.echo(f"  {app.plist_path()}")
+    click.echo("and load it with launchctl, so the app starts at login.")
+    click.echo("")
+    if not yes and not click.confirm("Install now?", default=False):
+        click.echo("Aborted, nothing installed.")
+        sys.exit(1)
+
+    try:
+        status, bundle = app.build()
+    except install_module.InstallError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"  {status}: {bundle}")
+    # Only a rebuild changed the signature, and only a changed signature
+    # has an orphaned grant to clear (see app.py's docstring).
+    if status == "rebuilt":
+        app.reset_accessibility()
+        # The old app's last `app.status` still says "granted"; the new one
+        # rewrites the file at launch, so until then a reader must see no
+        # file ("unknown") rather than a grant that was just reset.
+        try:
+            app.status_path().unlink()
+        except OSError:
+            pass
+        click.echo(app.APP_REGRANT_WARNING)
+
+    try:
+        click.echo(f"  wrote {app.write_plist()}")
+    except OSError as exc:
+        # A symlink planted at our own plist name (ELOOP under O_NOFOLLOW),
+        # a directory we cannot write: the bundle is built and stays built,
+        # the agent is simply not loaded, and the message says which path.
+        raise click.ClickException(
+            f"Could not write the LaunchAgent {app.plist_path()}: {exc.strerror or exc}"
+        ) from exc
+    app.bootout()  # not loaded is the state we want, not an error
+    result = app.bootstrap()
+    if result is None or result.returncode != 0:
+        raise _tool_failed(result, app.bootstrap_command())
+
+    click.echo("")
+    for line in app.status_lines():
+        click.echo(line)
+
+
+@app_group.command("status")
+@click.option(
+    "--json", "as_json", is_flag=True,
+    help="Print the state as one JSON object instead of lines.",
+)
+def app_status(as_json) -> None:
+    """What is built, whether the agent is loaded, what the app reports."""
+    app, _ = _app_modules()
+
+    state = app.status_dict()
+    if as_json:
+        click.echo(json.dumps(state))
+    else:
+        for key, value in state.items():
+            click.echo(f"{key}: {value}")
+    if state["bundle"] != "current" or state["agent"] != "loaded":
+        sys.exit(1)
+
+
+@app_group.command("restart")
+def app_restart() -> None:
+    """Stop the app and start it again, leaving the LaunchAgent alone."""
+    app, _ = _app_modules()
+
+    result = app.kickstart()
+    if result is None or result.returncode != 0:
+        raise _tool_failed(result, f"{app.LAUNCHCTL} kickstart -k {app.gui_target()}")
+    click.echo("Restarted.")
+
+
+@app_group.command("uninstall")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def app_uninstall(yes) -> None:
+    """Unload the app and remove what `app install` put on this machine."""
+    app, _ = _app_modules()
+
+    # By name, never a directory wholesale: the recorder bundle and its
+    # microphone grant live next door and are none of this command's
+    # business, and so does everything else under ~/.cache/vocalize.
+    candidates = (
+        app.bundle_path(), app.plist_path(), app.stamp_path(),
+        app.status_path(), app.log_path(), app.copied_path(),
+    )
+    # is_dir() + not is_symlink(), like `local uninstall --stt`: exists()
+    # follows symlinks, and rmtree on a symlink raises instead of removing.
+    targets = [
+        path for path in candidates
+        if (path.is_dir() or path.is_file()) and not path.is_symlink()
+    ]
+    symlinked = [path for path in candidates if path.is_symlink()]
+
+    if targets or symlinked:
+        click.echo("This will remove:")
+        for path in targets:
+            click.echo(f"  {path}")
+        for path in symlinked:
+            click.echo(f"  {path} (a symlink — remove it yourself)")
+    else:
+        click.echo("None of the app's files are on disk.")
+    click.echo("")
+    click.echo("The app will be unloaded, and the Accessibility entry stays in")
+    click.echo("System Settings › Privacy & Security › Accessibility (macOS keeps it;")
+    click.echo("remove it there if you want it gone). Dictation and the recorder's")
+    click.echo("microphone grant are untouched.")
+    click.echo("")
+    if not yes and not click.confirm("Remove now?", default=False):
+        click.echo("Aborted, nothing removed.")
+        sys.exit(1)
+
+    app.bootout()  # before the plist goes, and a failure means it was not loaded
+    for path in targets:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            raise click.ClickException(f"Could not remove {path}: {exc}") from exc
+        click.echo(f"  removed {path}")
+    app.forget_binary_override()  # nothing there is a failure, and is fine
+    click.echo("The menu-bar app is uninstalled.")
+
+
+@main.group("integrate")
+def integrate_group() -> None:
+    """One-shot installers that wire vocalize into other tools."""
+
+
+@integrate_group.command("claude")
+@click.option("--yes", is_flag=True,
+              help="Overwrite an existing /speak skill file instead of keeping it.")
+def integrate_claude_cmd(yes) -> None:
+    """Install the /speak skill and the Quick Actions, print the GUI-only steps."""
+    from .integrate import integrate_claude
+
+    sys.exit(integrate_claude(yes=yes))
+
+
 # --- the optional local provider -------------------------------------
 # Deliberately last in the file: everything below is Kokoro's opt-in
 # setup, and nothing above it knows or cares that it exists.
@@ -1687,16 +1945,28 @@ def _uninstall_stt(yes: bool) -> None:
     install_module, manifest = _stt_modules()
 
     model_dir = manifest.MODEL_DIR
-    # ~/.cache/vocalize/bin — the recorder bundle `local install --stt`
-    # compiles. Removing it drops the ad-hoc signature the microphone
-    # grant is attached to; the grant itself stays in System Settings.
-    bin_dir = install_module.BIN_DIR
+    # The recorder bundle `local install --stt` compiles, and its stamp,
+    # under ~/.cache/vocalize/bin — plus any `.recorder-build-*` or
+    # `.recorder-old-*` bundle a build killed mid-swap left behind (the
+    # latter carries the granted signature). Removing the bundle drops the
+    # ad-hoc signature the microphone grant is attached to; the grant itself
+    # stays in System Settings. Only the recorder's own files go, by name:
+    # this command removes what it built, never a directory wholesale.
+    bundle = install_module.recorder_bundle()
+    stamp = install_module.recorder_stamp_path()
+    leftovers = sorted(
+        path for pattern in (".recorder-build-*.app", ".recorder-old-*.app")
+        for path in install_module.BIN_DIR.glob(pattern)
+    ) if install_module.BIN_DIR.is_dir() else []
     # is_dir() + not is_symlink(): path.exists() follows symlinks, and a
     # bare `shutil.rmtree()` on a symlinked target raises OSError instead
     # of removing anything — a user who pointed the model dir at an
     # external disk gets a clean message instead.
-    candidates = (model_dir, bin_dir)
-    targets = [path for path in candidates if path.is_dir() and not path.is_symlink()]
+    candidates = (model_dir, bundle, stamp, *leftovers)
+    targets = [
+        path for path in candidates
+        if (path.is_dir() or path.is_file()) and not path.is_symlink()
+    ]
     symlinked = [path for path in candidates if path.is_symlink()]
 
     if not targets and not symlinked:
@@ -1717,7 +1987,10 @@ def _uninstall_stt(yes: bool) -> None:
 
     for path in targets:
         try:
-            shutil.rmtree(path)
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
         except OSError as exc:
             raise click.ClickException(f"Could not remove {path}: {exc}") from exc
         click.echo(f"  removed {path}")

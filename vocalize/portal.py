@@ -89,7 +89,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import auth, config, ledger, readiness, wizard
+from . import app, auth, config, ledger, readiness, wizard
 from .exceptions import (
     ConfigChangedError,
     MissingAPIKeyError,
@@ -225,8 +225,12 @@ VOICES_FAILED = (
     "typed voice id."
 )
 
-#: What `POST /api/local/install/start` will install.
-INSTALL_TARGETS = ("kokoro", "stt")
+#: What `POST /api/local/install/start` will install. "app" runs the same
+#: build/write_plist/bootout/bootstrap sequence as `vocalize app install`,
+#: through the same `app` module functions readiness and the CLI use, so
+#: the Setup tab's "Install the app" button ends in exactly the state a
+#: terminal install would.
+INSTALL_TARGETS = ("kokoro", "stt", "app")
 
 #: Where run 9's page will live. Absent until then, so `/` and `/portal.js`
 #: fall back to a placeholder rather than 404 — and, more to the point,
@@ -1151,6 +1155,7 @@ class Portal:
                     for slot in auth.KEY_SLOTS
                 },
                 "stt": stt,
+                "app": app.status_dict(),
                 "config_path": str(config.config_path()),
                 "config_error": config_error,
                 "fingerprint": _wire(fingerprint),
@@ -1576,6 +1581,8 @@ class Portal:
             try:
                 if target == "kokoro":
                     self._install_kokoro()
+                elif target == "app":
+                    self._install_app()
                 else:
                     self._install_stt(model)
                 self._progress(step="installed")
@@ -1602,6 +1609,36 @@ class Portal:
             self._progress(downloaded=already + done)
 
         return report
+
+    def _install_app(self) -> None:
+        """Build Vocalize.app and load it — `cli.app_install`'s sequence,
+        through the same `app` module functions, so a portal-driven install
+        ends in the state a terminal `vocalize app install` would.
+
+        `launchctl`'s own stderr never reaches this progress dict: unlike
+        the CLI, which prints straight to the owner's terminal, this reaches
+        a web page (`_one_line` only ever wraps text this module itself
+        wrote), so a failed bootstrap is one fixed sentence, not whatever
+        `launchctl` said about the path.
+
+        A build or plist error's own message does reach the progress
+        message: this package's fixed strings, a compiler's last line, or a
+        path — never a user's text.
+        """
+        self._progress(step="building the app")
+        status, _bundle = app.build()
+        # Only a rebuild changed the ad-hoc signature, and only a changed
+        # signature has an orphaned Accessibility grant to clear — see
+        # app.py's docstring. A "built" or "current" install must not touch it.
+        if status == "rebuilt":
+            app.reset_accessibility()
+            self._progress(note=app.APP_REGRANT_WARNING)
+        self._progress(step="loading the app")
+        app.write_plist()
+        app.bootout()  # not loaded is the state we want, not an error
+        result = app.bootstrap()
+        if result is None or result.returncode != 0:
+            raise RuntimeError("Could not load the app with launchctl.")
 
     def _install_kokoro(self) -> None:
         from .local import install as install_module

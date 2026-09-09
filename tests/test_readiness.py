@@ -6,15 +6,18 @@ one in-flight probe per row name, and a function that never raises.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 import vocalize.readiness as readiness_module
+from vocalize import app as app_module
 from vocalize import ledger
 from vocalize.cli import main
 from vocalize.readiness import Row, readiness
@@ -640,3 +643,391 @@ def test_wedged_probes_are_joined_against_one_shared_deadline():
         assert elapsed < 1.0, f"three wedged probes took {elapsed:.2f}s of a 0.5s budget"
     finally:
         blocked.set()
+
+
+# --- app rows -----------------------------------------------------------
+
+
+def test_app_rows_absent_when_no_bundle_is_built(monkeypatch):
+    monkeypatch.setattr(app_module, "bundle_state", lambda: "not built")
+    rows = readiness({"chain": ["say"]})
+    assert set(readiness_module.APP_ROW_NAMES).isdisjoint(row.name for row in rows)
+
+
+def test_app_rows_present_once_a_bundle_exists(monkeypatch):
+    monkeypatch.setattr(app_module, "bundle_state", lambda: "current")
+    monkeypatch.setattr(
+        app_module,
+        "status_dict",
+        lambda: {
+            "bundle": "current",
+            "agent": "loaded",
+            "accessibility": "granted",
+            "hotkeys": "ok",
+            "hotkey_backend": "carbon",
+            "vocalize": "/opt/homebrew/bin/vocalize",
+        },
+    )
+    rows = readiness({"chain": ["say"]})
+    names = {row.name for row in rows}
+    assert set(readiness_module.APP_ROW_NAMES) <= names
+    assert _row(rows, "app") == Row("app", "ok", "Vocalize.app is built", "")
+    assert _row(rows, "app agent") == Row("app agent", "ok", "loaded", "")
+    assert _row(rows, "accessibility") == Row("accessibility", "ok", "granted", "")
+
+
+@pytest.mark.parametrize(
+    "bundle,expected",
+    [
+        ("current", Row("app", "ok", "Vocalize.app is built", "")),
+        ("stale", Row("app", "warn", "stale — run: vocalize app install", "")),
+        ("not built", Row("app", "fail", "not built", "vocalize app install")),
+        ("some-hostile-word", Row("app", "fail", "not built", "vocalize app install")),
+    ],
+)
+def test_app_row_state_mapping(monkeypatch, bundle, expected):
+    monkeypatch.setattr(app_module, "status_dict", lambda: {"bundle": bundle})
+    assert readiness_module._app_row() == expected
+
+
+@pytest.mark.parametrize(
+    "agent,bundle,expected",
+    [
+        ("loaded", "current", Row("app agent", "ok", "loaded", "")),
+        (
+            "not running",
+            "current",
+            Row("app agent", "fail", "not running", "vocalize app restart"),
+        ),
+        (
+            "not running",
+            "stale",
+            Row("app agent", "fail", "not running", "vocalize app install"),
+        ),
+        ("unknown", "current", Row("app agent", "warn", "unknown", "")),
+        ("some-hostile-word", "current", Row("app agent", "warn", "unknown", "")),
+    ],
+)
+def test_app_agent_row_state_mapping(monkeypatch, agent, bundle, expected):
+    monkeypatch.setattr(app_module, "status_dict", lambda: {"agent": agent, "bundle": bundle})
+    assert readiness_module._app_agent_row() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("granted", Row("accessibility", "ok", "granted", "")),
+        (
+            "not granted",
+            Row(
+                "accessibility",
+                "warn",
+                "not granted",
+                "grant Accessibility to Vocalize in System Settings",
+            ),
+        ),
+        ("unknown", Row("accessibility", "warn", "unknown", "")),
+    ],
+)
+def test_accessibility_row_state_mapping(monkeypatch, value, expected):
+    monkeypatch.setattr(app_module, "status_dict", lambda: {"accessibility": value})
+    assert readiness_module._accessibility_row() == expected
+
+
+def test_hostile_app_status_word_never_reaches_a_row_detail_unchanged(monkeypatch):
+    """`app.status` is untrusted (DEC-028): a word outside the known
+    vocabulary must read as "unknown" on the row, never pass through raw."""
+    hostile = "<script>alert(1)</script>"
+    monkeypatch.setattr(
+        app_module, "status_dict", lambda: {"accessibility": hostile, "agent": hostile}
+    )
+
+    accessibility_row = readiness_module._accessibility_row()
+    agent_row = readiness_module._app_agent_row()
+
+    assert accessibility_row.detail == "unknown"
+    assert hostile not in accessibility_row.detail
+    assert hostile not in accessibility_row.action
+    assert agent_row.detail == "unknown"
+    assert hostile not in agent_row.detail
+    assert hostile not in agent_row.action
+
+
+# --- doctor -----------------------------------------------------------
+
+_DOCTOR_ONLY_NAMES = (
+    "cli path", "uv", "swiftc", "claude", "shebang", "hammerspoon",
+    "cli start-up", "app bundle", "notes folder",
+)
+
+
+@pytest.fixture
+def _no_real_tools(monkeypatch, tmp_path):
+    """Keep the doctor_rows() composition tests off whatever toolchain
+    (and notes folder) happens to exist on the machine running the suite:
+    no real `which`, `xcrun` or `vocalize` subprocess, and HOME pointed at
+    tmp_path so the default notes folder is never the developer's real
+    ~/Documents. Only the composition (names, order) is under test here —
+    the state each probe reports for a real machine is covered
+    probe-by-probe above with an explicit fake.
+    """
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def boom(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", boom)
+
+
+def test_doctor_includes_every_provider_regardless_of_chain(_no_real_tools):
+    rows = readiness_module.doctor_rows({"chain": ["say"]})
+    names = {row.name for row in rows}
+    from vocalize.auth import PROVIDER_NAMES
+
+    assert set(PROVIDER_NAMES) <= names
+
+
+def test_doctor_includes_stt_rows_even_when_never_set_up(_no_real_tools):
+    rows = readiness_module.doctor_rows({})
+    names = {row.name for row in rows}
+    assert set(readiness_module.STT_ROW_NAMES) <= names
+
+
+def test_doctor_includes_app_rows_even_when_no_bundle_is_built(monkeypatch, _no_real_tools):
+    monkeypatch.setattr(app_module, "bundle_state", lambda: "not built")
+    rows = readiness_module.doctor_rows({})
+    names = {row.name for row in rows}
+    assert set(readiness_module.APP_ROW_NAMES) <= names
+
+
+def test_doctor_appends_the_toolchain_rows_in_order(_no_real_tools):
+    rows = readiness_module.doctor_rows({})
+    names = [row.name for row in rows]
+    tail = names[-len(_DOCTOR_ONLY_NAMES):]
+    assert tail == list(_DOCTOR_ONLY_NAMES)
+
+
+def test_doctor_never_raises_when_a_probe_blows_up(monkeypatch, tmp_path, _no_real_tools):
+    monkeypatch.setattr(
+        "vocalize.config._validate_notes_table",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    rows = readiness_module.doctor_rows({})
+    row = _row(rows, "notes folder")
+    assert row.state == "warn"
+    assert "boom" not in row.detail  # exception message never leaks (see run_probes)
+
+
+def test_cli_path_row_ok_when_a_known_candidate(monkeypatch):
+    candidate = app_module.BINARY_CANDIDATES[1]  # /opt/homebrew/bin/vocalize
+    monkeypatch.setattr(shutil, "which", lambda name: str(candidate))
+    row = readiness_module._cli_path_row()
+    assert row == Row("cli path", "ok", str(candidate), "")
+
+
+def test_cli_path_row_warns_with_the_override_command_otherwise(monkeypatch, tmp_path):
+    odd = tmp_path / "vocalize"
+    monkeypatch.setattr(shutil, "which", lambda name: str(odd))
+    row = readiness_module._cli_path_row()
+    assert row.state == "warn"
+    assert row.action == app_module.override_command(odd)
+
+
+def test_cli_path_row_warns_when_not_on_path(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    row = readiness_module._cli_path_row()
+    assert row.state == "warn"
+    assert row.action == ""
+
+
+def test_uv_row_ok_when_on_path(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/uv" if name == "uv" else None)
+    assert readiness_module._uv_row().state == "ok"
+
+
+def test_uv_row_fails_with_an_install_hint(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    row = readiness_module._uv_row()
+    assert row.state == "fail"
+    assert "astral.sh" in row.action
+
+
+def test_swiftc_row_ok_when_xcrun_finds_it(monkeypatch):
+    monkeypatch.setattr(
+        readiness_module.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "/usr/bin/swiftc\n", ""),
+    )
+    row = readiness_module._swiftc_row()
+    assert row == Row("swiftc", "ok", "/usr/bin/swiftc", "")
+
+
+def test_swiftc_row_fails_when_xcrun_cannot_find_it(monkeypatch):
+    monkeypatch.setattr(
+        readiness_module.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "error: unable to find"),
+    )
+    row = readiness_module._swiftc_row()
+    assert row.state == "fail"
+    assert row.action == "xcode-select --install"
+
+
+def test_swiftc_row_fails_when_xcrun_is_missing(monkeypatch):
+    def boom(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory", "xcrun")
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", boom)
+    row = readiness_module._swiftc_row()
+    assert row.state == "fail"
+    assert row.action == "xcode-select --install"
+
+
+def test_claude_row_ok_on_path(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/claude")
+    assert readiness_module._claude_row().state == "ok"
+
+
+def test_claude_row_warns_off_path(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    row = readiness_module._claude_row()
+    assert row.state == "warn"
+    assert "not on PATH" in row.detail
+
+
+def test_shebang_row_ok_when_the_interpreter_exists(monkeypatch, tmp_path):
+    interpreter = tmp_path / "python3"
+    interpreter.write_text("#!/bin/sh\n")
+    script = tmp_path / "vocalize"
+    script.write_text(f"#!{interpreter}\n")
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    row = readiness_module._shebang_row()
+    assert row.state == "ok"
+    assert row.detail == str(interpreter)
+
+
+def test_shebang_row_fails_when_the_interpreter_is_gone(monkeypatch, tmp_path):
+    script = tmp_path / "vocalize"
+    script.write_text(f"#!{tmp_path / 'no-such-python'}\n")
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    row = readiness_module._shebang_row()
+    assert row.state == "fail"
+    assert "uv tool install --reinstall vocalize-cli" in row.action
+
+
+def test_shebang_row_ok_when_not_a_console_script(monkeypatch, tmp_path):
+    script = tmp_path / "vocalize"
+    script.write_text("import vocalize.cli\n")  # no shebang line at all
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    assert readiness_module._shebang_row().state == "ok"
+
+
+def test_shebang_row_ok_when_the_script_cannot_be_read(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "does-not-exist")])
+    assert readiness_module._shebang_row().state == "ok"
+
+
+def test_hammerspoon_row_warns_when_running(monkeypatch):
+    monkeypatch.setattr(app_module, "hammerspoon_running", lambda: True)
+    row = readiness_module._hammerspoon_row()
+    assert row.state == "warn"
+    assert "init.lua" in row.action
+
+
+def test_hammerspoon_row_ok_when_not_running(monkeypatch):
+    monkeypatch.setattr(app_module, "hammerspoon_running", lambda: False)
+    assert readiness_module._hammerspoon_row() == Row("hammerspoon", "ok", "not running", "")
+
+
+def test_no_doctor_row_warns_about_a_quick_action_integrate_installs(
+    monkeypatch, tmp_path, _no_real_tools
+):
+    """`vocalize integrate claude` installs "Dictate with Vocalize" on
+    purpose, as an unbound Services-menu entry, so a row that warns on its
+    existence never clears and tells the user to delete what this release
+    ships. The real conflict is an assigned shortcut, which no probe can
+    see."""
+    workflow = tmp_path / "Dictate with Vocalize.workflow"
+    workflow.mkdir()
+    monkeypatch.setattr(app_module, "SERVICES_WORKFLOW", workflow)
+
+    rows = readiness_module.doctor_rows({})
+
+    assert not any("Quick Action" in row.detail for row in rows)
+    assert not any(row.action == "remove it in Finder" for row in rows)
+
+
+def test_cli_startup_row_ok_when_fast(monkeypatch):
+    monkeypatch.setattr(
+        readiness_module.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "vocalize 0.13.0\n", ""),
+    )
+    ticks = iter([0.0, 0.05])
+    monkeypatch.setattr(readiness_module.time, "monotonic", lambda: next(ticks))
+    row = readiness_module._cli_startup_row()
+    assert row.state == "ok"
+    assert row.detail == "50 ms"
+
+
+def test_cli_startup_row_warns_above_400ms(monkeypatch):
+    monkeypatch.setattr(
+        readiness_module.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "vocalize 0.13.0\n", ""),
+    )
+    ticks = iter([0.0, 0.5])
+    monkeypatch.setattr(readiness_module.time, "monotonic", lambda: next(ticks))
+    row = readiness_module._cli_startup_row()
+    assert row.state == "warn"
+    assert row.detail == "500 ms"
+
+
+def test_cli_startup_row_warns_on_a_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(
+        readiness_module.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "boom"),
+    )
+    monkeypatch.setattr(readiness_module.time, "monotonic", lambda: 0.0)
+    row = readiness_module._cli_startup_row()
+    assert row.state == "warn"
+
+
+def test_cli_startup_row_warns_when_vocalize_is_not_on_path(monkeypatch):
+    def boom(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory", "vocalize")
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", boom)
+    assert readiness_module._cli_startup_row().state == "warn"
+
+
+@pytest.mark.parametrize(
+    "bundle,expected_state",
+    [("current", "ok"), ("stale", "warn"), ("not built", "fail")],
+)
+def test_app_bundle_row_mirrors_the_app_row(monkeypatch, bundle, expected_state):
+    monkeypatch.setattr(app_module, "status_dict", lambda: {"bundle": bundle})
+    row = readiness_module._app_bundle_row()
+    assert row.name == "app bundle"
+    assert row.state == expected_state
+
+
+def test_notes_folder_row_reports_not_created_yet(tmp_path, monkeypatch):
+    folder = tmp_path / "Vocalize Notes"
+    row = readiness_module._notes_folder_row({"notes": {"folder": str(folder)}})
+    assert row == Row("notes folder", "ok", "not created yet", "")
+
+
+def test_notes_folder_row_reports_size_on_disk(tmp_path):
+    folder = tmp_path / "Vocalize Notes"
+    folder.mkdir()
+    (folder / "one.md").write_bytes(b"x" * 1024 * 1024)
+    (folder / "one.m4a").write_bytes(b"y" * 1024 * 1024)  # kept audio counts too
+    row = readiness_module._notes_folder_row({"notes": {"folder": str(folder)}})
+    assert row.state == "ok"
+    assert row.detail == "2.0 MB on disk"
+
+
+def test_notes_folder_row_warns_under_icloud_mobile_documents(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    folder = tmp_path / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "Vocalize Notes"
+    row = readiness_module._notes_folder_row({"notes": {"folder": str(folder)}})
+    assert row.state == "warn"
+    assert "iCloud" in row.detail

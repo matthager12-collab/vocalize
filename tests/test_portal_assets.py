@@ -322,7 +322,7 @@ def test_every_tab_has_a_panel():
     script = JS.read_text(encoding="utf-8")
     page = HTML.read_text(encoding="utf-8")
 
-    for name in ("chain", "providers", "keys", "usage", "local"):
+    for name in ("chain", "providers", "keys", "usage", "local", "setup"):
         assert f'id="panel-{name}"' in page
         assert f"renderers.{name} = function" in script
 
@@ -360,7 +360,19 @@ def test_the_readiness_list_keeps_its_role_under_list_style_none():
 
 
 @pytest.mark.parametrize(
-    "scenario", ["race", "keys", "fatal", "lists", "voices", "keystate", "keyslots", "sidebar"]
+    "scenario",
+    [
+        "race",
+        "keys",
+        "fatal",
+        "lists",
+        "voices",
+        "keystate",
+        "keyslots",
+        "sidebar",
+        "setup",
+        "setup_progress",
+    ],
 )
 def test_the_page_behaves_when_driven(scenario):
     """`portal.js` under node, over a stub DOM and a hand-answered `fetch`.

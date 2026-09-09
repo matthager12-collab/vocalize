@@ -36,3 +36,12 @@ rss coreml: 1.38 GB
 verdict: loses — CoreML is about 75 % slower and uses 600 MB more; no knob is added, and the Kokoro RAM figure in the docs is corrected to 760 MB.
 
 Run 2, T-12, 2026-09-07. `vocalize speak --provider kokoro --no-play --output <tmp>` with a unique sentence per run (no cache hits), four runs per path, `/usr/bin/time -l` on the CLI process (peak RSS is the largest process in the tree, the worker). CPU is the default; CoreML is `ONNX_PROVIDER=CoreMLExecutionProvider`, which the worker inherits from the environment. Run 4 of each path (not counted above): CPU 2.94 s, CoreML 5.09 s.
+
+## Hotkeys
+
+Run 7, T-60, 2026-09-07. A throwaway Swift probe (`NSApplication` in accessory mode, Carbon `RegisterEventHotKey` for control-option-command-D, one log line per `kEventHotKeyPressed` and `kEventHotKeyReleased` with the frontmost app's name). Register status 0 with Hammerspoon running on ctrl-alt-cmd-S and -X.
+
+Claude desktop, normal window: down and up, held 2 s.
+Ghostty (self-drawn terminal): down and up, held 3 s.
+Claude desktop, full-screen: down and up, held 3 s.
+Decision: Carbon (DEC-033 A). No Accessibility grant needed for dictation.

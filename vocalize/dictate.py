@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import shutil
 import signal
 import stat
@@ -376,8 +377,44 @@ def _claim_session(workdir: Path) -> bool:
     except OSError as exc:
         raise DictationError(f"Could not start a dictation: {exc}") from exc
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump({"dir": str(workdir), "started": time.time()}, handle)
+        json.dump(
+            {
+                "dir": str(workdir),
+                "started": time.time(),
+                # Which dictation this is, for anything watching from
+                # outside the process: the menu bar app reads the session
+                # file and has no other way to tell one take from the next
+                # one started a moment later (design § App state).
+                "nonce": secrets.token_hex(8),
+                "state": "starting",
+            },
+            handle,
+        )
     return True
+
+
+def _write_session(workdir: Path, state: str) -> None:
+    """Move this dictation's session on to `state`. Best effort by design.
+
+    Re-reads first and writes nothing unless the session still names this
+    workdir, for `_release_session`'s reason: once a later press owns the
+    session, this one must not touch its record. `nonce` and `started` are
+    carried through unchanged — the nonce is minted once, at the claim.
+    """
+    try:
+        data = json.loads(session_path().read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or Path(data.get("dir", "")) != workdir:
+            return
+        data["state"] = state
+        fd = os.open(
+            session_path(),
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def _read_session() -> tuple[Path, float] | None:
@@ -465,7 +502,7 @@ def _release_session(workdir: Path) -> None:
     """
     try:
         data = json.loads(session_path().read_text(encoding="utf-8"))
-        if Path(data.get("dir", "")) != workdir:
+        if not isinstance(data, dict) or Path(data.get("dir", "")) != workdir:
             return
     except FileNotFoundError:
         return
@@ -664,6 +701,7 @@ def _mark_finishing(workdir: Path) -> None:
         )
     except OSError:
         pass
+    _write_session(workdir, "transcribing")
 
 
 def _refresh_claim(workdir: Path) -> None:
@@ -1038,6 +1076,7 @@ def _start(workdir: Path, stt: dict) -> int:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
         return 1
+    _write_session(workdir, "recording")
     _play(_SOUND_START, stt, only="sound")
     return 0
 
@@ -1279,6 +1318,7 @@ def listen(stt: dict, *, wait) -> str | None:
         audio.stop_playback()
         started = time.time()
         pid = _launch_recorder(workdir, stt)
+        _write_session(workdir, "recording")
         try:
             wait(started + float(stt["max_seconds"]))
         except KeyboardInterrupt:

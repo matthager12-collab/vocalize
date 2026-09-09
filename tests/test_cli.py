@@ -17,6 +17,8 @@ from click.testing import CliRunner
 
 import vocalize.audio as audio_module
 import vocalize.cli as cli_module
+import vocalize.integrate as integrate_module
+from vocalize import app as app_module
 from vocalize import interrupted
 from vocalize.cli import main
 from vocalize.config import resolve_provider_settings
@@ -645,6 +647,11 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert "stt.max_seconds=30" in result.output
     assert "stt.cues=sounds" in result.output
     assert "notes.summarizer=local" in result.output
+    # The menu-bar app parses exactly these four lines (design.md § The [app] table).
+    assert "app.dictate=ctrl+alt+cmd+d" in result.output
+    assert "app.dictate_mode=toggle" in result.output
+    assert "app.speak=ctrl+alt+cmd+s" in result.output
+    assert "app.stop=ctrl+alt+cmd+x" in result.output
     assert "notes.template=memo" in result.output
 
 
@@ -806,12 +813,22 @@ def test_clip_refuses_a_credential_without_echoing_it(monkeypatch):
 
     result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 3  # its own code: "I refused to read this"
     assert "Refusing to speak" in result.output
     # The whole point: nothing secret in the transcript, nothing to the API.
     assert secret not in result.output
     assert "supersecret" not in result.output
     assert captured_text == []
+
+
+def test_clip_reserves_exit_3_for_the_refusal_not_for_ordinary_failures(monkeypatch):
+    """Exit 3 has to mean one thing, or a caller cannot branch on it."""
+    _played, _captured_text, _settings = _patch_tts(monkeypatch)
+    monkeypatch.setattr(cli_module, "read_clipboard", lambda: "   \n ")
+
+    result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
+
+    assert result.exit_code not in (0, 3)
 
 
 def test_clip_allow_secret_bypasses_the_guard(monkeypatch, tmp_path):
@@ -2144,3 +2161,281 @@ def test_portal_help_binds_nothing(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "--no-browser" in result.output
+
+
+# --- doctor -------------------------------------------------------------
+#
+# `doctor_rows()` itself (every row it returns, in what order, from what
+# probes) is tested in test_readiness.py. These tests are about the CLI
+# command's own wiring: it calls doctor_rows(), prints the rows the same
+# way `status` does, and its exit code follows only "fail" — not "warn"
+# the way `status`'s does.
+
+
+def test_doctor_json_lists_the_required_rows(monkeypatch):
+    from vocalize.readiness import Row
+
+    rows = [
+        Row("cli path", "ok", "/opt/homebrew/bin/vocalize", ""),
+        Row("uv", "ok", "uv on PATH", ""),
+        Row("swiftc", "ok", "/usr/bin/swiftc", ""),
+        Row("claude", "warn", "not on PATH", ""),
+    ]
+    monkeypatch.setattr(cli_module, "doctor_rows", lambda file_config: rows)
+
+    result = CliRunner().invoke(main, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    names = {row["name"] for row in json.loads(result.output)}
+    assert {"cli path", "uv", "swiftc", "claude"} <= names
+
+
+def test_doctor_exit_code_zero_when_no_row_fails(monkeypatch):
+    from vocalize.readiness import Row
+
+    rows = [Row("uv", "ok", "uv on PATH", ""), Row("claude", "warn", "not on PATH", "")]
+    monkeypatch.setattr(cli_module, "doctor_rows", lambda file_config: rows)
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_doctor_exit_code_one_when_a_row_fails(monkeypatch):
+    from vocalize.readiness import Row
+
+    rows = [Row("uv", "fail", "uv not found", "install it from https://docs.astral.sh/uv/")]
+    monkeypatch.setattr(cli_module, "doctor_rows", lambda file_config: rows)
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 1
+
+
+def test_doctor_plain_output_names_each_row_and_its_action(monkeypatch):
+    from vocalize.readiness import Row
+
+    rows = [Row("uv", "fail", "uv not found", "install it from https://docs.astral.sh/uv/")]
+    monkeypatch.setattr(cli_module, "doctor_rows", lambda file_config: rows)
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert "uv" in result.output
+    assert "uv not found" in result.output
+    assert "install it from https://docs.astral.sh/uv/" in result.output
+
+
+def test_doctor_reports_a_bad_config_as_one_failed_row(monkeypatch):
+    """A typo in an `[app]` chord used to abort doctor before it printed a
+    single row — the one command built to diagnose it."""
+    from vocalize.exceptions import ConfigError
+    from vocalize.readiness import Row
+
+    def raises():
+        raise ConfigError("Invalid app.dictate 'ctrl+alt+cmd+space': unknown key 'space'")
+
+    monkeypatch.setattr(cli_module, "load_config_file", raises)
+    monkeypatch.setattr(
+        cli_module, "doctor_rows", lambda file_config: [Row("uv", "ok", "uv on PATH", "")]
+    )
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "config file" in result.output
+    assert "unknown key 'space'" in result.output
+    assert "uv on PATH" in result.output  # the other rows still ran
+
+
+def test_doctor_help_runs_nothing(monkeypatch):
+    def never(file_config):
+        raise AssertionError("--help called doctor_rows")
+
+    monkeypatch.setattr(cli_module, "doctor_rows", never)
+
+    result = CliRunner().invoke(main, ["doctor", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--json" in result.output
+
+
+# --- integrate claude (T-81) --------------------------------------------
+
+
+@pytest.fixture
+def integrate_env(tmp_path, monkeypatch):
+    """A scratch HOME for `vocalize integrate claude`.
+
+    Uses the real shipped Quick Action templates and the real shipped
+    /speak skill (TEMPLATES_DIR and SKILL_SRC are left alone) — only the
+    destinations under HOME are pointed at tmp_path, and the four PATH
+    tools plus the PBS call are faked so nothing real is touched.
+    """
+    home = tmp_path / "home"
+    services = home / "Library" / "Services"
+    skill_dest = home / ".claude" / "skills" / "speak" / "SKILL.md"
+    monkeypatch.setattr(integrate_module, "SERVICES_DIR", services)
+    monkeypatch.setattr(integrate_module, "SKILL_DEST", skill_dest)
+
+    fake_bin = tmp_path / "path" / "vocalize"
+    fake_claude = tmp_path / "path" / "claude"
+    fake_node = tmp_path / "path" / "node"
+    # `which` finding it means it is really there and really executable —
+    # `main()` refuses to bake a path that is not (T-81).
+    fake_bin.parent.mkdir(parents=True, exist_ok=True)
+    fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
+
+    def which(name):
+        return {
+            "vocalize": str(fake_bin), "claude": str(fake_claude),
+            "node": str(fake_node), "python3": "/usr/bin/python3",
+        }.get(name)
+
+    monkeypatch.setattr(integrate_module.shutil, "which", which)
+
+    pbs_calls = []
+    monkeypatch.setattr(
+        integrate_module.subprocess, "run",
+        lambda argv, **kwargs: pbs_calls.append(argv),
+    )
+    monkeypatch.setattr(app_module, "status_dict", lambda: {"accessibility": "granted"})
+
+    return home, services, skill_dest, fake_claude, pbs_calls
+
+
+def _wflow_text(services: Path, name: str = "Speak with Vocalize.workflow") -> str:
+    return (services / name / "Contents" / "Resources" / "document.wflow").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_integrate_claude_lands_skill_and_four_bundles_on_scratch_home(integrate_env):
+    _home, services, skill_dest, _claude, _pbs = integrate_env
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert skill_dest.is_file()
+    assert skill_dest.read_bytes() == integrate_module.SKILL_SRC.read_bytes()
+    bundles = [p for p in services.iterdir() if p.name.endswith(".workflow")]
+    assert len(bundles) == 4
+
+
+def test_integrate_claude_bakes_the_unresolved_which_path(integrate_env):
+    _home, services, _skill_dest, fake_claude, _pbs = integrate_env
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    text = _wflow_text(services)
+    # Unresolved: exactly what which() returned, never a symlink target.
+    assert str(fake_claude) in text
+    assert "__CLAUDE_BIN__" not in text
+
+
+def test_integrate_claude_runs_pbs_update(integrate_env):
+    *_common, pbs_calls = integrate_env
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert pbs_calls == [[integrate_module.PBS, "-update"]]
+
+
+def test_integrate_claude_never_touches_claude_commands(integrate_env):
+    home, _services, _skill_dest, _claude, _pbs = integrate_env
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert not (home / ".claude" / "commands").exists()
+
+
+def test_integrate_claude_keeps_a_different_existing_skill_without_yes(integrate_env):
+    _home, _services, skill_dest, _claude, _pbs = integrate_env
+    skill_dest.parent.mkdir(parents=True)
+    skill_dest.write_text("a hand-edited skill", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["integrate", "claude"])
+
+    assert result.exit_code == 0, result.output
+    assert skill_dest.read_text(encoding="utf-8") == "a hand-edited skill"
+    assert "Kept existing" in result.output
+
+
+def test_integrate_claude_overwrites_existing_skill_with_yes(integrate_env):
+    _home, _services, skill_dest, _claude, _pbs = integrate_env
+    skill_dest.parent.mkdir(parents=True)
+    skill_dest.write_text("a hand-edited skill", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert skill_dest.read_bytes() == integrate_module.SKILL_SRC.read_bytes()
+
+
+def test_integrate_claude_path_precheck_reports_each_tool(integrate_env):
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "vocalize:" in result.output
+    assert "claude:" in result.output
+    assert "node:" in result.output
+    assert "python3:" in result.output
+
+
+def test_integrate_claude_reports_missing_tools(integrate_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(integrate_module.shutil, "which", lambda name: None)
+    # Nothing on PATH, but this process was started from a real executable:
+    # the pre-check still names every missing tool.
+    monkeypatch.setattr(
+        integrate_module, "_resolve_vocalize_bin", lambda: str(tmp_path / "path" / "vocalize")
+    )
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "missing" in result.output
+
+
+def test_integrate_claude_gui_steps_name_p_and_v_not_d_or_x(integrate_env):
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "ctrl-alt-cmd-P" in result.output
+    assert '"Speak Latest Plan"' in result.output
+    assert "ctrl-alt-cmd-V" in result.output
+    assert '"Speak with Vocalize"' in result.output
+    assert "Do not assign the D or X chords" in result.output
+
+
+def test_integrate_claude_names_accessibility_grant_when_not_granted(integrate_env, monkeypatch):
+    monkeypatch.setattr(app_module, "status_dict", lambda: {"accessibility": "not granted"})
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Accessibility" in result.output
+    assert "needs you" in result.output.lower()
+
+
+def test_integrate_claude_omits_accessibility_grant_when_already_granted(integrate_env):
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "grant Accessibility to Vocalize.app" not in result.output
+
+
+def test_integrate_claude_refuses_an_unsafe_resolved_path(integrate_env, monkeypatch):
+    _home, services, _skill_dest, _claude, pbs_calls = integrate_env
+    monkeypatch.setattr(
+        integrate_module.shutil, "which",
+        lambda name: 'has"quote' if name == "vocalize" else None,
+    )
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 1
+    assert not services.exists()
+    assert pbs_calls == []

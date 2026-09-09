@@ -13,6 +13,7 @@ Voice, model and speed are resolved per setting, in this order:
 
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
 KNOWN_CONFIG_KEYS = (
-    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt", "notes",
+    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt", "notes", "app",
 )
 
 # Keys inside a [providers.<name>] table that become a request field or an
@@ -223,6 +224,8 @@ def load_config_file() -> dict:
         _validate_stt_table(data["stt"], path)
     if "notes" in data:
         _validate_notes_table(data["notes"], path)
+    if "app" in data:
+        _validate_app_table(data["app"], path)
 
     return data
 
@@ -505,6 +508,131 @@ def resolve_notes(file_config: dict | None = None) -> dict:
     _validate_notes_table(table, config_path())
     resolved = dict(NOTES_DEFAULTS)
     resolved.update({key: table[key] for key in KNOWN_NOTES_KEYS if key in table})
+    return resolved
+
+
+# --- the [app] table -----------------------------------------------------
+#
+# The menu-bar app's chords (0.13.0, design.md § The [app] table). The app
+# reads them from `vocalize settings` as `app.<key>=…` lines, so what is
+# printed is the canonical form: modifiers in one fixed order, lowercase,
+# aliases resolved. The Swift side keeps its own keycode table; a test
+# holds the two allowlists equal.
+
+KNOWN_APP_KEYS = ("dictate", "dictate_mode", "speak", "stop")
+APP_CHORD_KEYS = ("dictate", "speak", "stop")
+APP_DICTATE_MODES = ("toggle", "hold")
+APP_DEFAULTS = {
+    "dictate": "ctrl+alt+cmd+d",
+    "dictate_mode": "toggle",  # "hold" parses from 0.13.0, works from 0.13.1
+    "speak": "ctrl+alt+cmd+s",
+    "stop": "ctrl+alt+cmd+x",
+}
+CHORD_MODIFIERS = ("ctrl", "alt", "cmd", "shift")  # the canonical order
+_CHORD_ALIASES = {"control": "ctrl", "option": "alt", "command": "cmd"}
+CHORD_KEYS = (
+    tuple("abcdefghijklmnopqrstuvwxyz")
+    + tuple("0123456789")
+    + tuple(f"f{n}" for n in range(1, 13))
+)
+_HOLD_ARRIVES = (
+    'vocalize: [app] dictate_mode = "hold" arrives in 0.13.1; treated as "toggle" for now'
+)
+
+
+def parse_chord(text) -> tuple[tuple[str, ...], str] | None:
+    """`"ctrl+alt+cmd+d"` -> `(("ctrl", "alt", "cmd"), "d")`; `""` -> None (disabled).
+
+    Raises ValueError with the reason (TypeError for a non-string). Tokens
+    split on `+`; modifiers are
+    ctrl, alt, cmd, shift (aliases control, option, command); the key is
+    one of a-z, 0-9, f1-f12; a chord must carry ctrl or cmd, because macOS
+    refuses to register the rest (error -9868).
+    """
+    if not isinstance(text, str):
+        raise TypeError("expected a string")
+    if text == "":
+        return None
+    tokens = text.lower().split("+")
+    if any(not token or token != token.strip() for token in tokens):
+        raise ValueError("expected tokens joined by '+', with no spaces")
+    *modifiers, key = tokens
+    modifiers = [_CHORD_ALIASES.get(token, token) for token in modifiers]
+    for token in modifiers:
+        if token not in CHORD_MODIFIERS:
+            raise ValueError(f"unknown modifier {token!r}: expected ctrl, alt, cmd or shift")
+    if len(set(modifiers)) != len(modifiers):
+        raise ValueError("a modifier is repeated")
+    if key in CHORD_MODIFIERS or key in _CHORD_ALIASES:
+        raise ValueError("a chord needs a key after its modifiers (a-z, 0-9 or f1-f12)")
+    if key not in CHORD_KEYS:
+        raise ValueError(f"unknown key {key!r}: expected a-z, 0-9 or f1-f12")
+    if "ctrl" not in modifiers and "cmd" not in modifiers:
+        raise ValueError("a chord must include ctrl or cmd (macOS refuses the rest)")
+    return tuple(name for name in CHORD_MODIFIERS if name in modifiers), key
+
+
+def chord_text(parsed: tuple[tuple[str, ...], str] | None) -> str:
+    """The canonical spelling of a parsed chord; `""` for a disabled one."""
+    if parsed is None:
+        return ""
+    modifiers, key = parsed
+    return "+".join((*modifiers, key))
+
+
+def _validate_app_table(value, path: Path) -> None:
+    """Check the `[app]` table. Unknown keys warn; bad values raise.
+
+    Chords are checked pairwise distinct against the resolved set — the
+    file's own values over the defaults — so a file that sets only `speak`
+    to the default dictate chord is refused too.
+    """
+    if not isinstance(value, dict):
+        raise ConfigError(f"config key 'app' in {path} must be a table")
+    for key in value:
+        if key not in KNOWN_APP_KEYS:
+            _warn(f"vocalize: unknown config key {key!r} in [app] in {path}")
+
+    resolved = {**APP_DEFAULTS, **{key: value[key] for key in KNOWN_APP_KEYS if key in value}}
+    parsed = {}
+    for key in APP_CHORD_KEYS:
+        try:
+            parsed[key] = parse_chord(resolved[key])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"Invalid app.{key} {resolved[key]!r} in {path}: {exc}.") from None
+    for first, second in itertools.combinations(APP_CHORD_KEYS, 2):
+        if parsed[first] is not None and parsed[first] == parsed[second]:
+            raise ConfigError(
+                f"app.{first} and app.{second} in {path} are the same chord "
+                f"({chord_text(parsed[first])}); chords must differ."
+            )
+
+    mode = resolved["dictate_mode"]
+    if mode not in APP_DICTATE_MODES:
+        raise ConfigError(
+            f"Invalid app.dictate_mode {mode!r} in {path}: expected one of "
+            f"{', '.join(APP_DICTATE_MODES)}."
+        )
+
+
+def resolve_app(file_config: dict | None = None) -> dict:
+    """The `[app]` settings with defaults filled in, chords canonical.
+
+    0.13.0 parses `dictate_mode = "hold"` but has no hold dispatch, so it
+    resolves to toggle with one warning: a config written for 0.13.1 must
+    not brick the CLI on a rollback (DEC-032).
+    """
+    if file_config is None:
+        file_config = load_config_file()
+    table = file_config.get("app") or {}
+    _validate_app_table(table, config_path())
+    resolved = dict(APP_DEFAULTS)
+    resolved.update({key: table[key] for key in KNOWN_APP_KEYS if key in table})
+    for key in APP_CHORD_KEYS:
+        resolved[key] = chord_text(parse_chord(resolved[key]))
+    if resolved["dictate_mode"] == "hold":
+        _warn(_HOLD_ARRIVES)
+        resolved["dictate_mode"] = "toggle"
     return resolved
 
 

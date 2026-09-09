@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -335,16 +336,100 @@ _LICENSE_HINT = (
 )
 
 
+@dataclass(frozen=True)
+class BundleSpec:
+    """Everything a compiled, ad-hoc signed bundle is built from.
+
+    The recorder was the only bundle until 0.13.0; the menu-bar app is the
+    second. Both are content-addressed the same way, so one builder does
+    both, and `RECORDER_SPEC` reproduces the 0.12.0 recorder build byte for
+    byte — `tests/test_app_build.py` pins that, because an argv drift is a
+    new ad-hoc signature and a microphone re-grant for every user.
+    """
+
+    source: Path
+    plist_template: Path
+    entitlements: Path | None
+    bundle_name: str  # "Vocalize Recorder.app"
+    binary_name: str  # Contents/MacOS/<binary_name>; also the staging stem
+    frameworks: tuple[str, ...]
+    stamp_name: str  # a dotfile beside the bundle in the bin dir
+    stamp_version: int
+    noun: str  # "recorder": "The recorder bundle could not be compiled"
+
+
+RECORDER_SPEC = BundleSpec(
+    source=RECORDER_SOURCE,
+    plist_template=RECORDER_PLIST_TEMPLATE,
+    entitlements=RECORDER_ENTITLEMENTS,
+    bundle_name=BUNDLE_NAME,
+    binary_name="recorder",
+    frameworks=("AVFoundation", "CoreAudio"),
+    stamp_name=RECORDER_STAMP_NAME,
+    stamp_version=RECORDER_STAMP_VERSION,
+    noun="recorder",
+)
+
+
+# --- the menu-bar app bundle ------------------------------------------
+#
+# The second bundle, and the same content-addressed build: the app's
+# ad-hoc signature is the identity the *Accessibility* grant is attached
+# to, so a rebuild costs the user a re-grant exactly as the recorder's
+# costs a microphone one. It asks for no device, so it signs without
+# entitlements; it lives under ~/Library/Application Support/vocalize
+# rather than ~/.cache, which the README calls safe to delete.
+
+_MENUBAR_DIR = Path(__file__).resolve().parent.parent / "menubar"
+APP_SOURCE = _MENUBAR_DIR / "VocalizeApp.swift"
+APP_PLIST_TEMPLATE = _MENUBAR_DIR / "Info.plist.in"
+
+APP_SPEC = BundleSpec(
+    source=APP_SOURCE,
+    plist_template=APP_PLIST_TEMPLATE,
+    entitlements=None,
+    bundle_name="Vocalize.app",
+    binary_name="vocalize-app",
+    frameworks=("AppKit", "Carbon"),
+    stamp_name=".app",
+    stamp_version=1,
+    noun="app",
+)
+
+
+def _recorder_spec() -> BundleSpec:
+    """`RECORDER_SPEC` re-read from the module constants at call time, so a
+    test that points `RECORDER_SOURCE` at a scratch file drives this build."""
+    return replace(
+        RECORDER_SPEC,
+        source=RECORDER_SOURCE, plist_template=RECORDER_PLIST_TEMPLATE,
+        entitlements=RECORDER_ENTITLEMENTS, bundle_name=BUNDLE_NAME,
+        stamp_name=RECORDER_STAMP_NAME, stamp_version=RECORDER_STAMP_VERSION,
+    )
+
+
+def bundle_path(spec: BundleSpec, bin_dir: Path | None = None) -> Path:
+    return (BIN_DIR if bin_dir is None else bin_dir) / spec.bundle_name
+
+
+def bundle_binary(spec: BundleSpec, bin_dir: Path | None = None) -> Path:
+    return bundle_path(spec, bin_dir) / "Contents" / "MacOS" / spec.binary_name
+
+
+def bundle_stamp_path(spec: BundleSpec, bin_dir: Path | None = None) -> Path:
+    return (BIN_DIR if bin_dir is None else bin_dir) / spec.stamp_name
+
+
 def recorder_bundle(bin_dir: Path | None = None) -> Path:
-    return (BIN_DIR if bin_dir is None else bin_dir) / BUNDLE_NAME
+    return bundle_path(_recorder_spec(), bin_dir)
 
 
 def recorder_binary(bin_dir: Path | None = None) -> Path:
-    return recorder_bundle(bin_dir) / "Contents" / "MacOS" / "recorder"
+    return bundle_binary(_recorder_spec(), bin_dir)
 
 
 def recorder_stamp_path(bin_dir: Path | None = None) -> Path:
-    return (BIN_DIR if bin_dir is None else bin_dir) / RECORDER_STAMP_NAME
+    return bundle_stamp_path(_recorder_spec(), bin_dir)
 
 
 def _sha256_of(path: Path) -> str:
@@ -358,21 +443,28 @@ def _sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _recorder_fingerprint() -> dict:
+def _fingerprint(spec: BundleSpec) -> dict:
     """What the bundle was built from: change any of it and the ad-hoc
     signature changes, so the microphone grant has to be given again.
 
     The vocalize version is deliberately absent. The bundle's signature is
     its TCC identity, and a fingerprint that moved with every release would
     rebuild a byte-identical recorder and cost the user a re-grant on every
-    upgrade (DEC-010).
+    upgrade (DEC-010). A spec without entitlements has no
+    `entitlements_sha256` key rather than a placeholder.
     """
-    return {
-        "stamp_version": RECORDER_STAMP_VERSION,
-        "source_sha256": _sha256_of(RECORDER_SOURCE),
-        "plist_sha256": _sha256_of(RECORDER_PLIST_TEMPLATE),
-        "entitlements_sha256": _sha256_of(RECORDER_ENTITLEMENTS),
+    fingerprint = {
+        "stamp_version": spec.stamp_version,
+        "source_sha256": _sha256_of(spec.source),
+        "plist_sha256": _sha256_of(spec.plist_template),
     }
+    if spec.entitlements is not None:
+        fingerprint["entitlements_sha256"] = _sha256_of(spec.entitlements)
+    return fingerprint
+
+
+def _recorder_fingerprint() -> dict:
+    return _fingerprint(_recorder_spec())
 
 
 def _stamp_is_current(stamp, fingerprint: dict, binary: Path) -> bool:
@@ -394,17 +486,17 @@ def _stamp_is_current(stamp, fingerprint: dict, binary: Path) -> bool:
     return recorded == _sha256_of(binary)
 
 
-def write_recorder_stamp(bin_dir: Path | None = None) -> Path:
+def write_bundle_stamp(spec: BundleSpec, bin_dir: Path | None = None) -> Path:
     """Record what the bundle was built from, and which binary that made.
 
     Written last, over a finished bundle, exactly like the model
-    manifests' `.verified` stamp — and read back by
-    `recorder_is_current()` before anything launches the binary.
+    manifests' `.verified` stamp — and read back by `bundle_is_current()`
+    before anything launches the binary.
     """
-    path = recorder_stamp_path(bin_dir)
+    path = bundle_stamp_path(spec, bin_dir)
     path.write_text(
         json.dumps(
-            {**_recorder_fingerprint(), "binary_sha256": _sha256_of(recorder_binary(bin_dir))},
+            {**_fingerprint(spec), "binary_sha256": _sha256_of(bundle_binary(spec, bin_dir))},
             indent=2,
         )
         + "\n",
@@ -413,8 +505,12 @@ def write_recorder_stamp(bin_dir: Path | None = None) -> Path:
     return path
 
 
-def recorder_is_current(bin_dir: Path | None = None) -> bool:
-    """Whether the built recorder is the one this install of vocalize signed.
+def write_recorder_stamp(bin_dir: Path | None = None) -> Path:
+    return write_bundle_stamp(_recorder_spec(), bin_dir)
+
+
+def bundle_is_current(spec: BundleSpec, bin_dir: Path | None = None) -> bool:
+    """Whether the built bundle is the one this install of vocalize signed.
 
     `_stamp_is_current` says why the binary is hashed at all: this is the
     one artifact the machine *executes*, so anything that can write to the
@@ -428,21 +524,27 @@ def recorder_is_current(bin_dir: Path | None = None) -> bool:
     """
     try:
         return _stamp_is_current(
-            read_recorder_stamp(bin_dir),
-            _recorder_fingerprint(),
-            recorder_binary(bin_dir),
+            read_bundle_stamp(spec, bin_dir), _fingerprint(spec), bundle_binary(spec, bin_dir),
         )
     except OSError:
         return False
 
 
-def read_recorder_stamp(bin_dir: Path | None = None) -> dict | None:
-    """The recorder stamp, or None when it is missing or unreadable garbage."""
+def recorder_is_current(bin_dir: Path | None = None) -> bool:
+    return bundle_is_current(_recorder_spec(), bin_dir)
+
+
+def read_bundle_stamp(spec: BundleSpec, bin_dir: Path | None = None) -> dict | None:
+    """The bundle's stamp, or None when it is missing or unreadable garbage."""
     try:
-        data = json.loads(recorder_stamp_path(bin_dir).read_text(encoding="utf-8"))
+        data = json.loads(bundle_stamp_path(spec, bin_dir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_recorder_stamp(bin_dir: Path | None = None) -> dict | None:
+    return read_bundle_stamp(_recorder_spec(), bin_dir)
 
 
 def _compiler_argv(compiler) -> list[str]:
@@ -455,7 +557,7 @@ def _compiler_argv(compiler) -> list[str]:
     return [str(part) for part in compiler]
 
 
-def _diagnose_compiler(output: str, what: str) -> str:
+def _diagnose_compiler(output: str, what: str, noun: str = "recorder") -> str:
     """Turn a build failure into the one command that fixes it.
 
     Two failures are not the developer's Swift going wrong and must not be
@@ -474,10 +576,12 @@ def _diagnose_compiler(output: str, what: str) -> str:
         return _CLT_HINT
     lines = [line for line in output.strip().splitlines() if line.strip()]
     detail = lines[-1] if lines else "no output"
-    return f"The recorder bundle could not be {what}: {detail}"
+    return f"The {noun} bundle could not be {what}: {detail}"
 
 
-def _run_build_step(argv: list[str], runner, missing_hint: str, what: str) -> None:
+def _run_build_step(
+    argv: list[str], runner, missing_hint: str, what: str, noun: str = "recorder",
+) -> None:
     try:
         result = runner(
             argv, capture_output=True, text=True, timeout=_BUILD_TIMEOUT, check=False,
@@ -486,14 +590,14 @@ def _run_build_step(argv: list[str], runner, missing_hint: str, what: str) -> No
     except FileNotFoundError as exc:
         raise InstallError(missing_hint) from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise InstallError(f"The recorder bundle could not be {what}: {exc}") from exc
+        raise InstallError(f"The {noun} bundle could not be {what}: {exc}") from exc
     if result.returncode != 0:
         raise InstallError(
-            _diagnose_compiler(f"{result.stdout or ''}\n{result.stderr or ''}", what)
+            _diagnose_compiler(f"{result.stdout or ''}\n{result.stderr or ''}", what, noun)
         )
 
 
-def _swap_in(staging: Path, bundle: Path) -> None:
+def _swap_in(staging: Path, bundle: Path, stem: str = "recorder") -> None:
     """Put the finished bundle where the granted one was, as one rename.
 
     The bundle the user granted the microphone to must never be left holding
@@ -501,7 +605,7 @@ def _swap_in(staging: Path, bundle: Path) -> None:
     no longer validates, which surfaces as an unexplained SIGKILL long after
     the install said nothing.
     """
-    previous = bundle.with_name(f".recorder-old-{os.getpid()}.app")
+    previous = bundle.with_name(f".{stem}-old-{os.getpid()}.app")
     shutil.rmtree(previous, ignore_errors=True)
     if bundle.exists():
         os.replace(bundle, previous)
@@ -524,10 +628,10 @@ REGRANT_WARNING = (
 )
 
 
-def build_recorder(
-    bin_dir: Path | None = None, compiler=None, runner=subprocess.run,
+def build_bundle(
+    spec: BundleSpec, bin_dir: Path | None = None, compiler=None, runner=subprocess.run,
 ) -> tuple[str, Path]:
-    """Build (or leave alone) the recorder bundle. Returns (status, bundle).
+    """Build (or leave alone) a bundle. Returns (status, bundle).
 
     status is "current" when the bundle already matches the shipped source,
     "built" the first time, and "rebuilt" when a bundle was there and had to
@@ -538,17 +642,20 @@ def build_recorder(
     through a fake compiler: nothing here should ever need Xcode to be
     installed on the machine running the suite.
     """
-    if not all(p.is_file() for p in (RECORDER_SOURCE, RECORDER_PLIST_TEMPLATE, RECORDER_ENTITLEMENTS)):
+    inputs = [spec.source, spec.plist_template]
+    if spec.entitlements is not None:
+        inputs.append(spec.entitlements)
+    if not all(p.is_file() for p in inputs):
         raise InstallError(
-            "This install of vocalize is missing the recorder source "
-            f"({RECORDER_SOURCE.name}); reinstall vocalize to get it back."
+            f"This install of vocalize is missing the {spec.noun} source "
+            f"({spec.source.name}); reinstall vocalize to get it back."
         )
 
-    bundle = recorder_bundle(bin_dir)
-    binary = recorder_binary(bin_dir)
+    bundle = bundle_path(spec, bin_dir)
+    binary = bundle_binary(spec, bin_dir)
     plist = bundle / "Contents" / "Info.plist"
-    fingerprint = _recorder_fingerprint()
-    stamp = read_recorder_stamp(bin_dir)
+    fingerprint = _fingerprint(spec)
+    stamp = read_bundle_stamp(spec, bin_dir)
 
     if _stamp_is_current(stamp, fingerprint, binary) and plist.is_file():
         return "current", bundle
@@ -560,22 +667,23 @@ def build_recorder(
     status = "rebuilt" if (stamp is not None or bundle.exists()) else "built"
 
     ensure_private_dir(bundle.parent)
-    staging = bundle.with_name(f".recorder-build-{os.getpid()}.app")
+    staging = bundle.with_name(f".{spec.binary_name}-build-{os.getpid()}.app")
     try:
         shutil.rmtree(staging, ignore_errors=True)
-        staged_binary = staging / "Contents" / "MacOS" / "recorder"
+        staged_binary = staging / "Contents" / "MacOS" / spec.binary_name
         staged_binary.parent.mkdir(parents=True, mode=0o700)
+        frameworks = [flag for name in spec.frameworks for flag in ("-framework", name)]
         _run_build_step(
             [
                 *_compiler_argv(compiler), "-O",
-                "-framework", "AVFoundation", "-framework", "CoreAudio",
-                "-o", str(staged_binary), str(RECORDER_SOURCE),
+                *frameworks,
+                "-o", str(staged_binary), str(spec.source),
             ],
-            runner, _CLT_HINT, "compiled",
+            runner, _CLT_HINT, "compiled", spec.noun,
         )
 
         (staging / "Contents" / "Info.plist").write_text(
-            RECORDER_PLIST_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8",
+            spec.plist_template.read_text(encoding="utf-8"), encoding="utf-8",
         )
 
         # Last, and over the finished bundle: the signature has to cover the
@@ -585,24 +693,36 @@ def build_recorder(
         # dylib into the one process on this machine holding a microphone
         # grant. The hardened runtime also refuses the microphone itself,
         # silently and with no dialog, unless the signature carries
-        # com.apple.security.device.audio-input — hence --entitlements
-        # (0.10.0 shipped without it and no first dictation could start).
+        # com.apple.security.device.audio-input — hence --entitlements for
+        # the recorder (0.10.0 shipped without it and no first dictation
+        # could start); a bundle that asks for no device has none to carry.
         # It does *not* stop that bundle being launched directly:
         # the grant belongs to the bundle, and anything running as this user
         # can `open` it with its own --out and record. That is inherent to
         # DEC-001 and is stated in docs/dictation.md § Privacy; there is no
         # code mitigation, only `local uninstall --stt` plus revoking the
         # grant in System Settings.
+        entitlements = (
+            [] if spec.entitlements is None else ["--entitlements", str(spec.entitlements)]
+        )
         _run_build_step(
             [
                 "codesign", "-s", "-", "--force", "--options", "runtime",
-                "--entitlements", str(RECORDER_ENTITLEMENTS), str(staging),
+                *entitlements, str(staging),
             ],
-            runner, _CLT_HINT, "signed",
+            runner, _CLT_HINT, "signed", spec.noun,
         )
-        _swap_in(staging, bundle)
+        _swap_in(staging, bundle, spec.binary_name)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
-    write_recorder_stamp(bin_dir)
+    write_bundle_stamp(spec, bin_dir)
     return status, bundle
+
+
+def build_recorder(
+    bin_dir: Path | None = None, compiler=None, runner=subprocess.run,
+) -> tuple[str, Path]:
+    """`build_bundle(RECORDER_SPEC)`; see there. Kept as the recorder's own
+    door because every caller and its tests name it."""
+    return build_bundle(_recorder_spec(), bin_dir, compiler, runner)

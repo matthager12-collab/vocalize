@@ -1,7 +1,9 @@
 import plistlib
+from pathlib import Path
 
-import install_quick_action
 import pytest
+
+from vocalize import integrate as install_quick_action
 
 
 def _seed_templates(tmp_path):
@@ -34,6 +36,7 @@ def install_env(monkeypatch, tmp_path):
     fake_bin = tmp_path / "venv-bin" / "vocalize"
     fake_bin.parent.mkdir()
     fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
     monkeypatch.setattr(install_quick_action, "_resolve_vocalize_bin", lambda: fake_bin)
 
     fake_helper = tmp_path / "hooks" / "speak_options.py"
@@ -139,6 +142,45 @@ def test_refuses_an_unsafe_vocalize_path(install_env, monkeypatch, tmp_path, cap
     assert pbs_calls == []
 
 
+def test_refuses_a_vocalize_path_that_is_not_executable(
+    install_env, monkeypatch, tmp_path, capsys
+):
+    """`python -m vocalize integrate claude` resolves argv[0] to a
+    non-executable `__main__.py`; baking it gives four Quick Actions that
+    fail their own `[[ -x "$BIN" ]]` guard while the command reports
+    success."""
+    services, _bin, _helper, _claude, pbs_calls = install_env
+    not_executable = tmp_path / "checkout" / "__main__.py"
+    not_executable.parent.mkdir()
+    not_executable.write_text("# entry point\n", encoding="utf-8")
+    monkeypatch.setattr(
+        install_quick_action, "_resolve_vocalize_bin", lambda: not_executable
+    )
+
+    assert install_quick_action.main() == 1
+
+    assert "Refusing to install" in capsys.readouterr().err
+    assert not services.exists()
+    assert pbs_calls == []
+
+
+def test_refuses_a_relative_vocalize_path(install_env, monkeypatch, capsys):
+    """The legacy `python3 hooks/install_quick_action.py` route bakes argv[0]
+    verbatim; a relative path is resolved against the Service's cwd, not the
+    repo root."""
+    services, bin_path, _helper, _claude, pbs_calls = install_env
+    monkeypatch.chdir(bin_path.parent)
+    monkeypatch.setattr(
+        install_quick_action, "_resolve_vocalize_bin", lambda: Path("./vocalize")
+    )
+
+    assert install_quick_action.main() == 1
+
+    assert "Refusing to install" in capsys.readouterr().err
+    assert not services.exists()
+    assert pbs_calls == []
+
+
 def test_refuses_an_unsafe_claude_path(install_env, monkeypatch, tmp_path, capsys):
     services, _bin, _helper, _claude, pbs_calls = install_env
     monkeypatch.setattr(
@@ -153,41 +195,20 @@ def test_refuses_an_unsafe_claude_path(install_env, monkeypatch, tmp_path, capsy
     assert pbs_calls == []
 
 
-def test_resolves_repo_venv_before_path(monkeypatch, tmp_path):
-    venv_bin = tmp_path / "repo" / ".venv" / "bin" / "vocalize"
-    venv_bin.parent.mkdir(parents=True)
-    venv_bin.write_text("", encoding="utf-8")
-    fake_file = tmp_path / "repo" / "hooks" / "install_quick_action.py"
-    monkeypatch.setattr(install_quick_action, "__file__", str(fake_file))
-    monkeypatch.setattr(
-        install_quick_action.shutil, "which",
-        lambda name: (_ for _ in ()).throw(AssertionError("PATH consulted despite venv")),
-    )
-
-    assert install_quick_action._resolve_vocalize_bin() == venv_bin
-
-
-def test_falls_back_to_path_lookup(monkeypatch, tmp_path):
-    fake_file = tmp_path / "empty-repo" / "hooks" / "install_quick_action.py"
-    monkeypatch.setattr(install_quick_action, "__file__", str(fake_file))
+def test_resolve_vocalize_bin_uses_which_unresolved(monkeypatch, tmp_path):
+    # A symlink stays a symlink — never .resolve()'d to a Cellar/Caskroom
+    # target that breaks on the next Homebrew/uv upgrade (T-81).
     on_path = tmp_path / "usr-bin" / "vocalize"
-    on_path.parent.mkdir()
-    on_path.write_text("", encoding="utf-8")
     monkeypatch.setattr(install_quick_action.shutil, "which", lambda name: str(on_path))
 
-    assert install_quick_action._resolve_vocalize_bin() == on_path
+    assert install_quick_action._resolve_vocalize_bin() == str(on_path)
 
 
-def test_errors_when_no_binary_found(monkeypatch, tmp_path, capsys):
-    fake_file = tmp_path / "empty-repo" / "hooks" / "install_quick_action.py"
-    monkeypatch.setattr(install_quick_action, "__file__", str(fake_file))
+def test_resolve_vocalize_bin_falls_back_to_argv0(monkeypatch):
     monkeypatch.setattr(install_quick_action.shutil, "which", lambda name: None)
+    monkeypatch.setattr(install_quick_action.sys, "argv", ["/some/fallback/vocalize"])
 
-    with pytest.raises(SystemExit) as excinfo:
-        install_quick_action._resolve_vocalize_bin()
-
-    assert excinfo.value.code == 1
-    assert "Could not find a vocalize binary" in capsys.readouterr().err
+    assert install_quick_action._resolve_vocalize_bin() == "/some/fallback/vocalize"
 
 
 def test_resolves_helper_next_to_installer():
@@ -219,10 +240,12 @@ def test_resolve_claude_includes_node_dir(monkeypatch, tmp_path):
 
     monkeypatch.setattr(install_quick_action.shutil, "which", which)
     path, extra = install_quick_action._resolve_claude()
-    assert path == str(claude.resolve())
+    # Unresolved — never .resolve(): the gate greps for the symlink itself,
+    # not its Cellar/Caskroom target (T-81).
+    assert path == str(claude)
     parts = extra.split(install_quick_action.os.pathsep)
-    assert str(claude.resolve().parent) in parts
-    assert str(node.resolve().parent) in parts
+    assert str(claude.parent) in parts
+    assert str(node.parent) in parts
 
 
 def _real_wflow(name):
@@ -343,3 +366,20 @@ def test_the_dictate_bundle_never_passes_text_on_its_command_line():
     assert "$@" not in script
     assert "$1" not in script
     assert "$*" not in script
+
+
+def test_a_symlinked_destination_is_refused_and_nothing_is_replaced(install_env, tmp_path, capsys):
+    """A link at a bundle's name points somewhere the installer must not
+    rmtree or rewrite; it refuses with a message and exit 1."""
+    services = install_quick_action.SERVICES_DIR
+    services.mkdir(parents=True, exist_ok=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep").write_text("x", encoding="utf-8")
+    (services / "Speak with Vocalize.workflow").symlink_to(elsewhere)
+
+    assert install_quick_action.main() == 1
+
+    assert "Refusing to replace" in capsys.readouterr().err
+    assert (elsewhere / "keep").read_text(encoding="utf-8") == "x"
+    assert (services / "Speak with Vocalize.workflow").is_symlink()

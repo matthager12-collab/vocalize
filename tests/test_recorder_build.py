@@ -20,6 +20,7 @@ from pathlib import Path
 import click
 import pytest
 from click.testing import CliRunner
+from conftest import FakeToolchain
 
 from vocalize.cli import _build_recorder_step
 from vocalize.local import install as install_module
@@ -28,43 +29,6 @@ from vocalize.local import install as install_module
 @pytest.fixture
 def bin_dir(tmp_path):
     return tmp_path / "bin"
-
-
-class FakeToolchain:
-    """A stand-in for subprocess.run covering both build steps.
-
-    `compile_fails` / `sign_fails` take the (returncode, stderr) a broken
-    toolchain would produce; `missing` names programs that are not
-    installed at all, which is a FileNotFoundError, not an exit code.
-    """
-
-    def __init__(self, *, compile_fails=None, sign_fails=None, missing=()):
-        self.calls = []
-        self.compile_fails = compile_fails
-        self.sign_fails = sign_fails
-        self.missing = set(missing)
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append((list(argv), kwargs))
-        program = Path(argv[0]).name
-        if program in self.missing:
-            raise FileNotFoundError(2, "No such file or directory", argv[0])
-        if program == "codesign":
-            if self.sign_fails:
-                code, stderr = self.sign_fails
-                return subprocess.CompletedProcess(argv, code, "", stderr)
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        if self.compile_fails:
-            code, stderr = self.compile_fails
-            return subprocess.CompletedProcess(argv, code, "", stderr)
-        target = Path(argv[argv.index("-o") + 1])
-        target.write_bytes(b"fake-mach-o")
-        target.chmod(0o755)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    @property
-    def programs(self):
-        return [Path(argv[0]).name for argv, _ in self.calls]
 
 
 # --- the shipped source and template ----------------------------------
