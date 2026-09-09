@@ -17,9 +17,9 @@ Point one at a markdown report and it reads a table cell by cell. You get
 Headings, bullets and inline code get read exactly as typed, backticks and
 all.
 
-I am dyslexic. I listen to a lot of documents. That failure costs me real
-time every week, so I fixed the half of it that can be fixed without a vision
-model.
+I find it helpful to listen and read at the same time, so I run a lot of
+documents through a reader. That failure costs me time every week. I fixed
+the half of it that can be fixed without a vision model.
 
 `vocalize/preprocess.py` rewrites markdown into declarative sentences before
 any voice sees it. Tables become "for Q1, revenue is 4.2 million". Bullets
