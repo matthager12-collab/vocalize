@@ -89,7 +89,9 @@ SPEECH_FURNITURE_MIN_REPEATS = 3    # repeats to drop furniture
 
 Wiring mirrors `[notes]`/`[stt]`: add `speech` to `KNOWN_SPEECH_KEYS`, add `_validate_speech_table` (unknown key warns, bad value raises; `SPEECH_*` bounded like `stt.max_seconds`), add `resolve_speech` against `SPEECH_DEFAULTS`. `flatten_markdown(text, speech=None)` keeps every call site working.
 
-## Decisions for the owner
+## Decisions
+
+All seven approved by the owner on 2026-09-08. The config table's defaults are these.
 
 1. **Heading cue.** Use `Heading,` for levels 1–2 and `Sub-heading,` for 3–6.
 2. **Parentheticals.** Default to pause; drop silently deletes content you asked to hear.
