@@ -503,6 +503,7 @@ def settings() -> None:
     click.echo(f"stt.verbatim={'true' if stt['verbatim'] else 'false'}")
     click.echo(f"stt.max_seconds={stt['max_seconds']}")
     click.echo(f"stt.cues={stt['cues']}")
+    click.echo(f"stt.paste={'true' if stt['paste'] else 'false'}")
     notes = resolve_notes(file_config)
     click.echo(f"notes.summarizer={notes['summarizer']}")
     click.echo(f"notes.template={notes['template']}")
@@ -1150,21 +1151,40 @@ def listen(check_only, list_devices, toggle, cancel, wav, cleanup, verbatim, max
 
 
 @main.command("dictate")
+@click.option("--start", "start_hold", is_flag=True,
+              help="Hold-to-talk: the key went down — start recording and return.")
+@click.option("--stop", "stop_hold", is_flag=True,
+              help="Hold-to-talk: the key came up — stop, transcribe and copy.")
 @click.option("--cleanup", is_flag=True,
               help="Tidy the transcript with a language model before copying it.")
 @click.option("--verbatim", is_flag=True,
               help="Keep every word: fix punctuation and casing only.")
 @click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
               help="Stop recording after this many seconds (default: [stt] max_seconds).")
-def dictate_cmd(cleanup, verbatim, max_seconds) -> None:
+def dictate_cmd(start_hold, stop_hold, cleanup, verbatim, max_seconds) -> None:
     """Start a dictation, or stop the one already running.
 
-    The same thing as `vocalize listen --toggle`, under the name the
-    keyboard shortcut uses: press once to record, press again to stop and
-    copy what you said to the clipboard.
+    \b
+        vocalize dictate           # press once to record, again to stop
+        vocalize dictate --start   # hold-to-talk: the key is down
+        vocalize dictate --stop    # hold-to-talk: the key came up
+
+    With no flag this is the same thing as `vocalize listen --toggle`,
+    under the name the keyboard shortcut uses: press once to record, press
+    again to stop and copy what you said to the clipboard. The two flags
+    are what the menu-bar app runs on key-down and key-up when `[app]
+    dictate_mode = "hold"`; `--start` is idempotent and `--stop` never
+    cancels, however briefly the key was held.
     """
+    if start_hold and stop_hold:
+        raise click.UsageError("Use only one of --start, --stop.")
+    stt = _stt_options(cleanup, verbatim, max_seconds)
     try:
-        sys.exit(dictate.toggle(_stt_options(cleanup, verbatim, max_seconds)))
+        if start_hold:
+            sys.exit(dictate.start_hold(stt))
+        if stop_hold:
+            sys.exit(dictate.stop_hold(stt))
+        sys.exit(dictate.toggle(stt))
     except DictationError as exc:
         raise click.ClickException(str(exc)) from exc
 

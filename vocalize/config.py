@@ -78,7 +78,8 @@ STT_CLEANUP_BACKENDS = ("off", "local", "claude-cli", "anthropic")
 # What `cues` may be: the fixed system sounds, spoken words instead, or both.
 STT_CUE_MODES = ("sounds", "words", "both")
 
-# `paste` is reserved by DEC-006 and deliberately does nothing in 0.10.0.
+# `paste` was reserved by DEC-006 and did nothing through 0.13.0; from
+# 0.13.1 `dictate._stop` honours it (design § Auto-paste).
 STT_DEFAULTS = {
     # turbo q5_0: the first model that kept "the merge" as two words on the
     # owner's voice (issue #4), no slower than small.en on an M4 and only
@@ -524,7 +525,7 @@ APP_CHORD_KEYS = ("dictate", "speak", "stop")
 APP_DICTATE_MODES = ("toggle", "hold")
 APP_DEFAULTS = {
     "dictate": "ctrl+alt+cmd+d",
-    "dictate_mode": "toggle",  # "hold" parses from 0.13.0, works from 0.13.1
+    "dictate_mode": "toggle",  # "hold" parses from 0.13.0, dispatches from 0.13.1
     "speak": "ctrl+alt+cmd+s",
     "stop": "ctrl+alt+cmd+x",
 }
@@ -535,10 +536,6 @@ CHORD_KEYS = (
     + tuple("0123456789")
     + tuple(f"f{n}" for n in range(1, 13))
 )
-_HOLD_ARRIVES = (
-    'vocalize: [app] dictate_mode = "hold" arrives in 0.13.1; treated as "toggle" for now'
-)
-
 
 def parse_chord(text) -> tuple[tuple[str, ...], str] | None:
     """`"ctrl+alt+cmd+d"` -> `(("ctrl", "alt", "cmd"), "d")`; `""` -> None (disabled).
@@ -618,9 +615,10 @@ def _validate_app_table(value, path: Path) -> None:
 def resolve_app(file_config: dict | None = None) -> dict:
     """The `[app]` settings with defaults filled in, chords canonical.
 
-    0.13.0 parses `dictate_mode = "hold"` but has no hold dispatch, so it
-    resolves to toggle with one warning: a config written for 0.13.1 must
-    not brick the CLI on a rollback (DEC-032).
+    `dictate_mode` is passed through as written: 0.13.0 parsed `"hold"`
+    but resolved it to toggle with a warning, and 0.13.1 has the hold
+    dispatch behind it (`dictate --start` / `--stop`), so the mode the
+    file asks for is the mode the app is told about.
     """
     if file_config is None:
         file_config = load_config_file()
@@ -630,9 +628,6 @@ def resolve_app(file_config: dict | None = None) -> dict:
     resolved.update({key: table[key] for key in KNOWN_APP_KEYS if key in table})
     for key in APP_CHORD_KEYS:
         resolved[key] = chord_text(parse_chord(resolved[key]))
-    if resolved["dictate_mode"] == "hold":
-        _warn(_HOLD_ARRIVES)
-        resolved["dictate_mode"] = "toggle"
     return resolved
 
 

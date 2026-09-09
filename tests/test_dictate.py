@@ -30,6 +30,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -137,8 +138,13 @@ class Harness:
         self.osascript_argv = self.root / "osascript-argv"
         self.claude_argv = self.root / "claude-argv"
         self.claude_stdin = self.root / "claude-stdin"
+        self.uv_take = self.root / "uv-take.wav"
         self.played = []
         self.stops = []
+        # How long `audio.play` blocks. The cue trim measures itself
+        # against the wall clock, so a cue that takes no time trims
+        # nothing: the trim tests set this and then count frames.
+        self.play_seconds = 0.0
 
     # Everything a subprocess of this dictation was given.
     def every_argv(self) -> list[str]:
@@ -152,6 +158,11 @@ class Harness:
 
     def notifications(self) -> list[str]:
         return [line for line in lines(self.osascript_argv) if "display notification" in line]
+
+    def worker_frames(self) -> int:
+        """How many frames of audio the fake `uv` was handed to transcribe."""
+        with wave.open(str(self.uv_take), "rb") as reader:
+            return reader.getnframes()
 
     def clipboard(self) -> str:
         return self.pbcopy_stdin.read_text(encoding="utf-8") if (
@@ -186,7 +197,12 @@ def harness(tmp_path, monkeypatch):
 
     # Sounds go through vocalize.audio so they queue on the playback lock;
     # recording the calls there is what proves they still do.
-    monkeypatch.setattr(audio, "play", lambda path: h.played.append(Path(path).name) or 0)
+    def play(path):
+        time.sleep(h.play_seconds)
+        h.played.append(Path(path).name)
+        return 0
+
+    monkeypatch.setattr(audio, "play", play)
     # Records what each stop asked for: True is `remember=True`, the
     # hotkey's stop, which is what leaves a read resumable (DEC-003).
     monkeypatch.setattr(
@@ -199,6 +215,11 @@ def harness(tmp_path, monkeypatch):
     # Presses here land microseconds apart, which to the real debounce is
     # a held key. Its own tests below put the window back.
     monkeypatch.setattr(dictate, "_DEBOUNCE", 0.0)
+    # The shell fake below copies its take in one go when the recording
+    # ends, so `take.wav` never grows *during* one: every start here takes
+    # the no-growth path, which cues anyway and trims nothing. Only
+    # `growing_recorder` flushes in steps, and it puts the real grace back.
+    monkeypatch.setattr(dictate, "_AUDIO_GRACE", 0.1)
 
     # A live PID is our recorder; a dead one is nothing. Replaced because
     # no shebang script can ever be *named* `recorder` to real `ps`.
@@ -206,6 +227,39 @@ def harness(tmp_path, monkeypatch):
         dictate, "_process_name", _name_while_alive(dictate._RECORDER_PROCESS_NAME)
     )
     return h
+
+
+def install_fake_open(tmp_path, monkeypatch, harness, loop_pids, child,
+                      *, launch_rc=0, name="fake-open"):
+    """A fake `open` that logs its argv and runs `child "$OUT" "$STOP" $PPID`."""
+    fake_open = script(
+        tmp_path / name,
+        f'for a in "$@"; do printf "%s\\n" "$a"; done >> "{harness.open_argv}"\n'
+        'OUT=""; STOP=""\n'
+        "while [ $# -gt 0 ]; do\n"
+        '  case "$1" in\n'
+        '    --out) OUT="$2"; shift;;\n'
+        '    --stop) STOP="$2"; shift;;\n'
+        "  esac\n"
+        "  shift\n"
+        "done\n"
+        + (
+            # The redirections have to sit on the backgrounded command
+            # itself: an `A && B &` list keeps a subshell alive holding
+            # `open`'s stdout pipe, and subprocess.run would then wait
+            # out the whole recording instead of returning at once —
+            # exactly what the real `open` does not do.
+            'if [ -n "$OUT" ]; then\n'
+            f'  {child} "$OUT" "$STOP" {os.getpid()} >/dev/null 2>&1 </dev/null &\n'
+            f'  echo $! >> "{loop_pids}"\n'
+            "fi\n"
+            if launch_rc == 0
+            else ""
+        )
+        + f"exit {launch_rc}\n",
+    )
+    monkeypatch.setattr(dictate, "_OPEN", str(fake_open))
+    return fake_open
 
 
 @pytest.fixture
@@ -233,34 +287,86 @@ def recorder(tmp_path, monkeypatch, harness, loop_pids):
             encoding="utf-8",
         )
 
-        fake_open = script(
-            tmp_path / "fake-open",
-            f'for a in "$@"; do printf "%s\\n" "$a"; done >> "{harness.open_argv}"\n'
-            'OUT=""; STOP=""\n'
-            "while [ $# -gt 0 ]; do\n"
-            '  case "$1" in\n'
-            '    --out) OUT="$2"; shift;;\n'
-            '    --stop) STOP="$2"; shift;;\n'
-            "  esac\n"
-            "  shift\n"
-            "done\n"
-            + (
-                # The redirections have to sit on the backgrounded command
-                # itself: an `A && B &` list keeps a subshell alive holding
-                # `open`'s stdout pipe, and subprocess.run would then wait
-                # out the whole recording instead of returning at once —
-                # exactly what the real `open` does not do.
-                'if [ -n "$OUT" ]; then\n'
-                f'  /bin/sh "{loop}" "$OUT" "$STOP" >/dev/null 2>&1 </dev/null &\n'
-                f'  echo $! >> "{loop_pids}"\n'
-                "fi\n"
-                if launch_rc == 0
-                else ""
-            )
-            + f"exit {launch_rc}\n",
+        return install_fake_open(
+            tmp_path, monkeypatch, harness, loop_pids,
+            f'/bin/sh "{loop}"', launch_rc=launch_rc,
         )
-        monkeypatch.setattr(dictate, "_OPEN", str(fake_open))
-        return fake_open
+
+    return install
+
+
+# The growing fake recorder (T-101). The shell fake above copies its take
+# in one go when the recording ends, which is the one thing the real
+# recorder does not do: it writes a 4096-byte header first and then audio
+# in steps (10240 bytes about every 320 ms on USB, ~5460 every 170 ms on
+# Bluetooth — spike-notes.md § Cue). That growth is the only open-
+# microphone signal `_wait_for_audio` has, so the trim cannot be tested
+# without it. The take it finalises is always the same length, whenever
+# the stop lands, so a test can count the frames the cue cost.
+GROW_CHUNK_FRAMES = 1600  # 0.1 s of 16 kHz audio per flush
+GROW_CHUNKS = 10
+GROW_TOTAL_FRAMES = GROW_CHUNK_FRAMES * GROW_CHUNKS  # a one-second take
+_GROWER = """
+import os, sys, time, wave
+
+out, stop, parent = sys.argv[1], sys.argv[2], int(sys.argv[3])
+chunk = (6000).to_bytes(2, "little", signed=True) * {chunk_frames}
+pid_file = os.path.join(os.path.dirname(out), "rec.pid")
+
+
+def alive():
+    try:
+        os.kill(parent, 0)
+    except OSError:
+        return False
+    return True
+
+
+with open(pid_file, "w") as handle:
+    handle.write(str(os.getpid()))
+time.sleep({pid_to_audio})  # the take does not exist yet when the PID lands
+try:
+    with open(out, "wb") as handle:
+        handle.write(b"\\0" * 4096)  # the header, with no audio in it
+        handle.flush()
+        for _ in range({chunks}):
+            time.sleep({flush_every})
+            handle.write(chunk)
+            handle.flush()
+    ticks = 0
+    while not os.path.exists(stop) and ticks < 1500 and alive():
+        time.sleep(0.02)
+        ticks += 1
+    with wave.open(out, "wb") as writer:  # the finished take, always this long
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(chunk * {chunks})
+    os.remove(pid_file)
+except OSError:
+    pass  # the dictation was cancelled and took the directory with it
+"""
+
+
+@pytest.fixture
+def growing_recorder(tmp_path, monkeypatch, harness, loop_pids):
+    """Install a fake `open` whose recorder flushes `take.wav` in steps."""
+
+    def install(*, pid_to_audio=0.1, flush_every=0.02):
+        grower = tmp_path / "grower.py"
+        grower.write_text(
+            _GROWER.format(
+                chunk_frames=GROW_CHUNK_FRAMES, chunks=GROW_CHUNKS,
+                pid_to_audio=pid_to_audio, flush_every=flush_every,
+            ),
+            encoding="utf-8",
+        )
+        # This one really does grow, so it gets the real grace back.
+        monkeypatch.setattr(dictate, "_AUDIO_GRACE", 5.0)
+        return install_fake_open(
+            tmp_path, monkeypatch, harness, loop_pids,
+            f'"{sys.executable}" "{grower}"', name="fake-open-growing",
+        )
 
     return install
 
@@ -275,6 +381,13 @@ def transcriber(tmp_path, monkeypatch, harness):
         fake_uv = script(
             tmp_path / "fake-uv",
             f'for a in "$@"; do printf "%s\\n" "$a"; done >> "{harness.uv_argv}"\n'
+            # Keep the WAV the worker was handed: what is *in* it is the
+            # only proof that no cue word reached whisper (T-101).
+            'prev=""\n'
+            'for a in "$@"; do\n'
+            f'  [ "$prev" = "--transcribe" ] && cp "$a" "{harness.uv_take}"\n'
+            '  prev="$a"\n'
+            "done\n"
             f"cat <<'EOF'\n{payload}\nEOF\n"
             f"exit {rc}\n",
         )
@@ -441,6 +554,96 @@ def test_the_second_press_transcribes_and_copies_to_the_clipboard(
     assert any(dictate._NOTIFY_COPIED in line for line in harness.notifications())
 
 
+# --- auto-paste (T-103, `[stt] paste`, design § Auto-paste) ------------
+
+
+def test_the_copied_marker_carries_the_sessions_nonce_and_is_0600(
+    recorder, transcriber, harness, monkeypatch
+):
+    recorder()
+    transcriber()
+    start(paste=True)
+    nonce = json.loads(dictate.session_path().read_text(encoding="utf-8"))["nonce"]
+
+    assert press_again(monkeypatch, paste=True) == 0
+
+    marker = json.loads(dictate.copied_path().read_text(encoding="utf-8"))
+    assert marker["nonce"] == nonce
+    assert isinstance(marker["epoch"], float)
+    assert stat.S_IMODE(dictate.copied_path().stat().st_mode) == 0o600
+
+
+def test_no_copied_marker_is_written_when_paste_is_off(
+    recorder, transcriber, harness, monkeypatch
+):
+    recorder()
+    transcriber()
+    start()  # paste defaults to False
+
+    assert press_again(monkeypatch) == 0
+
+    assert harness.clipboard() == TRANSCRIPT  # the dictation still worked
+    assert not dictate.copied_path().exists()
+
+
+def test_no_copied_marker_is_written_when_nothing_was_heard(
+    recorder, transcriber, harness, monkeypatch
+):
+    recorder(take="silent")
+    transcriber()
+    start(paste=True)
+
+    assert press_again(monkeypatch, paste=True) == 0
+
+    assert not dictate.copied_path().exists()
+
+
+def test_a_symlinked_copied_path_is_never_followed(
+    recorder, transcriber, harness, monkeypatch, capsys
+):
+    """ELOOP on the open — no write, and the dictation still succeeds."""
+    recorder()
+    transcriber()
+    dictate.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    target = dictate.CACHE_DIR / "elsewhere"
+    target.write_text("mine", encoding="utf-8")
+    dictate.copied_path().symlink_to(target)
+    start(paste=True)
+
+    assert press_again(monkeypatch, paste=True) == 0
+
+    assert harness.clipboard() == TRANSCRIPT
+    assert target.read_text(encoding="utf-8") == "mine"  # never truncated through the symlink
+    assert dictate.copied_path().is_symlink()  # untouched, not replaced
+    assert "could not write the paste marker" in capsys.readouterr().err
+
+
+def test_a_fifo_at_the_copied_path_never_blocks_the_stop(
+    recorder, transcriber, harness, monkeypatch, capsys
+):
+    """A FIFO is not a symlink: without `O_NONBLOCK` the open hangs for ever,
+    the `finally` never releases the session and every later press is told
+    the last dictation is still transcribing."""
+    recorder()
+    transcriber()
+    dictate.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(dictate.copied_path(), 0o600)
+    start(paste=True)
+    monkeypatch.setattr(dictate, "_CANCEL_WINDOW", 0.0)
+
+    codes: list[int] = []
+    stop = threading.Thread(
+        target=lambda: codes.append(dictate.toggle(stt(paste=True))), daemon=True
+    )
+    stop.start()
+    stop.join(10.0)
+
+    assert codes == [0]  # ENXIO, not a wait for a reader that never comes
+    assert not dictate.session_path().exists()  # the claim was released
+    assert harness.clipboard() == TRANSCRIPT
+    assert "could not write the paste marker" in capsys.readouterr().err
+
+
 # --- spoken cues (`[stt] cues`) ----------------------------------------
 
 
@@ -452,13 +655,14 @@ def test_words_mode_speaks_start_stop_and_done(
 
     original_launch = dictate._launch_recorder
 
-    def launch_after_start_cue(workdir, settings):
-        # The spoken "Start." must finish before the microphone opens, or
-        # it would be recorded and transcribed along with the dictation.
-        assert "start.wav" in harness.played
+    def launch_before_any_cue(workdir, settings):
+        # Under the trim branch the spoken "Start." waits for the
+        # microphone to open and is cut back out of the take (DEC-031), so
+        # nothing at all has played by the time the recorder is launched.
+        assert harness.played == []
         return original_launch(workdir, settings)
 
-    monkeypatch.setattr(dictate, "_launch_recorder", launch_after_start_cue)
+    monkeypatch.setattr(dictate, "_launch_recorder", launch_before_any_cue)
 
     assert start(cues="words") == 0
     assert press_again(monkeypatch, cues="words") == 0
@@ -474,15 +678,13 @@ def test_both_mode_speaks_the_word_then_plays_the_sound(
 
     original_launch = dictate._launch_recorder
 
-    def launch_between_word_and_sound(workdir, settings):
-        # "Start." is "get ready" and plays before the microphone opens;
-        # the Tink is "talk now" and must wait until the recorder reports
-        # it is recording — otherwise the sound promises a microphone that
-        # is still a second away.
-        assert harness.played == ["start.wav"]
+    def launch_before_any_cue(workdir, settings):
+        # Both halves now play together, after the microphone is open:
+        # "Start." then the Tink, both trimmed off the head of the take.
+        assert harness.played == []
         return original_launch(workdir, settings)
 
-    monkeypatch.setattr(dictate, "_launch_recorder", launch_between_word_and_sound)
+    monkeypatch.setattr(dictate, "_launch_recorder", launch_before_any_cue)
 
     assert start(cues="both") == 0
     assert press_again(monkeypatch, cues="both") == 0
@@ -524,6 +726,272 @@ def test_a_missing_cue_word_file_falls_back_to_the_sound(
     assert press_again(monkeypatch, cues="words") == 0
 
     assert harness.played == ["Tink.aiff", "Pop.aiff", "Glass.aiff"]
+
+
+# --- the cue trim (T-101, DEC-031) ------------------------------------
+
+
+@pytest.mark.parametrize("cues,plays", [("sounds", 1), ("words", 1), ("both", 2)])
+def test_the_trim_keeps_every_cue_out_of_the_take(
+    cues, plays, growing_recorder, transcriber, harness, monkeypatch
+):
+    """Whatever the cue is, whisper never hears it (DEC-031).
+
+    The proof is the take itself: the fake worker keeps the WAV it was
+    handed, and what is missing from the head of it is the cue. `both`
+    plays twice and so costs twice as much.
+    """
+    harness.play_seconds = 0.25
+    growing_recorder()
+    transcriber()
+
+    assert start(cues=cues) == 0
+    assert press_again(monkeypatch, cues=cues) == 0
+
+    dropped = GROW_TOTAL_FRAMES - harness.worker_frames()
+    cue_frames = int(plays * harness.play_seconds * 16000)
+    # A poll late on `t0` under-trims, which is the safe side: the trim may
+    # fall short of the cue and must never reach into the first word.
+    assert cue_frames - 1000 <= dropped <= cue_frames + 4000
+
+
+def test_the_fallback_order_speaks_before_the_launch_and_trims_nothing(
+    growing_recorder, transcriber, harness, monkeypatch
+):
+    """The branch for a recorder that does not flush incrementally.
+
+    No cue word reaches the worker there either — not because the take is
+    trimmed, but because the word finished before the microphone opened.
+    """
+    monkeypatch.setattr(dictate, "CUE_ORDER", "fallback")
+    harness.play_seconds = 0.25
+    growing_recorder()
+    transcriber()
+
+    original_launch = dictate._launch_recorder
+
+    def launch_after_the_word(workdir, settings):
+        assert harness.played == ["start.wav"]
+        return original_launch(workdir, settings)
+
+    monkeypatch.setattr(dictate, "_launch_recorder", launch_after_the_word)
+
+    assert start(cues="both") == 0
+    workdir = Path(json.loads(dictate.session_path().read_text(encoding="utf-8"))["dir"])
+    assert not (workdir / "cue").exists()  # nothing to trim, and nothing trimmed
+
+    assert press_again(monkeypatch, cues="both") == 0
+
+    assert harness.worker_frames() == GROW_TOTAL_FRAMES
+    assert harness.played[:2] == ["start.wav", "Tink.aiff"]
+
+
+def test_a_take_that_never_grows_writes_no_cue_file_and_trims_nothing(
+    recorder, transcriber, harness, monkeypatch
+):
+    """The `_AUDIO_GRACE` timeout: cue anyway, trim nothing.
+
+    A `t0` nobody observed is a guess, and a trim keyed to a guess can eat
+    the first word — so the take goes to the worker whole.
+    """
+    recorder()  # copies its take in one go: no growth for `_wait_for_audio`
+    transcriber()
+
+    assert start() == 0
+    workdir = Path(json.loads(dictate.session_path().read_text(encoding="utf-8"))["dir"])
+    assert not (workdir / "cue").exists()
+    assert harness.played == ["Tink.aiff"]  # the cue still plays
+
+    assert press_again(monkeypatch) == 0
+
+    assert harness.worker_frames() == 3200  # the whole 0.2 s sample
+
+
+def test_the_trim_drops_exactly_the_cue_from_the_head_of_the_take(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    write_wav(workdir / "take.wav", seconds=0.2)
+    (workdir / "cue").write_text("0.05\n", encoding="utf-8")
+
+    dictate._trim_cue(workdir)
+
+    assert frames_in(workdir / "take.wav") == 3200 - 800
+    with wave.open(str(workdir / "take.wav"), "rb") as reader:
+        assert (reader.getnchannels(), reader.getsampwidth(), reader.getframerate()) == (
+            1, 2, 16000,
+        )  # still what the worker takes
+    assert not (workdir / "take.trimmed.wav").exists()
+
+
+@pytest.mark.parametrize("cue", ["9.5", "0.2", "not a number", "-0.5", "", "nan", "inf", "-inf"])
+def test_a_cue_that_cannot_be_used_leaves_the_take_untrimmed(tmp_path, cue):
+    """Past the end of the take, negative, unparsable: never a lost take."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    write_wav(workdir / "take.wav", seconds=0.2)
+    (workdir / "cue").write_text(cue + "\n", encoding="utf-8")
+
+    dictate._trim_cue(workdir)
+
+    assert frames_in(workdir / "take.wav") == 3200
+    assert not (workdir / "take.trimmed.wav").exists()
+
+
+def test_a_take_that_is_not_a_wav_is_left_untrimmed(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "take.wav").write_bytes(b"not audio at all")
+    (workdir / "cue").write_text("0.05\n", encoding="utf-8")
+
+    dictate._trim_cue(workdir)
+
+    assert (workdir / "take.wav").read_bytes() == b"not audio at all"
+    assert not (workdir / "take.trimmed.wav").exists()
+
+
+def test_no_cue_file_at_all_leaves_the_take_untrimmed(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    write_wav(workdir / "take.wav", seconds=0.2)
+
+    dictate._trim_cue(workdir)
+
+    assert frames_in(workdir / "take.wav") == 3200
+
+
+# --- hold to talk (T-102, design § Hold-to-talk) ----------------------
+
+
+def hold_start(**overrides):
+    return dictate.start_hold(stt(**overrides))
+
+
+def hold_stop(**overrides):
+    return dictate.stop_hold(stt(**overrides))
+
+
+def test_hold_to_talk_records_and_transcribes_with_no_cue_at_all(
+    recorder, transcriber, harness
+):
+    """The key-down is the cue, so nothing is played and nothing trimmed."""
+    recorder()
+    transcriber()
+
+    assert hold_start() == 0
+
+    session = json.loads(dictate.session_path().read_text(encoding="utf-8"))
+    workdir = Path(session["dir"])
+    assert session["state"] == "recording"
+    assert (workdir / "rec.pid").is_file()
+    assert not (workdir / "cue").exists()
+    assert harness.played == []
+    assert harness.stops == [True]  # a running read is still stopped, resumably
+
+    assert hold_stop() == 0
+
+    assert harness.clipboard() == TRANSCRIPT
+    assert harness.played == ["Pop.aiff", "Glass.aiff"]
+    assert not workdir.exists() and not dictate.session_path().exists()
+
+
+def test_start_hold_is_idempotent(recorder, harness):
+    """A repeated key-down must never start a second recorder."""
+    recorder()
+    assert hold_start() == 0
+    session = dictate.session_path().read_text(encoding="utf-8")
+    launches = lines(harness.open_argv).count("-n")
+
+    assert hold_start() == 0
+
+    assert dictate.session_path().read_text(encoding="utf-8") == session
+    assert lines(harness.open_argv).count("-n") == launches
+
+
+def test_stop_hold_transcribes_inside_the_two_second_cancel_window(
+    recorder, transcriber, harness
+):
+    """A key held for half a second is a short sentence, not a change of mind.
+
+    `_CANCEL_WINDOW` is deliberately not touched here: the hold path must
+    not consult it at all, however fast the key-up follows the key-down.
+    """
+    recorder()
+    transcriber()
+    assert hold_start() == 0
+
+    assert hold_stop() == 0
+
+    assert harness.clipboard() == TRANSCRIPT
+    assert not any(dictate._NOTIFY_CANCELLED in line for line in harness.notifications())
+
+
+def test_stop_hold_with_no_session_does_nothing_at_all(harness):
+    assert dictate.stop_hold(stt()) == 0
+
+    assert harness.notifications() == []
+    assert harness.played == []
+
+
+def test_stop_hold_waits_for_a_recorder_that_has_not_reported_yet(
+    recorder, transcriber, harness, monkeypatch
+):
+    """The key came up while `dictate --start` was still in the launch."""
+    recorder()
+    transcriber()
+    assert hold_start() == 0
+
+    real_recorder_pid = dictate._recorder_pid
+    looks = []
+
+    def slow_to_report(workdir):
+        looks.append(workdir)
+        return None if len(looks) <= 3 else real_recorder_pid(workdir)
+
+    monkeypatch.setattr(dictate, "_recorder_pid", slow_to_report)
+
+    assert hold_stop() == 0
+
+    assert len(looks) > 3  # it waited rather than reporting a failure
+    assert harness.clipboard() == TRANSCRIPT
+
+
+def test_stop_hold_after_a_dead_recorder_clears_the_dictation(
+    recorder, harness, monkeypatch
+):
+    recorder()
+    assert hold_start() == 0
+    workdir = Path(json.loads(dictate.session_path().read_text(encoding="utf-8"))["dir"])
+    (workdir / "rec.pid").unlink()  # the recorder is gone, with no take behind it
+    monkeypatch.setattr(dictate, "_START_GRACE", 0.0)
+
+    assert hold_stop() == 1
+
+    assert not workdir.exists() and not dictate.session_path().exists()
+    assert any(dictate._NOTIFY_RECORDER_FAILED in line for line in harness.notifications())
+
+
+def test_stop_hold_refuses_while_the_last_take_is_still_being_finished(
+    recorder, harness
+):
+    recorder()
+    assert hold_start() == 0
+    workdir = Path(json.loads(dictate.session_path().read_text(encoding="utf-8"))["dir"])
+    dictate._mark_finishing(workdir)  # a stop in another process owns this take
+
+    assert hold_stop() == 0
+
+    assert any(dictate._NOTIFY_BUSY in line for line in harness.notifications())
+    assert dictate.session_path().is_file()  # left to the process that owns it
+
+
+def test_stop_hold_clears_a_session_file_no_press_could_ever_use(harness):
+    """Otherwise every later key-down finds it claimed and records nothing."""
+    dictate.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dictate.session_path().write_text("", encoding="utf-8")  # died before its JSON
+
+    assert dictate.stop_hold(stt()) == 1
+
+    assert not dictate.session_path().exists()
 
 
 def test_the_working_directory_and_session_are_gone_after_a_stop(
@@ -2527,3 +2995,22 @@ def test_a_session_a_later_press_owns_keeps_its_state(recorder, tmp_path):
     dictate._mark_finishing(ours)  # this take finishing must not touch theirs
 
     assert session_data() == theirs
+
+
+def test_session_state_never_moves_backwards(monkeypatch, tmp_path):
+    """A `--start` still waiting for audio must not turn a session a racing
+    stop already marked `transcribing` back into `recording`."""
+    import json
+
+    monkeypatch.setattr(dictate, "CACHE_DIR", tmp_path / "cache")
+    workdir = tmp_path / "vocalize-dictate-x"
+    workdir.mkdir()
+    (tmp_path / "cache").mkdir()
+    dictate.session_path().write_text(
+        json.dumps({"dir": str(workdir), "started": 1.0, "nonce": "ab", "state": "starting"}),
+        encoding="utf-8",
+    )
+    dictate._write_session(workdir, "transcribing")
+    dictate._write_session(workdir, "recording")
+
+    assert json.loads(dictate.session_path().read_text(encoding="utf-8"))["state"] == "transcribing"

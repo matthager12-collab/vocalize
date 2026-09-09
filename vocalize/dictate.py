@@ -65,6 +65,8 @@ _PS = "/bin/ps"
 _RECORDER_PROCESS_NAME = "recorder"
 
 _TAKE_NAME = "take.wav"
+_TRIMMED_NAME = "take.trimmed.wav"
+_CUE_NAME = "cue"
 _STOP_NAME = "stop"
 _PID_NAME = "rec.pid"
 # Present only while the system microphone dialog is on screen, written by
@@ -72,6 +74,25 @@ _PID_NAME = "rec.pid"
 _PROMPT_NAME = "rec.prompt"
 _TRANSCRIBING_NAME = "transcribing"
 _WORKDIR_PREFIX = "vocalize-dictate-"
+
+# Where the start cue sits relative to the open microphone (DEC-031).
+# "trim": the whole cue plays after `take.wav` first grows — the real
+# open-microphone signal — and the seconds it took are cut off the head of
+# the take before it reaches the worker. "fallback" is the order 0.13.0
+# shipped: the spoken word before the launch, the sound once the
+# microphone is open, and nothing trimmed. The T-100 spike chose "trim"
+# (spike-notes.md § Cue); the other branch stays here, and stays tested,
+# because a machine whose recorder does not flush incrementally has no
+# growth to key the trim to.
+CUE_ORDER = "trim"
+
+# The recorder writes a 4096-byte WAV header before any audio, so a file
+# of exactly that size is an open microphone that has captured nothing
+# yet. `_wait_for_audio` waits for the first byte past it.
+_WAV_HEADER_BYTES = 4096
+# How long the first growth of `take.wav` is waited for. The spike's worst
+# case was 521 ms on a Bluetooth input; this is ten times that.
+_AUDIO_GRACE = 5.0
 
 # A second press this soon after the first is the user changing their mind,
 # not the end of a sentence (design § Key flows).
@@ -208,6 +229,10 @@ def session_path() -> Path:
     return CACHE_DIR / "dictate.session"
 
 
+def copied_path() -> Path:
+    return CACHE_DIR / "dictate.copied"
+
+
 def mic_status_path() -> Path:
     return CACHE_DIR / "mic.status"
 
@@ -223,7 +248,10 @@ def write_mic_status(word: str) -> None:
 
     `O_NOFOLLOW` for the same reason the session file uses `O_EXCL`: this
     path is guessable, and a symlink planted at it would otherwise make
-    this truncate whatever it points at.
+    this truncate whatever it points at. `O_NONBLOCK` covers the other
+    half of the same trick: a FIFO planted at the path is not a symlink,
+    and an open-for-write on one with no reader would otherwise hang here
+    for ever. With it the open fails `ENXIO` and lands in the `OSError`.
     """
     if word not in MIC_STATUS_WORDS:
         return
@@ -231,7 +259,9 @@ def write_mic_status(word: str) -> None:
         audio.ensure_private_dir(CACHE_DIR)
         path = mic_status_path()
         fd = os.open(
-            path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            path,
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
         )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(f"{word}\n{time.time()}\n")
@@ -393,6 +423,9 @@ def _claim_session(workdir: Path) -> bool:
     return True
 
 
+_SESSION_STATES = ("starting", "recording", "transcribing")
+
+
 def _write_session(workdir: Path, state: str) -> None:
     """Move this dictation's session on to `state`. Best effort by design.
 
@@ -405,16 +438,71 @@ def _write_session(workdir: Path, state: str) -> None:
         data = json.loads(session_path().read_text(encoding="utf-8"))
         if not isinstance(data, dict) or Path(data.get("dir", "")) != workdir:
             return
+        # Forward only: a `--start` still waiting for audio must not move a
+        # session a racing `--stop` or cancel has already marked
+        # `transcribing` back to `recording` — the app would show an open
+        # microphone that is already closed.
+        current = data.get("state")
+        if (
+            current in _SESSION_STATES and state in _SESSION_STATES
+            and _SESSION_STATES.index(state) < _SESSION_STATES.index(current)
+        ):
+            return
         data["state"] = state
         fd = os.open(
             session_path(),
-            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
         )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
     except (OSError, ValueError, TypeError):
         pass
+
+
+def _session_nonce(workdir: Path) -> str | None:
+    """This dictation's nonce, re-read from the session file. None if stale.
+
+    Same guard as `_write_session`: read fresh rather than carrying the
+    nonce `_claim_session` handed back, because by the time a stop reaches
+    here a later press may already own the session file (`_write_session`'s
+    reason applies equally to reading it).
+    """
+    try:
+        data = json.loads(session_path().read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or Path(data.get("dir", "")) != workdir:
+            return None
+        nonce = data.get("nonce")
+    except (OSError, ValueError, TypeError):
+        return None
+    return nonce if isinstance(nonce, str) else None
+
+
+def _write_copied_marker(nonce: str) -> None:
+    """Tell the app a transcript just landed on the clipboard (0.13.1).
+
+    Only `_stop` calls this, and only when `[stt] paste` is on: the app
+    unlinks this marker before pasting, and pastes only if the nonce
+    matches the session it watched, the same application is still
+    frontmost, and the marker is under 2 s old (design § Auto-paste).
+    `O_NOFOLLOW` for the same reason `write_mic_status` uses it: this path
+    is guessable, and a planted symlink must not get truncated through it;
+    `O_NONBLOCK` so a FIFO planted there fails `ENXIO` instead of blocking
+    this stop for ever with the session still claimed.
+    Best effort — a marker that fails to write costs a paste, not a
+    dictation, so the failure is logged and swallowed.
+    """
+    try:
+        audio.ensure_private_dir(CACHE_DIR)
+        fd = os.open(
+            copied_path(),
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"epoch": time.time(), "nonce": nonce}, handle)
+    except OSError as exc:
+        print(f"vocalize: could not write the paste marker: {exc}", file=sys.stderr)
 
 
 def _read_session() -> tuple[Path, float] | None:
@@ -789,6 +877,105 @@ def _wait_for_exit(pid: int, started: float, stt: dict) -> None:
 # --- the take ---------------------------------------------------------
 
 
+def _wait_for_audio(workdir: Path) -> float | None:
+    """When `take.wav` first grew past its header, or None if it never did.
+
+    The only signal this side of the frozen recorder has that the
+    microphone is *open* rather than merely launched (DEC-031). The
+    recorder writes a 4096-byte header first and then audio in steps, and
+    the file does not exist at all when `rec.pid` lands — so the baseline
+    is the larger of the first size seen and the header, and the first
+    byte past it is `t0`.
+
+    Returns a `time.monotonic()` reading, so the caller can measure the
+    cue against it. None means the grace ran out with no growth: the
+    caller cues anyway and trims nothing, because a trim keyed to a
+    guessed `t0` could eat the first word.
+    """
+    take = workdir / _TAKE_NAME
+    deadline = time.monotonic() + _AUDIO_GRACE
+    baseline: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            size = take.stat().st_size
+        except OSError:
+            if not workdir.is_dir():
+                # Another press cancelled this dictation and took the
+                # directory with it. Nothing is coming.
+                return None
+            size = 0
+        if baseline is None:
+            baseline = max(size, _WAV_HEADER_BYTES)
+        elif size > baseline:
+            return time.monotonic()
+        time.sleep(_POLL_INTERVAL)
+    return None
+
+
+def _write_cue(workdir: Path, seconds: float) -> None:
+    """Leave the seconds `_trim_cue` should cut off the head of the take.
+
+    Best effort: a cue file that cannot be written costs a cue word in the
+    transcript, which is not worth failing a dictation for.
+    """
+    try:
+        (workdir / _CUE_NAME).write_text(f"{seconds}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _cue_the_open_microphone(workdir: Path, stt: dict) -> None:
+    """Play the start cue where it belongs, and record what to trim.
+
+    Trim branch: the whole cue plays *after* the microphone is open, so it
+    is heard where it means something ("talk now") — and it lands in the
+    recording, which is why the seconds from `t0` to the end of it are
+    written down for `_trim_cue`. Fallback branch: the word has already
+    played, before the launch, so only the sound is left and nothing is
+    trimmed.
+    """
+    t0 = _wait_for_audio(workdir)
+    if CUE_ORDER != "trim":
+        _play(_SOUND_START, stt, only="sound")
+        return
+    _play(_SOUND_START, stt)
+    if t0 is not None:
+        _write_cue(workdir, time.monotonic() - t0)
+
+
+def _trim_cue(workdir: Path) -> None:
+    """Cut the recorded cue off the head of the take (DEC-031).
+
+    Never pads and never rounds up: the trim is `int(seconds * rate)`
+    frames, so it can fall a flush short of the cue and can never reach
+    into the first word. Anything unexpected — no cue file, an unparsable
+    or negative one, a cue at or past the end of the take, a take that is
+    not a readable WAV — leaves the recording exactly as it is. A cue word
+    in the transcript is a blemish; a lost take is a lost dictation.
+    """
+    try:
+        seconds = float((workdir / _CUE_NAME).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if not (math.isfinite(seconds) and seconds >= 0):  # NaN and infinity included
+        return
+    take, trimmed = workdir / _TAKE_NAME, workdir / _TRIMMED_NAME
+    try:
+        with wave.open(str(take), "rb") as reader:
+            drop = int(seconds * reader.getframerate())
+            if drop >= reader.getnframes():
+                return
+            params = reader.getparams()
+            reader.setpos(drop)
+            frames = reader.readframes(reader.getnframes() - drop)
+        with wave.open(str(trimmed), "wb") as writer:
+            writer.setparams(params)
+            writer.writeframes(frames)
+        os.replace(trimmed, take)
+    except (OSError, wave.Error, EOFError, ValueError):
+        trimmed.unlink(missing_ok=True)
+
+
 def _take_is_usable(workdir: Path) -> bool:
     """Whether a finished recording is sitting in the directory.
 
@@ -959,6 +1146,7 @@ def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool]:
     by `_mark_finishing` before either caller gets here — the claim has to
     be older than the first thing that can block, not than the transcription.
     """
+    _trim_cue(workdir)  # before anything reads the take: the cue is not speech
     take = workdir / _TAKE_NAME
     if _is_silent(take):
         return None, False
@@ -1031,8 +1219,12 @@ def toggle(stt: dict) -> int:
         _stamp_press()  # a repeat queued behind this press begins right now
 
 
-def _start(workdir: Path, stt: dict) -> int:
-    """First press: stop any read, launch the recorder, say so."""
+def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
+    """First press: stop any read, launch the recorder, say so.
+
+    `cue=False` is hold-to-talk (`dictate --start`): the key-down the user
+    is holding *is* the cue, so nothing is played and nothing is trimmed.
+    """
     _sweep_stale_workdirs()
     # Everything that can say "this dictation cannot happen" without side
     # effects, before the read is killed: settings that will not validate
@@ -1051,14 +1243,13 @@ def _start(workdir: Path, stt: dict) -> int:
     # that read saves its place, and this dictation offers it back once the
     # transcript has landed (DEC-003).
     audio.stop_playback(remember=True)
-    # A spoken "Start." has to finish *before* the microphone opens, or it
-    # is recorded and transcribed along with the dictation (`audio.play`
-    # blocks until playback ends). The Tink plays *after* the recorder
-    # reports it is recording, as it always has — so in "both" mode the
-    # two cues keep distinct meanings: the word is "get ready", the sound
-    # is "the microphone is open, talk now". The gap between them is the
-    # recorder's start-up; closing it is issue #2.
-    _play(_SOUND_START, stt, only="word")
+    # The fallback branch keeps 0.13.0's order, where the only way to keep
+    # a spoken "Start." out of the take was to finish it before the
+    # microphone opened (`audio.play` blocks until playback ends). The
+    # trim branch plays the whole cue after the microphone is open and
+    # cuts it back out — issue #2, DEC-031.
+    if cue and CUE_ORDER != "trim":
+        _play(_SOUND_START, stt, only="word")
     try:
         _launch_recorder(workdir, stt)
     except DictationError:
@@ -1076,8 +1267,11 @@ def _start(workdir: Path, stt: dict) -> int:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
         return 1
+    if cue:
+        _cue_the_open_microphone(workdir, stt)
+    else:
+        _wait_for_audio(workdir)  # "recording" means the microphone is open
     _write_session(workdir, "recording")
-    _play(_SOUND_START, stt, only="sound")
     return 0
 
 
@@ -1191,6 +1385,72 @@ def _second_press(stt: dict) -> int:
     return _after_stop(_stop(workdir, pid, started, stt), started, stt)
 
 
+# --- hold to talk -----------------------------------------------------
+
+
+def _wait_for_pid(workdir: Path, started: float) -> int | None:
+    """The recorder's PID, waiting out a launch that may still be in flight.
+
+    A key-up half a second after the key-down lands while `dictate
+    --start` is still inside `_launch_recorder`: there is no PID to signal
+    yet, and the take is real. Waiting for it is the difference between
+    stopping that recording and reporting that the recorder died.
+    """
+    deadline = time.monotonic() + max(0.0, _START_GRACE - (time.time() - started))
+    while True:
+        pid = _recorder_pid(workdir)
+        if pid is not None or time.monotonic() >= deadline:
+            return pid
+        time.sleep(_POLL_INTERVAL)
+
+
+def start_hold(stt: dict) -> int:
+    """`dictate --start`: the dictation key went down (design § Hold-to-talk).
+
+    Idempotent, because the app can send a second key-down — a repeat, a
+    dropped key-up, two chords sharing a key — and a hold that started a
+    second recorder would leave the first one holding the microphone. An
+    already-claimed session is somebody else's dictation: exit 0 and touch
+    nothing.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX))
+    if not _claim_session(workdir):
+        shutil.rmtree(workdir, ignore_errors=True)
+        return 0
+    return _start(workdir, stt, cue=False)
+
+
+def stop_hold(stt: dict) -> int:
+    """`dictate --stop`: the dictation key came up (design § Hold-to-talk).
+
+    Never the 2-second cancel window: a key held for half a second is a
+    short sentence, not a change of mind, and there is no second press to
+    read as one. Cancelling a hold is `vocalize listen --cancel`.
+    """
+    session = _read_session()
+    if session is None:
+        # No session at all is nothing to stop. A session file no press
+        # can use is cleared here, and only here: in hold mode every later
+        # key-down would find it claimed and record nothing (DEC-011).
+        return _clear_wedged_session(stt, _NOTIFY_FAILED, 1)
+    workdir, started = session
+
+    claim = _finish_claim(workdir)
+    if claim == "live":
+        _play(_SOUND_STOP, stt)
+        _notify(_NOTIFY_BUSY)
+        return 0
+    if claim == "dead":
+        return _fail(workdir, stt, _NOTIFY_FAILED)
+
+    pid = _recorder_pid(workdir)
+    if pid is None and not _take_is_usable(workdir):
+        pid = _wait_for_pid(workdir, started)
+        if pid is None and not _take_is_usable(workdir):
+            return _fail(workdir, stt, _NOTIFY_RECORDER_FAILED)
+    return _after_stop(_stop(workdir, pid, started, stt), started, stt)
+
+
 def _clear_wedged_session(stt: dict, message: str, code: int) -> int:
     """Answer a claim that cannot be read at all.
 
@@ -1263,6 +1523,10 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
         except DictationError:
             _notify(_NOTIFY_CLIPBOARD_FAILED)
             return 1
+        if stt.get("paste"):
+            nonce = _session_nonce(workdir)
+            if nonce is not None:
+                _write_copied_marker(nonce)
         _play(_SOUND_DONE, stt)
         if cleanup_skipped:
             _notify(_NOTIFY_COPIED_RAW)
@@ -1318,6 +1582,7 @@ def listen(stt: dict, *, wait) -> str | None:
         audio.stop_playback()
         started = time.time()
         pid = _launch_recorder(workdir, stt)
+        _cue_the_open_microphone(workdir, stt)
         _write_session(workdir, "recording")
         try:
             wait(started + float(stt["max_seconds"]))

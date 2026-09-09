@@ -984,19 +984,21 @@ def test_an_unknown_app_key_warns_but_still_loads(monkeypatch, tmp_path, capsys)
     assert "unknown config key 'stop_hotkey' in [app]" in capsys.readouterr().err
 
 
-def test_dictate_mode_hold_resolves_to_toggle_with_one_warning(monkeypatch, tmp_path, capsys):
-    """A config from 0.13.1 must not brick a rolled-back 0.13.0 (DEC-032)."""
+def test_dictate_mode_hold_resolves_to_hold(monkeypatch, tmp_path, capsys):
+    """0.13.0 coerced `hold` to toggle with a warning; 0.13.1 dispatches it.
+
+    The settings line the menu-bar app reads is what changes: it now says
+    `app.dictate_mode=hold`, which is what sends key-down and key-up to
+    `vocalize dictate --start` and `--stop`.
+    """
     from vocalize import config
     from vocalize.config import resolve_app
 
     monkeypatch.setattr(config, "_warned", set())  # once per process: start this one clean
     data = _load_stt(monkeypatch, tmp_path, '[app]\ndictate_mode = "hold"\n')
-    resolved = resolve_app(data)
-    resolve_app(data)  # a second resolve in the same process does not repeat it
 
-    assert resolved["dictate_mode"] == "toggle"
-    err = capsys.readouterr().err
-    assert err.count("arrives in 0.13.1") == 1
+    assert resolve_app(data)["dictate_mode"] == "hold"
+    assert capsys.readouterr().err == ""  # nothing left to warn about
 
 
 def test_resolve_app_chord_grammar_accepts_every_key_it_lists():

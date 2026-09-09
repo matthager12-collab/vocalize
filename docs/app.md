@@ -74,7 +74,7 @@ Three chords, set under `[app]` in `~/.config/vocalize/config.toml`:
 | Key | What it does | Default |
 |---|---|---|
 | `dictate` | start/stop dictation | `ctrl+alt+cmd+d` |
-| `dictate_mode` | `toggle` or `hold` (`hold` arrives in 0.13.1) | `toggle` |
+| `dictate_mode` | `toggle` or `hold` | `toggle` |
 | `speak` | speak the selection | `ctrl+alt+cmd+s` |
 | `stop` | stop whatever is playing | `ctrl+alt+cmd+x` |
 

@@ -5,7 +5,27 @@ All notable changes to this project are documented here. Format follows
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **The dictation cue no longer reaches the transcript.** The "Start."
+  word and/or Tink now play after the microphone is actually open, timed
+  off the real first growth of the recording rather than a guess, and
+  those seconds are trimmed back off the head of the take before it's
+  transcribed ([#2](https://github.com/matthager12-collab/vocalize/issues/2)).
+  A machine where the recording never grows incrementally falls back to
+  today's order (word before the microphone opens) with no trim.
+- **Hold-to-talk.** `[app] dictate_mode = "hold"` turns the dictate chord
+  from a toggle into a press-and-hold: hold it, speak, let go, no cancel
+  window. `vocalize dictate --start` / `--stop` drive the same thing from
+  a terminal or a script. `--start` is idempotent; `--stop` never treats a
+  short hold as a cancel.
+- **`[stt] paste`** (default off). When on, a dictation that copies to the
+  clipboard also pastes into the app you started it in — a marker file
+  carrying the dictation's nonce is how the menu-bar app knows it's safe
+  to paste (same session, same frontmost app, under 2 seconds old); a
+  window switch leaves the transcript on the clipboard and says "Copied,
+  not pasted (window changed)." instead.
+- `vocalize settings` prints `stt.paste=…`.
 
 ## 0.13.0 - 2026-09-08
 

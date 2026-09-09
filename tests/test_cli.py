@@ -646,6 +646,8 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert "stt.verbatim=false" in result.output
     assert "stt.max_seconds=30" in result.output
     assert "stt.cues=sounds" in result.output
+    assert "stt.paste=false" in result.output
+    assert result.output.index("stt.paste=") > result.output.index("stt.cues=")
     assert "notes.summarizer=local" in result.output
     # The menu-bar app parses exactly these four lines (design.md § The [app] table).
     assert "app.dictate=ctrl+alt+cmd+d" in result.output
@@ -653,6 +655,62 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert "app.speak=ctrl+alt+cmd+s" in result.output
     assert "app.stop=ctrl+alt+cmd+x" in result.output
     assert "notes.template=memo" in result.output
+
+
+def test_settings_prints_stt_paste_true_when_configured(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    cfg = tmp_path / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('[stt]\npaste = true\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "stt.paste=true" in result.output
+
+
+def test_dictate_start_runs_the_hold_to_talk_start(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module.dictate, "start_hold", lambda stt: calls.append(stt) or 0)
+
+    result = CliRunner().invoke(main, ["dictate", "--start"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_dictate_stop_runs_stop_hold(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module.dictate, "stop_hold", lambda stt: calls.append(stt) or 0)
+
+    result = CliRunner().invoke(main, ["dictate", "--stop"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_bare_dictate_is_still_the_toggle_not_hold_to_talk(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module.dictate, "toggle", lambda stt: calls.append(stt) or 0)
+
+    result = CliRunner().invoke(main, ["dictate"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_hold_to_talk_refuses_start_and_stop_in_one_run(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module.dictate, "start_hold", lambda stt: 0)
+    monkeypatch.setattr(cli_module.dictate, "stop_hold", lambda stt: 0)
+
+    result = CliRunner().invoke(main, ["dictate", "--start", "--stop"])
+
+    assert result.exit_code == 2
+    assert "Use only one of --start, --stop." in result.output
 
 
 def test_the_verbatim_flag_and_a_bare_cleanup_reach_the_stt_options(monkeypatch, tmp_path):
