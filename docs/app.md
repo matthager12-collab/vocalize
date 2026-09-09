@@ -41,6 +41,36 @@ This:
 It asks to confirm first, listing exactly what it's about to write.
 `--yes` skips that prompt.
 
+It also needs `swiftc`, from Apple's command line tools, to build the bundle.
+If `xcode-select --install` has never been run on the machine, do that first.
+
+## Then grant Accessibility
+
+**Install is not finished when the command exits.** The app is running and
+its chords are registered, and not one of them will fire until you grant
+Accessibility by hand.
+
+**System Settings → Privacy & Security → Accessibility → enable Vocalize.**
+
+```bash
+vocalize app restart
+vocalize app status      # want: accessibility: granted
+```
+
+macOS neither prompts for this nor logs the refusal. A keypress simply never
+arrives. That silence is why this is the most common "the install worked but
+nothing happens" report, and why it gets its own heading here rather than a
+line inside the install steps.
+
+`status` can read `hotkeys: ok` and `accessibility: not granted` at the same
+time. The chords registered with the OS; the OS is not delivering them. The
+accessibility row is the one that decides whether anything works.
+
+No installer can do this step. Anything able to grant itself the right to
+watch your keyboard would be a keylogger, so Apple reserves the switch for a
+human at the machine. See also [the re-grant rule](#the-re-grant-rule) — a
+rebuild resets the grant and you come back here.
+
 ## Status
 
 ```bash
