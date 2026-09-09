@@ -21,6 +21,24 @@ Everything below fills in the parts those three commands don't fully
 automate: providers, the model download, and two GUI-only steps macOS
 reserves for a human.
 
+New to this, or handing it to someone who is? Send them to
+[docs/getting-started.md](getting-started.md) instead. Same install, spelled
+out step by step, with every System Settings screen named.
+
+## 0. Apple's command line tools
+
+```bash
+xcode-select --install
+```
+
+Both `vocalize local install --stt` and `vocalize app install` compile a
+small Swift bundle on your machine, so `swiftc` has to exist. A Mac that has
+never had Xcode or its command line tools installed does not have it, and the
+failure arrives late, at build time. `vocalize doctor` reports it as the
+`swiftc` row.
+
+Already installed? The command says so and exits. That's a pass.
+
 ---
 
 ## 1. The CLI
@@ -103,6 +121,29 @@ The app needs dictation's recorder bundle (step 3 above) before its
 dictate hotkey does anything; each install is a no-op if the other one
 hasn't happened yet.
 
+### Then grant Accessibility — the app does nothing until you do
+
+`app install` finishes successfully, loads the agent, and registers the
+chords. None of them fire. macOS will not deliver a keypress to an app
+without an Accessibility grant, and it neither prompts nor logs when it
+withholds one.
+
+**System Settings → Privacy & Security → Accessibility → enable Vocalize.**
+Then:
+
+```bash
+vocalize app restart
+vocalize app status      # want: accessibility: granted
+```
+
+This is the single most common reason a fresh install appears to do nothing.
+`vocalize doctor` and `vocalize app status` both report it, and both are
+worth running before you conclude anything else is wrong.
+
+Note that `app status` can report `hotkeys: ok` while `accessibility: not
+granted`. The chords registered. They will still never fire. Read the
+accessibility row, not the hotkeys row.
+
 ## 5. `vocalize integrate claude` — Claude Code and Quick Actions
 
 ```bash
@@ -138,9 +179,9 @@ Neither is scriptable — macOS reserves both for a human:
    under the **Text** category there). Don't assign D or X — the menu-bar
    app already owns those chords; Dictate and Stop stay reachable from the
    Services menu if you want a Quick Action fallback too.
-2. **Accessibility.** If `vocalize integrate claude` reports it isn't
-   granted, System Settings → Privacy & Security → Accessibility → enable
-   Vocalize.app.
+2. **Accessibility.** Covered in [step 4](#then-grant-accessibility--the-app-does-nothing-until-you-do)
+   — it is a requirement of `vocalize app install`, not of this step. If you
+   skipped the menu-bar app, you can skip it here too.
 
 ## 6. The Stop hook (optional, still a repo script)
 
@@ -195,7 +236,7 @@ vocalize doctor                    # everything above, in one shot
 vocalize settings                  # chain + resolved config
 echo test | vocalize speak-file -  # audible, names the provider used
 vocalize listen --check            # dictation: model + recorder + microphone
-vocalize app status                # bundle built, agent loaded, hotkeys registered
+vocalize app status                # bundle built, agent loaded, ACCESSIBILITY GRANTED
 ```
 
 Not verifiable from a shell: first-use TCC prompts, and whether audio is

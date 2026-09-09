@@ -10,8 +10,18 @@ aloud in your terminal or IDE.
 
 ## Quickstart
 
+**New here?** [docs/getting-started.md](docs/getting-started.md) walks the
+whole install one step at a time, including the two System Settings switches
+macOS reserves for a human. This section assumes you're comfortable in a
+terminal.
+
+**Evaluating rather than installing?**
+[docs/for-reviewers.md](docs/for-reviewers.md) covers what the project does
+and the decisions behind it.
+
 ```bash
-pipx install vocalize-cli
+xcode-select --install          # if you've never installed Apple's dev tools
+uv tool install vocalize-cli
 ```
 
 ```bash
@@ -50,12 +60,27 @@ API key or network access (see `tests/test_preprocess.py`).
 ## Install
 
 ```bash
-pipx install vocalize-cli
+uv tool install vocalize-cli
 ```
 
-(or `uvx --from vocalize-cli vocalize` for a one-off run without installing
-anything). The package is published on PyPI as `vocalize-cli`; the command
-it installs is still `vocalize`.
+`pipx install vocalize-cli` works identically. Pick one, not both.
+[`uv`](https://docs.astral.sh/uv/) is the one shown throughout because
+`vocalize local install` needs it anyway for the on-device voice, so it's one
+tool instead of two. For a one-off run without installing anything at all,
+`uvx --from vocalize-cli vocalize`.
+
+The package is published on PyPI as `vocalize-cli`; the command it installs
+is still `vocalize`.
+
+Building the recorder and the menu-bar app needs `swiftc`, from Apple's
+command line tools:
+
+```bash
+xcode-select --install
+```
+
+Already present on any Mac that has had Xcode or its command line tools. Not
+present on a fresh one, and the failure arrives late, at build time.
 
 For a from-source or dev install:
 
@@ -485,6 +510,14 @@ dictation hotkey (and speak/stop) system-wide, no Services menu or
 per-app shortcut assignment needed — see [docs/app.md](docs/app.md) for
 install, uninstall, status and restart. `vocalize dictate` is the same
 command from a terminal, if you'd rather trigger it that way.
+
+**Then grant Accessibility, or none of the chords fire.** System Settings →
+Privacy & Security → Accessibility → enable Vocalize, then
+`vocalize app restart`. macOS neither prompts for this nor logs the refusal,
+so an ungranted app looks exactly like a working one that ignores you.
+`vocalize app status` reports the grant; note that it can read `hotkeys: ok`
+and `accessibility: not granted` together, and the accessibility row is the
+one that matters.
 
 Prefer a Quick Action instead? That still works:
 

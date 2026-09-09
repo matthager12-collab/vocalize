@@ -130,7 +130,7 @@ def _common_options(f):
 @click.group()
 @click.version_option(__version__, prog_name="vocalize")
 def main() -> None:
-    """Turn text, markdown, or piped stdin into speech via ElevenLabs."""
+    """Speak text, markdown, or piped stdin — and dictate back — on your own machine."""
 
 
 def _ask_to_truncate(input_chars: int, cap: int) -> bool | None:
