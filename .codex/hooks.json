@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/Users/jenandmatshome/Library/Application Support/pipx/venvs/sentience-governor/bin/sentience-claude-code-hook\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/Users/jenandmatshome/Library/Application Support/pipx/venvs/sentience-governor/bin/sentience-claude-code-hook\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/Users/jenandmatshome/Library/Application Support/pipx/venvs/sentience-governor/bin/sentience-claude-code-hook\""
+          }
+        ]
+      }
+    ]
+  }
+}
