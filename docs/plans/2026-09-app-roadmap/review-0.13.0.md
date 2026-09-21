@@ -250,3 +250,64 @@ The absence of a finding is only evidence if the check is written down. Each bul
 - All 28 relative markdown links and heading anchors across README.md, CHANGELOG.md, docs/app.md, docs/installation.md, docs/dictation.md and docs/roadmap.md resolve.
 - Python-version floor is honest (`>=3.10`, no 3.11/3.12-only syntax; `tomllib` guarded by a `tomli` fallback).
 - `tests/test_app_build.py`, `test_recorder_build.py`, `test_portal_assets.py`, `test_cue_assets.py`, `test_uv_path.py`: 86 passed. `ruff check vocalize hooks tests`: All checks passed.
+
+# Adversarial review: vocalize 0.13.1 (T-110, dictation cue trim, hold-to-talk, pause/resume, and spoken rendering rules)
+
+**Date:** 2026-09-21
+**Scope:** branch `hold-to-talk` at `7650883` against `main` at `b59cd5d` — runs 11, spoken rendering rules, and 11b of `docs/plans/2026-09-app-roadmap/plan.md`:
+- Run 11: `vocalize/dictate.py` (`_wait_for_audio`, `_AUDIO_GRACE`, `_cue_the_open_microphone`, `_trim_cue`, `start_hold`, `stop_hold`, `copied_path`, `_write_copied_marker`), `vocalize/cli.py` (`dictate --start`/`--stop`, `settings` printing `stt.paste`), `vocalize/config.py` (`[app] dictate_mode` passthrough, `[stt] paste` support).
+- Spoken rendering rules: `docs/research/2026-09-08-spoken-rendering-rules.md`, `vocalize/preprocess.py` (forty spoken markdown / punctuation rules, `resolve_speech`), `vocalize/config.py` (`[speech]` table validation and defaults), `vocalize/cli.py` (`_run_tts` speech config resolution).
+- Run 11b: `vocalize/interrupted.py` (`wait_for_record`, `_RESUME_REWIND = 1.0` in `slice_from`), `vocalize/cli.py` (`vocalize pause`, `vocalize stop` with `app.stop_hotkey = "pause"`), `vocalize/config.py` (`[app] stop_hotkey` validation).
+- Hardening: `O_NONBLOCK` on all marker writers in `dictate.py` (`write_mic_status`, `_write_session`, `_write_copied_marker`) preventing FIFO wedging; `_SESSION_STATES` monotonic progression guard in `_write_session`.
+
+**Lenses:**
+- dictate-and-cue: `_wait_for_audio` 4096-byte header threshold and growth polling; cue playback timing after growth; integer frame calculation and atomic `os.replace` in `_trim_cue`; `start_hold` idempotency and `stop_hold` grace/PID resolution.
+- paste-and-nonce: marker writing at `~/.cache/vocalize/dictate.copied` under 0600 mode with `O_NOFOLLOW` and `O_NONBLOCK`; session nonce validation; matching between Python marker and Swift reader.
+- pause-and-resume: `wait_for_record` bounded polling; `slice_from` 1.0 s rewind clamped at 0.0; stop hotkey toggle routing refusing during active dictation.
+- spoken-rendering: preprocess pipeline idempotency; regex bounding and non-exponential rules; safe table and enum validation in `config.py`.
+
+### Findings
+
+| Severity | Title | File | Status | Resolution |
+|---|---|---|---|---|
+| low | 0.13.0 deferred obligation: frozen Swift `dictate --start`/`--stop` flags and `stt.paste` settings display | `vocalize/cli.py` | fixed | 0.13.0 finding line 178 deferred to 0.13.1: `dictate --start` and `--stop` are now fully implemented in `vocalize/cli.py` and backed by `dictate.start_hold` / `stop_hold`; `vocalize settings` now prints `stt.paste=true|false`. Tests: `test_dictate.py`, `test_cli.py`, `test_config.py`. |
+| low | FIFO planted at `mic.status`, `dictate.session`, or `dictate.copied` could wedge writer | `vocalize/dictate.py` | fixed | `write_mic_status`, `_write_session`, and `_write_copied_marker` now open with `O_NONBLOCK` alongside `O_NOFOLLOW` and 0600 mode. A planted FIFO fails with `ENXIO` immediately instead of blocking the process indefinitely. |
+| low | Out-of-order session progression: slow `--start` waiting for audio could revert `transcribing` to `recording` | `vocalize/dictate.py` | fixed | `_SESSION_STATES = ("starting", "recording", "transcribing")` enforces monotonic forward progression. If the on-disk session state is already further ahead, a lagging worker aborts the write silently. |
+
+### Carried from earlier reviews
+
+| ID | Title | File | Status |
+|---|---|---|---|
+| F-10 | "verbatim" spoken alone produces an egress line and a real POST with an empty message body | `vocalize/llm.py` | still open — carried forward as low |
+| F-13 | The fallback note tells the user to install Kokoro when Kokoro is installed and was skipped by budget | `vocalize/chain.py` | still open — carried forward as low |
+| F-14 | Keys tab hides "Remove stored key" when environment variable shadows keychain key | `vocalize/assets/portal.js` | still open — carried forward as low |
+| — | The 0.11.0 tmpdir sweep for playback/resume temp directories | `vocalize/cli.py` | still open — carried forward as low |
+
+**No critical or high finding exists in this review, and none is open or accepted: all new features pass all security gates, all regressions pass, and all carried items remain low severity.**
+
+### What each lens checked and found clean
+
+#### dictate-and-cue
+- `_wait_for_audio` waits up to 5.0 s (`_AUDIO_GRACE`) for `take.wav` size to exceed `_WAV_HEADER_BYTES` (4096 bytes). If cancelled or directory vanishes, returns None safely.
+- `_cue_the_open_microphone` plays `_SOUND_START` after audio begins growing, recording exact cue duration to `workdir / "cue"`.
+- `_trim_cue` parses cue seconds safely (`math.isfinite(seconds) and seconds >= 0`), bounds frame drops to `< reader.getnframes()`, writes `take.trimmed.wav`, and executes atomic `os.replace`. Clean exception handling deletes temporary trimmed file on failure.
+- `start_hold` uses `_claim_session(workdir)` with `O_EXCL` and cleans up tempdir on duplicate calls; `stop_hold` skips the 2-second cancel window, resolves recorder PID within grace period, and transcribes cleanly.
+
+#### paste-and-nonce
+- `_write_copied_marker` writes `{"epoch": time.time(), "nonce": nonce}` to `~/.cache/vocalize/dictate.copied` using `O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_NONBLOCK` at mode 0600.
+- `_session_nonce` verifies the session directory matches the active workdir and re-reads fresh from disk before issuing paste marker.
+- Swift paste listener validates nonce match, age under 2.0 s, and matching frontmost application before triggering synthetic Command-V paste.
+
+#### pause-and-resume
+- `vocalize pause` issues `stop_playback(remember=True)` and awaits record write via `interrupted.wait_for_record(since)` with 3.0 s deadline.
+- `[app] stop_hotkey = "pause"` toggles: pauses active playback, or resumes saved record with 1.0 s rewind overlap (`_RESUME_REWIND = 1.0` clamped at 0.0) when idle, while safely refusing during an active dictation session (`dictate._read_session() is not None`).
+- Negative tests verify dictation while paused preserves the paused record without corruption.
+
+#### spoken-rendering
+- Forty spoken rendering rules implemented in `vocalize/preprocess.py` correctly convert headings, lists, abbreviations, citations, block quotes, URLs, and punctuation to natural spoken prose.
+- Rule evaluation is idempotent: running `flatten_markdown` multiple times produces the identical result.
+- `[speech]` table options in `vocalize/config.py` validate all modes and integer bounds with helpful error messages.
+
+#### artifact and suite verification
+- Full test suite: 2,231 passed, 3 skipped; ruff clean.
+- Wheel package builds cleanly without leaking ML runtimes (`pywhispercpp`, `onnxruntime`, `mlx`, `sherpa`, `numpy`, `torch`, `boto3`).
