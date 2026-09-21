@@ -10,7 +10,7 @@ from vocalize.preprocess import (
 
 RULE_CASES = [
     # 1. Soft line wrap
-    ("wraps\nonto", "wraps onto."),
+    ("wraps\nonto", "wraps onto"),
     # 2. Blank line
     ("First para\n\nSecond.", "First para.\n\nSecond."),
     # 3. Heading levels 1-2
@@ -22,40 +22,40 @@ RULE_CASES = [
     ("### Sub Three", "Sub-heading, Sub Three."),
     ("#### Sub Four", "Sub-heading, Sub Four."),
     # 5. Em dash, en dash, or spaced hyphen
-    ("clear—we shipped", "clear, we shipped."),
-    ("simple - just restart", "simple, just restart."),
+    ("clear—we shipped", "clear, we shipped"),
+    ("simple - just restart", "simple, just restart"),
     # 6. En dash between numbers
-    ("pages 3–5", "pages 3 to 5."),
+    ("pages 3–5", "pages 3 to 5"),
     # 7. Guards: compound hyphen, digit-period, numbers, ALL CAPS
-    ("well-known", "well-known."),
-    ("3.5 GB, v2.0.1", "3.5 GB, v2.0.1."),
-    ("12:30, 50%", "12:30, 50%."),
-    ("URGENT NOTICE", "URGENT NOTICE."),
+    ("well-known", "well-known"),
+    ("3.5 GB, v2.0.1", "3.5 GB, v2.0.1"),
+    ("12:30, 50%", "12:30, 50%"),
+    ("URGENT NOTICE", "URGENT NOTICE"),
     # 8. Parenthetical mid-sentence
-    ("results (which surprised everyone) were", "results, which surprised everyone, were."),
+    ("results (which surprised everyone) were", "results, which surprised everyone, were"),
     # 9. Parenthetical at sentence end
     ("The trend is clear (see fig. 3).", "The trend is clear, see fig 3."),
     # 10. Parenthetical whole sentence
     ("(See the appendix.)", "See the appendix."),
     # 11. Square brackets around words
-    ("the plan [the second one] was", "the plan, the second one, was."),
+    ("the plan [the second one] was", "the plan, the second one, was"),
     # 12. Guard bracket: nested
-    ("((a+b)*c)", "((a+b)*c)."),
+    ("((a+b)*c)", "((a+b)*c)"),
     # 13. Task checkbox and ref-link
     ("- [x] done", "First, done."),
-    ("[the docs][1]", "the docs."),
+    ("[the docs][1]", "the docs"),
     # 14. Abbreviation period, title list
-    ("Dr. Smith", "Dr Smith."),
-    ("Prof. Higgins", "Prof Higgins."),
+    ("Dr. Smith", "Dr Smith"),
+    ("Prof. Higgins", "Prof Higgins"),
     # 15. Abbreviation period, context list
     ("pens, etc. Then start.", "pens, etc. Then start."),
-    ("Fig. 3", "Fig 3."),
+    ("Fig. 3", "Fig 3"),
     # 16. Abbreviation, Latin list
-    ("e.g. chips", "for example, chips."),
-    ("i.e. this", "that is, this."),
+    ("e.g. chips", "for example, chips"),
+    ("i.e. this", "that is, this"),
     # 17. Initials
-    ("J. R. R. Tolkien", "J R R Tolkien."),
-    ("J.R.R. Tolkien", "J R R Tolkien."),
+    ("J. R. R. Tolkien", "J R R Tolkien"),
+    ("J.R.R. Tolkien", "J R R Tolkien"),
     # 18. Bulleted / numbered list
     ("- one\n- two", "First, one.\n\nSecond, two."),
     ("1. buy milk\n2. walk dog", "Item 1: buy milk.\n\nItem 2: walk dog."),
@@ -65,15 +65,15 @@ RULE_CASES = [
     ("| Q1 | Revenue |\n|---|---|\n| Jan | 4.2M |", "Table with 1 row. For Jan: Revenue is 4.2M."),
     # 21. Inline code, bold, italic, HTML tag
     ("Run `pip install` now.", "Run pip install now."),
-    ("a<br>b", "a b."),
+    ("a<br>b", "a b"),
     ("This is **very** important and *also* urgent.", "This is very important and also urgent."),
     # 22. Code block
     ("```python\ndef f(): pass\n```", "Skipping a code block."),
     # 23. Markdown link, image
-    ("[the docs](https://example.com)", "the docs."),
-    ("![Revenue chart](c.png)", "Revenue chart."),
+    ("[the docs](https://example.com)", "the docs"),
+    ("![Revenue chart](c.png)", "Revenue chart"),
     # 24. Bare URL
-    ("https://example.com/page", "example dot com."),
+    ("https://example.com/page", "example dot com"),
     # 25. Block quote
     ("> A line.\n> Two.", "Quote, A line. Two. End quote."),
     ("> Single line.", "Quote, Single line."),
@@ -89,9 +89,9 @@ RULE_CASES = [
     # 30. Front matter
     ("---\ntitle: X\n---\nBody text.", "Body text."),
     # 31. Ellipsis
-    ("And then... nothing", "And then, nothing."),
+    ("And then... nothing", "And then, nothing"),
     # 32. Emoji
-    ("job! 🎉 Let's", "job! Let's."),
+    ("job! 🎉 Let's", "job! Let's"),
     # 33. Final spacing pass
     ("Done  .   Next (really) .", "Done. Next, really."),
 ]

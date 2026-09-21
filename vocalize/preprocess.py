@@ -538,12 +538,18 @@ def flatten_markdown(text: str, speech: dict[str, Any] | None = None) -> str:
         para_text = " ".join(para_lines)
         spoken_para = _apply_inline_rules(para_text, speech)
         if spoken_para:
-            blocks.append(_ensure_block_terminator(spoken_para))
+            blocks.append(spoken_para)
         list_ordinal = 0
 
     if footnotes_count > 0:
         noun = "footnote" if footnotes_count == 1 else "footnotes"
         blocks.append(f"Skipping {footnotes_count} {noun}.")
+
+    # Rule 2: Blank line gets a full stop if the block lacks .?!:
+    for idx in range(len(blocks) - 1):
+        b = blocks[idx].rstrip()
+        if b and b[-1] not in ".?!:":
+            blocks[idx] = b + "."
 
     # Join blocks with double newline to keep distinct spoken blocks
     result = "\n\n".join(b for b in blocks if b)
