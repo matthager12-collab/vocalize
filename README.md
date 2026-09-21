@@ -657,6 +657,7 @@ where it stopped, and once your transcript has landed, vocalize asks:
 up after 15 seconds (counted as no). From a terminal, the same thing is:
 
 ```bash
+vocalize pause             # pause live playback and save your place
 vocalize resume            # continue where the last read left off
 vocalize resume --forget   # discard it instead
 ```

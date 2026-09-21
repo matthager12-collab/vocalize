@@ -633,8 +633,35 @@ def resume(forget_only) -> None:
 
 
 @main.command()
+def pause() -> None:
+    """Pause any audio vocalize is currently playing."""
+    since = time.time()
+    stop_playback(remember=True)
+    if interrupted.wait_for_record(since) is not None:
+        click.echo("Paused. Resume it within the hour with: vocalize resume")
+    else:
+        click.echo("Nothing is playing.")
+
+
+@main.command()
 def stop() -> None:
     """Stop any audio vocalize is currently playing."""
+    file_config = load_config_file()
+    app = resolve_app(file_config)
+    if app.get("stop_hotkey") == "pause":
+        since = time.time()
+        stop_playback(remember=True)
+        if interrupted.wait_for_record(since) is not None:
+            click.echo("Paused. Resume it within the hour with: vocalize resume")
+            return
+        if dictate._read_session() is not None:
+            return
+        if interrupted.load() is not None:
+            resume_interrupted()
+            return
+        click.echo("Nothing is playing.")
+        return
+
     if stop_playback():
         click.echo("Stopped playback.")
     else:

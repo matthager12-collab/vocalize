@@ -383,7 +383,15 @@ Exit code is 0 when every row — providers and dictation both — is `ok`,
 and 1 otherwise, so it composes with `&&` the same way `vocalize usage`'s
 sibling commands do.
 
-## Interrupted reads and `resume`
+## Pausing, interrupted reads, and `resume`
+
+You can deliberately pause any playback vocalize is currently speaking:
+
+```bash
+vocalize pause             # pause playback and remember where it stopped
+vocalize resume            # play the saved piece, then read the rest
+vocalize resume --forget   # discard the saved read
+```
 
 Starting a dictation always stops whatever vocalize was reading aloud
 first — you can't record over your own voice being played back — but it
@@ -397,14 +405,15 @@ Once your dictation's transcript has landed, vocalize shows a dialog:
 > **Continue the read you interrupted?** [Discard] [Continue]
 
 Default button is Continue; the dialog gives up after 15 seconds, which
-counts as Discard. From a terminal (or if you missed the dialog), the same
-thing is:
+counts as Discard.
 
-```bash
-vocalize resume            # play the saved piece, then read the rest
-vocalize resume --forget   # discard the interrupted read
-vocalize resume            # "Nothing to resume." if there's nothing saved
-```
+### Zero-re-grant hotkey pause
+
+With `[app] stop_hotkey = "pause"` in `~/.config/vocalize/config.toml`, the
+menu-bar app's stop chord (Control-Option-Command-X) becomes a play/pause toggle
+with zero Accessibility re-grant: pressing it while audio is playing pauses the
+read, and pressing it when nothing is playing resumes the saved read (refusing
+silently while a dictation is recording).
 
 ### What's stored, and where
 
@@ -413,7 +422,7 @@ together:
 
 | File | Contents |
 |---|---|
-| `interrupted.<ext>` | one piece of audio — the chunk that was playing when the dictation started, or the whole file for a provider that doesn't stream |
+| `interrupted.<ext>` | one piece of audio — the chunk that was playing when the pause or dictation landed, or the whole file for a provider that doesn't stream |
 | `interrupted.txt` | the text after that piece — everything not yet spoken |
 | `interrupted.json` | `version`, `saved_at`, `provider`, `ext`, `offset_seconds`, `remaining_chars` |
 
@@ -426,14 +435,14 @@ moment you resume, decline, or `--forget` it, and an automatic expiry after
 **one hour** even if you never touch it. Nothing beyond that — a backup job
 that runs inside that hour will see it. No dictation audio and no
 dictation transcript is ever written into this record (see
-[Privacy](#privacy)); it only ever holds a *TTS read* your dictation
-interrupted.
+[Privacy](#privacy)); it only ever holds a *TTS read* paused or interrupted.
 
-Resuming plays the saved piece from where it was cut off (converting to
-WAV first if needed, then slicing by sample), then continues through the
-rest of the text via the normal chain, same provider, same cache — so
-anything already rendered is a cache hit and the continuation starts
-immediately.
+Resuming plays the saved piece from one second before where it was cut off
+(converting to WAV first if needed, then slicing by sample with a 1.0 s
+rewind overlap so the continuation never starts mid-syllable), then continues
+through the rest of the text via the normal chain, same provider, same
+cache — so anything already rendered is a cache hit and the continuation
+starts immediately.
 
 ## Uninstalling
 

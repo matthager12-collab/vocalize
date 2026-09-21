@@ -203,11 +203,6 @@ _FIXED_NOTIFICATIONS = frozenset(
 # nothing about the read, and nothing about the dictation, is in it. A
 # dialog nobody answers gives up, and giving up is a "no".
 _RESUME_GIVE_UP = 15
-# How long the dialog waits for a record the interrupted read has not
-# written yet. A read stopped mid-chunk only learns about it when the
-# provider call it is inside returns, and the dictation can easily finish
-# first (DEC-012). Skipped entirely when the stop found nothing playing.
-_RESUME_GRACE = 3.0
 _RESUME_DIALOG = (
     'display dialog "Continue the read you interrupted?" '
     'buttons {"Discard", "Continue"} default button "Continue" '
@@ -1281,38 +1276,12 @@ def _offer_resume(started: float) -> None:
     Runs after the session file is released, because a resumed read can
     take minutes and must never look like a dictation still in progress.
     """
-    if _wait_for_record(started) is None:
+    if interrupted.wait_for_record(started) is None:
         return
     if _ask_to_continue():
         _resume_read()
     else:
         interrupted.forget()
-
-
-def _wait_for_record(started: float) -> interrupted.Record | None:
-    """The record this dictation's stop left, once it has been written.
-
-    Only a record written *after* this dictation claimed the session: an
-    older one belongs to a read the user has already been asked about, and
-    `vocalize resume` is where a record nobody answered for still lives.
-
-    One look is not an answer. The stopped read writes its record when the
-    provider call it was inside returns, which on a cloud provider can be
-    ten seconds after the player died — long after a short dictation has
-    finished — and a record that lands late is never offered at all,
-    because every later dictation is newer than it. So this waits, briefly
-    and only when there is something to wait for: a stop that found nothing
-    playing leaves its marker unclaimed, and that means no record is coming
-    (DEC-012).
-    """
-    deadline = time.monotonic() + _RESUME_GRACE
-    while True:
-        record = interrupted.load()
-        if record is not None and record.saved_at > started:
-            return record
-        if audio.stop_found_no_player(started) or time.monotonic() >= deadline:
-            return None
-        time.sleep(_POLL_INTERVAL)
 
 
 def _ask_to_continue() -> bool:

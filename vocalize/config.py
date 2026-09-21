@@ -522,14 +522,16 @@ def resolve_notes(file_config: dict | None = None) -> dict:
 # aliases resolved. The Swift side keeps its own keycode table; a test
 # holds the two allowlists equal.
 
-KNOWN_APP_KEYS = ("dictate", "dictate_mode", "speak", "stop")
+KNOWN_APP_KEYS = ("dictate", "dictate_mode", "speak", "stop", "stop_hotkey")
 APP_CHORD_KEYS = ("dictate", "speak", "stop")
 APP_DICTATE_MODES = ("toggle", "hold")
+APP_STOP_HOTKEY_MODES = ("stop", "pause")
 APP_DEFAULTS = {
     "dictate": "ctrl+alt+cmd+d",
     "dictate_mode": "toggle",  # "hold" parses from 0.13.0, dispatches from 0.13.1
     "speak": "ctrl+alt+cmd+s",
     "stop": "ctrl+alt+cmd+x",
+    "stop_hotkey": "stop",
 }
 CHORD_MODIFIERS = ("ctrl", "alt", "cmd", "shift")  # the canonical order
 _CHORD_ALIASES = {"control": "ctrl", "option": "alt", "command": "cmd"}
@@ -611,6 +613,13 @@ def _validate_app_table(value, path: Path) -> None:
         raise ConfigError(
             f"Invalid app.dictate_mode {mode!r} in {path}: expected one of "
             f"{', '.join(APP_DICTATE_MODES)}."
+        )
+
+    stop_hotkey = resolved["stop_hotkey"]
+    if stop_hotkey not in APP_STOP_HOTKEY_MODES:
+        raise ConfigError(
+            f"Invalid app.stop_hotkey {stop_hotkey!r} in {path}: expected one of "
+            f"{', '.join(APP_STOP_HOTKEY_MODES)}."
         )
 
 

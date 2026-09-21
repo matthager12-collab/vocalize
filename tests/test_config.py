@@ -977,11 +977,16 @@ def test_two_disabled_app_chords_do_not_count_as_a_clash(monkeypatch, tmp_path):
 
 
 def test_an_unknown_app_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
-    """`stop_hotkey` arrives in 0.13.1; a file written for it must load here."""
-    data = _load_stt(monkeypatch, tmp_path, '[app]\nstop_hotkey = "pause"\n')
+    """An unknown app key warns but still loads."""
+    data = _load_stt(monkeypatch, tmp_path, '[app]\nfuture_key = "pause"\n')
 
-    assert data["app"] == {"stop_hotkey": "pause"}
-    assert "unknown config key 'stop_hotkey' in [app]" in capsys.readouterr().err
+    assert data["app"] == {"future_key": "pause"}
+    assert "unknown config key 'future_key' in [app]" in capsys.readouterr().err
+
+
+def test_stop_hotkey_rejects_an_unknown_word(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError, match="Invalid app.stop_hotkey 'unknown'"):
+        _load_stt(monkeypatch, tmp_path, '[app]\nstop_hotkey = "unknown"\n')
 
 
 def test_dictate_mode_hold_resolves_to_hold(monkeypatch, tmp_path, capsys):

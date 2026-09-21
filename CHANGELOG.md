@@ -7,6 +7,15 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- **`vocalize pause`** pauses live playback and saves your place for up to an
+  hour under `~/.cache/vocalize/interrupted.*` (0600 mode), continuing where you
+  left off with `vocalize resume` (with a 1.0-second rewind overlap).
+- **`[app] stop_hotkey = "stop" | "pause"`** (default `"stop"`). Set to
+  `"pause"`, the stop chord (Control-Option-Command-X) becomes a play/pause
+  toggle with zero Accessibility re-grant: pauses live audio, and resumes a
+  saved read when nothing is playing (refusing silently during dictation).
+- `vocalize settings` prints `app.stop_hotkey=…`.
+
 - **The dictation cue no longer reaches the transcript.** The "Start."
   word and/or Tink now play after the microphone is actually open, timed
   off the real first growth of the recording rather than a guess, and

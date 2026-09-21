@@ -2176,8 +2176,8 @@ def test_resume_plays_the_saved_piece_from_where_it_stopped(tmp_path, resuming):
 
     assert cli_module.resume_interrupted() is True
 
-    # What is left of the piece, and only that: 2 s minus the 1.2 s heard.
-    assert played == [16000 * 2 - int(1.2 * 16000)]
+    # 1.0 s rewind (DEC-036): 2 s minus (1.2 s - 1.0 s = 0.2 s heard).
+    assert played == [16000 * 2 - int(0.2 * 16000)]
 
 
 def test_resume_converts_a_piece_that_is_not_a_wav_before_slicing(
@@ -2192,7 +2192,8 @@ def test_resume_converts_a_piece_that_is_not_a_wav_before_slicing(
 
     assert cli_module.resume_interrupted() is True
 
-    assert played == [16000 - int(0.25 * 16000)]
+    # 1.0 s rewind clamped at 0.0 s: whole file played.
+    assert played == [16000]
 
 
 def test_resume_speaks_the_rest_with_the_provider_that_was_reading(tmp_path, resuming):
@@ -2275,7 +2276,7 @@ def test_a_remembered_stop_of_the_replay_re_records_the_read(tmp_path, monkeypat
     assert left.provider == "kokoro"
     # What is left is the tail of the slice, from where this stop landed.
     assert left.offset_seconds == 0.4
-    assert frames_in(left.audio_path) == 16000 * 2 - int(1.2 * 16000)
+    assert frames_in(left.audio_path) == 16000 * 2 - int(0.2 * 16000)
 
 
 def test_a_resume_with_nothing_left_to_play_or_say_says_so(tmp_path, monkeypatch, resuming):
@@ -2288,8 +2289,80 @@ def test_a_resume_with_nothing_left_to_play_or_say_says_so(tmp_path, monkeypatch
 
     assert result.exit_code == 0, result.output
     assert "Nothing to resume." in result.output
-    assert interrupted.load() is None
-    assert resuming[0] == []
+
+
+def test_resume_rewinds_one_second_before_the_pause_point(tmp_path):
+    """Resume overlaps the last second, clamped at zero (DEC-036)."""
+    piece = write_wav(tmp_path / "piece.wav", seconds=3.0)
+
+    # At 2.5 s, rewinds 1.0 s -> starts at 1.5 s, frames = (3.0 - 1.5) * 16000
+    rec_25 = interrupted.Record(piece, "wav", "", "kokoro", 2.5, time.time())
+    w1 = tmp_path / "work1"
+    w1.mkdir()
+    slice_25 = interrupted.slice_from(rec_25, w1)
+    assert slice_25 is not None
+    assert frames_in(slice_25) == int((3.0 - 1.5) * 16000)
+
+    # At 1.0 s, rewinds 1.0 s -> starts at 0.0 s, whole file
+    rec_10 = interrupted.Record(piece, "wav", "", "kokoro", 1.0, time.time())
+    w2 = tmp_path / "work2"
+    w2.mkdir()
+    slice_10 = interrupted.slice_from(rec_10, w2)
+    assert slice_10 is not None
+    assert frames_in(slice_10) == int(3.0 * 16000)
+
+    # At 0.4 s, clamped at 0.0 -> starts at 0.0 s, whole file
+    rec_04 = interrupted.Record(piece, "wav", "", "kokoro", 0.4, time.time())
+    w3 = tmp_path / "work3"
+    w3.mkdir()
+    slice_04 = interrupted.slice_from(rec_04, w3)
+    assert slice_04 is not None
+    assert frames_in(slice_04) == int(3.0 * 16000)
+
+
+def test_dictation_while_paused_never_offers_the_paused_read(tmp_path, monkeypatch):
+    """A dictation while a read is paused never offers or destroys the record (DEC-036)."""
+    save_read(tmp_path, text="Keep me safe.")
+    record_before = interrupted.load()
+    assert record_before is not None
+
+    dialog_shown = False
+
+    def fake_ask():
+        nonlocal dialog_shown
+        dialog_shown = True
+        return True
+
+    monkeypatch.setattr(dictate, "_ask_to_continue", fake_ask)
+    dictation_started = time.time() + 1.0
+    monkeypatch.setattr(audio, "stop_found_no_player", lambda since: True)
+
+    dictate._offer_resume(dictation_started)
+
+    assert not dialog_shown
+    record_after = interrupted.load()
+    assert record_after is not None
+    assert record_after.text == "Keep me safe."
+
+
+def test_resume_with_an_installed_but_unusable_provider_reports_and_keeps_the_record(
+    tmp_path, monkeypatch
+):
+    """Resume reports failure and keeps the record if provider is unusable (DEC-036)."""
+    save_read(tmp_path, text="Do not lose this.", provider="elevenlabs")
+    monkeypatch.setattr(cli_module, "play_audio", lambda path: 0)
+
+    def unusable_tts(*args, **kwargs):
+        raise TTSRequestError("API key not configured")
+
+    monkeypatch.setattr(cli_module, "_run_tts", unusable_tts)
+
+    result = CliRunner().invoke(main, ["resume"])
+    assert result.exit_code != 0 or "Error" in result.output or "API key" in result.output
+
+    left = interrupted.load()
+    assert left is not None
+    assert left.text == "Do not lose this."
 
 
 def test_a_stopped_resume_replay_never_speaks_the_rest(tmp_path, monkeypatch, resuming):

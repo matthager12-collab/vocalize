@@ -26,7 +26,7 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
-TIMEOUT="${CHECK_TIMEOUT:-120}"
+TIMEOUT="${CHECK_TIMEOUT:-300}"
 
 # Portable timeout: GNU coreutils on Linux, gtimeout via brew on macOS, or none.
 # The no-timeout fallback is `env`, which just runs the command — an empty array

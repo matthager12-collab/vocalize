@@ -56,6 +56,14 @@ _EXTS = ("mp3", "m4a", "wav")
 # Past this, the read is not what the user is doing any more.
 MAX_AGE = 60 * 60.0
 
+# How long to wait for a stopped read to finish writing its record.
+_RESUME_GRACE = 3.0
+_POLL_INTERVAL = 0.05
+
+# How many seconds of audio to rewind when resuming so continuation overlaps
+# the last word instead of starting mid-syllable (DEC-036).
+_RESUME_REWIND = 1.0
+
 # 2 adds voice_id/model_id/speed/chunk_chars. A version-1 record is
 # discarded on upgrade like any other record this module cannot use — at
 # most one read, at most an hour old.
@@ -282,7 +290,8 @@ def slice_from(record: Record, workdir: Path) -> Path | None:
     out = workdir / "slice.wav"
     try:
         with wave.open(str(source), "rb") as reader:
-            start = min(int(record.offset_seconds * reader.getframerate()),
+            offset = max(0.0, round(record.offset_seconds - _RESUME_REWIND, 3))
+            start = min(int(offset * reader.getframerate()),
                         reader.getnframes())
             reader.setpos(start)
             frames = reader.readframes(reader.getnframes() - start)
@@ -321,3 +330,27 @@ def remember_stop(
         offset_seconds=stop.elapsed_seconds,
         settings=settings,
     )
+
+
+def wait_for_record(since: float) -> Record | None:
+    """The record a stop left, once it has been written.
+
+    Only a record written *after* `since`: an older one belongs to a read
+    the user has already been asked about or a previous pause.
+
+    One look is not an answer. The stopped read writes its record when the
+    provider call it was inside returns, which on a cloud provider can be
+    ten seconds after the player died — long after a short stop has
+    finished — and a record that lands late is never offered at all if we
+    do not wait. So this waits, briefly and only when there is something to
+    wait for: a stop that found nothing playing leaves its marker unclaimed,
+    and that means no record is coming (DEC-012).
+    """
+    deadline = time.monotonic() + _RESUME_GRACE
+    while True:
+        record = load()
+        if record is not None and record.saved_at > since:
+            return record
+        if audio_module.stop_found_no_player(since) or time.monotonic() >= deadline:
+            return None
+        time.sleep(_POLL_INTERVAL)
