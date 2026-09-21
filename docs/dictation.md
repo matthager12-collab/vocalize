@@ -140,9 +140,8 @@ touching System Settings at all, whichever way you trigger it.
   classic symptom of an unworn Bluetooth microphone — the dictation ends
   quietly: "Nothing heard — nothing was transcribed," no clipboard write.
 - If words were heard, a Glass plays and the transcript is copied to the
-  clipboard. Nothing is typed or pasted for you; that's a deliberate
-  narrowing (`[stt] paste` is reserved for a future release and does
-  nothing in 0.10.0).
+  clipboard. Nothing is typed or pasted for you unless you've turned on
+  `[stt] paste` — see [Auto-paste](#auto-paste) below.
 
 **A second press within two seconds of the first is a cancel**, not a
 stop — treated as "I changed my mind" rather than the end of a very short
@@ -164,12 +163,61 @@ silently drops one either. Wait for the clipboard notification, or use
 New to the sounds and can't tell Tink from Pop from Glass? Set
 `[stt] cues = "words"` and vocalize says "Start.", "Stopped." and "Ready."
 instead, or `"both"` to hear the word and then its sound — see the `[stt]`
-table below. Timing matters: "Start." is spoken *before* the microphone
-opens (so it is never in your recording), and the microphone is open
-about a second later — the Tink marks that moment. So in `"both"` mode
-talk after the Tink; in `"words"` mode give it a beat after "Start.".
-Closing that gap is
-[#2](https://github.com/matthager12-collab/vocalize/issues/2).
+table below.
+
+**Talk any time after the cue — there's no gap to leave any more.** The
+cue now plays *after* the microphone is actually open, and vocalize cuts
+those seconds back off the head of the recording afterward, so it never
+reaches the transcript ([#2](https://github.com/matthager12-collab/vocalize/issues/2)).
+Earlier releases played "Start." before the microphone opened and made
+you wait out a beat for it to catch up; that guesswork is gone.
+Vocalize waits for the recording to actually start growing — about
+150 ms after the press on the machines this was measured on, then another
+380–520 ms before the first real audio lands (Bluetooth mics run slower
+than a built-in or USB one) — before it cues you at all.
+
+## Hold-to-talk
+
+Set `dictate_mode = "hold"` under `[app]` and the dictate chord stops
+toggling and starts holding: hold it down, speak, let go. There's no
+cancel window — even a half-second hold transcribes, because there's no
+second press to read as "I changed my mind" against.
+
+The key-down itself is the cue, so there's no Tink and no "Start." to
+play or trim. The key-up stops, transcribes and copies exactly like a
+toggle's second press.
+
+The same two actions from a terminal or a script:
+
+```bash
+vocalize dictate --start   # key down
+vocalize dictate --stop    # key up
+```
+
+`--start` is idempotent — a second key-down while a dictation is already
+running does nothing, rather than opening a second microphone. `--stop`
+with nothing running also does nothing (exit 0); a `--stop` that lands
+before the recorder has even reported its PID waits for it and then
+stops; a recorder that's actually dead is the same failure as today's
+toggle.
+
+## Auto-paste
+
+Set `[stt] paste = true` and a dictation that copies also pastes,
+straight into the app you started it in — not just onto the clipboard.
+
+After copying, vocalize drops a marker
+(`~/.cache/vocalize/dictate.copied`) carrying this dictation's nonce. The
+menu-bar app is watching for that marker, and only pastes (a synthetic
+Command-V) when the nonce matches the session it watched, the app that
+was frontmost when you started dictating is still frontmost, and the
+marker is under two seconds old. Switch windows or wait too long and it
+says so instead of pasting: **"Copied, not pasted (window changed)."**
+The transcript stays on your clipboard either way, so nothing is lost.
+
+Off by default. Nothing is written when nothing was heard, the marker
+file is `0600`, and a symlink planted at that path is refused rather than
+followed.
 
 ## `vocalize listen`
 
@@ -238,7 +286,7 @@ language = "en"
 input_device = ""
 cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local" (local arrives in 0.14.0)
 verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
-paste = false
+paste = false        # paste after copying — see Auto-paste
 max_seconds = 120
 sounds = true
 cues = "sounds"  # "sounds" | "words" | "both"
@@ -252,7 +300,7 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable only, can't start with `-` | `""` | see [The input-device gotcha](#the-input-device-gotcha) |
 | `cleanup` | `off`, `claude-cli`, `anthropic`, `local` | `off` | where the cleanup pass runs. `claude-cli` is `claude -p` on your Claude Code subscription (shares its usage pool, and Claude Code logs the run); `anthropic` is the Messages API with a stored key and a monthly character budget; `local` is accepted now and honoured from 0.14.0. Older configs' `true` / `false` still work: `true` means `claude-cli` |
 | `verbatim` | `true` / `false` | `false` | keep every word; the default pass also drops restatements, false starts and filler ([#3](https://github.com/matthager12-collab/vocalize/issues/3)). Saying "verbatim" as the first word of a take does the same for that take |
-| `paste` | reserved | `false` | not implemented in 0.10.0 — setting it does nothing |
+| `paste` | `true` / `false` | `false` | paste into the app you dictated in, after copying — see [Auto-paste](#auto-paste) |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
 | `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
@@ -276,6 +324,7 @@ stt.cleanup=off
 stt.verbatim=false
 stt.max_seconds=120
 stt.cues=sounds
+stt.paste=false
 ```
 
 ### The input-device gotcha
@@ -334,7 +383,15 @@ Exit code is 0 when every row — providers and dictation both — is `ok`,
 and 1 otherwise, so it composes with `&&` the same way `vocalize usage`'s
 sibling commands do.
 
-## Interrupted reads and `resume`
+## Pausing, interrupted reads, and `resume`
+
+You can deliberately pause any playback vocalize is currently speaking:
+
+```bash
+vocalize pause             # pause playback and remember where it stopped
+vocalize resume            # play the saved piece, then read the rest
+vocalize resume --forget   # discard the saved read
+```
 
 Starting a dictation always stops whatever vocalize was reading aloud
 first — you can't record over your own voice being played back — but it
@@ -348,14 +405,15 @@ Once your dictation's transcript has landed, vocalize shows a dialog:
 > **Continue the read you interrupted?** [Discard] [Continue]
 
 Default button is Continue; the dialog gives up after 15 seconds, which
-counts as Discard. From a terminal (or if you missed the dialog), the same
-thing is:
+counts as Discard.
 
-```bash
-vocalize resume            # play the saved piece, then read the rest
-vocalize resume --forget   # discard the interrupted read
-vocalize resume            # "Nothing to resume." if there's nothing saved
-```
+### Zero-re-grant hotkey pause
+
+With `[app] stop_hotkey = "pause"` in `~/.config/vocalize/config.toml`, the
+menu-bar app's stop chord (Control-Option-Command-X) becomes a play/pause toggle
+with zero Accessibility re-grant: pressing it while audio is playing pauses the
+read, and pressing it when nothing is playing resumes the saved read (refusing
+silently while a dictation is recording).
 
 ### What's stored, and where
 
@@ -364,7 +422,7 @@ together:
 
 | File | Contents |
 |---|---|
-| `interrupted.<ext>` | one piece of audio — the chunk that was playing when the dictation started, or the whole file for a provider that doesn't stream |
+| `interrupted.<ext>` | one piece of audio — the chunk that was playing when the pause or dictation landed, or the whole file for a provider that doesn't stream |
 | `interrupted.txt` | the text after that piece — everything not yet spoken |
 | `interrupted.json` | `version`, `saved_at`, `provider`, `ext`, `offset_seconds`, `remaining_chars` |
 
@@ -377,14 +435,14 @@ moment you resume, decline, or `--forget` it, and an automatic expiry after
 **one hour** even if you never touch it. Nothing beyond that — a backup job
 that runs inside that hour will see it. No dictation audio and no
 dictation transcript is ever written into this record (see
-[Privacy](#privacy)); it only ever holds a *TTS read* your dictation
-interrupted.
+[Privacy](#privacy)); it only ever holds a *TTS read* paused or interrupted.
 
-Resuming plays the saved piece from where it was cut off (converting to
-WAV first if needed, then slicing by sample), then continues through the
-rest of the text via the normal chain, same provider, same cache — so
-anything already rendered is a cache hit and the continuation starts
-immediately.
+Resuming plays the saved piece from one second before where it was cut off
+(converting to WAV first if needed, then slicing by sample with a 1.0 s
+rewind overlap so the continuation never starts mid-syllable), then continues
+through the rest of the text via the normal chain, same provider, same
+cache — so anything already rendered is a cache hit and the continuation
+starts immediately.
 
 ## Uninstalling
 

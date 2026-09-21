@@ -19,7 +19,7 @@ import vocalize.audio as audio_module
 import vocalize.cli as cli_module
 import vocalize.integrate as integrate_module
 from vocalize import app as app_module
-from vocalize import interrupted
+from vocalize import dictate, interrupted
 from vocalize.cli import main
 from vocalize.config import resolve_provider_settings
 from vocalize.exceptions import ConfigChangedError, ConfigError
@@ -646,6 +646,8 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert "stt.verbatim=false" in result.output
     assert "stt.max_seconds=30" in result.output
     assert "stt.cues=sounds" in result.output
+    assert "stt.paste=false" in result.output
+    assert result.output.index("stt.paste=") > result.output.index("stt.cues=")
     assert "notes.summarizer=local" in result.output
     # The menu-bar app parses exactly these four lines (design.md § The [app] table).
     assert "app.dictate=ctrl+alt+cmd+d" in result.output
@@ -653,6 +655,62 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert "app.speak=ctrl+alt+cmd+s" in result.output
     assert "app.stop=ctrl+alt+cmd+x" in result.output
     assert "notes.template=memo" in result.output
+
+
+def test_settings_prints_stt_paste_true_when_configured(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    cfg = tmp_path / "vocalize" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('[stt]\npaste = true\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "stt.paste=true" in result.output
+
+
+def test_dictate_start_runs_the_hold_to_talk_start(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module.dictate, "start_hold", lambda stt: calls.append(stt) or 0)
+
+    result = CliRunner().invoke(main, ["dictate", "--start"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_dictate_stop_runs_stop_hold(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module.dictate, "stop_hold", lambda stt: calls.append(stt) or 0)
+
+    result = CliRunner().invoke(main, ["dictate", "--stop"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_bare_dictate_is_still_the_toggle_not_hold_to_talk(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module.dictate, "toggle", lambda stt: calls.append(stt) or 0)
+
+    result = CliRunner().invoke(main, ["dictate"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_hold_to_talk_refuses_start_and_stop_in_one_run(monkeypatch, tmp_path):
+    _isolate_overflow_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module.dictate, "start_hold", lambda stt: 0)
+    monkeypatch.setattr(cli_module.dictate, "stop_hold", lambda stt: 0)
+
+    result = CliRunner().invoke(main, ["dictate", "--start", "--stop"])
+
+    assert result.exit_code == 2
+    assert "Use only one of --start, --stop." in result.output
 
 
 def test_the_verbatim_flag_and_a_bare_cleanup_reach_the_stt_options(monkeypatch, tmp_path):
@@ -1996,6 +2054,204 @@ def test_a_stop_while_a_non_streaming_read_renders_is_still_obeyed(monkeypatch, 
 
     assert result.exit_code == 0, result.output
     assert _record_json()["provider"] == "kokoro"  # and it is resumable
+
+
+def test_pause_saves_the_record_like_a_dictation(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+
+    def fake_stop_playback(*, remember=False):
+        if remember:
+            piece = tmp_path / "piece.wav"
+            piece.write_bytes(b"RIFF" + b"\x00" * 40)
+            interrupted.save(
+                piece=piece,
+                ext="wav",
+                remaining_text="Second sentence here.",
+                provider="kokoro",
+                offset_seconds=1.5,
+                settings={"voice_id": "af_bella", "model_id": "kokoro-v1", "speed": 1.0, "chunk_chars": 200},
+            )
+            return True
+        return False
+
+    monkeypatch.setattr(cli_module, "stop_playback", fake_stop_playback)
+
+    result = CliRunner().invoke(main, ["pause"])
+    assert result.exit_code == 0
+    assert "Paused. Resume it within the hour with: vocalize resume" in result.output
+
+    record = interrupted.load()
+    assert record is not None
+    assert record.provider == "kokoro"
+    assert record.voice_id == "af_bella"
+    assert record.model_id == "kokoro-v1"
+    assert record.speed == 1.0
+    assert record.chunk_chars == 200
+    assert record.text == "Second sentence here."
+    assert record.ext == "wav"
+
+
+def test_pause_with_nothing_playing_reports_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cli_module, "stop_playback", lambda *, remember=False: False)
+    monkeypatch.setattr(audio_module, "stop_found_no_player", lambda since: True)
+
+    result = CliRunner().invoke(main, ["pause"])
+    assert result.exit_code == 0
+    assert "Nothing is playing." in result.output
+
+
+def test_pause_in_the_chunk_gap_records_the_queued_piece(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+
+    def fake_stop_playback(*, remember=False):
+        piece = tmp_path / "piece4.wav"
+        piece.write_bytes(b"RIFF" + b"\x00" * 40)
+        interrupted.save(
+            piece=piece,
+            ext="wav",
+            remaining_text="Fifth sentence.",
+            provider="kokoro",
+            offset_seconds=0.0,
+        )
+        return False
+
+    monkeypatch.setattr(cli_module, "stop_playback", fake_stop_playback)
+
+    result = CliRunner().invoke(main, ["pause"])
+    assert result.exit_code == 0
+    assert "Paused. Resume it within the hour with: vocalize resume" in result.output
+    record = interrupted.load()
+    assert record is not None
+    assert record.offset_seconds == 0.0
+    assert record.text == "Fifth sentence."
+
+
+def test_stop_hotkey_pause_pauses_then_resumes(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"app": {"stop_hotkey": "pause"}})
+    monkeypatch.setattr(dictate, "_read_session", lambda: None)
+
+    piece = tmp_path / "piece.wav"
+    piece.write_bytes(b"RIFF" + b"\x00" * 40)
+    playing = True
+
+    def fake_stop_playback(*, remember=False):
+        nonlocal playing
+        if playing and remember:
+            interrupted.save(
+                piece=piece,
+                ext="wav",
+                remaining_text="Rest of text.",
+                provider="kokoro",
+                offset_seconds=1.0,
+            )
+            playing = False
+            return True
+        return False
+
+    monkeypatch.setattr(cli_module, "stop_playback", fake_stop_playback)
+    resumed = False
+
+    def fake_resume():
+        nonlocal resumed
+        resumed = True
+        return True
+
+    monkeypatch.setattr(cli_module, "resume_interrupted", fake_resume)
+
+    res1 = CliRunner().invoke(main, ["stop"])
+    assert res1.exit_code == 0
+    assert "Paused. Resume it within the hour with: vocalize resume" in res1.output
+    assert not resumed
+
+    monkeypatch.setattr(audio_module, "stop_found_no_player", lambda since: True)
+    res2 = CliRunner().invoke(main, ["stop"])
+    assert res2.exit_code == 0
+    assert resumed
+    assert "Nothing is playing." not in res2.output
+
+
+def test_stop_hotkey_pause_never_resumes_while_a_dictation_is_live(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"app": {"stop_hotkey": "pause"}})
+    monkeypatch.setattr(cli_module, "stop_playback", lambda *, remember=False: False)
+    monkeypatch.setattr(audio_module, "stop_found_no_player", lambda since: True)
+
+    piece = tmp_path / "piece.wav"
+    piece.write_bytes(b"RIFF" + b"\x00" * 40)
+    interrupted.save(
+        piece=piece,
+        ext="wav",
+        remaining_text="Rest of text.",
+        provider="kokoro",
+        offset_seconds=1.0,
+    )
+
+    monkeypatch.setattr(dictate, "_read_session", lambda: (tmp_path / "dictate-session", time.time()))
+    monkeypatch.setattr(cli_module, "resume_interrupted", lambda: True)
+
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert result.output == ""
+    assert interrupted.load() is not None
+
+
+def test_settings_prints_stop_hotkey(monkeypatch):
+    monkeypatch.setattr(cli_module, "load_config_file", dict)
+    res1 = CliRunner().invoke(main, ["settings"])
+    assert res1.exit_code == 0
+    assert "app.stop_hotkey=stop" in res1.output
+
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"app": {"stop_hotkey": "pause"}})
+    res2 = CliRunner().invoke(main, ["settings"])
+    assert res2.exit_code == 0
+    assert "app.stop_hotkey=pause" in res2.output
+
+
+def test_plain_stop_records_nothing_and_never_resumes(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cli_module, "load_config_file", dict)
+
+    piece = tmp_path / "piece.wav"
+    piece.write_bytes(b"RIFF" + b"\x00" * 40)
+    interrupted.save(
+        piece=piece,
+        ext="wav",
+        remaining_text="Rest of text.",
+        provider="kokoro",
+        offset_seconds=1.0,
+    )
+
+    monkeypatch.setattr(cli_module, "stop_playback", lambda *, remember=False: True)
+    resumed = False
+    monkeypatch.setattr(cli_module, "resume_interrupted", lambda: True)
+
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert "Stopped playback." in result.output
+    assert not resumed
+
+
+def test_two_resumes_do_not_corrupt_the_record(monkeypatch, tmp_path):
+    monkeypatch.setattr(interrupted, "CACHE_DIR", tmp_path / "cache")
+    piece = tmp_path / "piece.wav"
+    piece.write_bytes(b"RIFF" + b"\x00" * 40)
+    interrupted.save(
+        piece=piece,
+        ext="wav",
+        remaining_text="Rest of text.",
+        provider="kokoro",
+        offset_seconds=1.0,
+    )
+
+    rec1 = interrupted.load()
+    assert rec1 is not None
+    rec2 = interrupted.load()
+    assert rec2 is not None
+    assert rec1.saved_at == rec2.saved_at
+    assert rec1.audio_path == rec2.audio_path
+    assert (tmp_path / "cache" / "interrupted.json").is_file()
 
 
 # --- vocalize portal (T-64) -------------------------------------------

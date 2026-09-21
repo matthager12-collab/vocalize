@@ -45,3 +45,12 @@ Claude desktop, normal window: down and up, held 2 s.
 Ghostty (self-drawn terminal): down and up, held 3 s.
 Claude desktop, full-screen: down and up, held 3 s.
 Decision: Carbon (DEC-033 A). No Accessibility grant needed for dictation.
+
+## Cue
+
+Run 11, T-100, 2026-09-08. The real recorder launched through `dictate._launch_recorder` into a scratch workdir, `take.wav` polled every 20 ms from the moment `rec.pid` appeared, three launches per input, owner present.
+branch: trim — the take grows incrementally on both inputs, so the first growth past the 4096-byte header is the open-microphone signal; the cue plays after it and is trimmed from the head.
+Yeti Stereo Microphone (USB): pid→first growth 383, 359, 383 ms; launch→pid 152, 149, 153 ms; growth in 10240-byte steps (about 320 ms of 16 kHz audio per write).
+Mat's AirPods Pro (Bluetooth): pid→first growth 500, 521 ms (a third run measured 50 ms, which was the 4096-byte header landing on a file that did not exist yet, not audio — the baseline must be the header, see below); launch→pid 147, 154, 146 ms; growth in about 5460-byte steps (about 170 ms per write).
+Baseline rule for `_wait_for_audio`: the file may not exist at pid time, and its first write is a 4096-byte header with no audio in it; t0 is the first moment the size exceeds max(first observed size, 4096). `_AUDIO_GRACE` 5 s is ten times the worst case seen.
+Write granularity bounds the cue's lateness at one write (320 ms USB, 170 ms Bluetooth); late is the safe side, because the user speaks after the cue and the trim covers t0 to the end of the cue.

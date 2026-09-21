@@ -232,7 +232,7 @@ def integrate_claude(*, yes: bool) -> int:
     if quick_actions_result != 0:
         return quick_actions_result
 
-    needs_you = ["assign the two keyboard shortcuts below"]
+    needs_you = ["assign the two keyboard shortcuts above"]
     print()
     print("GUI-only, in System Settings:")
     print(

@@ -597,7 +597,7 @@ cues = "sounds"        # "sounds" | "words" | "both" — speak "Start."/"Stopped
 | `cleanup` | `off`, `local` (0.13), `claude-cli`, `anthropic`; an old `true`/`false` reads as `claude-cli`/`off` | `off` |
 | `verbatim` | `true` / `false` — keep every word even when cleanup is on | `false` |
 | `beam_size` | integer, 1–8 | `5` |
-| `paste` | reserved — not implemented in 0.10.0 | `false` |
+| `paste` | `true` / `false` — paste into the app you dictated in, after copying (see docs/dictation.md § Auto-paste) | `false` |
 | `max_seconds` | integer, 1–600 | `120` |
 | `sounds` | `true` / `false` | `true` |
 | `cues` | `sounds`, `words`, `both` | `sounds` |
@@ -625,7 +625,7 @@ The chords the menu-bar app owns, system-wide. A change needs
 ```toml
 [app]
 dictate = "ctrl+alt+cmd+d"   # start/stop dictation
-dictate_mode = "toggle"      # toggle | hold ("hold" arrives in 0.13.1)
+dictate_mode = "toggle"      # toggle | hold
 speak = "ctrl+alt+cmd+s"     # speak the selection
 stop = "ctrl+alt+cmd+x"      # stop whatever is playing
 ```
@@ -690,6 +690,7 @@ where it stopped, and once your transcript has landed, vocalize asks:
 up after 15 seconds (counted as no). From a terminal, the same thing is:
 
 ```bash
+vocalize pause             # pause live playback and save your place
 vocalize resume            # continue where the last read left off
 vocalize resume --forget   # discard it instead
 ```

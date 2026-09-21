@@ -936,6 +936,7 @@ def test_app_table_loads_with_valid_values_and_canonical_chords(monkeypatch, tmp
     )
     assert resolve_app(data) == {
         "dictate": "ctrl+alt+cmd+d", "dictate_mode": "toggle", "speak": "cmd+shift+f5", "stop": "",
+        "stop_hotkey": "stop",
     }
 
 
@@ -977,26 +978,33 @@ def test_two_disabled_app_chords_do_not_count_as_a_clash(monkeypatch, tmp_path):
 
 
 def test_an_unknown_app_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
-    """`stop_hotkey` arrives in 0.13.1; a file written for it must load here."""
-    data = _load_stt(monkeypatch, tmp_path, '[app]\nstop_hotkey = "pause"\n')
+    """An unknown app key warns but still loads."""
+    data = _load_stt(monkeypatch, tmp_path, '[app]\nfuture_key = "pause"\n')
 
-    assert data["app"] == {"stop_hotkey": "pause"}
-    assert "unknown config key 'stop_hotkey' in [app]" in capsys.readouterr().err
+    assert data["app"] == {"future_key": "pause"}
+    assert "unknown config key 'future_key' in [app]" in capsys.readouterr().err
 
 
-def test_dictate_mode_hold_resolves_to_toggle_with_one_warning(monkeypatch, tmp_path, capsys):
-    """A config from 0.13.1 must not brick a rolled-back 0.13.0 (DEC-032)."""
+def test_stop_hotkey_rejects_an_unknown_word(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError, match="Invalid app.stop_hotkey 'unknown'"):
+        _load_stt(monkeypatch, tmp_path, '[app]\nstop_hotkey = "unknown"\n')
+
+
+def test_dictate_mode_hold_resolves_to_hold(monkeypatch, tmp_path, capsys):
+    """0.13.0 coerced `hold` to toggle with a warning; 0.13.1 dispatches it.
+
+    The settings line the menu-bar app reads is what changes: it now says
+    `app.dictate_mode=hold`, which is what sends key-down and key-up to
+    `vocalize dictate --start` and `--stop`.
+    """
     from vocalize import config
     from vocalize.config import resolve_app
 
     monkeypatch.setattr(config, "_warned", set())  # once per process: start this one clean
     data = _load_stt(monkeypatch, tmp_path, '[app]\ndictate_mode = "hold"\n')
-    resolved = resolve_app(data)
-    resolve_app(data)  # a second resolve in the same process does not repeat it
 
-    assert resolved["dictate_mode"] == "toggle"
-    err = capsys.readouterr().err
-    assert err.count("arrives in 0.13.1") == 1
+    assert resolve_app(data)["dictate_mode"] == "hold"
+    assert capsys.readouterr().err == ""  # nothing left to warn about
 
 
 def test_resolve_app_chord_grammar_accepts_every_key_it_lists():
@@ -1029,3 +1037,59 @@ def test_the_chord_key_allowlist_matches_the_swift_keycode_table():
     block = text[opening:text.index("]", opening)]
     names = set(re.findall(r'"([a-z0-9]+)"\s*:', block))
     assert names == set(CHORD_KEYS), sorted(names ^ set(CHORD_KEYS))
+
+
+def test_speech_table_defaults():
+    from vocalize.config import SPEECH_DEFAULTS, resolve_speech
+
+    resolved = resolve_speech({})
+    assert resolved == SPEECH_DEFAULTS
+
+
+def test_speech_table_overrides():
+    from vocalize.config import resolve_speech
+
+    data = {
+        "speech": {
+            "headings": "plain",
+            "parentheticals": "drop",
+            "urls": "full",
+            "bracket_max_chars": 150,
+            "references": False,
+        }
+    }
+    resolved = resolve_speech(data)
+    assert resolved["headings"] == "plain"
+    assert resolved["parentheticals"] == "drop"
+    assert resolved["urls"] == "full"
+    assert resolved["bracket_max_chars"] == 150
+    assert resolved["references"] is False
+    assert resolved["emoji"] is True  # default kept
+
+
+@pytest.mark.parametrize("key,val", [
+    ("headings", "bad"),
+    ("parentheticals", "bad"),
+    ("urls", "bad"),
+    ("emoji", "not_a_bool"),
+    ("bracket_max_chars", 5),
+    ("bracket_max_chars", 5000),
+    ("furniture_max_chars", 5),
+    ("furniture_min_repeats", 1),
+])
+def test_invalid_speech_setting_raises(key, val):
+    from vocalize.config import resolve_speech
+    from vocalize.exceptions import ConfigError
+
+    with pytest.raises(ConfigError):
+        resolve_speech({"speech": {key: val}})
+
+
+def test_unknown_speech_key_warns(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+    from vocalize.config import resolve_speech
+
+    monkeypatch.setattr(config, "_warned", set())
+    data = _load_stt(monkeypatch, tmp_path, '[speech]\nunknown_speech_option = "yes"\n')
+    resolve_speech(data)
+    assert "unknown config key 'unknown_speech_option' in [speech]" in capsys.readouterr().err
