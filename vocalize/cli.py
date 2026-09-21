@@ -69,6 +69,7 @@ from .config import (
     resolve_overflow,
     resolve_provider_settings,
     resolve_settings,
+    resolve_speech,
     resolve_stt,
 )
 from .exceptions import (
@@ -315,11 +316,12 @@ def _run_tts(raw_text: str, *, api_key, voice_id, model_id, speed, output_path, 
     # belongs to somebody else and must never silence this read.
     read_started = time.time()
 
-    text = raw_text if raw else flatten_markdown(raw_text)
-
-    # Parsed once here and shared by both resolvers, so a config-file typo
+    # Parsed once here and shared by resolvers, so a config-file typo
     # warns once per run, not once per resolver.
     file_config = load_config_file()
+    speech = resolve_speech(file_config)
+
+    text = raw_text if raw else flatten_markdown(raw_text, speech=speech)
 
     mode, cap = resolve_overflow(overflow, max_chars, default_max_chars, file_config=file_config)
     if mode == "never":

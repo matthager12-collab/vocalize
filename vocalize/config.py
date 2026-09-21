@@ -31,7 +31,7 @@ SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
 KNOWN_CONFIG_KEYS = (
-    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt", "notes", "app",
+    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt", "notes", "app", "speech",
 )
 
 # Keys inside a [providers.<name>] table that become a request field or an
@@ -227,6 +227,8 @@ def load_config_file() -> dict:
         _validate_notes_table(data["notes"], path)
     if "app" in data:
         _validate_app_table(data["app"], path)
+    if "speech" in data:
+        _validate_speech_table(data["speech"], path)
 
     return data
 
@@ -628,6 +630,167 @@ def resolve_app(file_config: dict | None = None) -> dict:
     resolved.update({key: table[key] for key in KNOWN_APP_KEYS if key in table})
     for key in APP_CHORD_KEYS:
         resolved[key] = chord_text(parse_chord(resolved[key]))
+    return resolved
+
+
+# --- the [speech] table --------------------------------------------------
+#
+# Spoken rendering rules (docs/research/2026-09-08-spoken-rendering-rules.md).
+# Pure string transformations in preprocess.py, honoured by flatten_markdown.
+
+KNOWN_SPEECH_KEYS = (
+    "headings",
+    "blockquotes",
+    "nested_lists",
+    "parentheticals",
+    "abbreviations",
+    "citations",
+    "references",
+    "furniture",
+    "urls",
+    "emoji",
+    "bracket_max_chars",
+    "furniture_max_chars",
+    "furniture_min_repeats",
+    "SPEECH_BRACKET_MAX_CHARS",
+    "SPEECH_FURNITURE_MAX_CHARS",
+    "SPEECH_FURNITURE_MIN_REPEATS",
+)
+
+SPEECH_HEADINGS_MODES = ("cue", "plain", "off")
+SPEECH_BLOCKQUOTES_MODES = ("cue", "plain", "off")
+SPEECH_NESTED_LISTS_MODES = ("cue", "flat", "off")
+SPEECH_PARENTHETICALS_MODES = ("pause", "drop", "off")
+SPEECH_ABBREVIATIONS_MODES = ("expand", "protect", "off")
+SPEECH_CITATIONS_MODES = ("drop", "speak", "off")
+SPEECH_URLS_MODES = ("domain", "full", "drop")
+
+SPEECH_BRACKET_MAX_CHARS = 120
+SPEECH_FURNITURE_MAX_CHARS = 60
+SPEECH_FURNITURE_MIN_REPEATS = 3
+
+SPEECH_DEFAULTS = {
+    "headings": "cue",
+    "blockquotes": "cue",
+    "nested_lists": "cue",
+    "parentheticals": "pause",
+    "abbreviations": "expand",
+    "citations": "drop",
+    "references": True,
+    "furniture": True,
+    "urls": "domain",
+    "emoji": True,
+    "bracket_max_chars": SPEECH_BRACKET_MAX_CHARS,
+    "furniture_max_chars": SPEECH_FURNITURE_MAX_CHARS,
+    "furniture_min_repeats": SPEECH_FURNITURE_MIN_REPEATS,
+}
+
+SPEECH_BRACKET_CHARS_MIN = 10
+SPEECH_BRACKET_CHARS_MAX = 1000
+SPEECH_FURNITURE_CHARS_MIN = 10
+SPEECH_FURNITURE_CHARS_MAX = 500
+SPEECH_FURNITURE_REPEATS_MIN = 2
+SPEECH_FURNITURE_REPEATS_MAX = 20
+
+
+def _validate_speech_table(value, path: Path) -> None:
+    """Check the `[speech]` table. Unknown keys warn; bad values raise."""
+    if not isinstance(value, dict):
+        raise ConfigError(f"config key 'speech' in {path} must be a table")
+    for key in value:
+        if key not in KNOWN_SPEECH_KEYS:
+            _warn(f"vocalize: unknown config key {key!r} in [speech] in {path}")
+
+    modes = {
+        "headings": SPEECH_HEADINGS_MODES,
+        "blockquotes": SPEECH_BLOCKQUOTES_MODES,
+        "nested_lists": SPEECH_NESTED_LISTS_MODES,
+        "parentheticals": SPEECH_PARENTHETICALS_MODES,
+        "abbreviations": SPEECH_ABBREVIATIONS_MODES,
+        "citations": SPEECH_CITATIONS_MODES,
+        "urls": SPEECH_URLS_MODES,
+    }
+    for key, allowed in modes.items():
+        v = value.get(key)
+        if v is not None and v not in allowed:
+            raise ConfigError(
+                f"Invalid speech.{key} {v!r} in {path}: expected one of {', '.join(allowed)}."
+            )
+
+    bool_keys = ("references", "furniture", "emoji")
+    for key in bool_keys:
+        v = value.get(key)
+        if v is not None and not isinstance(v, bool):
+            raise ConfigError(f"Invalid speech.{key} {v!r} in {path}: expected true or false.")
+
+    bracket_chars = value.get("bracket_max_chars")
+    if bracket_chars is None:
+        bracket_chars = value.get("SPEECH_BRACKET_MAX_CHARS")
+    if bracket_chars is not None and (
+        isinstance(bracket_chars, bool)
+        or not isinstance(bracket_chars, int)
+        or not SPEECH_BRACKET_CHARS_MIN <= bracket_chars <= SPEECH_BRACKET_CHARS_MAX
+    ):
+        raise ConfigError(
+            f"Invalid speech.bracket_max_chars {bracket_chars!r} in {path}: expected an integer "
+            f"between {SPEECH_BRACKET_CHARS_MIN} and {SPEECH_BRACKET_CHARS_MAX}."
+        )
+
+    furn_chars = value.get("furniture_max_chars")
+    if furn_chars is None:
+        furn_chars = value.get("SPEECH_FURNITURE_MAX_CHARS")
+    if furn_chars is not None and (
+        isinstance(furn_chars, bool)
+        or not isinstance(furn_chars, int)
+        or not SPEECH_FURNITURE_CHARS_MIN <= furn_chars <= SPEECH_FURNITURE_CHARS_MAX
+    ):
+        raise ConfigError(
+            f"Invalid speech.furniture_max_chars {furn_chars!r} in {path}: expected an integer "
+            f"between {SPEECH_FURNITURE_CHARS_MIN} and {SPEECH_FURNITURE_CHARS_MAX}."
+        )
+
+    furn_repeats = value.get("furniture_min_repeats")
+    if furn_repeats is None:
+        furn_repeats = value.get("SPEECH_FURNITURE_MIN_REPEATS")
+    if furn_repeats is not None and (
+        isinstance(furn_repeats, bool)
+        or not isinstance(furn_repeats, int)
+        or not SPEECH_FURNITURE_REPEATS_MIN <= furn_repeats <= SPEECH_FURNITURE_REPEATS_MAX
+    ):
+        raise ConfigError(
+            f"Invalid speech.furniture_min_repeats {furn_repeats!r} in {path}: expected an integer "
+            f"between {SPEECH_FURNITURE_REPEATS_MIN} and {SPEECH_FURNITURE_REPEATS_MAX}."
+        )
+
+
+def resolve_speech(file_config: dict | None = None) -> dict:
+    """The `[speech]` settings with defaults filled in, re-validated."""
+    if file_config is None:
+        file_config = load_config_file()
+    table = file_config.get("speech") or {}
+    _validate_speech_table(table, config_path())
+    resolved = dict(SPEECH_DEFAULTS)
+    for k in (
+        "headings", "blockquotes", "nested_lists", "parentheticals",
+        "abbreviations", "citations", "references", "furniture", "urls", "emoji",
+    ):
+        if k in table:
+            resolved[k] = table[k]
+    if "bracket_max_chars" in table:
+        resolved["bracket_max_chars"] = table["bracket_max_chars"]
+    elif "SPEECH_BRACKET_MAX_CHARS" in table:
+        resolved["bracket_max_chars"] = table["SPEECH_BRACKET_MAX_CHARS"]
+
+    if "furniture_max_chars" in table:
+        resolved["furniture_max_chars"] = table["furniture_max_chars"]
+    elif "SPEECH_FURNITURE_MAX_CHARS" in table:
+        resolved["furniture_max_chars"] = table["SPEECH_FURNITURE_MAX_CHARS"]
+
+    if "furniture_min_repeats" in table:
+        resolved["furniture_min_repeats"] = table["furniture_min_repeats"]
+    elif "SPEECH_FURNITURE_MIN_REPEATS" in table:
+        resolved["furniture_min_repeats"] = table["SPEECH_FURNITURE_MIN_REPEATS"]
+
     return resolved
 
 

@@ -1,61 +1,129 @@
 import re
 
+import pytest
+
 from vocalize.preprocess import (
     flatten_markdown,
     split_for_synthesis,
     truncate_for_budget,
 )
 
+RULE_CASES = [
+    # 1. Soft line wrap
+    ("wraps\nonto", "wraps onto."),
+    # 2. Blank line
+    ("First para\n\nSecond.", "First para.\n\nSecond."),
+    # 3. Heading levels 1-2
+    ("# Title One", "Heading, Title One."),
+    ("## Title Two", "Heading, Title Two."),
+    ("Title Setext\n===", "Heading, Title Setext."),
+    ("Heading Question?\n---", "Heading, Heading Question?"),
+    # 4. Heading levels 3-6
+    ("### Sub Three", "Sub-heading, Sub Three."),
+    ("#### Sub Four", "Sub-heading, Sub Four."),
+    # 5. Em dash, en dash, or spaced hyphen
+    ("clear—we shipped", "clear, we shipped."),
+    ("simple - just restart", "simple, just restart."),
+    # 6. En dash between numbers
+    ("pages 3–5", "pages 3 to 5."),
+    # 7. Guards: compound hyphen, digit-period, numbers, ALL CAPS
+    ("well-known", "well-known."),
+    ("3.5 GB, v2.0.1", "3.5 GB, v2.0.1."),
+    ("12:30, 50%", "12:30, 50%."),
+    ("URGENT NOTICE", "URGENT NOTICE."),
+    # 8. Parenthetical mid-sentence
+    ("results (which surprised everyone) were", "results, which surprised everyone, were."),
+    # 9. Parenthetical at sentence end
+    ("The trend is clear (see fig. 3).", "The trend is clear, see fig 3."),
+    # 10. Parenthetical whole sentence
+    ("(See the appendix.)", "See the appendix."),
+    # 11. Square brackets around words
+    ("the plan [the second one] was", "the plan, the second one, was."),
+    # 12. Guard bracket: nested
+    ("((a+b)*c)", "((a+b)*c)."),
+    # 13. Task checkbox and ref-link
+    ("- [x] done", "First, done."),
+    ("[the docs][1]", "the docs."),
+    # 14. Abbreviation period, title list
+    ("Dr. Smith", "Dr Smith."),
+    ("Prof. Higgins", "Prof Higgins."),
+    # 15. Abbreviation period, context list
+    ("pens, etc. Then start.", "pens, etc. Then start."),
+    ("Fig. 3", "Fig 3."),
+    # 16. Abbreviation, Latin list
+    ("e.g. chips", "for example, chips."),
+    ("i.e. this", "that is, this."),
+    # 17. Initials
+    ("J. R. R. Tolkien", "J R R Tolkien."),
+    ("J.R.R. Tolkien", "J R R Tolkien."),
+    # 18. Bulleted / numbered list
+    ("- one\n- two", "First, one.\n\nSecond, two."),
+    ("1. buy milk\n2. walk dog", "Item 1: buy milk.\n\nItem 2: walk dog."),
+    # 19. Nested list item
+    ("- a\n  - b\n- c", "First, a.\n\nSub-item, b.\n\nSecond, c."),
+    # 20. Table
+    ("| Q1 | Revenue |\n|---|---|\n| Jan | 4.2M |", "Table with 1 row. For Jan: Revenue is 4.2M."),
+    # 21. Inline code, bold, italic, HTML tag
+    ("Run `pip install` now.", "Run pip install now."),
+    ("a<br>b", "a b."),
+    ("This is **very** important and *also* urgent.", "This is very important and also urgent."),
+    # 22. Code block
+    ("```python\ndef f(): pass\n```", "Skipping a code block."),
+    # 23. Markdown link, image
+    ("[the docs](https://example.com)", "the docs."),
+    ("![Revenue chart](c.png)", "Revenue chart."),
+    # 24. Bare URL
+    ("https://example.com/page", "example dot com."),
+    # 25. Block quote
+    ("> A line.\n> Two.", "Quote, A line. Two. End quote."),
+    ("> Single line.", "Quote, Single line."),
+    # 26. Footnotes
+    ("support[^1].\n\n[^1]: Smith, 2019.", "support.\n\nSkipping 1 footnote."),
+    # 27. Numeric citation bracket
+    ("shown previously [12].", "shown previously."),
+    ("Published in [2024].", "Published in [2024]."),
+    # 28. Reference list section
+    ("## References\n[1] Smith, 2019.", "Skipping the reference list."),
+    # 29. Furniture line repeated 3+ times dropped
+    ("Running Header\n\nPage one.\n\nRunning Header\n\nPage two.\n\nRunning Header\n\nPage three.", "Page one.\n\nPage two.\n\nPage three."),
+    # 30. Front matter
+    ("---\ntitle: X\n---\nBody text.", "Body text."),
+    # 31. Ellipsis
+    ("And then... nothing", "And then, nothing."),
+    # 32. Emoji
+    ("job! 🎉 Let's", "job! Let's."),
+    # 33. Final spacing pass
+    ("Done  .   Next (really) .", "Done. Next, really."),
+]
 
-def test_flattens_simple_table_into_per_row_sentences():
-    md = (
-        "| Quarter | Revenue |\n"
-        "|---------|---------|\n"
-        "| Q1      | 4.2M    |\n"
-        "| Q2      | 5.1M    |\n"
-    )
-    result = flatten_markdown(md)
-    assert "Table with 2 rows." in result
-    assert "For Q1: Revenue is 4.2M." in result
-    assert "For Q2: Revenue is 5.1M." in result
+
+@pytest.mark.parametrize("input_md,expected", RULE_CASES)
+def test_spoken_rendering_rules_table(input_md, expected):
+    result = flatten_markdown(input_md)
+    assert result == expected
 
 
-def test_flattens_table_with_multiple_columns():
-    md = (
-        "| Name | Age | City |\n"
-        "|------|-----|------|\n"
-        "| Ada  | 34  | London |\n"
-    )
-    result = flatten_markdown(md)
-    assert "For Ada: Age is 34; City is London." in result
+def test_flatten_markdown_is_idempotent():
+    samples = [
+        "# Title One\n\nSome text with (a parenthetical) and Dr. Smith.\n\n- item 1\n  - nested\n- item 2",
+        "Here is a table:\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAnd a quote:\n> First line\n> Second line",
+        "pages 3–5 of the report. See e.g. chips and [the link](http://example.com).",
+        "Check out https://github.com/vocalize and email info@example.com.",
+        "Done  .   Next (really) .",
+    ]
+    for sample in samples:
+        first = flatten_markdown(sample)
+        second = flatten_markdown(first)
+        assert first == second, f"Idempotency failed:\nFirst: {first}\nSecond: {second}"
 
 
-def test_strips_headings():
-    result = flatten_markdown("# Big Title\n\nSome text.")
-    assert "Big Title." in result
-    assert "#" not in result
-
-
-def test_converts_bullet_list_to_ordinals():
-    md = "- first thing\n- second thing\n- third thing\n"
-    result = flatten_markdown(md)
-    assert "First, first thing." in result
-    assert "Second, second thing." in result
-    assert "Third, third thing." in result
-
-
-def test_numbered_list_becomes_item_n():
-    md = "1. buy milk\n2. walk dog\n"
-    result = flatten_markdown(md)
-    assert "Item 1: buy milk." in result
-    assert "Item 2: walk dog." in result
-
-
-def test_strips_links_and_keeps_link_text():
-    result = flatten_markdown("Check out [the docs](https://example.com) for more.")
-    assert "the docs" in result
-    assert "https://example.com" not in result
-    assert "[" not in result
+def test_flatten_markdown_preserves_technical_tokens():
+    text = "Engineers in R&D work with C++ and Go 24/7 on TCP/IP protocols."
+    result = flatten_markdown(text)
+    assert "R&D" in result
+    assert "C++" in result
+    assert "24/7" in result
+    assert "TCP/IP" in result
 
 
 def test_strips_bold_and_italic_markers():

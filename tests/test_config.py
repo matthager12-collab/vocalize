@@ -1031,3 +1031,59 @@ def test_the_chord_key_allowlist_matches_the_swift_keycode_table():
     block = text[opening:text.index("]", opening)]
     names = set(re.findall(r'"([a-z0-9]+)"\s*:', block))
     assert names == set(CHORD_KEYS), sorted(names ^ set(CHORD_KEYS))
+
+
+def test_speech_table_defaults():
+    from vocalize.config import SPEECH_DEFAULTS, resolve_speech
+
+    resolved = resolve_speech({})
+    assert resolved == SPEECH_DEFAULTS
+
+
+def test_speech_table_overrides():
+    from vocalize.config import resolve_speech
+
+    data = {
+        "speech": {
+            "headings": "plain",
+            "parentheticals": "drop",
+            "urls": "full",
+            "bracket_max_chars": 150,
+            "references": False,
+        }
+    }
+    resolved = resolve_speech(data)
+    assert resolved["headings"] == "plain"
+    assert resolved["parentheticals"] == "drop"
+    assert resolved["urls"] == "full"
+    assert resolved["bracket_max_chars"] == 150
+    assert resolved["references"] is False
+    assert resolved["emoji"] is True  # default kept
+
+
+@pytest.mark.parametrize("key,val", [
+    ("headings", "bad"),
+    ("parentheticals", "bad"),
+    ("urls", "bad"),
+    ("emoji", "not_a_bool"),
+    ("bracket_max_chars", 5),
+    ("bracket_max_chars", 5000),
+    ("furniture_max_chars", 5),
+    ("furniture_min_repeats", 1),
+])
+def test_invalid_speech_setting_raises(key, val):
+    from vocalize.config import resolve_speech
+    from vocalize.exceptions import ConfigError
+
+    with pytest.raises(ConfigError):
+        resolve_speech({"speech": {key: val}})
+
+
+def test_unknown_speech_key_warns(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+    from vocalize.config import resolve_speech
+
+    monkeypatch.setattr(config, "_warned", set())
+    data = _load_stt(monkeypatch, tmp_path, '[speech]\nunknown_speech_option = "yes"\n')
+    resolve_speech(data)
+    assert "unknown config key 'unknown_speech_option' in [speech]" in capsys.readouterr().err
