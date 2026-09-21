@@ -936,6 +936,7 @@ def test_app_table_loads_with_valid_values_and_canonical_chords(monkeypatch, tmp
     )
     assert resolve_app(data) == {
         "dictate": "ctrl+alt+cmd+d", "dictate_mode": "toggle", "speak": "cmd+shift+f5", "stop": "",
+        "stop_hotkey": "stop",
     }
 
 
