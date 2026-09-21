@@ -211,7 +211,7 @@ def harness(tmp_path, monkeypatch):
     # That fake stop leaves no marker, so every toggle here would wait out
     # the grace for a record no fake read is going to write. The wait has
     # its own two tests below; these are about the toggle.
-    monkeypatch.setattr(dictate, "_RESUME_GRACE", 0.05)
+    monkeypatch.setattr(interrupted, "_RESUME_GRACE", 0.05)
     # Presses here land microseconds apart, which to the real debounce is
     # a held key. Its own tests below put the window back.
     monkeypatch.setattr(dictate, "_DEBOUNCE", 0.0)
@@ -2524,7 +2524,7 @@ def test_a_record_older_than_this_dictation_is_never_resumed(
 ):
     # It belongs to a read the user has already been asked about; only
     # `vocalize resume` can still reach it.
-    monkeypatch.setattr(dictate, "_RESUME_GRACE", 0.05)  # nothing newer is coming
+    monkeypatch.setattr(interrupted, "_RESUME_GRACE", 0.05)  # nothing newer is coming
     answering(tmp_path, monkeypatch, harness, "button returned:Continue\n")
     saved = save_read(tmp_path)
 
@@ -2542,7 +2542,7 @@ def test_the_dialog_waits_for_a_record_a_slow_chunk_has_not_written_yet(
     # record when that call returns — seconds after this dictation, which
     # took a short take and a fast transcription, is done. One look found
     # nothing and no dialog was ever shown for a read it had just cut off.
-    monkeypatch.setattr(dictate, "_RESUME_GRACE", 3.0)  # the shipped default
+    monkeypatch.setattr(interrupted, "_RESUME_GRACE", 3.0)  # the shipped default
     answering(tmp_path, monkeypatch, harness, "button returned:Continue, gave up:false\n")
     started = time.time()
     landing = threading.Thread(target=lambda: (time.sleep(0.3), save_read(tmp_path)))
@@ -2561,7 +2561,7 @@ def test_a_dictation_that_stopped_nothing_never_waits(
     # The stop found no player, so its marker is still sitting there and no
     # record is coming. Waiting three seconds for one on every ordinary
     # dictation is the cost this avoids.
-    monkeypatch.setattr(dictate, "_RESUME_GRACE", 30.0)
+    monkeypatch.setattr(interrupted, "_RESUME_GRACE", 30.0)
     audio._INTERRUPT_FILE.parent.mkdir(parents=True, exist_ok=True)
     audio._INTERRUPT_FILE.write_text(f"0\n{time.time()}\n")
 

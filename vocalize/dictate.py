@@ -203,6 +203,7 @@ _FIXED_NOTIFICATIONS = frozenset(
 # nothing about the read, and nothing about the dictation, is in it. A
 # dialog nobody answers gives up, and giving up is a "no".
 _RESUME_GIVE_UP = 15
+_RESUME_GRACE = interrupted._RESUME_GRACE
 _RESUME_DIALOG = (
     'display dialog "Continue the read you interrupted?" '
     'buttons {"Discard", "Continue"} default button "Continue" '
