@@ -77,3 +77,27 @@ Long audio: 306.8 s (5-minute take) looped from jargon clip.
 - large-v3-turbo-q5_0: 22.98 s real, peak RSS 976.1 MB (chunked, memory bounded).
 - parakeet-tdt int8: 17.29 s real (load 0.99 s, decode 16.06 s), peak RSS 3031.8 MB (3.03 GB, scales with sequence length).
 Decision: B, No-go (DEC-034). Parakeet fails the 1.5 GB RSS cap (1.73–3.03 GB) and does not improve on turbo's zero-miss accuracy.
+
+## Foundation Models
+
+Run 17, T-160, 2026-09-22. Swift probe against `FoundationModels.framework` on the reference Mac (Mac mini, Apple M4, 16 GB, macOS 26.5.1).
+availability: `SystemLanguageModel.default.availability` returns `unavailable(appleIntelligenceNotEnabled)`.
+cause: Apple Intelligence is not enabled in macOS System Settings on this machine.
+verdict: Drop / defer. Cannot serve as an out-of-the-box local dictation cleanup helper while Apple Intelligence is disabled estate-wide; retain `Qwen3.5-4B-4bit` under `mlx-lm` (Phase 14).
+
+## SpeechAnalyzer
+
+Run 17, T-161, 2026-09-22. Swift binary using `Speech.SpeechAnalyzer` and `SpeechTranscriber` from macOS 26 `Speech.framework` on the reference Mac (Mac mini, M4, 16 GB, macOS 26.5.1).
+Jargon audio: 20.45 s synthetic 16 kHz WAV (say render of the 12-token paragraph: pyproject, repository root, uv --no-project, sha256, resolve_provider_settings, ElevenLabs, Kokoro, MCP, ponytail, merge, 12 tokens, 731 characters).
+- timing: 0.39 s real (wall clock).
+- peak RSS: 18.7 MB (vs 800 MB whisper `large-v3-turbo-q5_0` and 1728 MB Parakeet).
+- accuracy: 7/10 technical jargon tokens correct. Misses: "pyproject" -> "Hyperject", "uv no-project" -> "of no project", "sha256" -> "Chat 256".
+verdict: No-go for primary dictation engine. Extremely fast (0.39 s) and negligible memory footprint (18.7 MB), but high failure rate on technical terms where whisper turbo achieves zero misses.
+
+## Voice Memos
+
+Run 17, T-162, 2026-09-22. Probe of macOS 26 Voice Memos on-device transcription storage on the reference Mac (Mac mini, M4, 16 GB, macOS 26.5.1).
+sandbox: `~/Library/Group Containers/group.com.apple.VoiceMemos.shared` produces `[Errno 1] Operation not permitted` under macOS TCC; requires Full Disk Access to read the app library directly.
+atom structure: Voice Memos embeds on-device transcripts directly into `.m4a` files using a custom, undocumented leaf atom `tsrp` (located at `moov.udta.tsrp` or `moov.trak.udta.tsrp`; or `com.apple.VoiceMemos.tsrp` in QuickTime metadata).
+payload: JSON containing `attributedString` segments with timing ranges and locale.
+verdict: Defer repository integration. Default Voice Memos directory is gated by TCC permissions. For exported `.m4a` files, parsing `tsrp` is lightweight and feasible in pure Python, but out-of-scope for Run 17 (which keeps `vocalize/` untouched).
