@@ -361,3 +361,58 @@ def test_transcribe_and_selftest_are_mutually_exclusive(worker, tmp_path):
     write_wav(wav)
     with pytest.raises(SystemExit):
         worker.parse_args(["--model", "m.bin", "--transcribe", str(wav), "--selftest"])
+
+
+# --- --segments contract (T-140) --------------------------------------
+
+
+class CentisecondSegment:
+    def __init__(self, t0, t1, text):
+        self.t0 = t0
+        self.t1 = t1
+        self.text = text
+
+
+class CentisecondModel(StubModel):
+    def transcribe(self, media, language=None, **params):
+        self.calls.append((media, language))
+        callback = params.get("new_segment_callback")
+        segs = [
+            CentisecondSegment(0, 150, " hello"),
+            CentisecondSegment(150, 325, " there"),
+        ]
+        if callback is not None:
+            for seg in segs:
+                callback(seg)
+        return segs
+
+
+def test_segments_contract_with_centisecond_timestamps(worker, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(worker, "_model_class", lambda: CentisecondModel)
+    wav = tmp_path / "clip.wav"
+    write_wav(wav)
+
+    # Without --segments: byte-identical to today (single line, no segments key)
+    code = worker.main(["--model", "m.bin", "--transcribe", str(wav)])
+    assert code == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {"ok": True, "text": "hello there"}
+
+    # With --segments: emits progress lines then final JSON with segments list
+    code = worker.main(["--model", "m.bin", "--transcribe", str(wav), "--segments"])
+    assert code == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 3
+    assert json.loads(lines[0]) == {"progress": 1.5}
+    assert json.loads(lines[1]) == {"progress": 3.25}
+    final = json.loads(lines[2])
+    assert final == {
+        "ok": True,
+        "text": "hello there",
+        "segments": [
+            {"start": 0.0, "end": 1.5, "text": "hello"},
+            {"start": 1.5, "end": 3.25, "text": "there"},
+        ],
+    }
+

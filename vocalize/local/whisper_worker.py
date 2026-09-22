@@ -97,6 +97,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--beam-size", type=int, default=5, choices=range(1, 9), metavar="N",
         help="1 keeps whisper.cpp's greedy decoder; 2-8 turns on beam search with N beams",
     )
+    parser.add_argument(
+        "--segments", action="store_true",
+        help="Emit progress lines and include segments in output",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--transcribe", metavar="WAV", help="Path to a 16 kHz mono 16-bit WAV")
     mode.add_argument("--selftest", action="store_true", help="Load the model and say one word")
@@ -134,12 +138,41 @@ def _join_segments(texts) -> str:
     return " ".join(part for part in (text.strip() for text in texts) if part)
 
 
-def transcribe(model, wav_path: str, language: str) -> dict:
+def transcribe(model, wav_path: str, language: str, emit_segments: bool = False) -> dict:
     """One transcription attempt -> the reply dict `main` prints. Never raises."""
     error = _check_wav(wav_path)
     if error is not None:
         return {"ok": False, "error": error}
     try:
+        if emit_segments:
+            def _callback(seg):
+                t1 = getattr(seg, "t1", 0)
+                sec = round(t1 / 100.0, 2)
+                print(json.dumps({"progress": sec}), flush=True)
+
+            try:
+                segments = model.transcribe(
+                    wav_path, language=language, new_segment_callback=_callback
+                )
+            except TypeError:
+                segments = model.transcribe(wav_path, language=language)
+                for seg in segments:
+                    _callback(seg)
+
+            text = _join_segments(segment.text for segment in segments)
+            seg_list = []
+            for segment in segments:
+                t0 = getattr(segment, "t0", 0)
+                t1 = getattr(segment, "t1", 0)
+                seg_text = segment.text.strip()
+                if seg_text:
+                    seg_list.append({
+                        "start": round(t0 / 100.0, 2),
+                        "end": round(t1 / 100.0, 2),
+                        "text": seg_text,
+                    })
+            return {"ok": True, "text": text, "segments": seg_list}
+
         segments = model.transcribe(wav_path, language=language)
         text = _join_segments(segment.text for segment in segments)
     except Exception as exc:  # noqa: BLE001 -- whisper.cpp can raise anything; report, don't crash
@@ -195,7 +228,7 @@ def main(argv=None) -> int:
         print("ok")
         return 0
 
-    print(json.dumps(transcribe(model, args.transcribe, args.language)))
+    print(json.dumps(transcribe(model, args.transcribe, args.language, emit_segments=args.segments)))
     return 0
 
 

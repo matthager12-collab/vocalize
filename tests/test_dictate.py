@@ -3087,3 +3087,258 @@ def test_session_state_never_moves_backwards(monkeypatch, tmp_path):
     dictate._write_session(workdir, "recording")
 
     assert json.loads(dictate.session_path().read_text(encoding="utf-8"))["state"] == "transcribing"
+
+
+# --- pause and resume (Phase 15b) -------------------------------------
+
+
+def test_pause_finalises_a_segment_and_leaves_the_session_claimed(recorder, harness):
+    recorder()
+    start()
+    workdir = Path(session_data()["dir"])
+    assert (workdir / "rec.pid").is_file()
+
+    code = dictate.pause(stt())
+    assert code == 0
+    assert not (workdir / "take.wav").exists()
+    assert (workdir / "take.001.wav").is_file()
+    assert (workdir / "paused").is_file()
+    assert stat.S_IMODE((workdir / "paused").stat().st_mode) == 0o600
+    assert dictate.session_path().is_file()
+    assert session_data()["dir"] == str(workdir)
+    assert session_data()["state"] == "recording"
+    assert not (workdir / "rec.pid").exists()
+
+
+def test_session_state_stays_recording_while_paused(recorder):
+    recorder()
+    start()
+    workdir = Path(session_data()["dir"])
+    dictate.pause(stt())
+
+    raw_session = dictate.session_path().read_text(encoding="utf-8")
+    assert "paused" not in raw_session
+    data = json.loads(raw_session)
+    assert data["state"] == "recording"
+    assert data["dir"] == str(workdir)
+
+
+def test_resume_launches_a_second_recorder_with_the_remaining_budget(recorder, harness):
+    recorder()
+    start(max_seconds=120, max_take_seconds=300)
+    workdir = Path(session_data()["dir"])
+    dictate.pause(stt(max_seconds=120, max_take_seconds=300))
+
+    dictate._write_paused_marker(workdir, time.time(), 100.0)
+
+    code = dictate.resume(stt(max_seconds=120, max_take_seconds=300))
+    assert code == 0
+    assert not (workdir / "paused").exists()
+    assert (workdir / "rec.pid").is_file()
+    assert session_data()["state"] == "recording"
+    assert "Tink.aiff" in harness.played
+
+
+def test_resume_max_never_falls_below_one_second(recorder, harness):
+    recorder()
+    start(max_seconds=120, max_take_seconds=100)
+    workdir = Path(session_data()["dir"])
+    dictate.pause(stt(max_seconds=120, max_take_seconds=100))
+
+    dictate._write_paused_marker(workdir, time.time(), 99.8)
+
+    code = dictate.resume(stt(max_seconds=120, max_take_seconds=100))
+    assert code == 0
+    args = lines(harness.open_argv)
+    assert "--max" in args
+    max_indices = [i for i, x in enumerate(args) if x == "--max"]
+    assert args[max_indices[-1] + 1] == "1"
+
+
+def test_resume_refuses_past_the_take_budget(recorder):
+    recorder()
+    start(max_seconds=120, max_take_seconds=100)
+    workdir = Path(session_data()["dir"])
+    dictate.pause(stt(max_seconds=120, max_take_seconds=100))
+
+    dictate._write_paused_marker(workdir, time.time(), 100.0)
+
+    code = dictate.resume(stt(max_seconds=120, max_take_seconds=100))
+    assert code != 0
+    assert not (workdir / "rec.pid").exists()
+
+
+def test_resume_refuses_a_twenty_first_segment(recorder):
+    recorder()
+    start()
+    workdir = Path(session_data()["dir"])
+    dictate.pause(stt())
+
+    for i in range(1, 21):
+        write_wav(workdir / f"take.{i:03d}.wav", seconds=0.1)
+
+    code = dictate.resume(stt())
+    assert code != 0
+    assert not (workdir / "rec.pid").exists()
+
+
+def test_wait_for_exit_backstop_uses_the_segment_start_not_the_take_start(monkeypatch, tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    take_start = time.time() - 1000.0
+    seg_start = time.time()
+    dictate._record_segment_start(workdir, seg_start)
+
+    terminated_deadline = None
+
+    def fake_terminate(pid, deadline):
+        nonlocal terminated_deadline
+        terminated_deadline = deadline
+
+    monkeypatch.setattr(dictate, "_terminate", fake_terminate)
+    dictate._wait_for_exit(4242, take_start, stt(max_seconds=120), workdir=workdir)
+
+    assert terminated_deadline is not None
+    assert terminated_deadline > time.monotonic() + 15.0
+
+
+def test_resume_treats_a_corrupt_paused_marker_as_no_pause(recorder):
+    recorder()
+    start()
+    workdir = Path(session_data()["dir"])
+    dictate.pause(stt())
+
+    (workdir / "paused").write_text("not-a-number-or-json\n-50.0\n", encoding="utf-8")
+
+    assert dictate.resume(stt()) == 0
+    assert not (workdir / "rec.pid").exists()
+
+
+def test_segment_self_stop_at_max_notifies_before_the_mic_closes(recorder, harness):
+    recorder()
+    start(max_seconds=1)
+    workdir = Path(session_data()["dir"])
+    write_wav(workdir / "take.wav", seconds=1.0)
+    time.sleep(1.05)
+    (workdir / "rec.pid").unlink(missing_ok=True)
+    assert _wait_until(lambda: any(dictate._NOTIFY_MIC_CLOSED in n for n in harness.notifications()))
+    assert "Pop.aiff" in harness.played
+    assert session_data()["state"] == "recording"
+
+
+def test_transcribe_timeout_scales_with_take_length():
+    assert dictate._transcribe_timeout(50.0) == 300
+    assert dictate._transcribe_timeout(150.0) == 300
+    assert dictate._transcribe_timeout(600.0) == 1200
+    assert dictate._transcribe_timeout(1800.0) == 3600
+
+
+def test_join_segments_frames_and_silence(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    write_wav(workdir / "take.001.wav", seconds=1.0)
+    write_wav(workdir / "take.002.wav", seconds=1.0)
+    write_wav(workdir / "take.wav", seconds=1.0)
+
+    dictate._join_segments(workdir)
+
+    assert (workdir / "take.wav").is_file()
+    assert not (workdir / "take.001.wav").exists()
+    assert not (workdir / "take.002.wav").exists()
+
+    with wave.open(str(workdir / "take.wav"), "rb") as r:
+        assert r.getnframes() == 56000
+        r.setpos(16000)
+        silence1 = r.readframes(4000)
+        assert silence1 == b"\x00" * (4000 * 2)
+        r.setpos(36000)
+        silence2 = r.readframes(4000)
+        assert silence2 == b"\x00" * (4000 * 2)
+
+
+def test_joined_wav_keeps_16k_mono_16bit(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    write_wav(workdir / "take.001.wav", seconds=0.5)
+    write_wav(workdir / "take.wav", seconds=0.5)
+
+    dictate._join_segments(workdir)
+
+    with wave.open(str(workdir / "take.wav"), "rb") as r:
+        assert r.getnchannels() == 1
+        assert r.getsampwidth() == 2
+        assert r.getframerate() == 16000
+
+
+def test_cue_trimmed_per_segment_never_reaches_the_worker(recorder, transcriber, harness, monkeypatch):
+    recorder()
+    transcriber()
+    harness.play_seconds = 0.1
+    start()
+    workdir = Path(session_data()["dir"])
+
+    write_wav(workdir / "take.wav", seconds=0.2)
+    dictate._write_cue(workdir, 0.1)
+
+    dictate.pause(stt())
+    assert (workdir / "take.001.wav").is_file()
+    with wave.open(str(workdir / "take.001.wav"), "rb") as r:
+        assert r.getnframes() == 1600
+
+    dictate.resume(stt())
+    write_wav(workdir / "take.wav", seconds=0.2)
+    dictate._write_cue(workdir, 0.1)
+
+    monkeypatch.setattr(dictate, "_CANCEL_WINDOW", 0.0)
+    assert dictate.toggle(stt()) == 0
+
+    with wave.open(str(harness.uv_take), "rb") as r:
+        assert r.getnframes() == 7200
+
+
+def test_toggle_while_paused_stops_and_transcribes(recorder, transcriber, harness, monkeypatch):
+    recorder()
+    transcriber()
+    start()
+    workdir = Path(session_data()["dir"])
+    write_wav(workdir / "take.wav", seconds=0.2)
+
+    dictate.pause(stt())
+    assert (workdir / "paused").is_file()
+
+    monkeypatch.setattr(dictate, "_CANCEL_WINDOW", 0.0)
+    assert dictate.toggle(stt()) == 0
+
+    assert harness.clipboard() == TRANSCRIPT
+    assert not dictate.session_path().exists()
+    assert not workdir.exists()
+
+
+def test_cancel_while_paused_removes_every_segment(recorder):
+    recorder()
+    start()
+    workdir = Path(session_data()["dir"])
+    write_wav(workdir / "take.wav", seconds=0.2)
+    dictate.pause(stt())
+
+    assert (workdir / "take.001.wav").is_file()
+    assert (workdir / "paused").is_file()
+
+    assert dictate.cancel(stt()) == 0
+    assert not workdir.exists()
+    assert not dictate.session_path().exists()
+
+
+def test_paused_workdir_younger_than_24h_is_not_swept(tmp_path, monkeypatch):
+    import shutil
+    import tempfile
+
+    workdir = Path(tempfile.mkdtemp(prefix=dictate._WORKDIR_PREFIX))
+    (workdir / "paused").touch()
+    try:
+        now = time.time()
+        os.utime(workdir, (now - 3600, now - 3600))
+        dictate._sweep_stale_workdirs()
+        assert workdir.is_dir()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)

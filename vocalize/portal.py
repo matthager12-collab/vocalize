@@ -230,7 +230,7 @@ VOICES_FAILED = (
 #: through the same `app` module functions readiness and the CLI use, so
 #: the Setup tab's "Install the app" button ends in exactly the state a
 #: terminal install would.
-INSTALL_TARGETS = ("kokoro", "stt", "app")
+INSTALL_TARGETS = ("kokoro", "stt", "llm", "app")
 
 #: Where run 9's page will live. Absent until then, so `/` and `/portal.js`
 #: fall back to a placeholder rather than 404 — and, more to the point,
@@ -1583,6 +1583,8 @@ class Portal:
                     self._install_kokoro()
                 elif target == "app":
                     self._install_app()
+                elif target == "llm":
+                    self._install_llm_model()
                 else:
                     self._install_stt(model)
                 self._progress(step="installed")
@@ -1702,6 +1704,38 @@ class Portal:
             # the next dictation would simply fail.
             self._progress(note=install_module.REGRANT_WARNING)
 
+    def _install_llm_model(self) -> None:
+        from .local import install as install_module
+        from .local import llm_manifest as manifest
+
+        uv = _uv_or_raise(install_module)
+
+        total = sum(e["size"] for e in manifest.FILES)
+        already = 0
+        self._progress(total=total, step="downloading model files")
+        for entry in manifest.FILES:
+            if install_module.file_is_verified(entry, manifest=manifest):
+                already += entry["size"]
+                self._progress(downloaded=already)
+                continue
+            self._downloading = manifest.MODEL_DIR / (entry["name"] + ".part")
+            install_module.download_file(
+                entry["url"],
+                manifest.MODEL_DIR / entry["name"],
+                entry["size"],
+                entry["sha256"],
+                opener=install_module._default_opener,
+                progress=self._downloaded(already),
+            )
+            already += entry["size"]
+            self._progress(downloaded=already)
+
+        self._progress(step="checking config")
+        manifest.check_config(manifest.MODEL_DIR)
+
+        install_module.write_stamp(manifest=manifest)
+        self._progress(step="warming the runtime")
+        install_module.selftest(uv, manifest=manifest)
 
 class _Handler(BaseHTTPRequestHandler):
     """Wire in, `route()`, wire out. No decisions of its own."""

@@ -8,7 +8,9 @@ as a subprocess.
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 # Where uv lives when it is on neither PATH nor in its own installer's
@@ -30,4 +32,40 @@ def uv_path() -> str | None:
     for fallback in (Path.home() / ".local" / "bin" / "uv", *UV_FALLBACKS):
         if fallback.is_file():
             return str(fallback)
+    return None
+
+
+def physical_ram_bytes() -> int | None:
+    """Total physical RAM in bytes, or None when it cannot be determined.
+
+    Used by ``vocalize local install --llm`` to gate the download on
+    machines below ``llm_manifest.MIN_RAM_BYTES``.  ``os.sysconf`` is the
+    POSIX path; on macOS the constants exist under Apple's names, so both
+    are tried.  The ``sysctl`` fallback covers the unlikely case where
+    sysconf is compiled out.
+    """
+    for pages_name, size_name in (
+        ("SC_PHYS_PAGES", "SC_PAGE_SIZE"),
+        ("SC_PHYS_PAGES", "SC_PAGESIZE"),
+        ("_SC_PHYS_PAGES", "_SC_PAGE_SIZE"),
+    ):
+        try:
+            pages = os.sysconf(pages_name)
+            size = os.sysconf(size_name)
+            if pages > 0 and size > 0:
+                return pages * size
+        except (ValueError, OSError, AttributeError):
+            continue
+
+    # macOS fallback: sysctl hw.memsize
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+
     return None

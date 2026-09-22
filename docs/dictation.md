@@ -284,10 +284,11 @@ invocation.
 model = "large-v3-turbo-q5_0"
 language = "en"
 input_device = ""
-cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local" (local arrives in 0.14.0)
+cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local"
 verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
 paste = false        # paste after copying — see Auto-paste
 max_seconds = 120
+max_take_seconds = 1800  # caps the whole paused-and-resumed take (60-7200)
 sounds = true
 cues = "sounds"  # "sounds" | "words" | "both"
 beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that many beams
@@ -298,10 +299,11 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 | `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` | must already be installed (`vocalize local install --stt --model …`) |
 | `language` | a whisper.cpp language code (`en`, `es`, `fr`, `de`, …) | `en` | an `.en` model (both `base.en` and `small.en`) is English-only regardless of this setting — pairing one with a non-`en` language is a `ConfigError` |
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable only, can't start with `-` | `""` | see [The input-device gotcha](#the-input-device-gotcha) |
-| `cleanup` | `off`, `claude-cli`, `anthropic`, `local` | `off` | where the cleanup pass runs. `claude-cli` is `claude -p` on your Claude Code subscription (shares its usage pool, and Claude Code logs the run); `anthropic` is the Messages API with a stored key and a monthly character budget; `local` is accepted now and honoured from 0.14.0. Older configs' `true` / `false` still work: `true` means `claude-cli` |
+| `cleanup` | `off`, `claude-cli`, `anthropic`, `local` | `off` | where the cleanup pass runs. `claude-cli` is `claude -p` on your Claude Code subscription (shares its usage pool, and Claude Code logs the run); `anthropic` is the Messages API with a stored key and a monthly character budget; `local` runs a language model on your machine — nothing leaves it ([install it first](#local-cleanup-model)). Older configs' `true` / `false` still work: `true` means `claude-cli` |
 | `verbatim` | `true` / `false` | `false` | keep every word; the default pass also drops restatements, false starts and filler ([#3](https://github.com/matthager12-collab/vocalize/issues/3)). Saying "verbatim" as the first word of a take does the same for that take |
 | `paste` | `true` / `false` | `false` | paste into the app you dictated in, after copying — see [Auto-paste](#auto-paste) |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
+| `max_take_seconds` | integer, 60–7200 | `1800` | caps the entire paused-and-resumed take; `max_seconds` stays per segment |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
 | `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
 | `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
@@ -323,9 +325,25 @@ stt.beam_size=5
 stt.cleanup=off
 stt.verbatim=false
 stt.max_seconds=120
+stt.max_take_seconds=1800
 stt.cues=sounds
 stt.paste=false
 ```
+
+## Pause and resume
+
+Dictation can be paused and resumed without losing captured audio:
+
+```bash
+vocalize dictate --pause
+vocalize dictate --resume
+```
+
+- **Mechanics:** `vocalize dictate --pause` cleanly stops the recorder, trims the start cue from that segment, renames it to `take.NNN.wav`, and records a private `paused` marker (`0600`). `vocalize dictate --resume` relaunches a fresh recorder with remaining budget `max(1, min(max_seconds, remaining))`.
+- **Budgets:** `--max` remains per-segment (1–600 s). `[stt] max_take_seconds` (default `1800` seconds, bounded 60–7200) caps the entire take, and at most 20 segments are allowed.
+- **Joining:** When the recording finishes, segments are joined losslessly in numeric order with 0.25 s of silence inserted at each seam to prevent whisper from merging words across pauses.
+- **Privacy:** Every segment lives strictly inside the private per-take temporary directory (`0700`) and is wiped upon transcription or cancellation. Segments never reach the notes folder.
+- **Stop chord:** When `[app] stop_hotkey = "pause"`, pressing the stop shortcut pauses a live recording, or resumes a paused recording.
 
 ### The input-device gotcha
 
@@ -444,7 +462,37 @@ through the rest of the text via the normal chain, same provider, same
 cache — so anything already rendered is a cache hit and the continuation
 starts immediately.
 
+## Local cleanup model
+
+The `local` cleanup backend runs a language model entirely on your Mac.
+No transcript ever leaves the machine.
+
+```bash
+vocalize local install --llm
+```
+
+This downloads ~2.5 GB of model weights (Qwen 3.5 4B, 4-bit quantised
+for Apple Silicon via MLX) plus a Python runtime managed by uv. The
+installer gates on 12 GB of RAM by default — use `--force` to override.
+
+Once installed, set the backend:
+
+```toml
+[stt]
+cleanup = "local"
+```
+
+Or use `--cleanup` on the command line — if the local model is installed,
+bare `--cleanup` prefers it over `claude-cli` automatically.
+
+```bash
+vocalize local status      # check whether the model is installed
+vocalize local uninstall --llm   # remove the model files
+```
+
 ## Uninstalling
+
+### Speech-to-text
 
 ```bash
 vocalize local uninstall --stt

@@ -18,7 +18,7 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 | DEC-031 | How is the cue kept out of the recording? | Decided | B — trim the take in dictate.py after the first growth of `take.wav`; the recorder stays frozen | R2 |
 | DEC-032 | How many releases, and where does the Swift source freeze? | Decided | B — four releases; the Swift source ships complete in 0.13.0 so 0.13.1 is Python only | R2 |
 | DEC-033 | Which hotkey backend? | Decided | A — Carbon; the T-60 spike passed with Claude desktop, Ghostty and full-screen Claude in front | R2, decided run 7 |
-| DEC-034 | Parakeet or whisper for 0.14? | Deferred | to the spike T-120; both branches planned | R2 |
+| DEC-034 | Parakeet or whisper for 0.14? | Decided | B — no-go: whisper stays the only engine; Parakeet RSS exceeds 1.5 GB cap | R2, decided run 13 |
 | DEC-035 | Does the `security` backend hold across rebuilt callers? | Decided | A — it holds; the backend is built (run 4, 2026-09-07) | R2 |
 | DEC-036 | How does a read pause, and how is it reached? | Decided | C — `vocalize pause` on the remembered stop, plus opt-in `[app] stop_hotkey = "pause"`; `stop` and the one-hour life unchanged | R3 |
 | DEC-037 | How does a recording pause without touching the frozen recorder? | Decided | C — stop, segment, relaunch, join in Python; `--max` per segment under a new `[stt] max_take_seconds` | R3 |
@@ -386,9 +386,9 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 ### DEC-034: Parakeet or whisper for 0.14?
 
-**Date**: 2026-09-06
-**Decided by**: deferred to the owner after T-120
-**Status**: Deferred
+**Date**: 2026-09-21
+**Decided by**: Mat (the spike's numbers accepted)
+**Status**: Decided
 
 **Context**: DEC-026 set the gate. This entry records the outcome.
 
@@ -399,13 +399,17 @@ Continues the sequence from [../2026-09-next-features/decisions.md](../2026-09-n
 
 **Recommendation**: Follow the numbers: fewer jargon misses, no slower than `small.en`, RSS under 1.5 GB.
 
-**Decision**: Pending the spike.
+**Decision**: B, No-go. The T-120 spike (2026-09-21, `sherpa-onnx==1.13.7` with int8 `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`, `model_type="nemo_transducer"`) failed two of the three acceptance bars:
+- **Peak RSS**: 1.73–1.93 GB on a 20 s take and 3.03 GB on a 5-minute take (exceeds the 1.5 GB limit by 2×; whisper holds at 800–976 MB).
+- **Jargon misses**: Parakeet transcribed "repository root" as "repository route" and added an extraneous comma ("with, no project"), where `large-v3-turbo-q5_0` transcribed all 12 jargon tokens with zero errors.
+- **Latency**: Warm decode is 0.59 s, but ONNX model load adds 0.87–1.03 s (total 1.45–1.76 s vs 1.07 s for warm `small.en`).
 
-**Consequences**: Recorded with the measured numbers when decided.
+**Consequences**: Whisper remains the sole speech-to-text engine across 0.13 and 0.14. T-122 (`parakeet_manifest.py`, `parakeet_worker.py`, engine dispatch) is skipped. `[stt]` keeps `model = large-v3-turbo-q5_0` with no engine enum needed.
 
 **Applied to**:
-- [plan.md](./plan.md) T-120, T-122
+- [plan.md](./plan.md) T-120, T-122 (skipped)
 - [verification.md](./verification.md) § Phase 13 exit
+- [spike-notes.md](./spike-notes.md) § Parakeet
 
 ---
 

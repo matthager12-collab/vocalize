@@ -1160,3 +1160,75 @@ def test_the_cache_directory_is_tightened_even_when_it_already_exists(tmp_path):
     install_module.ensure_private_dir(existing)
 
     assert stat.S_IMODE(existing.stat().st_mode) == 0o700
+
+
+# --- local install / uninstall --llm (T-132) -----------------------------
+
+
+def test_local_install_llm_stt_mutually_exclusive():
+    result = CliRunner().invoke(main, ["local", "install", "--stt", "--llm"])
+    assert result.exit_code != 0
+    assert "--stt and --llm are mutually exclusive" in result.output
+
+
+def test_local_install_llm_ram_gate_and_force(monkeypatch, tmp_path):
+    from vocalize import local as local_module
+    from vocalize.local import llm_manifest
+
+    monkeypatch.setattr(local_module, "physical_ram_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(llm_manifest, "MODEL_DIR", tmp_path / "models" / "qwen")
+
+    # Without --force: fails at RAM gate
+    result = CliRunner().invoke(main, ["local", "install", "--llm", "--yes"])
+    assert result.exit_code != 0
+    assert "8.0 GB of RAM" in result.output
+    assert "at least 12.0 GB" in result.output
+    assert "claude-cli" in result.output
+
+    # With --force: passes the RAM gate
+    # Fake download and selftest
+    monkeypatch.setattr(install_module, "download_file", lambda *a, **kw: None)
+    monkeypatch.setattr(install_module, "file_is_verified", lambda *a, **kw: True)
+    monkeypatch.setattr(install_module, "selftest", lambda *a, **kw: None)
+    monkeypatch.setattr(local_pkg, "uv_path", lambda: "/usr/bin/true")
+    monkeypatch.setattr(llm_manifest, "check_config", lambda *a, **kw: None)
+
+    result_force = CliRunner().invoke(main, ["local", "install", "--llm", "--force", "--yes"])
+    assert result_force.exit_code == 0
+    assert "--force: skipping RAM check" in result_force.output
+
+
+def test_local_install_llm_and_uninstall_lifecycle(monkeypatch, tmp_path):
+    from vocalize import local as local_module
+    from vocalize.local import llm_manifest
+
+    model_dir = tmp_path / "models" / "qwen"
+    monkeypatch.setattr(llm_manifest, "MODEL_DIR", model_dir)
+    monkeypatch.setattr(local_module, "physical_ram_bytes", lambda: 16 * 1024**3)
+    monkeypatch.setattr(local_pkg, "uv_path", lambda: "/usr/bin/true")
+    monkeypatch.setattr(llm_manifest, "check_config", lambda *a, **kw: None)
+
+    # Fake download: creates files and writes stamp
+    def _fake_download(url, dest, size, sha, **kw):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "wb") as f:
+            f.truncate(size)
+
+    monkeypatch.setattr(install_module, "download_file", _fake_download)
+    monkeypatch.setattr(install_module, "selftest", lambda *a, **kw: None)
+
+    # Install
+    res = CliRunner().invoke(main, ["local", "install", "--llm", "--yes"])
+    assert res.exit_code == 0
+    assert "LLM is ready." in res.output or "The language model runs entirely on this machine" in res.output
+
+    # Status shows LLM ready
+    res_status = CliRunner().invoke(main, ["local", "status"])
+    assert "LLM: ready" in res_status.output
+
+    # Uninstall
+    res_un = CliRunner().invoke(main, ["local", "uninstall", "--llm", "--yes"])
+    assert res_un.exit_code == 0
+    assert "Language model uninstalled." in res_un.output
+    assert not model_dir.exists()
+

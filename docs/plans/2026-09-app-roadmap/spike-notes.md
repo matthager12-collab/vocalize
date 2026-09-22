@@ -54,3 +54,26 @@ Yeti Stereo Microphone (USB): pid→first growth 383, 359, 383 ms; launch→pid 
 Mat's AirPods Pro (Bluetooth): pid→first growth 500, 521 ms (a third run measured 50 ms, which was the 4096-byte header landing on a file that did not exist yet, not audio — the baseline must be the header, see below); launch→pid 147, 154, 146 ms; growth in about 5460-byte steps (about 170 ms per write).
 Baseline rule for `_wait_for_audio`: the file may not exist at pid time, and its first write is a 4096-byte header with no audio in it; t0 is the first moment the size exceeds max(first observed size, 4096). `_AUDIO_GRACE` 5 s is ten times the worst case seen.
 Write granularity bounds the cue's lateness at one write (320 ms USB, 170 ms Bluetooth); late is the safe side, because the user speaks after the cue and the trim covers t0 to the end of the cue.
+
+## LLM
+
+Run 13, T-121, 2026-09-21. mlx-lm 0.31.3 with Qwen3.5-4B 4-bit (mlx-community/Qwen3.5-4B-4bit) in a throwaway environment on the reference Mac (Mac mini, M4, 16 GB, macOS 26.5.1). Tested against a 30 s dictation cleanup task with think-off ChatML.
+signatures: load(path_or_hf_repo, tokenizer_config=None, model_config=None, adapter_path=None, lazy=False, return_config=False, revision=None) -> (model, tokenizer); generate(model, tokenizer, prompt, verbose=False, **kwargs) -> str
+offline: HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1 keep execution fully local; Path(model_path).exists() bypasses download in mlx_lm.utils._download
+model_type: qwen3_5 loads mlx_lm.models.qwen3_5.Model (text-only backbone, no vision dependencies in mlx_lm)
+template: <|im_start|>assistant\n<think>\n\n</think>\n\n (prefilled think-off ChatML prompt suppresses reasoning overhead and outputs text directly)
+shards: single safetensors file model.safetensors (3,034,300,695 bytes) with model.safetensors.index.json
+cold: 6.03, 4.72, 4.03, 4.19, 4.09 s (median 4.19 s; >4 s requires resident session for dictation cleanup in T-133)
+warm: 1.84, 1.86, 1.87 s (median 1.86 s); peak RSS 1123.3 MB (under 1.5 GB cap)
+
+## Parakeet
+
+Run 13, T-120, 2026-09-21. sherpa-onnx 1.13.7 with csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8 (model_type="nemo_transducer") on the reference Mac (Mac mini, M4, 16 GB, macOS 26.5.1).
+Jargon audio: 20.45 s synthetic 16 kHz WAV (say render of the 12-token paragraph: pyproject, repository root, uv --no-project, sha256, resolve_provider_settings, ElevenLabs, Kokoro, MCP, ponytail, merge, 12 tokens, 731 characters).
+- small.en: warm 1.07 s, peak RSS 902.6 MB. Misses: "route", "pass the merge" (10/12).
+- large-v3-turbo-q5_0: warm 1.51 s (transcribe 2.18 s cold), peak RSS 800.8 MB. Zero misses (12/12).
+- parakeet-tdt int8: warm 1.45 s (load 0.87 s, decode 0.59 s), peak RSS 1728.2 MB (short take) to 1931.5 MB. Misses: "route", extra comma (10/12).
+Long audio: 306.8 s (5-minute take) looped from jargon clip.
+- large-v3-turbo-q5_0: 22.98 s real, peak RSS 976.1 MB (chunked, memory bounded).
+- parakeet-tdt int8: 17.29 s real (load 0.99 s, decode 16.06 s), peak RSS 3031.8 MB (3.03 GB, scales with sequence length).
+Decision: B, No-go (DEC-034). Parakeet fails the 1.5 GB RSS cap (1.73–3.03 GB) and does not improve on turbo's zero-miss accuracy.

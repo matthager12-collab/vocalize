@@ -670,6 +670,21 @@ def test_stt_max_seconds_at_the_edges_is_accepted(monkeypatch, tmp_path, value):
     assert resolve_stt(data)["max_seconds"] == int(value)
 
 
+def test_max_take_seconds_bounds(monkeypatch, tmp_path):
+    from vocalize.config import ConfigError, resolve_stt
+
+    assert resolve_stt({})["max_take_seconds"] == 1800
+
+    for val in (60, 1800, 7200):
+        data = _load_stt(monkeypatch, tmp_path, f"[stt]\nmax_take_seconds = {val}\n")
+        assert resolve_stt(data)["max_take_seconds"] == val
+
+    for bad in (59, 7201, -1, 0, '"abc"', "120.5", "true", "false"):
+        with pytest.raises(ConfigError) as excinfo:
+            _load_stt(monkeypatch, tmp_path, f"[stt]\nmax_take_seconds = {bad}\n")
+        assert "stt.max_take_seconds" in str(excinfo.value)
+
+
 @pytest.mark.parametrize("value", ["0", "9", "-1", '"5"', "2.5", "true"])
 def test_an_out_of_range_stt_beam_size_is_refused(monkeypatch, tmp_path, value):
     with pytest.raises(ConfigError) as excinfo:

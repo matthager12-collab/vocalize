@@ -178,6 +178,36 @@ def _stt_model_row() -> Row:
     return Row("stt model", "fail", "no speech-to-text model installed", _STT_INSTALL_ACTION)
 
 
+_LLM_INSTALL_ACTION = "vocalize local install --llm"
+
+
+def _llm_model_row() -> Row:
+    from . import local as local_module
+    from .local import install, llm_manifest
+
+    ready, reason = install.installed(
+        llm_manifest, install_hint=_LLM_INSTALL_ACTION,
+    )
+    if ready:
+        return Row("llm model", "ok", "installed and ready", "")
+
+    # When the model is not installed, check whether the machine has
+    # enough RAM — if not, the reason names the figures and the cloud
+    # alternatives.
+    ram = local_module.physical_ram_bytes()
+    if ram is not None and ram < llm_manifest.MIN_RAM_BYTES:
+        from .cli import _human_readable_size
+
+        measured = _human_readable_size(ram)
+        required = _human_readable_size(llm_manifest.MIN_RAM_BYTES)
+        return Row(
+            "llm model", "warn",
+            f"{measured} RAM, needs {required}; use claude-cli or anthropic instead",
+            "",
+        )
+    return Row("llm model", "warn", reason, _LLM_INSTALL_ACTION)
+
+
 def _recorder_row() -> Row:
     if _recorder_is_built():
         return Row("recorder", "ok", "Vocalize Recorder is built", "")
@@ -583,6 +613,10 @@ def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
             for name in STT_ROW_NAMES:
                 _PROBES.pop(name, None)
                 _drop_inflight(name)
+
+        # LLM row: always shown, since the local model is relevant to
+        # cleanup regardless of whether dictation is configured.
+        _PROBES["llm model"] = _llm_model_row
 
         if app.bundle_state() != "not built":
             _PROBES["app"] = _app_row

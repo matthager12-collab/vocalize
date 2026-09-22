@@ -31,7 +31,7 @@ from pathlib import Path
 
 import click
 
-from . import __version__, dictate, interrupted, ledger, providers, wizard
+from . import __version__, config, dictate, interrupted, ledger, providers, wizard
 from .audio import play as play_audio
 from .audio import play_sequence, stop_playback, take_gap_stop
 from .audio import save as save_audio
@@ -504,6 +504,7 @@ def settings() -> None:
     click.echo(f"stt.cleanup={stt['cleanup']}")
     click.echo(f"stt.verbatim={'true' if stt['verbatim'] else 'false'}")
     click.echo(f"stt.max_seconds={stt['max_seconds']}")
+    click.echo(f"stt.max_take_seconds={stt['max_take_seconds']}")
     click.echo(f"stt.cues={stt['cues']}")
     click.echo(f"stt.paste={'true' if stt['paste'] else 'false'}")
     notes = resolve_notes(file_config)
@@ -649,6 +650,25 @@ def stop() -> None:
     file_config = load_config_file()
     app = resolve_app(file_config)
     if app.get("stop_hotkey") == "pause":
+        session_file = dictate.session_path()
+        if session_file.exists():
+            try:
+                session_data = json.loads(session_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                session_data = None
+            if isinstance(session_data, dict):
+                state = session_data.get("state")
+                workdir = Path(session_data.get("dir", ""))
+                if state == "recording":
+                    stt = resolve_stt(file_config)
+                    if (workdir / "paused").exists():
+                        dictate.resume(stt)
+                        return
+                    else:
+                        dictate.pause(stt)
+                        return
+                # Anything unrecognised falls through to playback branches
+
         since = time.time()
         stop_playback(remember=True)
         if interrupted.wait_for_record(since) is not None:
@@ -1083,8 +1103,12 @@ def _stt_options(cleanup: bool, verbatim: bool, max_seconds: int | None) -> dict
     """
     stt = resolve_stt(load_config_file())
     if cleanup and stt["cleanup"] == "off":
-        # ponytail: 0.14.0 prefers an installed local model here.
-        stt["cleanup"] = "claude-cli"
+        # Prefer an installed local model; fall back to claude-cli.
+        from .local import install as install_module
+        from .local import llm_manifest
+
+        ready, _ = install_module.installed(llm_manifest, install_hint="")
+        stt["cleanup"] = "local" if ready else "claude-cli"
     if verbatim:
         stt["verbatim"] = True
     if max_seconds is not None:
@@ -1184,19 +1208,25 @@ def listen(check_only, list_devices, toggle, cancel, wav, cleanup, verbatim, max
               help="Hold-to-talk: the key went down — start recording and return.")
 @click.option("--stop", "stop_hold", is_flag=True,
               help="Hold-to-talk: the key came up — stop, transcribe and copy.")
+@click.option("--pause", "pause_cmd", is_flag=True,
+              help="Pause an in-progress dictation.")
+@click.option("--resume", "resume_cmd", is_flag=True,
+              help="Resume a paused dictation.")
 @click.option("--cleanup", is_flag=True,
               help="Tidy the transcript with a language model before copying it.")
 @click.option("--verbatim", is_flag=True,
               help="Keep every word: fix punctuation and casing only.")
 @click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
               help="Stop recording after this many seconds (default: [stt] max_seconds).")
-def dictate_cmd(start_hold, stop_hold, cleanup, verbatim, max_seconds) -> None:
+def dictate_cmd(start_hold, stop_hold, pause_cmd, resume_cmd, cleanup, verbatim, max_seconds) -> None:
     """Start a dictation, or stop the one already running.
 
     \b
         vocalize dictate           # press once to record, again to stop
         vocalize dictate --start   # hold-to-talk: the key is down
         vocalize dictate --stop    # hold-to-talk: the key came up
+        vocalize dictate --pause   # pause an in-progress recording
+        vocalize dictate --resume  # resume a paused recording
 
     With no flag this is the same thing as `vocalize listen --toggle`,
     under the name the keyboard shortcut uses: press once to record, press
@@ -1205,10 +1235,24 @@ def dictate_cmd(start_hold, stop_hold, cleanup, verbatim, max_seconds) -> None:
     dictate_mode = "hold"`; `--start` is idempotent and `--stop` never
     cancels, however briefly the key was held.
     """
-    if start_hold and stop_hold:
-        raise click.UsageError("Use only one of --start, --stop.")
+    mutually_exclusive = [
+        f
+        for f, val in [
+            ("--start", start_hold),
+            ("--stop", stop_hold),
+            ("--pause", pause_cmd),
+            ("--resume", resume_cmd),
+        ]
+        if val
+    ]
+    if len(mutually_exclusive) > 1:
+        raise click.UsageError(f"Use only one of {', '.join(mutually_exclusive)}.")
     stt = _stt_options(cleanup, verbatim, max_seconds)
     try:
+        if pause_cmd:
+            sys.exit(dictate.pause(stt))
+        if resume_cmd:
+            sys.exit(dictate.resume(stt))
         if start_hold:
             sys.exit(dictate.start_hold(stt))
         if stop_hold:
@@ -1652,7 +1696,16 @@ def _stt_modules():
     return install_module, manifest
 
 
+def _llm_modules():
+    """Imported inside the commands: `vocalize speak` must never pay for this."""
+    from .local import install as install_module
+    from .local import llm_manifest as manifest
+
+    return install_module, manifest
+
+
 _STT_INSTALL_HINT = "vocalize local install --stt"
+_LLM_INSTALL_HINT = "vocalize local install --llm"
 
 
 def _require_uv(uv: str | None) -> str:
@@ -1672,16 +1725,35 @@ def _require_uv(uv: str | None) -> str:
     help="Install the on-device speech-to-text runtime (whisper.cpp) instead of Kokoro.",
 )
 @click.option(
+    "--llm", is_flag=True,
+    help="Install the on-device language model for cleanup and summaries.",
+)
+@click.option(
+    "--force", is_flag=True,
+    help="Skip the RAM check (--llm only).",
+)
+@click.option(
     "--model", "model_name", default=None, metavar="NAME",
     help="Which speech-to-text model to install (--stt only; default: large-v3-turbo-q5_0).",
 )
-def local_install(yes, stt, model_name) -> None:
+def local_install(yes, stt, llm, force, model_name) -> None:
     """Download and verify a local runtime's model files, then warm it."""
+    if stt and llm:
+        raise click.ClickException("--stt and --llm are mutually exclusive")
     if stt:
+        if force:
+            raise click.ClickException("--force only applies together with --llm")
         _install_stt(yes, model_name)
+        return
+    if llm:
+        if model_name is not None:
+            raise click.ClickException("--model only applies together with --stt")
+        _install_llm(yes, force)
         return
     if model_name is not None:
         raise click.ClickException("--model only applies together with --stt")
+    if force:
+        raise click.ClickException("--force only applies together with --llm")
     _install_kokoro(yes)
 
 
@@ -1858,6 +1930,103 @@ def _install_stt(yes: bool, model_name: str | None) -> None:
     click.echo(f"Speech-to-text installed ({model}). Try: vocalize listen --check")
 
 
+def _install_llm(yes: bool, force: bool) -> None:
+    from . import local as local_module
+
+    install_module, manifest = _llm_modules()
+    uv = _require_uv(local_module.uv_path())
+
+    # RAM gate: refuse on machines below MIN_RAM_BYTES unless --force.
+    ram = local_module.physical_ram_bytes()
+    if ram is not None and ram < manifest.MIN_RAM_BYTES and not force:
+        measured = _human_readable_size(ram)
+        required = _human_readable_size(manifest.MIN_RAM_BYTES)
+        raise click.ClickException(
+            f"This machine has {measured} of RAM; the local language model "
+            f"needs at least {required}. Use --force to install anyway, or "
+            f'set [stt] cleanup = "claude-cli" or cleanup = "anthropic" to '
+            f"use a cloud backend instead."
+        )
+    if force and ram is not None:
+        click.echo(f"  --force: skipping RAM check ({_human_readable_size(ram)})")
+
+    ready, _ = install_module.installed(
+        manifest, install_hint=_LLM_INSTALL_HINT,
+    )
+    if ready:
+        click.echo("LLM is already installed. Re-warming the runtime...")
+        try:
+            install_module.selftest(uv, manifest=manifest)
+        except install_module.InstallError as exc:
+            raise click.ClickException(
+                f"The model files are installed, but the LLM runtime would not "
+                f"start: {exc}"
+            ) from exc
+        click.echo("LLM is ready.")
+        return
+
+    total = sum(entry["size"] for entry in manifest.FILES)
+    click.echo("The language model runs entirely on this machine — no text ever leaves it.")
+    click.echo("")
+    if total > 0:
+        click.echo(f"This will download {_human_readable_size(total)} of model files:")
+    else:
+        click.echo("This will download the model files:")
+    for entry in manifest.FILES:
+        size_str = f"  ({_human_readable_size(entry['size'])})" if entry["size"] > 0 else ""
+        click.echo(f"  {entry['name']}{size_str}")
+        click.echo(f"    {entry['url']}")
+    click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo("")
+    click.echo("It will also have uv fetch, into its own cache:")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo("")
+
+    if not yes and not click.confirm("Download and install now?", default=False):
+        click.echo("Aborted, nothing downloaded.")
+        sys.exit(1)
+
+    for entry in manifest.FILES:
+        if install_module.file_is_verified(entry, manifest=manifest):
+            click.echo(f"  {entry['name']}: already verified, skipping")
+            continue
+        click.echo(f"Downloading {entry['name']}...")
+        try:
+            install_module.download_file(
+                entry["url"],
+                manifest.MODEL_DIR / entry["name"],
+                entry["size"],
+                entry["sha256"],
+                progress=_download_progress(),
+            )
+        except install_module.InstallError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"  verified {entry['name']} (sha256 matches).")
+
+    # check_config runs BEFORE the stamp is written, so a poisoned
+    # download can never look "installed".
+    click.echo("Checking config files...")
+    try:
+        manifest.check_config(manifest.MODEL_DIR)
+    except (ValueError, TypeError) as exc:
+        raise click.ClickException(
+            f"The downloaded config files failed validation: {exc}"
+        ) from exc
+
+    install_module.write_stamp(manifest=manifest)
+
+    click.echo("Warming the runtime...")
+    try:
+        install_module.selftest(uv, manifest=manifest)
+    except install_module.InstallError as exc:
+        raise click.ClickException(
+            f"The model files are installed, but the LLM runtime would not "
+            f"start: {exc}"
+        ) from exc
+
+    click.echo('LLM installed. Set [stt] cleanup = "local" to use it.')
+
+
 def _download_progress():
     """Percentage every 10%. Plain lines, so a piped install stays readable."""
     state = {"last": -10}
@@ -1889,6 +2058,8 @@ def local_status() -> None:
     _status_kokoro(uv)
     click.echo("")
     _status_stt(uv)
+    click.echo("")
+    _status_llm(uv)
 
 
 def _status_kokoro(uv: str | None) -> None:
@@ -1977,17 +2148,65 @@ def _status_stt(uv: str | None) -> None:
         click.echo(f"STT: not ready — default model ({manifest.DEFAULT_MODEL}) {reason}")
 
 
+def _status_llm(uv: str | None) -> None:
+    install_module, manifest = _llm_modules()
+
+    click.echo("LLM (language model):")
+    click.echo(f"  Model directory: {manifest.MODEL_DIR}")
+
+    stamp = install_module.read_stamp(manifest=manifest)
+    recorded = install_module.stamp_files(stamp, manifest)
+    any_present = False
+    for entry in manifest.FILES:
+        path = manifest.MODEL_DIR / entry["name"]
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        any_present = True
+        seen = recorded.get(entry["name"]) or {}
+        verified = size == entry["size"] and (seen.get("sha256"), seen.get("size")) == (
+            entry["sha256"], entry["size"],
+        )
+        state = "verified" if verified else "present, not verified"
+        click.echo(f"  {entry['name']}: {state} ({_human_readable_size(size)})")
+    if not any_present:
+        click.echo("  no model files installed")
+
+    click.echo(f"  runtime: {manifest.RUNTIME_PACKAGE} via uv")
+
+    ready, reason = install_module.installed(
+        manifest, install_hint=_LLM_INSTALL_HINT,
+    )
+    if ready and uv:
+        click.echo("LLM: ready")
+    elif ready:
+        click.echo("LLM: not ready — uv is missing")
+    else:
+        click.echo(f"LLM: not ready — {reason}")
+
+
 @local.command("uninstall")
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
 @click.option(
     "--stt", is_flag=True,
     help="Remove the speech-to-text model files and recorder bundle.",
 )
-def local_uninstall(yes, stt) -> None:
+@click.option(
+    "--llm", is_flag=True,
+    help="Remove the language model files.",
+)
+def local_uninstall(yes, stt, llm) -> None:
     """Remove a local runtime's downloaded files."""
-    if not stt:
-        raise click.ClickException("Specify what to uninstall: --stt")
-    _uninstall_stt(yes)
+    if stt and llm:
+        raise click.ClickException("--stt and --llm are mutually exclusive")
+    if stt:
+        _uninstall_stt(yes)
+        return
+    if llm:
+        _uninstall_llm(yes)
+        return
+    raise click.ClickException("Specify what to uninstall: --stt or --llm")
 
 
 def _uninstall_stt(yes: bool) -> None:
@@ -2045,3 +2264,99 @@ def _uninstall_stt(yes: bool) -> None:
         click.echo(f"  removed {path}")
 
     click.echo("Speech-to-text uninstalled.")
+
+
+def _uninstall_llm(yes: bool) -> None:
+    _, manifest = _llm_modules()
+    from .local import install as install_module
+
+    model_dir = manifest.MODEL_DIR
+    stamp = install_module.stamp_path(manifest=manifest)
+
+    candidates = (model_dir, stamp)
+    targets = [
+        path for path in candidates
+        if (path.is_dir() or path.is_file()) and not path.is_symlink()
+    ]
+    symlinked = [path for path in candidates if path.is_symlink()]
+
+    if not targets and not symlinked:
+        click.echo("Nothing to remove.")
+        return
+
+    click.echo("This will remove:")
+    for path in targets:
+        click.echo(f"  {path}")
+    for path in symlinked:
+        click.echo(f"  {path} (a symlink — remove it yourself)")
+    click.echo("")
+
+    if not yes and not click.confirm("Remove now?", default=False):
+        click.echo("Aborted, nothing removed.")
+        sys.exit(1)
+
+    for path in targets:
+        try:
+            if not path.exists() and not path.is_symlink():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise click.ClickException(f"Could not remove {path}: {exc}") from exc
+        click.echo(f"  removed {path}")
+
+    click.echo("Language model uninstalled.")
+
+
+# --- `vocalize notes` (Phase 15, T-143) -----------------------------------
+
+
+@main.command(
+    "notes",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option(
+    "--template",
+    default=None,
+    help="Template to use (memo, meeting, lecture, journal, or path to .md).",
+)
+@click.option(
+    "--summarizer",
+    type=click.Choice(config.NOTES_SUMMARIZERS),
+    default=None,
+    help="Summarizer backend (local, claude-cli, anthropic, or off).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Re-process files even if already transcribed in notes folder.",
+)
+@click.option(
+    "--keep-audio",
+    is_flag=True,
+    default=None,
+    help="Save audio file in notes folder alongside note.",
+)
+@click.argument("sources", nargs=-1, required=False)
+@click.pass_context
+def notes(ctx, template, summarizer, force, keep_audio, sources) -> None:
+    """Transcribe audio or text files and generate structured notes."""
+    from . import notes as notes_module
+
+    all_sources = list(sources) + ctx.args
+    if not all_sources:
+        raise click.UsageError("Missing argument 'SOURCE...'.")
+
+    try:
+        notes_module.process_sources(
+            all_sources,
+            template=template,
+            summarizer=summarizer,
+            force=force,
+            keep_audio=keep_audio,
+        )
+    except notes_module.NotesError as exc:
+        raise click.ClickException(str(exc)) from exc
+

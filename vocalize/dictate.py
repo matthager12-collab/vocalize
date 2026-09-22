@@ -41,6 +41,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from array import array
@@ -66,9 +67,13 @@ _RECORDER_PROCESS_NAME = "recorder"
 
 _TAKE_NAME = "take.wav"
 _TRIMMED_NAME = "take.trimmed.wav"
+_JOINED_NAME = "take.joined.wav"
 _CUE_NAME = "cue"
 _STOP_NAME = "stop"
 _PID_NAME = "rec.pid"
+_PAUSED_NAME = "paused"
+_SEGMENT_START_NAME = "segment.start"
+_MAX_SEGMENTS = 20
 # Present only while the system microphone dialog is on screen, written by
 # the recorder itself.
 _PROMPT_NAME = "rec.prompt"
@@ -182,6 +187,7 @@ _NOTIFY_RECORDER_FAILED = "The recorder did not start. Run: vocalize listen --ch
 _NOTIFY_FAILED = "Dictation failed. Run: vocalize listen --check"
 _NOTIFY_CLIPBOARD_FAILED = "Could not copy the dictation to the clipboard."
 _NOTIFY_RESUME_FAILED = "Could not continue the interrupted read."
+_NOTIFY_MIC_CLOSED = "Microphone closed at the recording limit."
 
 _FIXED_NOTIFICATIONS = frozenset(
     {
@@ -195,6 +201,7 @@ _FIXED_NOTIFICATIONS = frozenset(
         _NOTIFY_FAILED,
         _NOTIFY_CLIPBOARD_FAILED,
         _NOTIFY_RESUME_FAILED,
+        _NOTIFY_MIC_CLOSED,
     }
 )
 
@@ -818,7 +825,9 @@ def _finish_claim(workdir: Path) -> str:
         age = time.time() - claim.stat().st_mtime
     except OSError:
         return "none"
-    if age > _FINISH_TIMEOUT:
+    take_dur = _wav_duration(workdir / _TAKE_NAME)
+    timeout = _STOP_TIMEOUT + _transcribe_timeout(take_dur) + llm.MAX_TIMEOUT
+    if age > timeout:
         return "dead"  # nothing has moved this claim on in a whole stage
     line = raw.splitlines()[0] if raw.splitlines() else ""
     number, _, name = line.partition(" ")
@@ -855,18 +864,17 @@ def _terminate(pid: int, deadline: float) -> None:
         time.sleep(_POLL_INTERVAL)
 
 
-def _wait_for_exit(pid: int, started: float, stt: dict) -> None:
+def _wait_for_exit(pid: int, started: float, stt: dict, workdir: Path | None = None) -> None:
     """Wait for the recorder to finish writing after a stop file was left.
 
     Bounded twice over, and by whichever comes first: a recorder that
     ignores its stop file is signalled `_STOP_TIMEOUT` after being asked,
     and one that outlived its own `--max` as soon as that plus
-    `_BACKSTOP_GRACE` has passed. Only the second existed before DEC-011,
-    which made it unreachable from a stop early in a recording: the wait
-    gave up at 20 s and left the microphone open for the rest of
-    `max_seconds`.
+    `_BACKSTOP_GRACE` has passed. Timed from this segment's own start,
+    not the take's, so a long take never backstops prematurely.
     """
-    backstop_in = (started + float(stt["max_seconds"]) + _BACKSTOP_GRACE) - time.time()
+    seg_start = _segment_start(workdir, started) if workdir is not None else started
+    backstop_in = (seg_start + float(stt["max_seconds"]) + _BACKSTOP_GRACE) - time.time()
     _terminate(pid, time.monotonic() + max(0.0, min(_STOP_TIMEOUT, backstop_in)))
 
 
@@ -978,7 +986,10 @@ def _take_is_usable(workdir: Path) -> bool:
     Tells "the recorder self-stopped at --max and tidied its PID file
     away" apart from "the recorder died before it recorded anything" —
     the second is a failure, the first is a dictation to transcribe.
+    Also returns True if segments are waiting to be joined.
     """
+    if any(p.is_file() for p in workdir.glob("take.*.wav") if p.name not in (_TRIMMED_NAME, _JOINED_NAME)):
+        return True
     try:
         with wave.open(str(workdir / _TAKE_NAME), "rb") as reader:
             return reader.getnframes() > 0
@@ -1078,11 +1089,13 @@ def transcribe(wav_path: Path, stt: dict) -> str:
     if not ready:
         raise DictationError(f"Speech-to-text model {model}: {reason}")
 
+    dur = _wav_duration(wav_path)
+    timeout = _transcribe_timeout(dur)
     try:
         result = subprocess.run(
             worker_argv(_uv_or_raise(), wav_path, stt),
             capture_output=True, text=True, check=False,
-            timeout=_TRANSCRIBE_TIMEOUT,
+            timeout=timeout,
             cwd=tempfile.gettempdir(),  # never the caller's project directory
         )
     except subprocess.TimeoutExpired as exc:
@@ -1143,6 +1156,7 @@ def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool]:
     be older than the first thing that can block, not than the transcription.
     """
     _trim_cue(workdir)  # before anything reads the take: the cue is not speech
+    _join_segments(workdir)
     take = workdir / _TAKE_NAME
     if _is_silent(take):
         return None, False
@@ -1247,7 +1261,7 @@ def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
     if cue and CUE_ORDER != "trim":
         _play(_SOUND_START, stt, only="word")
     try:
-        _launch_recorder(workdir, stt)
+        pid = _launch_recorder(workdir, stt)
     except DictationError:
         # Never a relaunch and never a retry: a revoked microphone would
         # turn the hotkey into a silent loop (design § Key flows).
@@ -1263,11 +1277,13 @@ def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
         return 1
+    _record_segment_start(workdir, time.time())
     if cue:
         _cue_the_open_microphone(workdir, stt)
     else:
         _wait_for_audio(workdir)  # "recording" means the microphone is open
     _write_session(workdir, "recording")
+    _spawn_self_stop_watcher(workdir, pid, int(stt.get("max_seconds", 120)), stt)
     return 0
 
 
@@ -1342,9 +1358,10 @@ def _second_press(stt: dict) -> int:
 
     pid = _recorder_pid(workdir)
     if pid is None:
-        if _take_is_usable(workdir):
+        if (workdir / _PAUSED_NAME).exists() or _take_is_usable(workdir):
             # The recorder reached --max, finalised the WAV and took its
-            # PID file with it. That is a finished dictation, not a death.
+            # PID file with it, or a pause is waiting to finish. That is a
+            # finished dictation, not a death.
             return _after_stop(_stop(workdir, None, started, stt), started, stt)
         if time.time() - started < _START_GRACE:
             return _cancel(workdir, None, started, stt)
@@ -1463,7 +1480,7 @@ def _cancel(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
         else:
             _stop_file(workdir)
             if pid is not None:
-                _wait_for_exit(pid, started, stt)
+                _wait_for_exit(pid, _segment_start(workdir, started), stt)
     finally:
         _discard(workdir)
     _play(_SOUND_STOP, stt)
@@ -1476,7 +1493,7 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
     try:
         _stop_file(workdir)
         if pid is not None:
-            _wait_for_exit(pid, started, stt)
+            _wait_for_exit(pid, _segment_start(workdir, started), stt)
         _refresh_claim(workdir)  # the recorder wait is over; the Pop can block
         _play(_SOUND_STOP, stt)
         _refresh_claim(workdir)  # the playback lock is behind us too
@@ -1530,6 +1547,238 @@ def cancel(stt: dict) -> int:
         _notify(_NOTIFY_CANCELLED)
         return 0
     return _cancel(workdir, _recorder_pid(workdir), started, stt)
+
+
+# --- pause and resume (DEC-037, Phase 15b) ----------------------------
+
+
+def _wav_duration(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as reader:
+            frames = reader.getnframes()
+            rate = reader.getframerate()
+            if rate > 0:
+                return frames / float(rate)
+    except (OSError, wave.Error, EOFError):
+        pass
+    return 0.0
+
+
+def _transcribe_timeout(take_seconds: float) -> int:
+    """Scale transcription timeout with take duration (max(300, take_seconds * 2))."""
+    return max(_TRANSCRIBE_TIMEOUT, int(take_seconds * 2.0))
+
+
+def _record_segment_start(workdir: Path, timestamp: float) -> None:
+    try:
+        audio.ensure_private_dir(workdir)
+        path = workdir / _SEGMENT_START_NAME
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{timestamp}\n")
+    except OSError:
+        pass
+
+
+def _segment_start(workdir: Path | None, started: float) -> float:
+    if workdir is None:
+        return started
+    path = workdir / _SEGMENT_START_NAME
+    try:
+        val = float(path.read_text(encoding="utf-8").strip())
+        if math.isfinite(val) and val > 0:
+            return val
+    except (OSError, ValueError):
+        pass
+    return started
+
+
+def _read_paused_marker(workdir: Path) -> tuple[float, float] | None:
+    path = workdir / _PAUSED_NAME
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            epoch = float(data.get("epoch", -1))
+            cum = float(data.get("cumulative", -1))
+            if math.isfinite(epoch) and epoch >= 0 and math.isfinite(cum) and cum >= 0:
+                return epoch, cum
+    except (ValueError, TypeError, KeyError):
+        pass
+    try:
+        parts = raw.split()
+        if len(parts) >= 2:
+            epoch = float(parts[0])
+            cum = float(parts[1])
+            if math.isfinite(epoch) and epoch >= 0 and math.isfinite(cum) and cum >= 0:
+                return epoch, cum
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _write_paused_marker(workdir: Path, epoch: float, cumulative: float) -> None:
+    audio.ensure_private_dir(workdir)
+    path = workdir / _PAUSED_NAME
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"epoch": epoch, "cumulative": cumulative}, handle)
+
+
+def _spawn_self_stop_watcher(workdir: Path, pid: int, max_seconds: int, stt: dict) -> None:
+    def _watch():
+        end_time = time.monotonic() + max_seconds
+        while time.monotonic() < end_time:
+            time.sleep(0.02)
+            if (workdir / _STOP_NAME).exists() or (workdir / _PAUSED_NAME).exists() or not _session_owns(workdir):
+                return
+        # Wait up to 3s for recorder to exit or remove rec.pid
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not _is_recorder(pid) or not (workdir / _PID_NAME).exists():
+                break
+            time.sleep(0.02)
+        if (workdir / _STOP_NAME).exists() or (workdir / _PAUSED_NAME).exists() or not _session_owns(workdir):
+            return
+        if _take_is_usable(workdir):
+            _play(_SOUND_STOP, stt)
+            _notify(_NOTIFY_MIC_CLOSED)
+
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+
+
+def _join_segments(workdir: Path) -> None:
+    """Join all take.NNN.wav segments and live take.wav losslessly with 0.25s silence."""
+    segments = [p for p in workdir.glob("take.*.wav") if p.name not in (_TRIMMED_NAME, _JOINED_NAME)]
+    if not segments:
+        return
+
+    def _num(p: Path) -> int:
+        try:
+            return int(p.stem.split(".")[1])
+        except (IndexError, ValueError):
+            return 999
+
+    segments.sort(key=_num)
+    take = workdir / _TAKE_NAME
+    all_wavs = list(segments)
+    if take.exists() and _wav_duration(take) > 0:
+        all_wavs.append(take)
+    if not all_wavs:
+        return
+
+    with wave.open(str(all_wavs[0]), "rb") as r:
+        first_params = r.getparams()
+    assert (first_params.nchannels, first_params.sampwidth, first_params.framerate) == (1, 2, 16000)
+
+    joined_path = workdir / _JOINED_NAME
+    silence_frames = int(0.25 * first_params.framerate)
+    silence_bytes = b"\x00" * (silence_frames * first_params.nchannels * first_params.sampwidth)
+
+    with wave.open(str(joined_path), "wb") as writer:
+        writer.setparams(first_params)
+        for i, wav_path in enumerate(all_wavs):
+            if i > 0:
+                writer.writeframes(silence_bytes)
+            with wave.open(str(wav_path), "rb") as reader:
+                assert (reader.getnchannels(), reader.getsampwidth(), reader.getframerate()) == (
+                    first_params.nchannels, first_params.sampwidth, first_params.framerate
+                )
+                writer.writeframes(reader.readframes(reader.getnframes()))
+
+    os.replace(joined_path, take)
+    for seg in segments:
+        seg.unlink(missing_ok=True)
+
+
+def pause(stt: dict) -> int:
+    """`vocalize dictate --pause`: finalize current segment and mark paused."""
+    session = _read_session()
+    if session is None:
+        return 0
+    workdir, started = session
+    if _finish_claim(workdir) == "live":
+        return 0
+    if (workdir / _PAUSED_NAME).exists():
+        return 0
+    pid = _recorder_pid(workdir)
+    seg_start = _segment_start(workdir, started)
+    _stop_file(workdir)
+    if pid is not None:
+        _wait_for_exit(pid, seg_start, stt, workdir=workdir)
+    if CUE_ORDER == "trim":
+        _trim_cue(workdir)
+    (workdir / _CUE_NAME).unlink(missing_ok=True)
+    (workdir / _STOP_NAME).unlink(missing_ok=True)
+    (workdir / _PID_NAME).unlink(missing_ok=True)
+    take = workdir / _TAKE_NAME
+    if not take.exists():
+        return 0
+    seg_duration = _wav_duration(take)
+    existing = sorted([p for p in workdir.glob("take.*.wav") if p.name not in (_TRIMMED_NAME, _JOINED_NAME)])
+    idx = len(existing) + 1
+    target = workdir / f"take.{idx:03d}.wav"
+    os.replace(take, target)
+
+    marker = _read_paused_marker(workdir)
+    prior_cum = marker[1] if marker is not None else 0.0
+    total_cum = prior_cum + seg_duration
+    _write_paused_marker(workdir, time.time(), total_cum)
+    _play(_SOUND_STOP, stt)
+    return 0
+
+
+def resume(stt: dict) -> int:
+    """`vocalize dictate --resume`: continue recording into a new segment."""
+    session = _read_session()
+    if session is None:
+        return 0
+    workdir, _started = session
+    if _finish_claim(workdir) == "live":
+        return 0
+    marker = _read_paused_marker(workdir)
+    if marker is None:
+        return 0
+    _epoch, cumulative_seconds = marker
+
+    existing = [p for p in workdir.glob("take.*.wav") if p.name not in (_TRIMMED_NAME, _JOINED_NAME)]
+    if len(existing) >= _MAX_SEGMENTS:
+        _play(_SOUND_STOP, stt)
+        return 1
+
+    max_take_seconds = float(stt.get("max_take_seconds", 1800))
+    remaining = max_take_seconds - cumulative_seconds
+    if remaining <= 0:
+        _play(_SOUND_STOP, stt)
+        return 1
+
+    max_seconds = float(stt.get("max_seconds", 120))
+    seg_max = max(1, min(int(max_seconds), int(remaining)))
+
+    stt_seg = dict(stt)
+    stt_seg["max_seconds"] = seg_max
+
+    _record_segment_start(workdir, time.time())
+    try:
+        pid = _launch_recorder(workdir, stt_seg)
+    except DictationError:
+        _play(_SOUND_STOP, stt)
+        _notify(_NOTIFY_RECORDER_FAILED)
+        return 1
+
+    t0 = _wait_for_audio(workdir)
+    _play(_SOUND_START, stt)
+    if t0 is not None:
+        _write_cue(workdir, time.monotonic() - t0)
+
+    (workdir / _PAUSED_NAME).unlink(missing_ok=True)
+    _write_session(workdir, "recording")
+    _spawn_self_stop_watcher(workdir, pid, seg_max, stt)
+    return 0
 
 
 # --- the terminal primitive -------------------------------------------

@@ -224,13 +224,67 @@ def test_off_makes_no_call_and_prints_nothing(claude, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_local_is_refused_until_the_model_ships(claude, capsys):
+def test_local_skips_when_not_installed(claude, capsys, monkeypatch):
+    from vocalize.local import install as install_module
+
     fake = claude()
+    monkeypatch.setattr(
+        install_module, "installed",
+        lambda manifest, **kw: (False, "not installed"),
+    )
 
     assert llm.cleanup_transcript(TRANSCRIPT, "local") == (TRANSCRIPT, False)
     assert not fake.argv.exists()
     err = capsys.readouterr().err
-    assert "0.14.0" in err and "sent to" not in err
+    assert "not installed" in err and "sent to" not in err
+
+
+def test_local_runs_offline_with_request_on_stdin(monkeypatch, capsys):
+    """The fake-uv test: --offline in argv, request on stdin, offline env
+    vars, transcript never in argv."""
+    from vocalize.local import install as install_module
+
+    monkeypatch.setattr(
+        install_module, "installed",
+        lambda manifest, **kw: (True, ""),
+    )
+
+    recorded = {}
+
+    def fake_run(argv, *, input=None, **kwargs):
+        recorded["argv"] = argv
+        recorded["input"] = input
+        recorded["env"] = kwargs.get("env", {})
+        import subprocess
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"ok": true, "text": "Cleaned."}', stderr="",
+        )
+
+    monkeypatch.setattr(llm, "LOCAL_RUN_SEAM", fake_run)
+
+    text, cleaned = llm.cleanup_transcript(TRANSCRIPT, "local")
+    assert cleaned is True
+    assert text == "Cleaned."
+
+    # --offline must be in the argv
+    assert "--offline" in recorded["argv"]
+
+    # Transcript must never appear in argv
+    for arg in recorded["argv"]:
+        assert TRANSCRIPT not in arg
+
+    # Request must be on stdin as JSON
+    import json
+    req = json.loads(recorded["input"])
+    assert req["text"] == TRANSCRIPT
+
+    # Offline env vars must be set
+    assert recorded["env"].get("HF_HUB_OFFLINE") == "1"
+    assert recorded["env"].get("TRANSFORMERS_OFFLINE") == "1"
+
+    # No egress line (nothing left the machine)
+    err = capsys.readouterr().err
+    assert "sent to" not in err
 
 
 # --- the spoken keyword (issue #3) -------------------------------------------

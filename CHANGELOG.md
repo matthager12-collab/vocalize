@@ -3,9 +3,35 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.14.0 - 2026-09-22
 
 ### Added
+
+- **Dictation pause and resume (`vocalize dictate --pause` and `--resume`).**
+  Pause a dictation take cleanly without losing audio. Each segment is saved as
+  `take.NNN.wav` under the private temporary directory. When resuming, a fresh
+  recorder is launched with the remaining budget up to `[stt] max_take_seconds`
+  (default 1800, bounded 60–7200) across at most 20 segments. Upon completion,
+  segments are joined losslessly with 0.25 s of silence at each seam. With
+  `[app] stop_hotkey = "pause"`, the stop shortcut pauses live dictation or
+  resumes a paused take before playback.
+
+- **`vocalize notes` command.** Transcribes audio recordings or text files and
+  generates structured markdown notes with timestamps, YAML frontmatter, and
+  summaries (`--summarizer local | claude-cli | anthropic | off`). The notes
+  folder (`~/Documents/Vocalize Notes`) acts as the ledger — previously processed
+  files are skipped by name (unless `--force`). Built-in templates: `memo`,
+  `meeting`, `lecture`, `journal` (or a custom `.md` path capped at 64 KB). Notes
+  are written `0600` with `trust: "untrusted-transcript"` in frontmatter.
+
+- **On-device transcript cleanup (`cleanup = "local"`).** A local language
+  model (Qwen 3.5 4B, 4-bit MLX) cleans up dictation transcripts entirely
+  on the Mac — no transcript ever leaves the machine. Install with
+  `vocalize local install --llm` (requires 12 GB RAM, overridable with
+  `--force`). Bare `--cleanup` now prefers the local model when installed.
+  `vocalize local status` shows installation state; `vocalize local
+  uninstall --llm` removes it. (DEC-027: no downloaded chat template is
+  ever evaluated — the worker builds token ids from a hardcoded constant.)
 
 - **`vocalize pause`** pauses live playback and saves your place for up to an
   hour under `~/.cache/vocalize/interrupted.*` (0600 mode), continuing where you

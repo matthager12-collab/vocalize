@@ -66,6 +66,7 @@ KNOWN_STT_KEYS = (
     "cues",
     "beam_size",
     "verbatim",
+    "max_take_seconds",
 )
 
 # Where a dictation's cleanup pass runs. `off` is the default: a press must
@@ -94,12 +95,17 @@ STT_DEFAULTS = {
     "sounds": True,
     "cues": "sounds",
     "beam_size": 5,
+    "max_take_seconds": 1800,
 }
 
 # The recorder self-stops at max_seconds and `dictate` backstops it, so this
 # is a real resource bound, not a cosmetic one.
 STT_MAX_SECONDS_MIN = 1
 STT_MAX_SECONDS_MAX = 600
+
+# `max_take_seconds` caps the entire paused-and-resumed take (DEC-037).
+STT_MAX_TAKE_SECONDS_MIN = 60
+STT_MAX_TAKE_SECONDS_MAX = 7200
 
 # `beam_size` becomes the worker's `--beam-size`: 1 is whisper.cpp's greedy
 # decoder (0.10.x behaviour), 5 is whisper.cpp's own beam default and the
@@ -353,6 +359,17 @@ def _validate_stt_table(value, path: Path) -> None:
         raise ConfigError(
             f"Invalid stt.max_seconds {seconds!r} in {path}: expected an integer "
             f"between {STT_MAX_SECONDS_MIN} and {STT_MAX_SECONDS_MAX}."
+        )
+
+    take_seconds = value.get("max_take_seconds")
+    if take_seconds is not None and (
+        isinstance(take_seconds, bool)
+        or not isinstance(take_seconds, int)
+        or not STT_MAX_TAKE_SECONDS_MIN <= take_seconds <= STT_MAX_TAKE_SECONDS_MAX
+    ):
+        raise ConfigError(
+            f"Invalid stt.max_take_seconds {take_seconds!r} in {path}: expected an integer "
+            f"between {STT_MAX_TAKE_SECONDS_MIN} and {STT_MAX_TAKE_SECONDS_MAX}."
         )
 
     beams = value.get("beam_size")

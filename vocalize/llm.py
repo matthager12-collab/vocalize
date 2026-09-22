@@ -88,7 +88,7 @@ _CLAUDE_FLAGS = (
 # never sees it.
 _STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
 
-LOCAL_ARRIVES = 'local model support arrives in 0.14.0 — set [stt] cleanup = "claude-cli"'
+LOCAL_NOT_INSTALLED = 'local model not installed — run: vocalize local install --llm'
 
 # The one seam the tests swap for the claude-cli backend.
 RUN_SEAM = subprocess.run
@@ -205,8 +205,20 @@ def _complete(system: str, text: str, *, feature: str, backend: str) -> str | No
             feature, lambda: _anthropic(key, system, text, timeout, max_tokens, feature)
         )
 
-    _skipped(feature, LOCAL_ARRIVES)
-    return None
+    # --- local: the on-device model, no egress ---------------------------
+    from .local import install as install_module
+    from .local import llm_manifest
+
+    ready, _reason = install_module.installed(
+        llm_manifest, install_hint="vocalize local install --llm",
+    )
+    if not ready:
+        _skipped(feature, LOCAL_NOT_INSTALLED)
+        return None
+    # No egress() call: local means nothing left the machine.
+    return _guarded(
+        feature, lambda: _local(system, text, timeout, max_tokens)
+    )
 
 
 # --- claude -p -----------------------------------------------------------
@@ -313,3 +325,57 @@ def validate_anthropic_key(key: str) -> None:
     if status in (401, 403):
         raise ProviderAuthError("anthropic", "the API refused this key")
     raise ProviderTransientError("anthropic", f"HTTP {status} while checking the key")
+
+
+# --- the local model ----------------------------------------------------
+
+
+# The seam the tests swap for the local backend.
+LOCAL_RUN_SEAM = subprocess.run
+
+
+def _local(system: str, text: str, timeout: float, max_tokens: int) -> str | None:
+    """Run the on-device LLM via ``uv run --offline``.
+
+    The request goes on stdin as JSON; the transcript never appears in
+    argv.  The environment carries the offline flags the spike confirmed.
+    """
+    from . import local as local_module
+    from .local import llm_manifest
+
+    uv = local_module.uv_path()
+    if not uv:
+        return None
+
+    argv = [uv, *llm_manifest.runtime_argv()]
+    request = json.dumps({
+        "system": system,
+        "text": text,
+        "max_tokens": max_tokens,
+    })
+
+    env = dict(os.environ)
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+
+    try:
+        result = LOCAL_RUN_SEAM(
+            argv, input=request, capture_output=True, text=True,
+            timeout=timeout, env=env, check=False,
+            cwd=tempfile.gettempdir(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        reply = json.loads(result.stdout)
+    except ValueError:
+        return None
+
+    if not reply.get("ok"):
+        return None
+
+    return (reply.get("text") or "").strip() or None

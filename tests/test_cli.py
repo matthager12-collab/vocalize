@@ -2197,6 +2197,80 @@ def test_stop_hotkey_pause_never_resumes_while_a_dictation_is_live(monkeypatch, 
     assert interrupted.load() is not None
 
 
+def test_stop_pauses_a_live_recording_before_playback(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    session_file = cache / "dictate.session"
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    session_file.write_text(json.dumps({"dir": str(workdir), "started": time.time(), "state": "recording"}), encoding="utf-8")
+    monkeypatch.setattr(dictate, "session_path", lambda: session_file)
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"app": {"stop_hotkey": "pause"}})
+
+    paused = False
+
+    def fake_pause(stt):
+        nonlocal paused
+        paused = True
+        return 0
+
+    monkeypatch.setattr(dictate, "pause", fake_pause)
+
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert paused
+
+
+def test_stop_resumes_a_paused_recording(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    session_file = cache / "dictate.session"
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "paused").touch()
+    session_file.write_text(json.dumps({"dir": str(workdir), "started": time.time(), "state": "recording"}), encoding="utf-8")
+    monkeypatch.setattr(dictate, "session_path", lambda: session_file)
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"app": {"stop_hotkey": "pause"}})
+
+    resumed = False
+
+    def fake_resume(stt):
+        nonlocal resumed
+        resumed = True
+        return 0
+
+    monkeypatch.setattr(dictate, "resume", fake_resume)
+
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert resumed
+
+
+def test_unknown_session_state_falls_through_to_playback(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    session_file = cache / "dictate.session"
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    session_file.write_text(json.dumps({"dir": str(workdir), "started": time.time(), "state": "weird_unknown_state"}), encoding="utf-8")
+    monkeypatch.setattr(dictate, "session_path", lambda: session_file)
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"app": {"stop_hotkey": "pause"}})
+
+    stopped = False
+
+    def fake_stop(*, remember=False):
+        nonlocal stopped
+        stopped = True
+        return False
+
+    monkeypatch.setattr(cli_module, "stop_playback", fake_stop)
+
+    result = CliRunner().invoke(main, ["stop"])
+    assert result.exit_code == 0
+    assert stopped
+    assert "Nothing is playing." in result.output
+
+
 def test_settings_prints_stop_hotkey(monkeypatch):
     monkeypatch.setattr(cli_module, "load_config_file", dict)
     res1 = CliRunner().invoke(main, ["settings"])

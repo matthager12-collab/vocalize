@@ -49,7 +49,11 @@ def _isolate_config(monkeypatch, tmp_path):
 
 def test_say_row_is_always_ok():
     rows = readiness({"chain": ["say"]})
-    assert rows == [Row("say", "ok", "local, no credentials needed", "")]
+    say = [r for r in rows if r.name == "say"]
+    assert say == [Row("say", "ok", "local, no credentials needed", "")]
+    # The llm model row is now always present.
+    llm = [r for r in rows if r.name == "llm model"]
+    assert len(llm) == 1
 
 
 def test_missing_key_yields_fail_row(monkeypatch, fake_keychain):
@@ -248,10 +252,10 @@ def test_stale_provider_dropped_when_chain_changes(monkeypatch, fake_keychain):
     """
     monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
     rows = readiness({"chain": ["elevenlabs"]})
-    assert [row.name for row in rows] == ["elevenlabs"]
+    assert [row.name for row in rows if row.name != "llm model"] == ["elevenlabs"]
 
     rows = readiness({"chain": ["say"]})
-    assert [row.name for row in rows] == ["say"]
+    assert [row.name for row in rows if row.name != "llm model"] == ["say"]
 
 
 def test_stale_pruning_leaves_non_provider_names_alone():
@@ -285,6 +289,15 @@ def test_status_json_has_row_shape(monkeypatch, tmp_path, fake_keychain):
     # which is a warn row on a machine with no model and would exit 1.
     monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
+    # The LLM row is always present; mark it installed so exit code is 0.
+    from vocalize.local import install as install_module
+    _original = install_module.installed
+    def _fake_installed(manifest, **kw):
+        from vocalize.local import llm_manifest
+        if manifest is llm_manifest:
+            return (True, "")
+        return _original(manifest, **kw)
+    monkeypatch.setattr(install_module, "installed", _fake_installed)
     runner = CliRunner()
     result = runner.invoke(main, ["status", "--json"])
     assert result.exit_code == 0, result.output
@@ -314,6 +327,15 @@ def test_status_exit_code_zero_when_all_ok(monkeypatch, tmp_path, fake_keychain)
     _isolate_config(monkeypatch, tmp_path)
     monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")  # an all-ok chain, named
     monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
+    # The LLM row is always present; mark it installed so exit code is 0.
+    from vocalize.local import install as install_module
+    _original = install_module.installed
+    def _fake_installed(manifest, **kw):
+        from vocalize.local import llm_manifest
+        if manifest is llm_manifest:
+            return (True, "")
+        return _original(manifest, **kw)
+    monkeypatch.setattr(install_module, "installed", _fake_installed)
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
@@ -335,6 +357,32 @@ def test_status_plain_output_names_each_provider(monkeypatch, tmp_path, fake_key
     result = runner.invoke(main, ["status"])
     assert "elevenlabs" in result.output
     assert "say" in result.output
+
+
+def test_llm_model_row_when_installed(monkeypatch):
+    from vocalize.local import install as install_module
+    from vocalize.local import llm_manifest
+    _original = install_module.installed
+    def _fake_installed(manifest, **kw):
+        if manifest is llm_manifest:
+            return (True, "")
+        return _original(manifest, **kw)
+    monkeypatch.setattr(install_module, "installed", _fake_installed)
+    row = _row(readiness({"chain": ["say"]}), "llm model")
+    assert row.state == "ok"
+    assert row.detail == "installed and ready"
+
+
+def test_llm_model_row_ram_gate_names_measured_and_required(monkeypatch):
+    from vocalize import local as local_module
+    from vocalize.local import install as install_module
+    monkeypatch.setattr(install_module, "installed", lambda m, **kw: (False, "not installed"))
+    monkeypatch.setattr(local_module, "physical_ram_bytes", lambda: 8 * 1024**3)
+    row = _row(readiness({"chain": ["say"]}), "llm model")
+    assert row.state == "warn"
+    assert "8.0 GB RAM, needs 12.0 GB" in row.detail
+    assert "claude-cli or anthropic instead" in row.detail
+
 
 
 # --- the dictation rows (T-45) ----------------------------------------
@@ -372,14 +420,14 @@ def _row(rows, name):
 def test_stt_rows_are_absent_on_a_machine_that_never_opted_in():
     rows = readiness({"chain": ["say"]})
 
-    assert [row.name for row in rows] == ["say"]
+    assert [row.name for row in rows if row.name != "llm model"] == ["say"]
 
 
 def test_stt_rows_appear_once_dictation_is_set_up(stt_machine):
     rows = readiness({"chain": ["say"]})
 
-    assert [row.name for row in rows][1:] == list(readiness_module.STT_ROW_NAMES)
-    assert all(row.state == "ok" for row in rows)
+    assert [row.name for row in rows if row.name not in ("say", "llm model")] == list(readiness_module.STT_ROW_NAMES)
+    assert all(row.state == "ok" for row in rows if row.name != "llm model")
 
 
 def test_stt_rows_appear_from_the_config_table_alone(monkeypatch):
@@ -399,7 +447,7 @@ def test_stt_rows_disappear_again_when_the_table_is_removed(stt_machine, monkeyp
 
     rows = readiness({"chain": ["say"]})
 
-    assert [row.name for row in rows] == ["say"]
+    assert [row.name for row in rows if row.name != "llm model"] == ["say"]
 
 
 def test_the_stt_model_row_names_what_is_on_disk(stt_machine):

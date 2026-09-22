@@ -594,7 +594,7 @@ cues = "sounds"        # "sounds" | "words" | "both" — speak "Start."/"Stopped
 | `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` |
 | `language` | a whisper.cpp language code (`en`, `es`, `fr`, …); an `.en` model must stay `en` | `en` |
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable, can't start with `-` | `""` |
-| `cleanup` | `off`, `local` (0.13), `claude-cli`, `anthropic`; an old `true`/`false` reads as `claude-cli`/`off` | `off` |
+| `cleanup` | `off`, `local`, `claude-cli`, `anthropic`; an old `true`/`false` reads as `claude-cli`/`off` | `off` |
 | `verbatim` | `true` / `false` — keep every word even when cleanup is on | `false` |
 | `beam_size` | integer, 1–8 | `5` |
 | `paste` | `true` / `false` — paste into the app you dictated in, after copying (see docs/dictation.md § Auto-paste) | `false` |
@@ -723,11 +723,33 @@ and only when you turn on `--cleanup`: it's sent to `claude -p` with every
 tool denied, purely to fix punctuation and casing. The audio itself is
 never sent anywhere.
 
-`--cleanup` has one consequence worth knowing before you turn it on:
-Claude Code logs the prompt and stdin of every print-mode run, so the
-transcript is written in plaintext to `~/.claude/projects/…`. vocalize
-cannot suppress that. It is off by default. Full accounting in
+With `cleanup = "local"` (`vocalize local install --llm`), the transcript
+stays on the machine: a local language model does the cleanup, and nothing
+is sent to any API.
+
+`--cleanup` with `claude-cli` or `anthropic` has one consequence worth
+knowing before you turn it on: Claude Code logs the prompt and stdin of
+every print-mode run, so the transcript is written in plaintext to
+`~/.claude/projects/…`. vocalize cannot suppress that. It is off by
+default. Full accounting in
 [docs/dictation.md](docs/dictation.md#privacy).
+
+## Notes (transcribe and summarize)
+
+`vocalize notes` transcribes audio recordings or text transcripts and generates structured markdown notes with timestamps and summaries:
+
+```bash
+vocalize notes recording.m4a
+vocalize notes *.mp3 --template meeting
+vocalize notes memo.txt --summarizer local
+```
+
+- **Built-in templates:** `memo` (default), `meeting`, `lecture`, `journal` (or custom `--template /path/to/prompt.md`).
+- **Summarizers:** `local` (on-device Qwen 3.5 4B), `claude-cli`, `anthropic`, or `off` (transcript only).
+- **Ledger:** The notes folder (`~/Documents/Vocalize Notes`) is the ledger — previously processed files are skipped unless `--force`.
+- **Security:** Notes are written `0600` with `trust: "untrusted-transcript"` in frontmatter.
+
+See [docs/notes.md](docs/notes.md) for full documentation.
 
 ## macOS Quick Actions (highlight → speak)
 
