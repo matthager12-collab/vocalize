@@ -775,3 +775,77 @@ def test_bootstrap_does_not_retry_a_success(monkeypatch):
 
     assert app_module.bootstrap().returncode == 0
     assert len(calls) == 1
+
+
+def test_key_equivalent_to_chord():
+    from vocalize.app import key_equivalent_to_chord
+
+    assert key_equivalent_to_chord("@~^d") == "ctrl+alt+cmd+d"
+    assert key_equivalent_to_chord("@~^x") == "ctrl+alt+cmd+x"
+    assert key_equivalent_to_chord("~^s") == "ctrl+alt+s"
+    assert key_equivalent_to_chord("@$p") == "cmd+shift+p"
+    assert key_equivalent_to_chord("") == ""
+
+
+def test_read_services_shortcuts_parses_pbs(monkeypatch):
+    data = {
+        "NSServicesStatus": {
+            "cards.arda.vocalize.dictate - Dictate with Vocalize - runWorkflowAsService": {
+                "key_equivalent": "@~^d"
+            },
+            "cards.arda.vocalize.stop - Stop Vocalize - runWorkflowAsService": {
+                "key_equivalent": "@~^x"
+            },
+            "cards.arda.vocalize.speak - Speak with Vocalize - runWorkflowAsService": {
+                "key_equivalent": "@~^v"
+            },
+            "other.service - Some Service - run": {
+                "enabled_context_menu": False
+            },
+        }
+    }
+    raw = plistlib.dumps(data)
+    monkeypatch.setattr(
+        app_module.subprocess,
+        "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout=raw, stderr=b""),
+    )
+
+    shortcuts = app_module.read_services_shortcuts()
+    assert shortcuts == {
+        "cards.arda.vocalize.dictate": "ctrl+alt+cmd+d",
+        "cards.arda.vocalize.stop": "ctrl+alt+cmd+x",
+        "cards.arda.vocalize.speak": "ctrl+alt+cmd+v",
+    }
+
+
+def test_services_shortcut_conflicts_flags_colliding_chords(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "read_services_shortcuts",
+        lambda: {
+            "cards.arda.vocalize.dictate": "ctrl+alt+cmd+d",
+            "cards.arda.vocalize.stop": "ctrl+alt+cmd+x",
+        },
+    )
+
+    conflicts = app_module.services_shortcut_conflicts()
+    assert conflicts == [
+        ("cards.arda.vocalize.dictate", "Dictate with Vocalize", "ctrl+alt+cmd+d"),
+        ("cards.arda.vocalize.stop", "Stop Vocalize", "ctrl+alt+cmd+x"),
+    ]
+
+
+def test_services_shortcut_conflicts_empty_when_no_collision(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "read_services_shortcuts",
+        lambda: {
+            "cards.arda.vocalize.dictate": "ctrl+alt+cmd+k",
+            "cards.arda.vocalize.speak": "ctrl+alt+cmd+v",
+        },
+    )
+
+    conflicts = app_module.services_shortcut_conflicts()
+    assert conflicts == []
+

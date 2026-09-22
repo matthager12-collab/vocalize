@@ -805,7 +805,7 @@ def test_hostile_app_status_word_never_reaches_a_row_detail_unchanged(monkeypatc
 
 _DOCTOR_ONLY_NAMES = (
     "cli path", "uv", "swiftc", "claude", "shebang", "hammerspoon",
-    "cli start-up", "app bundle", "notes folder",
+    "services shortcut", "cli start-up", "app bundle", "notes folder",
 )
 
 
@@ -1053,6 +1053,25 @@ def test_hammerspoon_row_warns_when_running(monkeypatch):
 def test_hammerspoon_row_ok_when_not_running(monkeypatch):
     monkeypatch.setattr(app_module, "hammerspoon_running", lambda: False)
     assert readiness_module._hammerspoon_row() == Row("hammerspoon", "ok", "not running", "")
+
+
+def test_services_shortcut_row_ok_when_no_conflicts(monkeypatch):
+    monkeypatch.setattr(app_module, "services_shortcut_conflicts", lambda cfg: [])
+    row = readiness_module._services_shortcut_row({})
+    assert row == Row("services shortcut", "ok", "none assigned", "")
+
+
+def test_services_shortcut_row_warns_when_conflicts_exist(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "services_shortcut_conflicts",
+        lambda cfg: [("cards.arda.vocalize.dictate", "Dictate with Vocalize", "ctrl+alt+cmd+d")],
+    )
+    row = readiness_module._services_shortcut_row({})
+    assert row.state == "warn"
+    assert "Dictate with Vocalize" in row.detail
+    assert "ctrl+alt+cmd+d" in row.detail
+    assert "System Settings" in row.action
 
 
 def test_no_doctor_row_warns_about_a_quick_action_integrate_installs(

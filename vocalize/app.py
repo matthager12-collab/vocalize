@@ -404,3 +404,95 @@ def override_command(path: Path) -> str:
     """The one line that points the app at a vocalize it cannot find,
     quoted for the shell it will be pasted into."""
     return f"defaults write {LABEL} {BINARY_OVERRIDE_KEY} {shlex.quote(str(path))}"
+
+
+# --- services shortcuts detection (Issue #10) -------------------------
+
+_SERVICES_NAMES = {
+    "cards.arda.vocalize.dictate": "Dictate with Vocalize",
+    "cards.arda.vocalize.stop": "Stop Vocalize",
+}
+
+
+def key_equivalent_to_chord(equiv: str) -> str:
+    """Convert Cocoa key_equivalent (e.g. '@~^d') into a canonical chord string ('ctrl+alt+cmd+d')."""
+    mods = set()
+    key = ""
+    for ch in equiv:
+        if ch == "@":
+            mods.add("cmd")
+        elif ch == "~":
+            mods.add("alt")
+        elif ch == "^":
+            mods.add("ctrl")
+        elif ch == "$":
+            mods.add("shift")
+        else:
+            key = ch.lower()
+    ordered = [m for m in ("ctrl", "alt", "cmd", "shift") if m in mods]
+    return "+".join((*ordered, key)) if key else ""
+
+
+def read_services_shortcuts() -> dict[str, str]:
+    """Read assigned keyboard shortcuts from macOS pbs table for vocalize services.
+
+    Read-only; never writes the `pbs` domain. Returns {service_id: canonical_chord}.
+    """
+    try:
+        res = subprocess.run(
+            [DEFAULTS, "export", "pbs", "-"],
+            check=False,
+            capture_output=True,
+            timeout=2.0,
+        )
+        if res is None or res.returncode != 0 or not res.stdout:
+            return {}
+        data = plistlib.loads(res.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, plistlib.InvalidFileException):
+        return {}
+
+    services_status = data.get("NSServicesStatus")
+    if not isinstance(services_status, dict):
+        return {}
+
+    shortcuts = {}
+    for key, value in services_status.items():
+        if not isinstance(value, dict):
+            continue
+        equiv = value.get("key_equivalent")
+        if not equiv or not isinstance(equiv, str):
+            continue
+        chord = key_equivalent_to_chord(equiv)
+        if not chord:
+            continue
+        service_id = key.split(" - ")[0].strip()
+        shortcuts[service_id] = chord
+    return shortcuts
+
+
+def services_shortcut_conflicts(
+    file_config: dict | None = None,
+) -> list[tuple[str, str, str]]:
+    """Return [(service_id, service_title, chord), ...] for any vocalize Quick Action
+    service in `pbs` whose assigned shortcut collides with the app's chords.
+    """
+    from . import config
+    from .exceptions import VocalizeError
+
+    try:
+        app_conf = config.resolve_app(file_config)
+    except VocalizeError:
+        app_conf = config.APP_DEFAULTS
+
+    all_app_chords = {
+        c for c in (app_conf.get("dictate"), app_conf.get("stop"), app_conf.get("speak")) if c
+    }
+
+    shortcuts = read_services_shortcuts()
+    conflicts = []
+    for service_id, title in _SERVICES_NAMES.items():
+        chord = shortcuts.get(service_id)
+        if chord and chord in all_app_chords:
+            conflicts.append((service_id, title, chord))
+    return conflicts
+

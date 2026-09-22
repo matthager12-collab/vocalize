@@ -243,6 +243,13 @@ def integrate_claude(*, yes: bool) -> int:
         "  Do not assign the D or X chords — the menu-bar app owns those; "
         "Dictate and Stop stay reachable from the Services menu."
     )
+    conflicts = app_module.services_shortcut_conflicts()
+    for _, title, chord in conflicts:
+        print(
+            f"  Clear '{title}' ({chord}) in System Settings › Keyboard › "
+            "Keyboard Shortcuts › Services."
+        )
+        needs_you.append(f"clear '{title}' shortcut in Services")
     if app_module.status_dict()["accessibility"] != "granted":
         print(
             "  Privacy & Security > Accessibility: grant it to Vocalize.app when it "
