@@ -836,6 +836,75 @@ def test_doctor_includes_every_provider_regardless_of_chain(_no_real_tools):
     assert set(PROVIDER_NAMES) <= names
 
 
+def test_doctor_unconfigured_providers_outside_chain_are_ok(
+    monkeypatch, fake_keychain, _no_real_tools
+):
+    """Issue #9: providers outside the resolved chain with no key stored
+    report ok with detail 'not in your chain; no key stored' instead of fail."""
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setattr(
+        "vocalize.providers.polly._profile_in_credentials_file", lambda profile: False
+    )
+
+    rows = readiness_module.doctor_rows({"chain": ["say"]})
+
+    for provider in ("elevenlabs", "openai", "google", "polly"):
+        row = _row(rows, provider)
+        assert row.state == "ok", f"{provider} should be ok"
+        assert row.detail == "not in your chain; no key stored"
+        assert row.action == ""
+
+
+def test_doctor_unconfigured_provider_in_chain_fails(
+    monkeypatch, fake_keychain, _no_real_tools
+):
+    """A provider that IS in the chain keeps failing when unconfigured."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setattr(
+        "vocalize.providers.polly._profile_in_credentials_file", lambda profile: False
+    )
+
+    rows = readiness_module.doctor_rows({"chain": ["openai", "say"]})
+
+    openai_row = _row(rows, "openai")
+    assert openai_row.state == "fail"
+    assert "no API key configured" in openai_row.detail
+    assert "auth login" in openai_row.action
+
+    for provider in ("elevenlabs", "google", "polly"):
+        row = _row(rows, provider)
+        assert row.state == "ok"
+        assert row.detail == "not in your chain; no key stored"
+
+
+def test_doctor_unused_provider_with_stored_key_warns(
+    monkeypatch, fake_keychain, _no_real_tools
+):
+    """An unused provider outside the chain with credentials stored warns
+    so stale keys are noticed."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+    rows = readiness_module.doctor_rows({"chain": ["say"]})
+
+    openai_row = _row(rows, "openai")
+    assert openai_row.state == "warn"
+    assert openai_row.detail == "key from environment (not in your chain)"
+
+    polly_row = _row(rows, "polly")
+    assert polly_row.state == "warn"
+    assert polly_row.detail == "credentials from environment (not in your chain)"
+
+
 def test_doctor_includes_stt_rows_even_when_never_set_up(_no_real_tools):
     rows = readiness_module.doctor_rows({})
     names = {row.name for row in rows}

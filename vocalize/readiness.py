@@ -74,15 +74,20 @@ _inflight: dict[str, _Slot] = {}
 _lock = threading.Lock()
 
 
-def _credential_row(name: str, file_config: dict) -> Row:
+def _credential_row(name: str, file_config: dict, *, in_chain: bool = True) -> Row:
     source = auth.key_source(None, name)
     if source == "not found":
+        if not in_chain:
+            return Row(name, "ok", "not in your chain; no key stored", "")
         return Row(
             name, "fail", "no API key configured",
             f"run: vocalize auth login --provider {name}",
         )
 
     detail = f"key from {source}"
+    if not in_chain:
+        return Row(name, "warn", f"{detail} (not in your chain)", "")
+
     budget = config.budget_for(name, file_config)
     if budget is not None:
         used, exhausted = ledger.status(name)
@@ -95,7 +100,7 @@ def _credential_row(name: str, file_config: dict) -> Row:
     return Row(name, "ok", detail, "")
 
 
-def _polly_row(file_config: dict) -> Row:
+def _polly_row(file_config: dict, *, in_chain: bool = True) -> Row:
     profile = (
         config.provider_table("polly", file_config).get("profile")
         or os.environ.get("AWS_PROFILE")
@@ -103,10 +108,14 @@ def _polly_row(file_config: dict) -> Row:
     )
     status = auth.polly_credential_status(profile)
     if status == "not configured":
+        if not in_chain:
+            return Row("polly", "ok", "not in your chain; no key stored", "")
         return Row(
             "polly", "fail", "no AWS credentials found",
             "set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or configure ~/.aws/credentials",
         )
+    if not in_chain:
+        return Row("polly", "warn", f"credentials from {status} (not in your chain)", "")
     return Row("polly", "ok", f"credentials from {status}", "")
 
 
@@ -486,11 +495,11 @@ def _notes_folder_row(file_config: dict) -> Row:
     return Row("notes folder", "ok", detail, "")
 
 
-def _make_probe(name: str, file_config: dict) -> Callable[[], Row]:
+def _make_probe(name: str, file_config: dict, *, in_chain: bool = True) -> Callable[[], Row]:
     if name in _CREDENTIAL_PROVIDERS:
-        return lambda: _credential_row(name, file_config)
+        return lambda: _credential_row(name, file_config, in_chain=in_chain)
     if name == "polly":
-        return lambda: _polly_row(file_config)
+        return lambda: _polly_row(file_config, in_chain=in_chain)
     if name == "kokoro":
         return _kokoro_row
     if name == "say":
@@ -644,8 +653,14 @@ def doctor_rows(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
     checks `status` has no reason to run. Same never-raises, never-hangs-
     past-`timeout` contract, via the same `run_probes`.
     """
+    try:
+        chain = set(config.resolve_chain(None, file_config))
+    except VocalizeError:
+        chain = set()
+
     probes: list[tuple[str, Callable[[], Row]]] = [
-        (name, _make_probe(name, file_config)) for name in auth.PROVIDER_NAMES
+        (name, _make_probe(name, file_config, in_chain=(name in chain)))
+        for name in auth.PROVIDER_NAMES
     ]
     probes += [
         ("stt model", _stt_model_row),
