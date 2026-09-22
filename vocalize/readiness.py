@@ -449,6 +449,18 @@ def _hammerspoon_row() -> Row:
     return Row("hammerspoon", "ok", "not running", "")
 
 
+def _services_shortcut_row(file_config: dict) -> Row:
+    conflicts = app.services_shortcut_conflicts(file_config)
+    if not conflicts:
+        return Row("services shortcut", "ok", "none assigned", "")
+    items = [f"'{title}' ({chord})" for _, title, chord in conflicts]
+    detail = "assigned: " + ", ".join(items)
+    return Row(
+        "services shortcut", "warn", detail,
+        "clear in System Settings › Keyboard › Keyboard Shortcuts › Services",
+    )
+
+
 def _cli_startup_row() -> Row:
     start = time.monotonic()
     try:
@@ -676,6 +688,7 @@ def doctor_rows(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
         ("claude", _claude_row),
         ("shebang", _shebang_row),
         ("hammerspoon", _hammerspoon_row),
+        ("services shortcut", lambda: _services_shortcut_row(file_config)),
         ("cli start-up", _cli_startup_row),
         ("app bundle", _app_bundle_row),
         ("notes folder", lambda: _notes_folder_row(file_config)),

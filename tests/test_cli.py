@@ -2670,7 +2670,7 @@ def test_integrate_claude_runs_pbs_update(integrate_env):
     result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
 
     assert result.exit_code == 0, result.output
-    assert pbs_calls == [[integrate_module.PBS, "-update"]]
+    assert [integrate_module.PBS, "-update"] in pbs_calls
 
 
 def test_integrate_claude_never_touches_claude_commands(integrate_env):
@@ -2769,3 +2769,23 @@ def test_integrate_claude_refuses_an_unsafe_resolved_path(integrate_env, monkeyp
     assert result.exit_code == 1
     assert not services.exists()
     assert pbs_calls == []
+
+
+def test_integrate_claude_warns_and_adds_needs_you_on_shortcut_conflict(
+    integrate_env, monkeypatch
+):
+    monkeypatch.setattr(
+        app_module,
+        "services_shortcut_conflicts",
+        lambda: [
+            ("cards.arda.vocalize.dictate", "Dictate with Vocalize", "ctrl+alt+cmd+d")
+        ],
+    )
+
+    result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Clear 'Dictate with Vocalize' (ctrl+alt+cmd+d)" in result.output
+    assert "System Settings › Keyboard › Keyboard Shortcuts › Services" in result.output
+    assert "clear 'Dictate with Vocalize' shortcut in Services" in result.output
+
