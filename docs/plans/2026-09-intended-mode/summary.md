@@ -46,7 +46,7 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 
 ## Resolved so far
 
-- **1. Latency: A**, Mat's "Go", 2026-09-26. Accept about 4 to 5 seconds per press. Measure the real figure in the spike. A resident model comes back only if the wait bothers Mat in daily use.
+- **1. Latency: reopened.** Mat said "Go" to A (accept 4 to 5 s). The measurement then showed today's real cost is about 11 s after the stop with local cleanup ([spike-notes.md](spike-notes.md)). Mat asked for a faster way that does not keep 1 GB loaded all day. The proposed answer is preload on press, for an estimated 3.2 s. It waits on Mat's yes.
 - **3. Default: decided as a two-way door.** The package default stays `off`, so no other user is surprised. Mat's own config turns cleanup on.
 - **4. Jargon list: decided as a two-way door.** A plain list in the config, filled by Mat. The design fixes the exact key.
 
