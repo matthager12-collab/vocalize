@@ -53,6 +53,10 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 - **3. Default: decided as a two-way door.** The package default stays `off`, so no other user is surprised. Mat's own config turns cleanup on.
 - **4. Jargon list: decided as a two-way door.** A plain list in the config, filled by Mat. The design fixes the exact key.
 
+## Standing authority
+
+Mat, 2026-09-26: "I'll take your rec on other questions." For this plan, Claude decides the remaining questions on its own recommendation. Each one is recorded with its reasoning, so Mat can catch a wrong call afterwards. This covers deciding, not building. Building still needs Mat's explicit go.
+
 ## Tier
 
 Full. There are several approaches with real trade-offs, and at least three open decisions.
