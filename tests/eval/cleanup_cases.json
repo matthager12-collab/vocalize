@@ -412,7 +412,7 @@
     "raw": "She said delete the repository, but we shouldn't.",
     "expected": "She said delete the repository, but we shouldn't.",
     "must_include": [
-      "should"
+      "delete the repository"
     ],
     "must_include_any": [
       "shouldn't",

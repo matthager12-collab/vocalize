@@ -151,24 +151,10 @@ def cleanup_transcript(text: str, backend: str, verbatim: bool = False) -> tuple
 
 # Words the guard lets a cleanup add or keep freely; negations are counted
 # separately, so "not" and "never" are deliberately absent.
-_STOPWORDS = frozenset("""
-a an the i you he she it we they me him her us them my your his its our
-their am is are was were be been being do does did have has had can
-could will would shall should may might must to of in on at for from
-with by and or but if then that this these those as
-""".split())
+_STOPWORDS = frozenset(["a", "an", "the", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "its", "our", "their", "am", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "have", "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must", "to", "of", "in", "on", "at", "for", "from", "with", "by", "and", "or", "but", "if", "then", "that", "this", "these", "those", "as"])
 # A raw take holding any of these may come back with digits, $ or %.
 # ponytail: any number word unlocks any digits; per-number mapping if it matters.
-_SPOKEN_NUMBERS = frozenset("""
-zero one two three four five six seven eight nine ten eleven twelve
-thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
-thirty forty fifty sixty seventy eighty ninety hundred thousand million
-percent dollars first second third fourth fifth sixth seventh eighth
-ninth tenth eleventh twelfth thirteenth fourteenth fifteenth sixteenth
-seventeenth eighteenth nineteenth twentieth twenty-first twenty-second
-twenty-third twenty-fourth twenty-fifth twenty-sixth twenty-seventh
-twenty-eighth twenty-ninth thirtieth thirty-first am pm
-""".split())
+_SPOKEN_NUMBERS = frozenset(["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "percent", "dollars", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth", "twenty-first", "twenty-second", "twenty-third", "twenty-fourth", "twenty-fifth", "twenty-sixth", "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth", "thirty-first", "am", "pm"])
 
 
 def _words(text: str) -> list[str]:
@@ -179,13 +165,24 @@ def _words(text: str) -> list[str]:
     ).split() if word.strip(".,:-'")]
 
 
+# Spoken words a cleanup legitimately turns into symbols or drops.
+_FILLERS = frozenset(["um", "uh", "er", "ah", "like", "know", "so", "well", "okay", "at", "dot"])
+_CORRECTIONS = ("i mean", "sorry", "actually", "wait", "scratch that", "or rather", ", no,")
+
+
 def faithful(raw: str, cleaned: str) -> bool:
-    """Reject cleanup output that adds words or drops a negation."""
+    """Reject cleanup output that adds words, drops a negation, or drops
+    most of what was said: that is an obeyed instruction, not a cleanup."""
     source, result = _words(raw), _words(cleaned)
-    corrections = ("i mean", "sorry", "actually", "wait", "scratch that", "or rather", ", no,")
-    if sum(word in ("not", "never") for word in result) < sum(
-        word in ("not", "never") for word in source
-    ) and not any(marker in raw.lower() for marker in corrections):
+    corrected = any(marker in raw.lower() for marker in _CORRECTIONS)
+    negations = ("not", "never")
+    if not corrected and sum(w in negations for w in result) < sum(w in negations for w in source):
+        return False
+    content = {w for w in source if w not in _STOPWORDS | _FILLERS | _SPOKEN_NUMBERS}
+    kept = {part for w in result for part in w.replace("@", ".").split(".") if part}
+    # ponytail: fixed bounds set from 78 spike outputs (good ones kept 100%,
+    # or 40% with a correction; attacks 0-38%). Retune in spike-notes § run 1.
+    if content and len(content & kept) / len(content) < (0.34 if corrected else 0.9):
         return False
     has_number = any(word in _SPOKEN_NUMBERS or any(ch.isdigit() for ch in word) for word in source)
     known = set(source)
