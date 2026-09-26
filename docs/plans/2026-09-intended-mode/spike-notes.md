@@ -45,3 +45,28 @@ Checked 2026-09-26 by script, after Codex's round-1 critique (critique-round-1.m
 - in the re-encoded ids: True
 
 So DEC-027's protection does not hold in 0.14.0. `mlx_lm.generate` 0.31.3 accepts `prompt: Union[str, List[int]]`, so the fix is to pass the ids directly. The plan carries it as its first task unless a separate fix lands first.
+
+## S1: whisper initial prompt
+
+2026-09-26, Claude Sonnet sub-agent. Raw output: scratchpad `spikes/s1/run_log.txt` (not kept in the repo). The runs used pywhispercpp 1.5.1, turbo q5_0 and beam 5, with `say` clips at 16 kHz. Every clip and variant ran twice.
+
+- **How it is passed.** `initial_prompt` is accepted by `Model(...)` and by `transcribe(...)`. pywhispercpp keeps the last params between calls and never resets an omitted key. A long-lived model must therefore pass `initial_prompt` on every call, with `""` for none.
+- **Jargon, out of 12** (default voice / Daniel voice). No prompt: 10.5 / 8.5. Style sentence: 10.5 / 10.5. **Vocabulary list: 11 / 12.** Vocabulary plus style: 11 / 11. Only the vocabulary list got `uv --no-project` and `resolve_provider_settings` right.
+- **Leak.** Every variant containing a natural sentence wrote that sentence onto input with nothing spoken, on one of its two runs. With the style sentence alone, 1.0 s of digital silence gave "We need to move the standup to Wednesday at 9:30." (run_log line 102). With vocabulary plus style, 2.0 s of noise at RMS 17.6 gave "So we need to move the standup to Wednesday at 9:30." (line 114). No prompt and the vocabulary list never leaked on silence, noise, "Yes." or "Okay, thanks.". Whisper's own "Thank you." on silence happens with no prompt too.
+- The RMS guard (below 20 is refused) already stops the digital-silence and RMS-17.6 clips in production. It does not stop quiet input at or above 20.
+- **Style.** Neither prompt removed "um" or "uh", and neither applied the self-correction. Any prompt at all moved "9.30" to "9:30".
+
+## S2: cleanup prompt, guard and gate
+
+2026-09-26, Claude Sonnet sub-agent. Raw output: scratchpad `spikes/s2/results.json`. 26 cases were written the way whisper outputs them, and each prompt was judged strictly by meaning. Qwen3.5-4B 4-bit, one model load, a generate per case.
+
+| Prompt | Pass | Self-corrections | Formatting | Median / slowest generate |
+|---|---|---|---|---|
+| P0, today's | 13/26 | 1/7 | 2/5 | 0.74 / 1.18 s |
+| P1, numbered rules | 20/26 | 5/7 | 5/5 | 0.94 / 1.47 s |
+| P2, rules plus 3 examples | **21/26** | 5/7 | 4/5 | 1.21 / 2.09 s |
+
+- **Remaining P2 failures.** Two were strict-judge ordinals ("June 12th", "March 3rd"). Two dropped a meaningful word ("I think", "now"). One was meta-commentary added in front of a dictated question ("What time is the meeting tomorrow?"). No prompt obeyed an embedded instruction or answered a question.
+- **P0 is unstable on corrections.** In this run it applied the Tuesday-to-Wednesday correction, but left 5 of 6 other corrections unapplied. The earlier run (above) kept "Tuesday" four times out of four.
+- **Guard, "no word the raw take lacks".** It never passed an output the judge failed for added content (0 of 78 unfaithful-and-PASS), and it caught the meta-commentary. By design it cannot see an unapplied correction or a dropped word.
+- **Gate, "skip the model when there is nothing to clean".** It would skip 6 of 26. One skip was wrong: a spoken email with no number word ("jen at example dot com").
