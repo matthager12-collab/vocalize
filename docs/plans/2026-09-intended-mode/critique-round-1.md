@@ -10,35 +10,35 @@
    - **Why the documents miss it:** DEC-027’s claimed protection is assumed. The faithfulness guard is unspecified; keeping “Tuesday” incorrectly introduces no new word.
    - **Mitigation:** Pass token IDs through generation without re-tokenization; test injection, negation, corrections and truncation. Reject uncertain cleanup. Define S2’s guard and skip criteria.
    - **Lands in:** Common to every candidate.
-   - **Proof:** Cited: [llm_worker.py:169](llm_worker.py:169); wrong-day result stated at spike-notes.md:26. Exploitability reasoned, not demonstrated.
+   - **Proof:** Cited: `llm_worker.py:169`; wrong-day result stated at spike-notes.md:26. Exploitability reasoned, not demonstrated.
 
 3. **Candidate: both · Severity: High — Cancel can still overwrite the clipboard**
    - **Scenario:** Cancel during cleanup, then copy something else. The old take finishes and overwrites it.
    - **Why the documents miss it:** A preserves existing behavior; C never defines cancellation of delivery. Existing cancel releases the session, but copying precedes the nonce check.
    - **Mitigation:** Serialize cancellation and delivery authorization using the take’s nonce; revoked takes must never copy, mark completion or notify success.
    - **Lands in:** New decision.
-   - **Proof:** Cited: [dictate.py:1541](dictate.py:1541) and [dictate.py:1509](dictate.py:1509); consequence reasoned.
+   - **Proof:** Cited: `dictate.py:1541` and `dictate.py:1509`; consequence reasoned.
 
 4. **Candidate: C · Severity: High — Stop files cannot identify intent**
    - **Scenario:** Pause or cancel writes the same stop file the finisher interprets as “deliver.” A paused segment could be transcribed prematurely.
    - **Why the documents miss it:** C specifies only stop-file observation, omitting explicit intent and ownership.
    - **Mitigation:** Define separate pause, cancel and finish commands; preserve toggle debounce, two-second cancellation, hold-release semantics and finisher-owned claims. Verify asynchronous completion against the frozen app’s existing nonce/state contract.
    - **Lands in:** Candidate C.
-   - **Proof:** Cited: [dictate.py:1710](dictate.py:1710), :1481, :1413, :484; interaction reasoned.
+   - **Proof:** Cited: `dictate.py:1710`, :1481, :1413, :484; interaction reasoned.
 
 5. **Candidate: both · Severity: High — COVERAGE GAP: clipboard execution and retention**
    - **Scenario:** Quotes become JavaScript if interpolated into the osascript program; multiline raw text executes commands when swapped and pasted into an unprotected terminal.
    - **Why the documents miss it:** “Stdin” does not establish code/data separation. A private clipboard type is neither access control nor guaranteed deletion.
    - **Mitigation:** Use fixed script code with separately parsed JSON; sanitize and flatten both types on every write/swap. Check clipboard change counts, handle partial failure, and disclose clipboard-manager retention.
    - **Lands in:** Common / Undo and Privacy wording.
-   - **Proof:** Reasoned; existing protection: [dictate.py:1123](dictate.py:1123).
+   - **Proof:** Reasoned; existing protection: `dictate.py:1123`.
 
 6. **Candidate: both · Severity: High — COVERAGE GAP: persistent transport**
    - **Scenario:** Oversized/malformed requests exhaust memory; detached stderr exposes transcript-bearing exceptions. A client trusts a substituted socket; C’s inherited pipe descriptors prevent shutdown.
    - **Why the documents miss it:** Permissions or parentage do not define a complete protocol.
    - **Mitigation:** Specify bounded schemas, framing, request IDs, deadlines, descriptor closure, request-state clearing and fixed error codes. A additionally needs client-side peer validation and safe socket-path ownership checks.
    - **Lands in:** New decision.
-   - **Proof:** Reasoned; unbounded request reading and exception-text clipping exist at [llm_worker.py:248](llm_worker.py:248) and :65.
+   - **Proof:** Reasoned; unbounded request reading and exception-text clipping exist at `llm_worker.py:248` and :65.
 
 7. **Candidate: A · Severity: Medium — Fallback can worsen the baseline**
    - **Scenario:** A slow server times out but continues generating while fallback loads another model. Concurrent clients can also race through ping-then-spawn.
@@ -52,14 +52,14 @@
    - **Why the documents miss it:** Timers track requests, not takes; whether ping counts as an answer is unspecified.
    - **Mitigation:** Take leases spanning recording and pause; explicit release on every outcome; bounded abandoned-lease expiry.
    - **Lands in:** Candidate A.
-   - **Proof:** Reasoned from candidates.md:23 and [dictate.py:1161](dictate.py:1161).
+   - **Proof:** Reasoned from candidates.md:23 and `dictate.py:1161`.
 
 9. **Candidate: C · Severity: Medium — Adoption and crash recovery are undesigned**
    - **Scenario:** The finisher exits while the next press hands over a workdir; its crash leaves workers or a recorder alive and the take undelivered.
    - **Why the documents miss it:** “Finds it through the session directory” specifies neither transport nor acknowledgment. That take directory is normally deleted.
    - **Mitigation:** Separate owner discovery from take storage; atomic adoption acknowledgment, verified process identity, bounded recovery and child shutdown on owner loss.
    - **Lands in:** Candidate C.
-   - **Proof:** Reasoned; deletion cited at [dictate.py:621](dictate.py:621).
+   - **Proof:** Reasoned; deletion cited at `dictate.py:621`.
 
 10. **Candidate: both · Severity: Medium — Upgrade identity is incomplete**
     - **Scenario:** Runtime pins, tokenizer files or settings change while workers remain warm. A’s filename/hash check misses some changes; C defines none.
@@ -73,7 +73,7 @@
     - **Why the documents miss it:** Approximately 3.2 seconds is an unmeasured overlap estimate. A’s ordinary listen path never calls `_start`; WAV input offers no recording interval.
     - **Mitigation:** Measure cold/short/warm paths and simultaneous-load contention; add explicit preload entry points.
     - **Lands in:** The contested part.
-    - **Proof:** Stated: spike-notes.md:30–38; cited: [dictate.py:1787](dictate.py:1787).
+    - **Proof:** Stated: spike-notes.md:30–38; cited: `dictate.py:1787`.
 
 12. **Candidate: both · Severity: Medium — Defaults and scope need explicit gates**
     - **Scenario:** Cleanup-off users still load an LLM; shared prompt changes affect cloud users; A’s shared local seam also affects notes.

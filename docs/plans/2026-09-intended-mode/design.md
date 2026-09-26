@@ -8,7 +8,7 @@ Dictation today (read from the source on 2026-09-26):
 - **Transcription.** `dictate.transcribe` runs `vocalize/local/whisper_worker.py` one-shot under `uv run --no-project`, with pywhispercpp 1.5.1, turbo q5_0 and beam 5. It passes no prompt.
 - **Cleanup.** `llm.cleanup_transcript` picks `CLEANUP_PROMPT` or `VERBATIM_PROMPT`, and `_complete` routes it to `off`, `local`, `claude-cli` or `anthropic`. `local` runs `vocalize/local/llm_worker.py` one-shot under `uv run --offline`, with Qwen3.5-4B 4-bit under mlx-lm 0.31.3.
 - **Privacy** (DEC-007, dictate.py docstring). A transcript is never a file, argv, log line or notification.
-- **Cost.** About 2.6 s after the stop without cleanup, and about 11 s with local cleanup, mostly loading ([spike-notes.md](spike-notes.md)).
+- **Cost.** About 1.5 s after the stop without cleanup, and about 7 to 8 s with local cleanup, mostly uv start, import and load. Warm, both together measured about 4 s ([spike-notes.md](spike-notes.md) § S3).
 
 The binding constraints are in [summary.md](summary.md): local only, speed beats RAM, the app is frozen, package defaults must not surprise other users, and no build without Mat's go.
 
@@ -148,7 +148,7 @@ The writer is a fixed script file, `vocalize/assets/clipboard.js`, run by `/usr/
 
 ## Memory
 
-See DEC-047 for the measured ceiling per worker and the combined figure while both are warm.
+Measured in S3, physical footprint peak on the model process: whisper 857 MB, cleanup 3.3 GB, together about 4.1 GB. RSS understates mlx (1.3 GB for the same process). While warm, that memory is held for `warm_minutes` after the last take; with the default of 0 it is held only during the take. DEC-047 sets the release ceilings and the speed gates.
 
 ## Testing strategy
 

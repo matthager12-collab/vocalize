@@ -15,7 +15,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 | DEC-044 | What is the warm-server lifecycle? | Decided | Leases per take, idle timer from the last release, flock-owned spawn, one total deadline, a fingerprint handshake | R1 |
 | DEC-045 | May a cancelled take still reach the clipboard? | Decided | No — delivery is authorised against the session nonce first | R1 |
 | DEC-046 | Which paths warm which models? | Decided | Whisper on every dictation and `listen` start; the LLM only when `cleanup = "local"` and installed; notes stay one-shot | R1 |
-| DEC-047 | What memory ceiling holds per worker? | Decided | Measured in S3; see the entry | R1 |
+| DEC-047 | What memory and speed does a release have to meet? | Decided | Physical footprint, not RSS: LLM at most 3.6 GB, whisper at most 1.0 GB; warm wait after stop at most 5.0 s and at least 1.5 s faster than one-shot | R1 |
 | DEC-048 | Where is the control-token defect fixed? | Decided | Pass token ids to `generate` directly; the plan's first task unless a separate fix merges first | R1 |
 
 ---
@@ -30,7 +30,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Decided by**: Claude, on Mat's standing authority
 **Status**: Decided
 
-**Context**: A press with local cleanup costs about 11 s after the stop, and most of that is loading (spike-notes § Where the seconds go). Mat's rule is that speed beats RAM. Today every press is a fresh `uv run` per worker (DEC-028), and the menu-bar app is frozen (DEC-032).
+**Context**: A press with local cleanup costs about 7 to 8 s after the stop today, and warm servers measured about 4 s (spike-notes § S3). Most of the difference is uv start, import and load. Mat's rule is that speed beats RAM. Today every press is a fresh `uv run` per worker (DEC-028), and the menu-bar app is frozen (DEC-032).
 
 | Option | Description | Trade-offs |
 |---|---|---|
@@ -212,6 +212,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 - **Handshake.** Each connection starts with a hello. The server answers its fingerprint: protocol version, sha256 of the worker file, the runtime pin, and the model file's name and size. A mismatch makes the client send `shutdown` and respawn under the lock.
 - **Leases.** `lease <id>` at take start; `release <id>` on every outcome (delivered, cancelled, silent, failed). An unreleased lease expires after `max_take_seconds` plus 60 s. The idle timer runs only while no lease is held. It is `warm_minutes`, or 0, which means exit at the last release.
 - **Requests.** One at a time, with a 64 KB cap on a request line and one JSON object per line. Fixed error codes only: `busy`, `loading`, `bad-request`, `failed`. No text from a request ever reaches stderr or a log.
+- **Robustness, from S3.** A server survives a client that connects and vanishes (`BrokenPipeError`, `ConnectionResetError`). Lifecycle control goes through the socket (`shutdown`), never a PID, because `uv run` does not replace itself and the spawned PID is uv's. The client refuses a socket path over 100 bytes and falls back.
 - **Deadline.** The client allows one total deadline per request. If the model is still loading and has not answered by then, the client falls back. A fallback first sends `cancel`, so the server stops generating.
 
 **Consequences**: The workers grow a small server loop each. The protocol file carries the shared framing and the fingerprint. Tests use stub models behind the existing seams.
@@ -258,7 +259,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 **Context**: Critique finding 12. Users with cleanup off should not load an LLM. `vocalize notes` shares the `_local` seam but runs long jobs with different limits.
 
-**Decision**:
+**Decision**: as follows.
 - The dictation start (toggle, hold-to-talk, and resume after pause) and `vocalize listen`'s own recording start warm whisper. They warm the LLM only when `cleanup = "local"` and the model is installed.
 - `listen --wav` warms nothing, but uses a warm server if one is up.
 - `vocalize notes` never uses a warm server. It keeps the one-shot path.
@@ -276,6 +277,43 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Applied to**:
 - [design.md](design.md) § Structure
 - [plan.md](plan.md) § Phase 3
+
+---
+
+### DEC-047: What memory and speed does a release have to meet?
+
+**Question**: The summary's constraint says each worker stays under 1.5 GB. S3 measured the cleanup model at 1.3 GB RSS but 3.3 GB physical footprint. What ceiling holds, and what speed must warm servers prove?
+
+**Date**: 2026-09-26
+**Decided by**: Claude, on Mat's standing authority (Mat's rule: speed beats RAM)
+**Status**: Decided
+
+**Context**: The 1.5 GB cap came from RSS readings (roadmap spike-notes § LLM). mlx's unified memory is mostly invisible to RSS, and today's one-shot worker already has the same 3.3 GB footprint while it runs. What warm servers change is how long that memory is held: the warm window instead of a few seconds. Warm saves about 2 to 4 s a take (spike-notes § S3).
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Keep the 1.5 GB RSS cap | Passes on paper, and measures the wrong thing for mlx |
+| B | Footprint ceilings at the measured peak plus about 10%, plus speed gates | Honest numbers. Holds about 4 GB for the warm window, on a machine the installer already requires to have 12 GiB |
+| C | A smaller cleanup model to fit 1.5 GB | Needs a download and a new quality run; S2 showed the 4B model is only just good enough |
+
+**Recommendation**: B, per Mat's rule.
+
+**Decision**: B. A release needs, on the reference Mac, with `vmmap --summary` on the model process (the child of `uv`, not `uv` itself):
+- LLM server physical footprint peak at most 3.6 GB
+- whisper server physical footprint peak at most 1.0 GB
+- both at once at most 4.6 GB
+- warm wait after the stop, S1 jargon clip, 3 s and 10 s takes: at most 5.0 s each
+- back-to-back warm takes: at most 4.5 s
+- warm at least 1.5 s faster than the one-shot path measured in the same run
+
+The summary's "under 1.5 GB per worker" is replaced by these. `llm_manifest.MIN_RAM_BYTES` (12 GiB) stays.
+
+**Consequences**: With `warm_minutes = 15` about 4 GB stays held for up to 15 minutes after a take. docs/dictation.md states the footprint, not the RSS. If a gate fails, the phase stops and the gate's numbers come back to Mat.
+
+**Applied to**:
+- [design.md](design.md) § Memory
+- [verification.md](verification.md) § Phase 3 exit
+- [plan.md](plan.md) § Phase 3, T-36
 
 ---
 
