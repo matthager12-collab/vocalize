@@ -39,7 +39,7 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 
 ## Corrections and assumptions to walk, one at a time
 
-1. **Latency.** The "about 2 seconds" quoted in chat was the warm figure. Today a local cleanup costs about 4 to 5 seconds per press.
+1. **Latency.** The "about 2 seconds" quoted in chat was the warm figure. The first correction said 4 to 5 seconds; the measurement says about 11 seconds after the stop (see below).
 2. **Undo versus privacy.** Keeping the raw take somewhere breaks the promise that vocalize never stores a transcript. A new hotkey means editing the frozen app.
 3. **Default.** Should the package default stay `off`, with Mat's own config turning it on?
 4. **Jargon list.** Where it lives, and who fills it.
