@@ -74,7 +74,7 @@ The `eval` marker is registered in `[tool.pytest.ini_options] markers` by T-12. 
 
 ## Manual checks
 
-Performed by Mat on his Mac after he applies the T-51 config block:
+Performed by the owner on their Mac after they applies the T-51 config block:
 
 1. Dictate the S1 jargon paragraph through the hotkey. Check the 12 words.
 2. Dictate "Um, so move the standup to, uh, Tuesday, no, Wednesday at nine thirty." Check that you get "Move the standup to Wednesday at 9:30." or equivalent.

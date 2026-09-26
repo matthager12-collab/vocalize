@@ -11,12 +11,12 @@ These parts do not change between candidates.
 - **Skip gate.** A deterministic check runs before cleanup. If the raw take has nothing to clean, the model is skipped. This ships only if S2 shows it never skips a take that needed cleaning.
 - **Whisper prompt.** An `initial_prompt` built from a new `[stt] vocabulary` list, and perhaps a style sentence. This ships only if spike S1 shows a jargon gain with no leak on silence, noise or short takes.
 - **Undo.** When cleanup changed the text, the clipboard gets two types: the cleaned text as `public.utf8-plain-text`, and the raw take as a private type `com.vocalize.said`. It is written by `/usr/bin/osascript -l JavaScript` with the text on stdin, never in argv (tested on a named pasteboard, 2026-09-26). A new Quick Action, "Swap in What I Said", runs a new `vocalize` verb that swaps the two types. Pressing it again swaps them back. The user then undoes the paste and pastes again. The frozen app is not edited. When cleanup did not change the text, `pbcopy` is used exactly as today.
-- **Settings.** `[stt] warm_minutes` is a whole number. 0 is the package default and means unload straight after the take. `[stt] vocabulary` is a list of strings. Both are added to `KNOWN_STT_KEYS`, validation, the portal and docs/dictation.md. Mat's own config sets `cleanup = "local"` and a warm window.
+- **Settings.** `[stt] warm_minutes` is a whole number. 0 is the package default and means unload straight after the take. `[stt] vocabulary` is a list of strings. Both are added to `KNOWN_STT_KEYS`, validation, the portal and docs/dictation.md. The owner's own config sets `cleanup = "local"` and a warm window.
 - **Privacy wording.** docs/dictation.md § Privacy gains the clipboard line. The raw take lives on the clipboard until the next copy, and nowhere else.
 
 ## The contested part: how the models get warm
 
-Today each press runs a fresh `uv run` per worker. The model load is paid after the stop: about 8.2 s for cleanup and 2.6 s for whisper, measured. The goal is to pay it while the user talks. Mat's rule is that speed beats RAM.
+Today each press runs a fresh `uv run` per worker. The model load is paid after the stop: about 8.2 s for cleanup and 2.6 s for whisper, measured. The goal is to pay it while the user talks. The owner's rule is that speed beats RAM.
 
 ### Candidate A: warm servers, with today's path as the fallback
 

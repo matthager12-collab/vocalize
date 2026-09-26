@@ -10,7 +10,7 @@ Dictation today (read from the source on 2026-09-26):
 - **Privacy** (DEC-007, dictate.py docstring). A transcript is never a file, argv, log line or notification.
 - **Cost.** About 1.5 s after the stop without cleanup, and about 7 to 8 s with local cleanup, mostly uv start, import and load. Warm, both together measured about 4 s ([spike-notes.md](spike-notes.md) § S3).
 
-The binding constraints are in [summary.md](summary.md): local only, speed beats RAM, the app is frozen, package defaults must not surprise other users, and no build without Mat's go.
+The binding constraints are in [summary.md](summary.md): local only, speed beats RAM, the app is frozen, package defaults must not surprise other users, and no build without the owner's go.
 
 ## Approach
 
@@ -156,5 +156,5 @@ Measured in S3, physical footprint peak on the model process: whisper 857 MB, cl
 
 - **Unit, no models.** The guard (S2's cases as fixtures), the prompt builder, settings validation, the protocol framing and bounds, lease and idle logic with a fake clock, the fingerprint mismatch path, the spawn lock race, the fallback on every warm failure, the nonce check, the swap rules, and that the clipboard script receives JSON on stdin with no text in argv. All run through the existing stub seams (`_model_class`, `_mlx`, `LOCAL_RUN_SEAM`, `RUN_SEAM`).
 - **Eval, with the real models, on the reference Mac.** The cleanup case set against the local model, the whisper leak run on quiet input, and the warm timings and memory. These are release gates, marked so the default `pytest` run skips them. See verification.md.
-- **Owner-present.** Mat dictates the jargon script and a disfluent script through the real hotkey and checks the undo once.
+- **Owner-present.** the owner dictates the jargon script and a disfluent script through the real hotkey and checks the undo once.
 - **Not unit tested.** Real pasteboard behaviour in other apps, and clipboard managers. They are named in the docs instead.

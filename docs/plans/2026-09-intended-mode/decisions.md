@@ -2,7 +2,7 @@
 
 Continues the sequence from [../2026-09-app-roadmap/decisions.md](../2026-09-app-roadmap/decisions.md) (DEC-020 to DEC-037).
 
-Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he said "I'll take your rec on other questions", so Claude decided the rest on its own recommendation. Each entry names its decider, and each carries its reasoning so a wrong call can be caught afterwards. Evidence is in [spike-notes.md](spike-notes.md) and [critique-round-1.md](critique-round-1.md).
+The owner decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 the owner said "I'll take your rec on other questions", so Claude decided the rest on its own recommendation. Each entry names its decider, and each carries its reasoning so a wrong call can be caught afterwards. Evidence is in [spike-notes.md](spike-notes.md) and [critique-round-1.md](critique-round-1.md).
 
 | # | Question | Status | Decision | Round |
 |---|---|---|---|---|
@@ -10,7 +10,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 | DEC-039 | Which cleanup prompt? | Decided | P2 (rules plus worked examples), data rule first, a question example added, for every backend | R1 |
 | DEC-040 | What does whisper get as a prompt? | Decided | A vocabulary list only, from `[stt] vocabulary`; never a sentence | R1 |
 | DEC-041 | Guard, gate, both or neither? | Decided | The added-content guard ships; the skip gate does not | R1 |
-| DEC-042 | How does the undo work? | Decided | A (Mat) — two clipboard types, swapped by `vocalize dictate --swap` from a Quick Action | R1 |
+| DEC-042 | How does the undo work? | Decided | A (the owner) — two clipboard types, swapped by `vocalize dictate --swap` from a Quick Action | R1 |
 | DEC-043 | What are the new settings called, and their defaults? | Decided | `[stt] warm_minutes` (0 to 240, default 0) and `[stt] vocabulary` (list, default empty) | R1 |
 | DEC-044 | What is the warm-server lifecycle? | Decided | Leases per take, idle timer from the last release, flock-owned spawn, one total deadline, a fingerprint handshake | R1 |
 | DEC-045 | May a cancelled take still reach the clipboard? | Decided | No — delivery is authorised against the session nonce first | R1 |
@@ -28,10 +28,10 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: How do the whisper and cleanup models get loaded while the user talks, and stay warm for the next take?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
-**Context**: A press with local cleanup costs about 7 to 8 s after the stop today, and warm servers measured about 4 s (spike-notes § S3). Most of the difference is uv start, import and load. Mat's rule is that speed beats RAM. Today every press is a fresh `uv run` per worker (DEC-028), and the menu-bar app is frozen (DEC-032).
+**Context**: A press with local cleanup costs about 7 to 8 s after the stop today, and warm servers measured about 4 s (spike-notes § S3). Most of the difference is uv start, import and load. The owner's rule is that speed beats RAM. Today every press is a fresh `uv run` per worker (DEC-028), and the menu-bar app is frozen (DEC-032).
 
 | Option | Description | Trade-offs |
 |---|---|---|
@@ -56,7 +56,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: Which system prompt produces intended text?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: Today's prompt kept the corrected-away word every time in the first spike, and passed 13 of 26 cases in S2. S2's P2 passed 21 of 26. Its remaining failures were two ordinals, two dropped words, and meta-commentary on a dictated question.
@@ -84,7 +84,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: Should whisper get an initial prompt, and what may it contain?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: In S1 a vocabulary list raised the jargon score to 11 and 12 out of 12, and never leaked. Every variant containing a natural sentence leaked that sentence onto silence or noise on one of two runs.
@@ -112,7 +112,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: Which deterministic checks wrap the cleanup call?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: In S2 the guard never passed added content, and caught the meta-commentary. The gate skipped one take that needed cleaning, a spoken email.
@@ -123,7 +123,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 | Gate only | Skip the model when there is nothing to clean | Saves about 1.2 s on clean takes. Wrong on formatting-only takes |
 | Both | Both | Speed from the gate and safety from the guard, plus the gate's wrong skips |
 
-**Recommendation**: Guard only. With warm models a clean take costs about a second of cleanup, and Mat's rule trades RAM for speed, not correctness for speed.
+**Recommendation**: Guard only. With warm models a clean take costs about a second of cleanup, and the owner's rule trades RAM for speed, not correctness for speed.
 
 **Decision**: Guard only, under 60 lines, in `llm.py`, applied to every backend's output. Round 2 (C5) adds one rule: every negation in the raw take ("not", "never", "no longer", any word ending in "n't") must survive, unless a correction marker is present. The docs call it an addition check, not injection prevention. A guard fallback prints `vocalize: cleanup skipped (unfaithful)` to stderr and uses the notification that says cleanup was skipped.
 
@@ -140,7 +140,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: How is the raw take kept one keystroke away without storing it?
 
 **Date**: 2026-09-26
-**Decided by**: Mat (option A); the mechanics by Claude
+**Decided by**: the owner (option A); the mechanics by Claude
 **Status**: Decided
 
 **Context**: DEC-007 promises a transcript is never a file, an argument, a log line or a notification. The app is frozen (DEC-032), and its paste watcher only pastes a marker tied to a watched dictation.
@@ -168,7 +168,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: The names, types, bounds and defaults of the new `[stt]` keys.
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: `[stt]` rejects unknown keys, so a key is a public contract. An older vocalize refuses a config that uses it.
@@ -182,7 +182,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 **Decision**: A. `warm_minutes` is an integer from 0 to 240, default 0; 0 means unload 10 s after the take ends (round 2, G3), so an immediate second take is still warm. `vocabulary` is a list of at most 50 entries, default empty. Each entry is 1 to 40 characters and 1 to 4 words, drawn only from letters, digits, spaces and `_ . - + / @ # :`, with no `<`, `|` or sentence-ending punctuation (round 2, C6). The built prompt is capped at 800 characters. Both are added to `KNOWN_STT_KEYS`, `_validate_stt_table`, the portal's `[stt]` form and docs/dictation.md.
 
-**Consequences**: A config with either key fails on 0.14.0 and older. Mat's own config gets `cleanup = "local"`, `warm_minutes = 15` and his list, applied by Mat at release.
+**Consequences**: A config with either key fails on 0.14.0 and older. The owner's own config gets `cleanup = "local"`, `warm_minutes = 15` and their list, applied by the owner at release.
 
 **Applied to**:
 - [design.md](design.md) § Contracts
@@ -195,7 +195,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: How are warm servers started, kept, reached and stopped without races, orphans or stale code?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: Critique findings 6, 7, 8 and 10 showed that an idle timer alone is not a take-shaped contract. Ping-then-spawn races, and a worker-file hash misses runtime and model changes.
@@ -231,7 +231,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: A cancel during transcription releases the session, but the transcribing process still copies its text (dictate.py `cancel`, then `_stop`'s `copy_to_clipboard`). Should it?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: This is a shipped behaviour, found in critique finding 3 and confirmed by reading `_stop` and `cancel`. Cleanup makes the window longer.
@@ -257,7 +257,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: What starts a warm server, and who uses one?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: Critique finding 12. Users with cleanup off should not load an LLM. `vocalize notes` shares the `_local` seam but runs long jobs with different limits.
@@ -288,7 +288,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 **Question**: The summary's constraint says each worker stays under 1.5 GB. S3 measured the cleanup model at 1.3 GB RSS but 3.3 GB physical footprint. What ceiling holds, and what speed must warm servers prove?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority (Mat's rule: speed beats RAM)
+**Decided by**: Claude, on the owner's standing authority (the owner's rule: speed beats RAM)
 **Status**: Decided
 
 **Context**: The 1.5 GB cap came from RSS readings (roadmap spike-notes § LLM). mlx's unified memory is mostly invisible to RSS, and today's one-shot worker already has the same 3.3 GB footprint while it runs. What warm servers change is how long that memory is held: the warm window instead of a few seconds. Warm saves about 2 to 4 s a take (spike-notes § S3).
@@ -299,7 +299,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 | B | Footprint ceilings at the measured peak plus about 10%, plus speed gates | Honest numbers. Holds about 4 GB for the warm window, on a machine the installer already requires to have 12 GiB |
 | C | A smaller cleanup model to fit 1.5 GB | Needs a download and a new quality run; S2 showed the 4B model is only just good enough |
 
-**Recommendation**: B, per Mat's rule.
+**Recommendation**: B, per the owner's rule.
 
 **Decision**: B. A release needs, on the reference Mac, with `vmmap --summary` on the model process (the child of `uv`, not `uv` itself):
 - LLM server physical footprint peak at most 3.6 GB
@@ -311,7 +311,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 The summary's "under 1.5 GB per worker" is replaced by these. `llm_manifest.MIN_RAM_BYTES` (12 GiB) stays.
 
-**Consequences**: With `warm_minutes = 15` about 4 GB stays held for up to 15 minutes after a take. docs/dictation.md states the footprint, not the RSS. If a gate fails, the phase stops and the gate's numbers come back to Mat.
+**Consequences**: With `warm_minutes = 15` about 4 GB stays held for up to 15 minutes after a take. docs/dictation.md states the footprint, not the RSS. If a gate fails, the phase stops and the gate's numbers come back to the owner.
 
 **Applied to**:
 - [design.md](design.md) § Memory
@@ -325,7 +325,7 @@ The summary's "under 1.5 GB per worker" is replaced by these. `llm_manifest.MIN_
 **Question**: Codex round 2 (C1) showed that a process running as the same user can replace a socket, answer with a valid fingerprint, or send `shutdown`. Is that in scope?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 **Context**: Every transcript ends on the general clipboard, which any same-user process can read. Same-user processes can also read `~/.cache/vocalize` and the config. macOS offers no cheap way to authenticate a peer process beyond its uid.
@@ -352,7 +352,7 @@ The summary's "under 1.5 GB per worker" is replaced by these. `llm_manifest.MIN_
 **Question**: `llm_worker._generate` decodes prompt ids to a string that `mlx_lm.generate` re-encodes, re-creating control tokens (spike-notes § Control tokens). Where does the fix go?
 
 **Date**: 2026-09-26
-**Decided by**: Claude, on Mat's standing authority
+**Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
 | Option | Description | Trade-offs |

@@ -2,12 +2,12 @@
 
 ## Overview
 
-Dictation gets a cleanup that writes what the speaker meant, whisper gets the user's jargon, both models load while the user talks, and the raw take stays one shortcut away. The architecture is in [design.md](design.md), the decisions in [decisions.md](decisions.md) and the measurements in [spike-notes.md](spike-notes.md). Nothing here is built until Mat says go, and releases stay Mat's.
+Dictation gets a cleanup that writes what the speaker meant, whisper gets the user's jargon, both models load while the user talks, and the raw take stays one shortcut away. The architecture is in [design.md](design.md), the decisions in [decisions.md](decisions.md) and the measurements in [spike-notes.md](spike-notes.md). Nothing here is built until the owner says go, and releases stay the owner's.
 
 ## Scope
 
 **In**: the intended cleanup prompt and guard; the whisper vocabulary prompt; warm servers with a one-shot fallback and the `warm_minutes` setting; the two-type clipboard undo with its Quick Action; the nonce check before delivery; the control-token fix, if not already merged; docs, the CHANGELOG and the eval gates.
-**Out**: CrisperWhisper or any new model; `vocalize notes` (DEC-046); any Swift change (DEC-032); a skip gate (DEC-041); a PyPI release, which is Mat's; editing Mat's own config, which is Mat's at release.
+**Out**: CrisperWhisper or any new model; `vocalize notes` (DEC-046); any Swift change (DEC-032); a skip gate (DEC-041); a PyPI release, which is the owner's; editing the owner's own config, which is the owner's at release.
 
 ## Repositories
 
@@ -19,7 +19,7 @@ Dictation gets a cleanup that writes what the speaker meant, whisper gets the us
 
 ### Phase 0: Fix what is already broken
 
-**Entry criteria**: Mat's go to build. `git log main` checked for the separate control-token fix (DEC-048).
+**Entry criteria**: the owner's go to build. `git log main` checked for the separate control-token fix (DEC-048).
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
@@ -81,17 +81,17 @@ Dictation gets a cleanup that writes what the speaker meant, whisper gets the us
 
 **Exit criteria**: verification.md § Phase 4 exit.
 
-### Phase 5: Ready for Mat's release
+### Phase 5: Ready for the owner's release
 
 **Entry criteria**: Phases 0 to 4 exit green on `main`.
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
 | T-50 | CHANGELOG under Unreleased, README's dictation paragraph, docs/dictation.md settings table | `vocalize` | T-43, T-35 | The entries name every new key and the new Quick Action |
-| T-51 | A proposed config block for Mat (`cleanup = "local"`, `warm_minutes = 15`, his vocabulary), written to the PR description only | `vocalize` | T-50 | Mat applies it himself |
-| T-52 | The owner-present check in verification.md § Manual checks | `vocalize` | T-51 | Mat's notes recorded in spike-notes.md |
+| T-51 | A proposed config block for the owner (`cleanup = "local"`, `warm_minutes = 15`, their vocabulary), written to the PR description only | `vocalize` | T-50 | The owner applies it |
+| T-52 | The owner-present check in verification.md § Manual checks | `vocalize` | T-51 | The owner's notes recorded in spike-notes.md |
 
-**Exit criteria**: verification.md § Phase 5 exit. The PyPI release is Mat's.
+**Exit criteria**: verification.md § Phase 5 exit. The PyPI release is the owner's.
 
 ## Dependencies
 
@@ -129,7 +129,7 @@ graph LR
 | Python builder (from a written spec) | `vocalize/`, `tests/` | own worktree per phase |
 | Eval runner on the reference Mac (needs the local models and Metal) | `tests/eval/` | own worktree; never writes to `~/.config/vocalize` |
 | Independent reviewer, another model family | the phase diff | read-only |
-| Mat | the owner-present check, the config block, the release | his Mac |
+| The owner | the owner-present check, the config block, the release | their Mac |
 
 Every builder and reviewer brief says: set `HOME` and `XDG_CONFIG_HOME` to a scratch directory for any command that reads or writes vocalize state, and never run state-mutating helpers against the real defaults.
 
