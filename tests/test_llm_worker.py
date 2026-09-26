@@ -224,3 +224,13 @@ def test_worker_check_config_refuses_auto_map(worker, tmp_path):
 
 def test_worker_check_config_passes_clean(worker, fake_model_dir):
     assert worker._check_config(str(fake_model_dir)) is None
+
+
+def test_worker_check_config_accepts_the_pinned_tokenizer_class(worker, tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}), encoding="utf-8",
+    )
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "TokenizersBackend"}), encoding="utf-8",
+    )
+    assert worker._check_config(str(tmp_path)) is None
