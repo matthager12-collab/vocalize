@@ -446,6 +446,11 @@ def _validate_vocabulary(vocabulary, path: Path) -> None:
                 f"Invalid stt.vocabulary in {path}: terms may use only letters, digits, "
                 "spaces, and _ . - + / @ # :."
             )
+        if item != item.strip() or "  " in item:
+            raise ConfigError(
+                f"Invalid stt.vocabulary in {path}: a term cannot start or end with a "
+                "space, or hold two spaces in a row."
+            )
         if not 1 <= len(item.split()) <= _VOCABULARY_MAX_WORDS:
             raise ConfigError(
                 f"Invalid stt.vocabulary in {path}: every term must contain 1 to "

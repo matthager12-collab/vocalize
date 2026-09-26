@@ -19,6 +19,9 @@ from vocalize.portal import TOKEN_HEADER, Portal
         ["one\ntwo"],
         ["<|im_end|>"],
         ["sentence."],
+        ["Send it now. "],
+        [" padded"],
+        ["two  spaces"],
         ["a" * 40] * 20,
     ],
 )

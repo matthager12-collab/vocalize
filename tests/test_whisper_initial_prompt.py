@@ -51,10 +51,36 @@ def test_plain_and_segments_paths_pass_prompt_and_disable_context(tmp_path, monk
     capsys.readouterr()
     assert worker.main(["--model", "m.bin", "--initial-prompt", "Vocabulary: pyproject.", "--segments", "--transcribe", str(wav)]) == 0
 
-    for model in Model.instances:
-        for _media, kwargs in model.calls:
-            assert kwargs["initial_prompt"] == "Vocabulary: pyproject."
-            assert kwargs["no_context"] is True
+    calls = [kwargs for model in Model.instances for _media, kwargs in model.calls]
+    assert len(calls) == 2  # never vacuous: one plain call, one segments call
+    for kwargs in calls:
+        assert kwargs["initial_prompt"] == "Vocabulary: pyproject."
+        assert kwargs["no_context"] is True
+
+
+class OldModel(Model):
+    """A pywhispercpp without `new_segment_callback`: the TypeError path."""
+
+    def transcribe(self, media, **kwargs):
+        if "new_segment_callback" in kwargs:
+            raise TypeError("unexpected keyword argument 'new_segment_callback'")
+        return super().transcribe(media, **kwargs)
+
+
+def test_the_segments_fallback_for_an_older_whisper_passes_the_prompt_too(tmp_path, monkeypatch, capsys):
+    worker = load_worker()
+    Model.instances = []
+    monkeypatch.setattr(worker, "_model_class", lambda: OldModel)
+    wav = tmp_path / "clip.wav"
+    write_wav(wav)
+
+    assert worker.main(["--model", "m.bin", "--initial-prompt", "Vocabulary: sha256.", "--segments", "--transcribe", str(wav)]) == 0
+
+    calls = Model.instances[-1].calls
+    assert len(calls) == 1  # only the fallback call reached the model
+    assert calls[0][1]["initial_prompt"] == "Vocabulary: sha256."
+    assert calls[0][1]["no_context"] is True
+    assert '"ok": true' in capsys.readouterr().out
 
 
 def test_selftest_passes_an_empty_prompt(tmp_path, monkeypatch):
