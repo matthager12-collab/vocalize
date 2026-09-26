@@ -171,7 +171,7 @@ The owner decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 
 **Decided by**: Claude, on the owner's standing authority
 **Status**: Decided
 
-**Context**: `[stt]` rejects unknown keys, so a key is a public contract. An older vocalize refuses a config that uses it.
+**Context**: `[stt]` warns on unknown keys and the portal refuses them, so a key is a public contract that older versions will complain about.
 
 | Option | Description | Trade-offs |
 |---|---|---|
@@ -182,7 +182,7 @@ The owner decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 
 
 **Decision**: A. `warm_minutes` is an integer from 0 to 240, default 0; 0 means unload 10 s after the take ends (round 2, G3), so an immediate second take is still warm. `vocabulary` is a list of at most 50 entries, default empty. Each entry is 1 to 40 characters and 1 to 4 words, drawn only from letters, digits, spaces and `_ . - + / @ # :`, with no `<`, `|` or sentence-ending punctuation (round 2, C6). The built prompt is capped at 800 characters. Both are added to `KNOWN_STT_KEYS`, `_validate_stt_table`, the portal's `[stt]` form and docs/dictation.md.
 
-**Consequences**: A config with either key fails on 0.14.0 and older. The owner's own config gets `cleanup = "local"`, `warm_minutes = 15` and their list, applied by the owner at release.
+**Consequences**: A config with either key makes 0.14.0 and older print "unknown config key" and ignore it (`_validate_stt_table` warns on unknown keys; the portal refuses to save them). The owner's own config gets `cleanup = "local"`, `warm_minutes = 15` and their list, applied by the owner at release.
 
 **Applied to**:
 - [design.md](design.md) § Contracts
