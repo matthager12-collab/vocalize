@@ -31,6 +31,7 @@ checking the process name is still the recorder's, the way
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -45,6 +46,7 @@ import threading
 import time
 import wave
 from array import array
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import audio, interrupted, llm
@@ -234,6 +236,38 @@ def session_path() -> Path:
 
 def copied_path() -> Path:
     return CACHE_DIR / "dictate.copied"
+
+
+@contextmanager
+def _delivery_lock():
+    """Serialize cancellation with the final clipboard delivery."""
+    fd = None
+    try:
+        audio.ensure_private_dir(CACHE_DIR)
+        fd = os.open(
+            CACHE_DIR / "dictate.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        )
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    fd = None
+                    break
+                time.sleep(0.02)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def mic_status_path() -> Path:
@@ -1505,22 +1539,25 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
         if text is None:
             _notify(_NOTIFY_NOTHING_HEARD)
             return 0
-        try:
-            copy_to_clipboard(text)
-        except DictationError:
-            _notify(_NOTIFY_CLIPBOARD_FAILED)
-            return 1
-        if stt.get("paste"):
-            nonce = _session_nonce(workdir)
-            if nonce is not None:
-                _write_copied_marker(nonce)
-        _play(_SOUND_DONE, stt)
-        if cleanup_skipped:
-            _notify(_NOTIFY_COPIED_RAW)
-        elif cleanup_backend(stt) in llm.CLOUD_BACKENDS:
-            _notify(_NOTIFY_COPIED_CLEANED)
-        else:
-            _notify(_NOTIFY_COPIED)
+        with _delivery_lock():
+            if not _session_owns(workdir):
+                return 0
+            try:
+                copy_to_clipboard(text)
+            except DictationError:
+                _notify(_NOTIFY_CLIPBOARD_FAILED)
+                return 1
+            if stt.get("paste"):
+                nonce = _session_nonce(workdir)
+                if nonce is not None:
+                    _write_copied_marker(nonce)
+            _play(_SOUND_DONE, stt)
+            if cleanup_skipped:
+                _notify(_NOTIFY_COPIED_RAW)
+            elif cleanup_backend(stt) in llm.CLOUD_BACKENDS:
+                _notify(_NOTIFY_COPIED_CLEANED)
+            else:
+                _notify(_NOTIFY_COPIED)
         return 0
     finally:
         _discard(workdir)
@@ -1542,11 +1579,13 @@ def cancel(stt: dict) -> int:
         # A transcription is running in another process. Release the claim
         # so the hotkey works again, but leave that process its directory:
         # it owns the take and removes it in its own `finally`.
-        _release_session(workdir)
-        _play(_SOUND_STOP, stt)
-        _notify(_NOTIFY_CANCELLED)
-        return 0
-    return _cancel(workdir, _recorder_pid(workdir), started, stt)
+        with _delivery_lock():
+            _release_session(workdir)
+            _play(_SOUND_STOP, stt)
+            _notify(_NOTIFY_CANCELLED)
+            return 0
+    with _delivery_lock():
+        return _cancel(workdir, _recorder_pid(workdir), started, stt)
 
 
 # --- pause and resume (DEC-037, Phase 15b) ----------------------------

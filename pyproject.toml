@@ -49,3 +49,4 @@ packages = ["vocalize"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["eval: needs the local models; runs only with VOCALIZE_EVAL=1"]
