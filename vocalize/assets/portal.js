@@ -515,8 +515,7 @@ var COST = {
 };
 
 /** The speech-to-text models, allowlisted by the server too. */
-// `config.STT_CLEANUP_BACKENDS`, in its order. "local" is not built yet
-// (0.13); the two cloud ones send the transcript off this Mac.
+// `config.STT_CLEANUP_BACKENDS`, in its order.
 var STT_CLEANUP = ["off", "local", "claude-cli", "anthropic"];
 
 var STT_MODELS = ["base.en", "small.en", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0"];
@@ -602,6 +601,14 @@ function asText(value) {
 function textBox(value) {
   var box = el("input");
   box.type = "text";
+  box.value = asText(value);
+  box.autocomplete = "off";
+  box.spellcheck = false;
+  return box;
+}
+
+function textArea(value) {
+  var box = el("textarea");
   box.value = asText(value);
   box.autocomplete = "off";
   box.spellcheck = false;
@@ -740,6 +747,17 @@ function changed(fields, status) {
   var settings = {};
   var bad = false;
   fields.forEach(function (entry) {
+    if (entry.list) {
+      var values = entry.box.value.split("\n").map(function (line) {
+        return line.trim();
+      }).filter(function (line) {
+        return line !== "";
+      });
+      var listNow = values.join("\n");
+      if (listNow === entry.initial) return;
+      settings[entry.key] = values.length ? values : null;
+      return;
+    }
     var now = entry.box.value.trim();
     if (now === entry.initial) return;
     if (now === "") {
@@ -1576,8 +1594,7 @@ function sttCard(data) {
       "Cleanup",
       cleanup,
       "What tidies a dictated take after transcription. off keeps the words " +
-        "as spoken; local runs on this Mac (not built yet — it is skipped " +
-        "with a note); claude-cli and anthropic send the transcript off this " +
+        "as spoken; local runs on this Mac; claude-cli and anthropic send the transcript off this " +
         "Mac and say so on stderr. The anthropic one needs a key on the Keys tab."
     )
   );
@@ -1593,6 +1610,16 @@ function sttCard(data) {
     )
   );
   fields.push({ key: "input_device", box: device, initial: asText(data.stt.input_device) });
+
+  var vocabulary = textArea((data.stt.vocabulary || []).join("\n"));
+  box.appendChild(
+    field(
+      "Vocabulary",
+      vocabulary,
+      "One word or short phrase per line. Helps Whisper expect jargon; this list is visible to other programs while Whisper runs."
+    )
+  );
+  fields.push({ key: "vocabulary", box: vocabulary, initial: (data.stt.vocabulary || []).join("\n"), list: true });
 
   var actions = el("div", "actions");
   var keep = button("Save dictation settings", async function () {

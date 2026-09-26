@@ -67,13 +67,13 @@ KNOWN_STT_KEYS = (
     "beam_size",
     "verbatim",
     "max_take_seconds",
+    "vocabulary",
 )
 
 # Where a dictation's cleanup pass runs. `off` is the default: a press must
-# never surprise with a pause or reworded text. `local` is accepted from
-# 0.12.0 so a 0.14 config never breaks an older binary; llm.py refuses it
-# at run time until the model ships. A legacy bool is coerced: true was
-# `claude -p`, false was off.
+# never surprise with a pause or reworded text. `local` runs the cleanup
+# pass on this Mac. A legacy bool is coerced: true was `claude -p`, false
+# was off.
 STT_CLEANUP_BACKENDS = ("off", "local", "claude-cli", "anthropic")
 
 # What `cues` may be: the fixed system sounds, spoken words instead, or both.
@@ -96,6 +96,7 @@ STT_DEFAULTS = {
     "cues": "sounds",
     "beam_size": 5,
     "max_take_seconds": 1800,
+    "vocabulary": [],
 }
 
 # The recorder self-stops at max_seconds and `dictate` backstops it, so this
@@ -120,6 +121,19 @@ STT_BEAM_SIZE_MAX = 8
 # character would let a hardware-shaped name drive a terminal, and a leading
 # '-' would turn a config value into a recorder flag.
 STT_DEVICE_MAX_CHARS = 128
+
+_VOCABULARY_MAX_ITEMS = 50
+_VOCABULARY_MAX_CHARS = 40
+_VOCABULARY_MAX_WORDS = 4
+_VOCABULARY_PROMPT_MAX_CHARS = 800
+_VOCABULARY_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _.\u002d+/@#:"
+)
+
+
+def vocabulary_prompt(items) -> str:
+    """The bounded, configured prompt passed to whisper.cpp."""
+    return "" if not items else "Vocabulary: " + ", ".join(items) + "."
 
 # chain = ["kokoro", "say"]: the on-device voice first, degrading to the
 # always-present `say` instead of erroring — so a keyless fresh Mac still
@@ -404,6 +418,46 @@ def _validate_stt_table(value, path: Path) -> None:
         raise ConfigError(
             f"Invalid stt.cues {cues!r} in {path}. Expected one of: "
             f"{', '.join(STT_CUE_MODES)}."
+        )
+
+    vocabulary = value.get("vocabulary")
+    if vocabulary is not None:
+        _validate_vocabulary(vocabulary, path)
+
+
+def _validate_vocabulary(vocabulary, path: Path) -> None:
+    """Validate the short terms that can become Whisper's initial prompt."""
+    if not isinstance(vocabulary, list):
+        raise ConfigError(f"Invalid stt.vocabulary in {path}: expected a list of terms.")
+    if len(vocabulary) > _VOCABULARY_MAX_ITEMS:
+        raise ConfigError(
+            f"Invalid stt.vocabulary in {path}: expected at most {_VOCABULARY_MAX_ITEMS} terms."
+        )
+    for item in vocabulary:
+        if not isinstance(item, str):
+            raise ConfigError(f"Invalid stt.vocabulary in {path}: every term must be a string.")
+        if not 1 <= len(item) <= _VOCABULARY_MAX_CHARS:
+            raise ConfigError(
+                f"Invalid stt.vocabulary in {path}: every term must be 1 to "
+                f"{_VOCABULARY_MAX_CHARS} characters."
+            )
+        if any(character not in _VOCABULARY_ALLOWED for character in item):
+            raise ConfigError(
+                f"Invalid stt.vocabulary in {path}: terms may use only letters, digits, "
+                "spaces, and _ . - + / @ # :."
+            )
+        if not 1 <= len(item.split()) <= _VOCABULARY_MAX_WORDS:
+            raise ConfigError(
+                f"Invalid stt.vocabulary in {path}: every term must contain 1 to "
+                f"{_VOCABULARY_MAX_WORDS} space-separated words."
+            )
+        if item.endswith((".", "!", "?", ";", ",")):
+            raise ConfigError(
+                f"Invalid stt.vocabulary in {path}: a term cannot end as a sentence.")
+    if len(vocabulary_prompt(vocabulary)) > _VOCABULARY_PROMPT_MAX_CHARS:
+        raise ConfigError(
+            f"Invalid stt.vocabulary in {path}: the built prompt must be at most "
+            f"{_VOCABULARY_PROMPT_MAX_CHARS} characters."
         )
 
 

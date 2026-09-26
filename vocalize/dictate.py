@@ -49,7 +49,7 @@ from array import array
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import audio, interrupted, llm
+from . import audio, config, interrupted, llm
 from .exceptions import DictationError, VocalizeError
 
 # Same directory as the playback lock and the ledger. Spelled out here so
@@ -1107,6 +1107,7 @@ def worker_argv(uv: str, wav_path: Path, stt: dict) -> list[str]:
         "--model", str(manifest.model_path(model)),
         "--language", str(stt["language"]),
         "--beam-size", str(stt["beam_size"]),
+        f"--initial-prompt={config.vocabulary_prompt(stt.get('vocabulary') or [])}",
     ]
 
 
