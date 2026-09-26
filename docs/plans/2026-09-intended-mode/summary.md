@@ -25,6 +25,7 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 
 ## Constraints
 
+- **Speed beats RAM** whenever a trade-off has to be made (Mat, 2026-09-26).
 - Local only. Nothing new leaves the Mac.
 - Keep each worker under 1.5 GB peak memory.
 - Test whether the whisper prompt leaks into the text on silence and on very short takes.
@@ -46,7 +47,7 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 
 ## Resolved so far
 
-- **1. Latency: reopened.** Mat said "Go" to A (accept 4 to 5 s). The measurement then showed today's real cost is about 11 s after the stop with local cleanup ([spike-notes.md](spike-notes.md)). Mat asked for a faster way that does not keep 1 GB loaded all day. The proposed answer is preload on press, for an estimated 3.2 s. It waits on Mat's yes.
+- **1. Latency: preload on press, plus a warm window.** Mat's rule, 2026-09-26: "Go for speed at the expense of Ram if a decision has to be made." Both workers start loading when the take starts. After the take they stay loaded for a warm window of a set number of minutes, then exit. Back-to-back dictations and short takes are then warm too. RAM is held for the window, never all day. The window length is a two-way door, tuned from the spike. Measured basis: [spike-notes.md](spike-notes.md).
 - **3. Default: decided as a two-way door.** The package default stays `off`, so no other user is surprised. Mat's own config turns cleanup on.
 - **4. Jargon list: decided as a two-way door.** A plain list in the config, filled by Mat. The design fixes the exact key.
 
