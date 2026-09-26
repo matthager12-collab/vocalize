@@ -185,7 +185,7 @@ def test_escape_sequences_in_the_cleanup_output_are_stripped(claude, monkeypatch
         lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout=out, stderr=""),
     )
 
-    text, cleaned = llm.cleanup_transcript(TRANSCRIPT, "claude-cli")
+    text, _cleaned = llm.cleanup_transcript(TRANSCRIPT, "claude-cli")
 
     assert "\x1b" not in text and "\x07" not in text
 
