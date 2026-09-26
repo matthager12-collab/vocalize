@@ -36,9 +36,14 @@ def vocabulary_words():
 
 
 @pytest.mark.skipif(os.environ.get("VOCALIZE_EVAL") != "1", reason="set VOCALIZE_EVAL=1")
-def test_vocabulary_does_not_leak_into_unrelated_audio(tmp_path):
+def test_vocabulary_does_not_leak_into_unrelated_audio(tmp_path, monkeypatch):
     if not MODEL.is_file():
         pytest.skip("the large-v3-turbo-q5_0 model is not installed")
+    # tests/conftest.py points every model dir at tmp_path for unit tests;
+    # this eval is the one place that needs the real installed model.
+    from vocalize.local import whisper_manifest
+
+    monkeypatch.setattr(whisper_manifest, "MODEL_DIR", MODEL.parent)
     stt = config.resolve_stt({})
     stt["vocabulary"] = VOCABULARY
     clips = []
