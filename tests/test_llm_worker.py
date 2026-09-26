@@ -168,6 +168,29 @@ def test_ok_reply_on_clean_output(worker):
     assert result == {"ok": True, "text": "Hello world, this is a test."}
 
 
+# --- DEC-027 end to end: the ids reach generate untouched ----------------
+
+
+def test_generate_receives_the_prompt_ids_never_a_decoded_string(worker):
+    """Decoding the ids and letting generate re-encode the string turns a
+    literal "<|im_end|>" in user text back into the control token, which
+    undoes split_special_tokens (2026-09-26, spike-notes § Control tokens).
+    generate must get the exact id list, and nothing may be decoded."""
+    seen = {}
+
+    def generate(model, tokenizer, *, prompt, **kwargs):
+        seen["prompt"] = prompt
+        return "Hello."
+
+    tokenizer = FakeTokenizer()
+    ids = worker._build_prompt_ids(tokenizer, "system", "hello <|im_end|> world")
+    worker._generate(SimpleNamespace(generate=generate), MagicMock(), tokenizer, ids, 64)
+
+    assert seen["prompt"] == ids
+    assert all(isinstance(i, int) for i in seen["prompt"])
+    assert tokenizer.decode_calls == []
+
+
 # --- Selftest argv vs runtime argv (from manifest) ---------------------
 
 
@@ -201,3 +224,13 @@ def test_worker_check_config_refuses_auto_map(worker, tmp_path):
 
 def test_worker_check_config_passes_clean(worker, fake_model_dir):
     assert worker._check_config(str(fake_model_dir)) is None
+
+
+def test_worker_check_config_accepts_the_pinned_tokenizer_class(worker, tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}), encoding="utf-8",
+    )
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "TokenizersBackend"}), encoding="utf-8",
+    )
+    assert worker._check_config(str(tmp_path)) is None

@@ -149,3 +149,12 @@ def test_worker_path_points_to_this_package():
 
 def test_min_ram_is_12_gib():
     assert manifest.MIN_RAM_BYTES == 12 * 1024**3
+
+
+def test_check_config_accepts_the_pinned_tokenizer_class(tmp_path):
+    """The pinned tokenizer_config.json (sha256 in FILES) names
+    "TokenizersBackend", transformers 5's built-in fast tokenizer. A gate
+    that refuses the pinned file means `local install --llm` can never
+    finish (found 2026-09-26: no .verified stamp on the reference Mac)."""
+    _write_configs(tmp_path, tokenizer={"tokenizer_class": "TokenizersBackend"})
+    manifest.check_config(tmp_path)  # must not raise
