@@ -1949,12 +1949,15 @@ def test_a_dictation_with_cleanup_on_copies_the_cleaned_text(
 ):
     recorder()
     transcriber()
-    claude("Cleaned up.")
+    # A faithful cleanup (the guard in llm.faithful refuses invented words),
+    # still different from the raw transcript so the test can tell them apart.
+    cleaned = "Read the pyproject at the repository root, then check the sha256."
+    claude(cleaned)
     start(cleanup=True)
 
     assert press_again(monkeypatch, cleanup=True) == 0
 
-    assert harness.clipboard() == "Cleaned up."
+    assert harness.clipboard() == cleaned
     # The one notification that says text left this Mac — fixed text, never the transcript.
     assert any(dictate._NOTIFY_COPIED_CLEANED in line for line in harness.notifications())
     assert dictate._NOTIFY_COPIED_CLEANED in dictate._FIXED_NOTIFICATIONS
