@@ -80,6 +80,7 @@ def _check_config(model_dir: str) -> str | None:
     _MODEL_TYPE = "qwen3_5"
     _TOKENIZER_ALLOWLIST = frozenset({
         "Qwen2Tokenizer", "Qwen2TokenizerFast", "PreTrainedTokenizerFast",
+        "TokenizersBackend",  # transformers 5; what the pinned config names
     })
     _REFUSED = frozenset({"auto_map", "model_file", "custom_pipelines"})
 
@@ -162,13 +163,12 @@ def _build_prompt_ids(tokenizer, system: str, text: str) -> list[int]:
 def _generate(mlx_lm_mod, model, tokenizer, prompt_ids: list[int], max_tokens: int) -> dict:
     """Run greedy generation and return the reply dict."""
     try:
-        # mlx_lm.generate takes a string prompt, but we need token-level
-        # control.  Use the lower-level generate_step or convert ids back
-        # to a string that produces the same ids.  The simplest correct
-        # approach: decode the ids back to a string and pass it.
-        prompt_text = tokenizer.decode(prompt_ids)
+        # The ids go in as they are. Decoding them to a string and letting
+        # generate re-encode it turns a literal "<|im_end|>" in user text
+        # back into the control token, undoing split_special_tokens
+        # (DEC-027). mlx_lm.generate accepts a list of ids since 0.31.
         output = mlx_lm_mod.generate(
-            model, tokenizer, prompt=prompt_text,
+            model, tokenizer, prompt=prompt_ids,
             max_tokens=max_tokens, verbose=False,
         )
     except Exception as exc:  # noqa: BLE001

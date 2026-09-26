@@ -99,6 +99,9 @@ _TOKENIZER_CLASS_ALLOWLIST = frozenset({
     "Qwen2Tokenizer",
     "Qwen2TokenizerFast",
     "PreTrainedTokenizerFast",
+    # transformers 5's built-in fast tokenizer, and what the pinned
+    # tokenizer_config.json names (its sha256 is in FILES below).
+    "TokenizersBackend",
 })
 
 # Keys in config.json or tokenizer_config.json that must never appear:

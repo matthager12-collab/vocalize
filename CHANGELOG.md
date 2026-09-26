@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- **Local cleanup: control tokens in dictated text stay text.** The worker
+  built its prompt as token ids so that a literal `<|im_end|>` in the
+  transcript could not end a turn (DEC-027), then decoded the ids back to a
+  string that `mlx_lm.generate` encoded again, which turned that text back
+  into the real control token. The ids now go to `generate` unchanged.
+- **Local cleanup installs with the pinned model.** The pinned
+  `tokenizer_config.json` names `TokenizersBackend` (transformers 5's built-in
+  fast tokenizer), which both config gates refused, so `vocalize local install
+  --llm` could never finish verifying and `[stt] cleanup = "local"` always
+  fell back to the raw transcript. Re-run `vocalize local install --llm` after
+  upgrading.
+
 ## 0.14.0 - 2026-09-22
 
 ### Added
