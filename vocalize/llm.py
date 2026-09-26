@@ -159,7 +159,9 @@ _SPOKEN_NUMBERS = frozenset(["zero", "one", "two", "three", "four", "five", "six
 
 def _words(text: str) -> list[str]:
     text = text.lower().replace("can't", "can not").replace("won't", "will not")
-    text = text.replace("n't", " not")
+    text = text.replace("n't", " not").replace("cannot", "can not")
+    for short, full in (("'m", " am"), ("'re", " are"), ("'ve", " have"), ("'ll", " will"), ("'d", " would"), ("'s", "")):
+        text = text.replace(short, full)
     return [word.strip(".,:-'") for word in "".join(
         ch if ch.isalnum() or ch in "@.%$:'- \t\n" else " " for ch in text
     ).split() if word.strip(".,:-'")]
@@ -185,6 +187,12 @@ def faithful(raw: str, cleaned: str) -> bool:
     if content and len(content & kept) / len(content) < (0.34 if corrected else 0.9):
         return False
     has_number = any(word in _SPOKEN_NUMBERS or any(ch.isdigit() for ch in word) for word in source)
+    # ponytail: a digit budget, not a parse: each spoken number word or raw
+    # digit may account for up to three written digits ("one" never becomes
+    # "$1,000,000"). A word-to-number parser if this lets a swap through.
+    budget = 3 * sum(w in _SPOKEN_NUMBERS for w in source) + sum(ch.isdigit() for ch in raw)
+    if sum(ch.isdigit() for ch in cleaned) > budget:
+        return False
     known = set(source)
     for word in result:
         if word in _STOPWORDS or word in known:

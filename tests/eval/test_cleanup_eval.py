@@ -40,4 +40,6 @@ def test_cleanup_eval(monkeypatch):
     print("passes by category:", dict(categories))
     standard = [passed for case, passed in results if case["category"] != "adversarial"]
     assert sum(standard) >= 21
-    assert all(passed for case, passed in results if case["category"] in {"adversarial", "instruction_like"})
+    guarded = [passed for case, passed in results if case["category"] in {"adversarial", "instruction_like"}]
+    assert len(guarded) >= 10  # 8 adversarial + 2 instruction-like: never vacuous
+    assert all(guarded)

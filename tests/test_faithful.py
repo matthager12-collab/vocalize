@@ -54,3 +54,11 @@ def test_guard_keeps_real_cleanups_that_drop_corrected_or_spoken_words():
     assert llm.faithful("The deadline is Friday, actually make that Monday.", "The deadline is Monday.")
     assert llm.faithful("Call me back at five five five, one two three.", "Call me back at 555-123.")
     assert llm.faithful("You can reach her at sam at example dot com.", "You can reach her at sam@example.com.")
+
+
+def test_guard_accepts_contractions_and_bounds_new_digits():
+    assert llm.faithful("I am sure it is done", "I'm sure it's done.")
+    assert llm.faithful("we cannot ship", "We can not ship.")
+    assert not llm.faithful("Transfer one to Bob", "Transfer $1,000,000 to Bob.")
+    assert llm.faithful("Transfer one hundred dollars to Bob", "Transfer $100 to Bob.")
+    assert llm.faithful("Call me at five five five, one two three, four five six seven", "Call me at 555-123-4567.")

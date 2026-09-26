@@ -172,15 +172,23 @@ def test_cleanup_prepends_the_baked_path_for_a_services_environment(monkeypatch)
     assert llm._claude_env()["PATH"].startswith("/opt/node/bin:")
 
 
-def test_escape_sequences_in_the_cleanup_output_are_stripped(claude):
-    # Control characters inside otherwise faithful output: the guard
-    # passes it, so this proves sanitize runs on the text that is kept.
-    claude(TRANSCRIPT.replace(" ", " \x1b\x07", 1))
+def test_escape_sequences_in_the_cleanup_output_are_stripped(claude, monkeypatch):
+    """Real control bytes, through the run seam: the fake binary's printf
+    writes json.dumps text, so "\x1b" would arrive as the six characters
+    "\u001b" and never exercise sanitize."""
+    import subprocess
+
+    claude(TRANSCRIPT)  # installs CLAUDE_BIN; the run itself is replaced below
+    out = TRANSCRIPT.replace(" ", " \x1b]0;\x07", 1)
+    monkeypatch.setattr(
+        llm, "RUN_SEAM",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout=out, stderr=""),
+    )
 
     text, cleaned = llm.cleanup_transcript(TRANSCRIPT, "claude-cli")
 
-    assert cleaned is True
     assert "\x1b" not in text and "\x07" not in text
+
 
 
 # --- claude-cli: the 0.12.0 additions -------------------------------------

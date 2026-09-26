@@ -240,7 +240,13 @@ def copied_path() -> Path:
 
 @contextmanager
 def _delivery_lock():
-    """Serialize cancellation with the final clipboard delivery."""
+    """Serialize cancellation with the final clipboard delivery.
+
+    Fails open, deliberately: if the lock file cannot be opened (a planted
+    symlink in the private cache dir, a full disk) or is held past 10 s,
+    the caller proceeds unlocked. Cancel must never refuse (DEC-011), and
+    delivery must not lose the take; unlocked is only the pre-DEC-045 race.
+    """
     fd = None
     try:
         audio.ensure_private_dir(CACHE_DIR)
@@ -1575,17 +1581,22 @@ def cancel(stt: dict) -> int:
     if session is None:
         return _clear_wedged_session(stt, _NOTIFY_CANCELLED, 0)
     workdir, started = session
-    if _finish_claim(workdir) == "live":
-        # A transcription is running in another process. Release the claim
-        # so the hotkey works again, but leave that process its directory:
-        # it owns the take and removes it in its own `finally`.
-        with _delivery_lock():
+    # Decided under the delivery lock (DEC-045): a take that finished and
+    # delivered while this cancel waited is no longer ours to cancel.
+    with _delivery_lock():
+        if not _session_owns(workdir):
+            return 0
+        if _finish_claim(workdir) == "live":
+            # A transcription is running in another process. Release the
+            # claim so the hotkey works again, but leave that process its
+            # directory: it owns the take and removes it in its own `finally`.
             _release_session(workdir)
             _play(_SOUND_STOP, stt)
             _notify(_NOTIFY_CANCELLED)
             return 0
-    with _delivery_lock():
-        return _cancel(workdir, _recorder_pid(workdir), started, stt)
+    # Still recording: nothing is being delivered, so the recorder wait
+    # below runs without holding the lock.
+    return _cancel(workdir, _recorder_pid(workdir), started, stt)
 
 
 # --- pause and resume (DEC-037, Phase 15b) ----------------------------

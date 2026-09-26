@@ -83,3 +83,17 @@ def test_cancel_does_not_refuse_when_lock_is_unavailable(tmp_path, monkeypatch):
         os.close(holder)
     assert dictate._NOTIFY_CANCELLED in notices
     assert not dictate.session_path().exists()
+
+
+def test_cancel_after_the_take_delivered_says_nothing(tmp_path, monkeypatch):
+    """A cancel that waited on the lock while the take was delivered must not
+    then announce a cancellation (Gemini review, run 1)."""
+    workdir = _session(tmp_path, monkeypatch)
+    notices = []
+    monkeypatch.setattr(dictate, "_notify", notices.append)
+    monkeypatch.setattr(dictate, "_play", lambda *_: None)
+    monkeypatch.setattr(dictate, "_session_owns", lambda *_: False)
+    monkeypatch.setattr(dictate, "_finish_claim", lambda *_: "live")
+    assert dictate.cancel({}) == 0
+    assert dictate._NOTIFY_CANCELLED not in notices
+    shutil.rmtree(workdir, ignore_errors=True)
