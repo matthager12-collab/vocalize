@@ -32,3 +32,13 @@ Split-plan, 2026-09-26, against [plan.md](plan.md).
 ## Open questions
 
 None. The undo (run 5) depends only on run 1's guard. It could run earlier, but it edits `dictate.py`'s delivery path, which runs 1 and 4 also edit, so it waits rather than risk a three-way conflict.
+
+## Exit scripts, proven before the build
+
+All six `validate-exit.sh` scripts were run on 2026-09-26 against the plan branch, before any build. Each exited 1. Every check for a not-yet-built artifact failed with exit 1. The only passes were regression checks: `ruff check .` (6), the whole unit suite (6) and the plan lint (run 6).
+
+The first attempt caught two bugs in the scripts, both fixed before this run:
+- `timeout` cannot call a shell function, so the pytest helpers returned 127.
+- A 120 s default timeout would have killed the 160 s suite and the evals.
+
+It also caught two vacuous checks. Both are now pinned: a docs grep that the old text already satisfied, and an orphan check with no existence precondition.
