@@ -1,4 +1,6 @@
+import fcntl
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -8,9 +10,9 @@ from pathlib import Path
 from vocalize import dictate
 
 
-def _session(tmp_path):
+def _session(tmp_path, monkeypatch):
     workdir = Path(tempfile.mkdtemp(prefix="vocalize-dictate-"))
-    dictate.CACHE_DIR = tmp_path
+    monkeypatch.setattr(dictate, "CACHE_DIR", tmp_path)
     dictate.session_path().write_text(
         json.dumps({"dir": str(workdir), "started": time.time(), "nonce": "n", "state": "transcribing"})
     )
@@ -18,7 +20,7 @@ def _session(tmp_path):
 
 
 def test_cancel_before_delivery_drops_the_take(tmp_path, monkeypatch):
-    workdir = _session(tmp_path)
+    workdir = _session(tmp_path, monkeypatch)
     monkeypatch.setattr(dictate, "_finish_take", lambda *_: ("words", False))
     monkeypatch.setattr(dictate, "_finish_claim", lambda *_: "live")
     monkeypatch.setattr(dictate, "_stop_file", lambda *_: None)
@@ -35,7 +37,7 @@ def test_cancel_before_delivery_drops_the_take(tmp_path, monkeypatch):
 
 
 def test_cancel_waits_for_delivery_lock(tmp_path, monkeypatch):
-    workdir = _session(tmp_path)
+    workdir = _session(tmp_path, monkeypatch)
     entered, release = threading.Event(), threading.Event()
     monkeypatch.setattr(dictate, "_finish_take", lambda *_: ("words", False))
     monkeypatch.setattr(dictate, "_finish_claim", lambda *_: "live")
@@ -63,10 +65,21 @@ def test_cancel_waits_for_delivery_lock(tmp_path, monkeypatch):
 
 
 def test_cancel_does_not_refuse_when_lock_is_unavailable(tmp_path, monkeypatch):
-    _session(tmp_path)
+    """A lock held elsewhere past the bound must not wedge cancel (DEC-011)."""
+    _session(tmp_path, monkeypatch)
     monkeypatch.setattr(dictate, "_finish_claim", lambda *_: "live")
     monkeypatch.setattr(dictate, "_play", lambda *_: None)
-    monkeypatch.setattr(dictate, "_notify", lambda *_: None)
-    clock = iter((0, 11))
-    monkeypatch.setattr(dictate.time, "monotonic", lambda: next(clock))
-    assert dictate.cancel({}) == 0
+    notices = []
+    monkeypatch.setattr(dictate, "_notify", notices.append)
+    holder = os.open(tmp_path / "dictate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    ticks = iter(range(0, 1000, 5))  # each poll moves the clock 5 s on
+    monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(dictate.time, "sleep", lambda _s: None)
+    try:
+        assert dictate.cancel({}) == 0
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    assert dictate._NOTIFY_CANCELLED in notices
+    assert not dictate.session_path().exists()

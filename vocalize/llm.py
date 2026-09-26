@@ -149,8 +149,26 @@ def cleanup_transcript(text: str, backend: str, verbatim: bool = False) -> tuple
     return (cleaned, True) if cleaned else (text, False)
 
 
-_STOPWORDS = frozenset(["a", "an", "the", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "its", "our", "their", "am", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "have", "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must", "to", "of", "in", "on", "at", "for", "from", "with", "by", "and", "or", "but", "if", "then", "that", "this", "these", "those", "as"])
-_SPOKEN_NUMBERS = frozenset(["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "percent", "dollars", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth", "twenty-first", "twenty-second", "twenty-third", "twenty-fourth", "twenty-fifth", "twenty-sixth", "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth", "thirty-first", "am", "pm"])
+# Words the guard lets a cleanup add or keep freely; negations are counted
+# separately, so "not" and "never" are deliberately absent.
+_STOPWORDS = frozenset("""
+a an the i you he she it we they me him her us them my your his its our
+their am is are was were be been being do does did have has had can
+could will would shall should may might must to of in on at for from
+with by and or but if then that this these those as
+""".split())
+# A raw take holding any of these may come back with digits, $ or %.
+# ponytail: any number word unlocks any digits; per-number mapping if it matters.
+_SPOKEN_NUMBERS = frozenset("""
+zero one two three four five six seven eight nine ten eleven twelve
+thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+thirty forty fifty sixty seventy eighty ninety hundred thousand million
+percent dollars first second third fourth fifth sixth seventh eighth
+ninth tenth eleventh twelfth thirteenth fourteenth fifteenth sixteenth
+seventeenth eighteenth nineteenth twentieth twenty-first twenty-second
+twenty-third twenty-fourth twenty-fifth twenty-sixth twenty-seventh
+twenty-eighth twenty-ninth thirtieth thirty-first am pm
+""".split())
 
 
 def _words(text: str) -> list[str]:
