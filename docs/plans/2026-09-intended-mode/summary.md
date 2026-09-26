@@ -49,6 +49,7 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 ## Resolved so far
 
 - **1. Latency: preload on press, plus a warm window.** Mat's rule, 2026-09-26: "Go for speed at the expense of Ram if a decision has to be made." Both workers start loading when the take starts. After the take they stay loaded for a warm window of a set number of minutes, then exit. Back-to-back dictations and short takes are then warm too. RAM is held for the window, never all day. The window length is a two-way door, tuned from the spike. Measured basis: [spike-notes.md](spike-notes.md).
+- **2. Undo: A, the clipboard holds both** (Mat, 2026-09-26). The cleaned text is the ordinary clipboard text. The raw take rides along as a second, private clipboard type. A "Paste What I Said" Quick Action swaps it in. Nothing is written to a file, and the frozen app is not edited. The raw text is gone as soon as anything else is copied. The privacy section of docs/dictation.md gains a line saying so.
 - **3. Default: decided as a two-way door.** The package default stays `off`, so no other user is surprised. Mat's own config turns cleanup on.
 - **4. Jargon list: decided as a two-way door.** A plain list in the config, filled by Mat. The design fixes the exact key.
 
