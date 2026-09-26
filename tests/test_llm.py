@@ -248,6 +248,10 @@ def test_local_runs_offline_with_request_on_stdin(monkeypatch, capsys):
         install_module, "installed",
         lambda manifest, **kw: (True, ""),
     )
+    # The run itself is faked below, so uv only has to be "found": a CI
+    # runner without uv must not turn this into a skipped cleanup.
+    from vocalize import local as local_module
+    monkeypatch.setattr(local_module, "uv_path", lambda: "/usr/bin/true")
 
     recorded = {}
 

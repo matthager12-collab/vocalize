@@ -1177,6 +1177,9 @@ def test_local_install_llm_ram_gate_and_force(monkeypatch, tmp_path):
 
     monkeypatch.setattr(local_module, "physical_ram_bytes", lambda: 8 * 1024**3)
     monkeypatch.setattr(llm_manifest, "MODEL_DIR", tmp_path / "models" / "qwen")
+    # uv is checked before the RAM gate; a CI runner without uv must still
+    # reach the gate this test is about.
+    monkeypatch.setattr(local_pkg, "uv_path", lambda: "/usr/bin/true")
 
     # Without --force: fails at RAM gate
     result = CliRunner().invoke(main, ["local", "install", "--llm", "--yes"])
