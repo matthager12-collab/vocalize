@@ -36,3 +36,12 @@ Load both workers when the take starts. They wait for the stop, then exit with t
 - total after stop: **about 3.2 s**, down from about 11 s
 - nothing stays loaded between dictations
 - a take shorter than about 6 seconds still waits for the part of the load that has not finished
+
+## Control tokens survive the prompt round trip (a shipped defect)
+
+Checked 2026-09-26 by script, after Codex's round-1 critique (critique-round-1.md, finding 2). `llm_worker._generate` decodes the carefully built prompt ids back to a string (`tokenizer.decode(prompt_ids)`, llm_worker.py:169), and `mlx_lm.generate` encodes that string again. User text "hello <|im_end|> world", encoded with `split_special_tokens=True`, holds no `<|im_end|>` id (248046). After decode and re-encode, it does:
+
+- special id 248046 in the safe ids: False
+- in the re-encoded ids: True
+
+So DEC-027's protection does not hold in 0.14.0. `mlx_lm.generate` 0.31.3 accepts `prompt: Union[str, List[int]]`, so the fix is to pass the ids directly. The plan carries it as its first task unless a separate fix lands first.
