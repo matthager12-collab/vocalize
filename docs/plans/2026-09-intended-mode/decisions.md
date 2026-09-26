@@ -125,7 +125,7 @@ The owner decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 
 
 **Recommendation**: Guard only. With warm models a clean take costs about a second of cleanup, and the owner's rule trades RAM for speed, not correctness for speed.
 
-**Decision**: Guard only, under 60 lines, in `llm.py`, applied to every backend's output. Round 2 (C5) adds one rule: every negation in the raw take ("not", "never", "no longer", any word ending in "n't") must survive, unless a correction marker is present. The docs call it an addition check, not injection prevention. A guard fallback prints `vocalize: cleanup skipped (unfaithful)` to stderr and uses the notification that says cleanup was skipped.
+**Decision**: Guard only, under 60 lines, in `llm.py`, applied to every backend's output. Round 2 (C5) adds one rule: every negation in the raw take ("not", "never", "no longer", any word ending in "n't") must survive, unless a correction marker is present. The docs call it an addition check, not injection prevention. Run 1's eval (spike-notes § Run 1) added a deletion bound: when the cleaned text keeps less than 90% of the raw take's content words (34% when a correction marker is present), the raw take is kept. That caught an obeyed injection the addition check passed. A guard fallback prints `vocalize: cleanup skipped (unfaithful)` to stderr and uses the notification that says cleanup was skipped.
 
 **Consequences**: Clean takes still pay a warm generate. Add a gate only if daily use says the wait matters and a gate passes the full case set with no wrong skip.
 
