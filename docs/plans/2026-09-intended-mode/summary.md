@@ -12,6 +12,7 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 4. Recognise Mat's jargon.
 5. Accept extra seconds per press for cleaner text.
 6. Keep the raw take one keystroke away, as an undo.
+7. Make the speed-versus-RAM trade a user setting (Mat, 2026-09-26: "can we make that a config option for users?"). Proposed: one whole-number setting, the minutes the models stay loaded after a take. 0 means unload straight after the take. The package default is 0, so no other user finds memory held after dictating. Mat's config sets a longer window. Preload during the take is always on and has no setting. It holds whisper and the cleanup model at the same time, about 1.9 GB, where today they run one after the other. The local model already refuses to install below 12 GiB of RAM (`llm_manifest.MIN_RAM_BYTES`). The setting's name and default are a public config contract, so they go to decision round 1.
 
 ## How dictation works today
 
