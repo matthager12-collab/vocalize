@@ -62,6 +62,6 @@ def test_vocabulary_does_not_leak_into_unrelated_audio(tmp_path):
             print(f"{name} run {run + 1}: {output}")
             leaked = [
                 word for word in words - spoken
-                if re.search(r"(?<!\\w)" + re.escape(word) + r"(?!\\w)", output, re.IGNORECASE)
+                if re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", output, re.IGNORECASE)
             ]
             assert not leaked, f"{name} run {run + 1} leaked: {', '.join(leaked)}"
