@@ -23,7 +23,7 @@ Dictation gets a cleanup that writes what the speaker meant, whisper gets the us
 
 | # | Task | Repo | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| T-01 | Skip this task if main already has the fix. Otherwise, in `llm_worker._generate`, pass `prompt_ids` (a list of ints) to `mlx_lm.generate` and delete the decode | `vocalize` | — | A new test through the `_mlx` seam records that `generate` got a `list[int]`, and that user text holding `<|im_end|>` never yields that token's id. It fails on the old code |
+| T-01 | **Done in PR #16 (squash 8dd4f61), with the tokenizer fix below.** Skip this task if main already has the fix. Otherwise, in `llm_worker._generate`, pass `prompt_ids` (a list of ints) to `mlx_lm.generate` and delete the decode | `vocalize` | — | A new test through the `_mlx` seam records that `generate` got a `list[int]`, and that user text holding `<|im_end|>` never yields that token's id. It fails on the old code |
 | T-02 | In `dictate._stop`, hold an exclusive `flock` on the session file across the nonce re-read and the clipboard write; `cancel` takes the same lock before releasing (DEC-045) | `vocalize` | — | Tests: a cancel between transcription and delivery means nothing reaches the pbcopy seam, no copied marker is written, and no success notification fires; a cancel that arrives while delivery holds the lock waits, then finds the take delivered. The first test fails on the old code |
 
 **Exit criteria**: verification.md § Phase 0 exit.

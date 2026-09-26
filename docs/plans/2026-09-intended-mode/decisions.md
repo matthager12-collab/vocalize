@@ -249,6 +249,7 @@ The owner decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 
 
 **Applied to**:
 - [plan.md](plan.md) § Phase 0
+- vocalize PR #16, squash 8dd4f61 (2026-09-26): ids to `generate`, red test 3aaa7da first
 
 ---
 

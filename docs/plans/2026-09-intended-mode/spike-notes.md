@@ -69,7 +69,7 @@ So DEC-027's protection does not hold in 0.14.0. `mlx_lm.generate` 0.31.3 accept
 - **Remaining P2 failures.** Two were strict-judge ordinals ("June 12th", "March 3rd"). Two dropped a meaningful word ("I think", "now"). One was meta-commentary added in front of a dictated question ("What time is the meeting tomorrow?"). No prompt obeyed an embedded instruction or answered a question.
 - **P0 is unstable on corrections.** In this run it applied the Tuesday-to-Wednesday correction, but left 5 of 6 other corrections unapplied. The earlier run (above) kept "Tuesday" four times out of four.
 - **Guard, "no word the raw take lacks".** It never passed an output the judge failed for added content (0 of 78 unfaithful-and-PASS), and it caught the meta-commentary. By design it cannot see an unapplied correction or a dropped word.
-- **Gate, "skip the model when there is nothing to clean".** It would skip 6 of 26. One skip was wrong: a spoken email with no number word ("jen at example dot com").
+- **Gate, "skip the model when there is nothing to clean".** It would skip 6 of 26. One skip was wrong: a spoken email with no number word ("sam at example dot com").
 
 ## S3: warm servers and memory
 
@@ -82,3 +82,9 @@ So DEC-027's protection does not hold in 0.14.0. `mlx_lm.generate` 0.31.3 accept
 - **Memory, per process, measured on the model process, not the uv wrapper.** Whisper: RSS peak 774 MB, physical footprint peak 857 MB. Cleanup: RSS peak 1,310 MB, **physical footprint peak 3.3 GB**. Combined at the same instant: 1.85 GB RSS, about 4.1 GB footprint. mlx's unified memory is mostly invisible to RSS, so the roadmap's 1.1 GB and the 1.5 GB cap were RSS figures. The one-shot worker has the same footprint while it runs.
 - **Idle exit.** With a 15 s idle limit, both servers logged "EXIT idle" and their sockets were gone by 20 s.
 - **Found on the way.** A connect-then-disconnect probe crashed the first server version with `BrokenPipeError`, so servers must survive a client that vanishes. `uv run` does not replace itself with Python, so the spawned PID is uv's; lifecycle control must go through the socket (`shutdown`), not PIDs. macOS limits a socket path to about 104 bytes.
+
+## Found while fixing the control tokens: local cleanup never installed
+
+2026-09-26. Running the fixed worker live against the pinned model failed its config check with "foreign tokenizer_class: TokenizersBackend". The pinned `tokenizer_config.json` (its sha256 matches `llm_manifest.FILES`) names `TokenizersBackend`, transformers 5's built-in fast tokenizer. Both the manifest's and the worker's allowlists refused it. So `vocalize local install --llm` never wrote `.verified`, and `[stt] cleanup = "local"` always fell back to the raw transcript. The reference Mac had no `.verified` stamp.
+
+Fixed in the same PR (#16): `TokenizersBackend` is allowlisted in both places, with red tests first (8271ca1). After the fix, the worker's `--selftest` printed `ok`, and a `--once` request whose text held `<|im_end|>` returned a normal cleanup. The same PR fixed two tests that assumed `uv` on the CI runner; CI had been red on `main` since 2026-09-22.
