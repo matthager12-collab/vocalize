@@ -44,6 +44,12 @@ Borrow CrisperWhisper's "intended mode" idea. Its weights are out, because of th
 3. **Default.** Should the package default stay `off`, with Mat's own config turning it on?
 4. **Jargon list.** Where it lives, and who fills it.
 
+## Resolved so far
+
+- **1. Latency: A**, Mat's "Go", 2026-09-26. Accept about 4 to 5 seconds per press. Measure the real figure in the spike. A resident model comes back only if the wait bothers Mat in daily use.
+- **3. Default: decided as a two-way door.** The package default stays `off`, so no other user is surprised. Mat's own config turns cleanup on.
+- **4. Jargon list: decided as a two-way door.** A plain list in the config, filled by Mat. The design fixes the exact key.
+
 ## Tier
 
 Full. There are several approaches with real trade-offs, and at least three open decisions.
