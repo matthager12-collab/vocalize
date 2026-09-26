@@ -17,6 +17,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 | DEC-046 | Which paths warm which models? | Decided | Whisper on every dictation and `listen` start; the LLM only when `cleanup = "local"` and installed; notes stay one-shot | R1 |
 | DEC-047 | What memory and speed does a release have to meet? | Decided | Physical footprint, not RSS: LLM at most 3.6 GB, whisper at most 1.0 GB; warm wait after stop at most 5.0 s and at least 1.5 s faster than one-shot | R1 |
 | DEC-048 | Where is the control-token defect fixed? | Decided | Pass token ids to `generate` directly; the plan's first task unless a separate fix merges first | R1 |
+| DEC-049 | Whom do the warm servers trust? | Decided | The user's own uid only; same-uid processes are out of scope, stated in the docs | R2 |
 
 ---
 
@@ -124,7 +125,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 **Recommendation**: Guard only. With warm models a clean take costs about a second of cleanup, and Mat's rule trades RAM for speed, not correctness for speed.
 
-**Decision**: Guard only, under 60 lines, in `llm.py`, applied to every backend's output. A guard fallback prints `vocalize: cleanup skipped (unfaithful)` to stderr and uses the notification that says cleanup was skipped.
+**Decision**: Guard only, under 60 lines, in `llm.py`, applied to every backend's output. Round 2 (C5) adds one rule: every negation in the raw take ("not", "never", "no longer", any word ending in "n't") must survive, unless a correction marker is present. The docs call it an addition check, not injection prevention. A guard fallback prints `vocalize: cleanup skipped (unfaithful)` to stderr and uses the notification that says cleanup was skipped.
 
 **Consequences**: Clean takes still pay a warm generate. Add a gate only if daily use says the wait matters and a gate passes the full case set with no wrong skip.
 
@@ -154,7 +155,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 **Decision**: A. When cleanup changed the text, delivery writes two types in one pasteboard write. `public.utf8-plain-text` gets the cleaned text, and `io.github.vocalize-cli.said` gets the raw take. A fixed JavaScript file shipped in the package runs under `/usr/bin/osascript -l JavaScript`, with one JSON object on stdin. No text is ever interpolated into script source. Both texts go through `sanitize` and `_one_line` before the write. `vocalize dictate --swap` swaps the two types, and a second press swaps them back. It acts only when the private type is present and the plain text equals one of the pair; otherwise it does nothing and says so with a fixed notification. A new Quick Action, "Swap in What I Said", runs it. The user then undoes the paste and pastes again. When cleanup did not change the text, delivery uses `pbcopy` exactly as today.
 
-**Consequences**: The undo is a shortcut plus undo plus paste, not one key. The privacy section of docs/dictation.md gains the clipboard line and the clipboard-manager caveat.
+**Consequences**: The undo is a shortcut plus undo plus paste, not one key. The privacy section of docs/dictation.md gains the clipboard line. It says that any app reading the clipboard can read the private type, that a clipboard manager may keep it, and that the next copy replaces the pair but does not guarantee erasure. It also names the existing `claude-cli` history exception. Round 2 (C8): the pair is not authenticated, so another app could forge one. The swap re-sanitises both types and checks the pasteboard change count before and after; it guarantees nothing beyond that. A raw-undo off switch was rejected (C2): cleanup is opt-in, and with cleanup off the same raw text is plain clipboard text today.
 
 **Applied to**:
 - [design.md](design.md) § Key flows, § Contracts
@@ -179,7 +180,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 **Recommendation**: A.
 
-**Decision**: A. `warm_minutes` is an integer from 0 to 240, default 0; 0 means unload when the take ends. `vocabulary` is a list of at most 50 strings, each 1 to 40 printable characters with no newline, default empty. The built prompt is capped at 800 characters. Both are added to `KNOWN_STT_KEYS`, `_validate_stt_table`, the portal's `[stt]` form and docs/dictation.md.
+**Decision**: A. `warm_minutes` is an integer from 0 to 240, default 0; 0 means unload 10 s after the take ends (round 2, G3), so an immediate second take is still warm. `vocabulary` is a list of at most 50 entries, default empty. Each entry is 1 to 40 characters and 1 to 4 words, drawn only from letters, digits, spaces and `_ . - + / @ # :`, with no `<`, `|` or sentence-ending punctuation (round 2, C6). The built prompt is capped at 800 characters. Both are added to `KNOWN_STT_KEYS`, `_validate_stt_table`, the portal's `[stt]` form and docs/dictation.md.
 
 **Consequences**: A config with either key fails on 0.14.0 and older. Mat's own config gets `cleanup = "local"`, `warm_minutes = 15` and his list, applied by Mat at release.
 
@@ -210,10 +211,12 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 - **Place.** `~/.cache/vocalize/warm/`, a 0700 directory checked with the same owner and mode test as the cache dir. One socket per model kind, 0600. The server checks the peer uid with `LOCAL_PEERCRED`. The client checks that the socket path is a socket owned by the user, with no symlink.
 - **Spawn.** An exclusive `flock` on `warm/<kind>.lock` decides who spawns. The server is started detached (`start_new_session`), with stdin, stdout and stderr on `/dev/null`, and with the offline environment variables for the LLM.
 - **Handshake.** Each connection starts with a hello. The server answers its fingerprint: protocol version, sha256 of the worker file, the runtime pin, and the model file's name and size. A mismatch makes the client send `shutdown` and respawn under the lock.
-- **Leases.** `lease <id>` at take start; `release <id>` on every outcome (delivered, cancelled, silent, failed). An unreleased lease expires after `max_take_seconds` plus 60 s. The idle timer runs only while no lease is held. It is `warm_minutes`, or 0, which means exit at the last release.
+- **Leases.** `lease <id>` at take start; `release <id>` on every outcome (delivered, cancelled, silent, failed). An unreleased lease expires after `max_take_seconds` plus 60 s. The idle timer runs only while no lease is held. It is `warm_minutes`, or 10 s when that is 0.
 - **Requests.** One at a time, with a 64 KB cap on a request line and one JSON object per line. Fixed error codes only: `busy`, `loading`, `bad-request`, `failed`. No text from a request ever reaches stderr or a log.
 - **Robustness, from S3.** A server survives a client that connects and vanishes (`BrokenPipeError`, `ConnectionResetError`). Lifecycle control goes through the socket (`shutdown`), never a PID, because `uv run` does not replace itself and the spawned PID is uv's. The client refuses a socket path over 100 bytes and falls back.
-- **Deadline.** The client allows one total deadline per request. If the model is still loading and has not answered by then, the client falls back. A fallback first sends `cancel`, so the server stops generating.
+- **Round 2 limits (C3, C4, G4).** Each connection has 2 s to deliver a full request line. `max_tokens` is at most 1,024, replies are capped at 64 KB, at most 8 leases are held, and one connection is served at a time. The whisper server opens a WAV once (`O_NOFOLLOW | O_NONBLOCK`), requires a regular file under 200 MB, validates the format on that handle, and transcribes the frames as an array, never the path. The LLM server uses `stream_generate` and checks its deadline and a cancel flag between tokens. Both run a watchdog thread that calls `os._exit` when a request outlives its deadline by 5 s. `no_context=True` and `initial_prompt` are passed on every whisper call. The LLM keeps no prompt cache. `cancel` names the request id it cancels (C1).
+- **Start never waits (G2).** Warming runs after the recorder is launched. A new server is spawned with `--lease <id>`, so no handshake is needed. A lease on a live server gets 200 ms, then is skipped.
+- **Deadline.** The client allows one total deadline per request. A `loading` reply is waited on, not treated as failure. If the model has not answered by the deadline, the client sends `shutdown` before falling back, so two copies of a model never run at once (G1).
 
 **Consequences**: The workers grow a small server loop each. The protocol file carries the shared framing and the fingerprint. Tests use stub models behind the existing seams.
 
@@ -240,7 +243,7 @@ Mat decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 he sai
 
 **Recommendation**: B.
 
-**Decision**: B. `_stop` re-reads the session nonce immediately before the clipboard write. If this take no longer owns the session, it discards the text, and releases its leases on the way out.
+**Decision**: B. `_stop` takes an exclusive `flock` on the session file, re-reads the nonce, writes the clipboard, then drops the lock. `cancel` takes the same lock before it releases the session, so a cancel can never land between the check and the write (round 2, C9). If this take no longer owns the session, it discards the text, and releases its leases on the way out.
 
 **Consequences**: One more check on the delivery path, with a test that cancels between transcription and delivery.
 
@@ -314,6 +317,33 @@ The summary's "under 1.5 GB per worker" is replaced by these. `llm_manifest.MIN_
 - [design.md](design.md) § Memory
 - [verification.md](verification.md) § Phase 3 exit
 - [plan.md](plan.md) § Phase 3, T-36
+
+---
+
+### DEC-049: Whom do the warm servers trust?
+
+**Question**: Codex round 2 (C1) showed that a process running as the same user can replace a socket, answer with a valid fingerprint, or send `shutdown`. Is that in scope?
+
+**Date**: 2026-09-26
+**Decided by**: Claude, on Mat's standing authority
+**Status**: Decided
+
+**Context**: Every transcript ends on the general clipboard, which any same-user process can read. Same-user processes can also read `~/.cache/vocalize` and the config. macOS offers no cheap way to authenticate a peer process beyond its uid.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Same uid is trusted; other uids are refused | Honest about what the platform gives. Matches the clipboard's exposure |
+| B | An authenticated broker with verified process identity | Real work (code-signing checks on an ad-hoc-signed toolchain), guarding text that reaches the clipboard anyway |
+
+**Recommendation**: A.
+
+**Decision**: A. The server checks the peer uid, and the client checks the socket's owner, type and mode and refuses symlinks. `cancel` names its request id. docs/dictation.md states the boundary: another program running as you can talk to the warm servers, as it can already read your clipboard.
+
+**Consequences**: No broker. If vocalize ever runs a server for another user, or on a shared machine, this entry is revisited.
+
+**Applied to**:
+- [design.md](design.md) § Contracts
+- [plan.md](plan.md) § Phase 3, T-30, T-43
 
 ---
 

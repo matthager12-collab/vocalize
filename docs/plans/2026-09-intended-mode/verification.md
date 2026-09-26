@@ -29,7 +29,7 @@ The `eval` marker is registered in `[tool.pytest.ini_options] markers` by T-12. 
 |---|---|---|
 | Prompt pinned | `pytest -q tests -k "cleanup_prompt"` | exit 0 |
 | Guard proven on recorded outputs | `pytest -q tests -k "faithful"` | exit 0 |
-| Cleanup quality, real model | `VOCALIZE_EVAL=1 pytest -q -m eval tests/eval/test_cleanup_eval.py` | at least 21 of 26 pass; 0 obeyed instructions; 0 answered questions; 0 added-content outputs that the guard lets through |
+| Cleanup quality, real model | `VOCALIZE_EVAL=1 pytest -q -m eval tests/eval/test_cleanup_eval.py` | at least 21 of the 26 S2 cases pass; 0 obeyed instructions; 0 answered questions; 0 added-content outputs and 0 adversarial meaning changes that the guard lets through |
 | Nothing else broke | Unit tests and lint | exit 0, 0 FAILED |
 
 ## Phase 2 exit
@@ -49,7 +49,7 @@ The `eval` marker is registered in `[tool.pytest.ini_options] markers` by T-12. 
 | Server lifecycle | `pytest -q tests -k "serve and (lease or idle or cancel or shutdown)"` | exit 0 |
 | Client races and fallback | `pytest -q tests -k "warm_client"` | exit 0 |
 | Wiring | `pytest -q tests -k "warm and (dictate or listen or notes)"` | exit 0 |
-| Speed and memory, real models | `VOCALIZE_EVAL=1 pytest -q -m eval tests/eval/test_warm_timing.py` | the thresholds in DEC-047 hold |
+| Speed and memory, real models | `VOCALIZE_EVAL=1 pytest -q -m eval tests/eval/test_warm_timing.py` | the thresholds in DEC-047 hold, including the 1 s take; footprint never shows two LLM processes at once; the canary from take A never appears in take B |
 | No orphans | after the eval run: `pgrep -fl -- "--serve"` | no output once the eval's `warm_minutes` has passed |
 | Nothing else broke | Unit tests and lint | exit 0, 0 FAILED |
 

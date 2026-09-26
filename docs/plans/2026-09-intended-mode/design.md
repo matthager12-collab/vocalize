@@ -60,6 +60,7 @@ sequenceDiagram
   participant WS as whisper server
   participant LS as LLM server
   participant P2 as Press 2 (stop)
+  Note over P1: recorder launched first; warming never waits
   P1->>WC: ensure_warm(whisper), ensure_warm(llm)
   WC->>WS: spawn if no live, matching server
   WC->>LS: spawn if cleanup=local and installed
@@ -83,7 +84,7 @@ On any warm failure (no server, fingerprint mismatch, `busy`, a deadline, a bad 
 1. The take ends with the cleaned text changed. Delivery writes both types in one pasteboard write.
 2. The user presses the Quick Action shortcut. `vocalize dictate --swap` checks that the private type is present and the plain text equals one of the pair, then swaps them.
 3. The user presses Command-Z, then Command-V. A second swap puts the cleaned text back.
-4. The next copy of anything replaces both types. Nothing else holds the raw take.
+4. The next copy of anything replaces both types, though that is not a guaranteed erasure. Any app that reads the clipboard can read the private type, and a clipboard manager may keep it (DEC-042).
 
 ## Contracts
 
@@ -100,7 +101,7 @@ The P2 text from spike S2, with the data rule moved to rule 1 and a fourth examp
 
 ### Guard (DEC-041)
 
-`llm.faithful(raw, cleaned) -> bool`. Every word of `cleaned`, lower-cased with punctuation stripped, that is not in a small stopword list must appear in `raw`. Digits and symbols are mapped back to spoken forms: `9:30` matches "nine thirty", `@` matches "at", `.` matches "dot", `%` matches "percent", `$` matches "dollars". Unfaithful output falls back to the raw take.
+`llm.faithful(raw, cleaned) -> bool`. Every word of `cleaned`, lower-cased with punctuation stripped, that is not in a small stopword list must appear in `raw`. Digits and symbols are mapped back to spoken forms: `9:30` matches "nine thirty", `@` matches "at", `.` matches "dot", `%` matches "percent", `$` matches "dollars". Every negation in the raw take must survive unless a correction marker is present. Unfaithful output falls back to the raw take. This is an addition check, not injection prevention.
 
 ### Whisper prompt (DEC-040)
 
@@ -119,7 +120,7 @@ The protocol lives in `vocalize/local/warm_protocol.py` (stdlib only, imports no
 | `{"op":"cancel"}` / `{"op":"shutdown"}` | `{"ok":true}` |
 | any failure | `{"ok":false,"error":"busy\|loading\|bad-request\|failed"}` |
 
-The whisper server re-applies `_check_wav` to every path. The LLM server passes token ids straight to `generate` (DEC-048).
+The whisper server opens a WAV once, checks it on that handle and transcribes the frames as an array. The LLM server passes token ids straight to `stream_generate` (DEC-048). Limits, deadlines, the watchdog and the lease cap are in DEC-044; the trust boundary is DEC-049.
 
 ### Clipboard (DEC-042)
 
@@ -145,6 +146,7 @@ The writer is a fixed script file, `vocalize/assets/clipboard.js`, run by `/usr/
 | DEC-046 | What warms which model | § Structure |
 | DEC-047 | Memory ceiling | § Memory |
 | DEC-048 | Ids straight to `generate` | § Contracts |
+| DEC-049 | Same-uid trust boundary | § Contracts |
 
 ## Memory
 
