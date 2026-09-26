@@ -19,7 +19,7 @@ Whisper is `pywhispercpp==1.5.1` with `ggml-large-v3-turbo-q5_0.bin` at beam 5. 
 - transcribe: 1.13 to 1.18 s
 - whole process: **2.58 s real when warm**
 
-**Correction to the summary.** The roadmap's 4.19 s cold figure left out uv start and import. Today a press with local cleanup costs about 2.6 + 8.2, or roughly **11 s** after the stop. Without cleanup, which is Mat's current setup, it costs about 2.6 s.
+**Correction to the summary.** The roadmap's 4.19 s cold figure left out uv start and import. The "whole process" figures above include a **second** generate or transcribe, so they overstate one press. One press is about 1.45 s for whisper and about 6.4 s for cleanup, so roughly **8 s** after the stop with local cleanup, and about 1.5 s without it. The "roughly 11 s" said in chat and in the first draft of this section was wrong. See S3 for the measured comparison.
 
 ## Quality finding
 
@@ -27,7 +27,7 @@ Today's `CLEANUP_PROMPT` turned "move the standup to uh Tuesday no Wednesday at 
 
 Whisper alone already wrote "9:30" (once "9.30"), and kept "PyProject" and "repository root" on the synthetic voice.
 
-## Preload on press: estimate, not yet measured
+## Preload on press: estimate (superseded by S3 below)
 
 Load both workers when the take starts. They wait for the stop, then exit with the take. The estimate uses the numbers above:
 
@@ -70,3 +70,15 @@ So DEC-027's protection does not hold in 0.14.0. `mlx_lm.generate` 0.31.3 accept
 - **P0 is unstable on corrections.** In this run it applied the Tuesday-to-Wednesday correction, but left 5 of 6 other corrections unapplied. The earlier run (above) kept "Tuesday" four times out of four.
 - **Guard, "no word the raw take lacks".** It never passed an output the judge failed for added content (0 of 78 unfaithful-and-PASS), and it caught the meta-commentary. By design it cannot see an unapplied correction or a dropped word.
 - **Gate, "skip the model when there is nothing to clean".** It would skip 6 of 26. One skip was wrong: a spoken email with no number word ("jen at example dot com").
+
+## S3: warm servers and memory
+
+2026-09-26, Claude Sonnet sub-agent. Raw output: scratchpad `spikes/s3/findings.md` and `results.json`. The runs used throwaway `--serve` prototypes of both workers on Unix sockets, with the S2 P2 prompt, ids passed straight to `generate`, and the vocabulary prompt on whisper. The input was the S1 jargon clip (about 12 s of speech).
+
+- **Ready after spawn** (includes Python import and model load; excludes uv resolution). Whisper 0.28 to 0.40 s, cleanup 1.61 to 2.13 s. Loading both at once cost nothing extra.
+- **Wait after the stop, warm.** A 3 s take: 4.57 s (whisper 1.49, cleanup 3.08). A 10 s take: 4.12 s. Back-to-back: 4.05 and 4.06 s. Warm cleanup is the bottleneck.
+- **Today's path, same prompt, fresh process per model** (excludes uv resolution): 6.59 and 6.01 s. Adding uv start and import, as the earlier whole-process runs did, puts today at about 7 to 8 s.
+- **So warm saves about 2 to 4 s a take**, not the 8 s first estimated. Most of the remaining time is cleanup generation, which the prompt's length drives.
+- **Memory, per process, measured on the model process, not the uv wrapper.** Whisper: RSS peak 774 MB, physical footprint peak 857 MB. Cleanup: RSS peak 1,310 MB, **physical footprint peak 3.3 GB**. Combined at the same instant: 1.85 GB RSS, about 4.1 GB footprint. mlx's unified memory is mostly invisible to RSS, so the roadmap's 1.1 GB and the 1.5 GB cap were RSS figures. The one-shot worker has the same footprint while it runs.
+- **Idle exit.** With a 15 s idle limit, both servers logged "EXIT idle" and their sockets were gone by 20 s.
+- **Found on the way.** A connect-then-disconnect probe crashed the first server version with `BrokenPipeError`, so servers must survive a client that vanishes. `uv run` does not replace itself with Python, so the spawned PID is uv's; lifecycle control must go through the socket (`shutdown`), not PIDs. macOS limits a socket path to about 104 bytes.
