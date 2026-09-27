@@ -293,7 +293,7 @@ class Server:
             handed_off = self._dispatch(conn, request)
         except ProtocolError as exc:
             self._reply(conn, {"ok": False, "error": exc.error})
-        except Exception:  # noqa: BLE001 -- one bad connection must never stop the server
+        except Exception:  # noqa: BLE001, S110 -- one bad connection must never stop the server
             pass
         finally:
             if not handed_off:
