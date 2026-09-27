@@ -102,3 +102,10 @@ The fix is a deletion bound in `llm.faithful`. Count the raw take's content word
 ## Run 3: real-model smoke of the warm servers
 
 2026-09-26, on the reference Mac, through `warm.ensure_warm` and `warm.request` with the real models, with a 3 s pause standing in for the user talking. `ensure_warm` for both kinds returned in 0.003 s: the spawn runs off the caller's path. Whisper, warm, on the 12 s jargon clip: 1.43 s. First cleanup request: 3.11 s, because the model was still loading when it arrived. Second cleanup request: 1.22 s. Token ids went straight to `stream_generate` and the numpy array to `transcribe`, with no errors. After `shutdown`, no `--serve` process was left running. Two mutations were caught by the tests: removing the peer-uid check, and removing the watchdog exit.
+
+Review of run 3 (Gemini 3.1 Pro), then the fixes:
+- **A short take could load two models.** The stop could reach `request()` before the spawned server had bound its socket, and it would then fall back while the server was still loading. The client now waits, within its deadline, while the lock file records a spawn in the last 10 s.
+- **Shutdown gets its own 0.2 s**, even after cancel used up the request's deadline.
+- **A kernel timer backs the watchdog thread.** `setitimer(ITIMER_REAL)` runs with no SIGALRM handler installed, so the kernel ends a server whose native call holds the GIL.
+- **Found through a full-suite flake:** the server freed its work slot only after replying, so an immediate second request was told "busy". The slot is now freed before the reply.
+After the fixes, the real-model smoke gave the same timings, and the run 3 exit script passed 10 of 10 twice in a row.
