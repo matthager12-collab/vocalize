@@ -35,6 +35,7 @@ import threading
 import time
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -2548,6 +2549,11 @@ def test_the_dialog_waits_for_a_record_a_slow_chunk_has_not_written_yet(
     monkeypatch.setattr(interrupted, "_RESUME_GRACE", 3.0)  # the shipped default
     answering(tmp_path, monkeypatch, harness, "button returned:Continue, gave up:false\n")
     started = time.time()
+    # A loaded runner: the poll's clock spends the whole grace before the
+    # writer thread is scheduled. CI hit this once (run 36281227462).
+    ticks = iter(range(100))
+    monkeypatch.setattr(interrupted, "time", SimpleNamespace(
+        time=time.time, monotonic=lambda: float(next(ticks)), sleep=lambda s: None))
     landing = threading.Thread(target=lambda: (time.sleep(0.3), save_read(tmp_path)))
     landing.start()
     try:
