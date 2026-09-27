@@ -83,7 +83,7 @@ export PY="${VOCALIZE_PY:-python}"
 # collecting nothing.
 
 echo "=== Entry criteria ==="
-check "run 4 merged: warm wiring on main" test -f tests/test_dictate_warm.py
+check "run 1 merged: guard on main (run 5 needs only run 1; runs 3-4 paused for the owner)" grep -q "^def faithful" vocalize/llm.py
 
 echo ""
 echo "=== Exit criteria ==="
@@ -93,7 +93,8 @@ check "T-41 swap tests" bash -c 'test -f tests/test_dictate_swap.py && "$PY" -m 
 check "T-42 Quick Action bundle" test -d "vocalize/assets/quick_actions/Swap in What I Said.workflow"
 check "T-42 installer lists it" grep -q "Swap in What I Said.workflow" vocalize/integrate.py
 check "T-43 private type documented" grep -q "io.github.vocalize-cli.said" docs/dictation.md
-check "T-43 same-user boundary documented" grep -qi "talk to the warm servers" docs/dictation.md
+check "T-43 clipboard-manager caveat documented" grep -qi "clipboard manager may keep" docs/dictation.md
+check "T-43 vocabulary visibility documented" grep -qi "process list" docs/dictation.md
 check "lint clean" ruff check .
 check "whole unit suite green" "$PY" -m pytest -q -p no:cacheprovider
 

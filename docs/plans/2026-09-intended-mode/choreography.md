@@ -8,7 +8,7 @@ Six runs, in order. Each is executed with implement-spec, one task at a time. Ea
 | [run-2-jargon](run-2-jargon/project-plan.md) | `[stt] vocabulary`, whisper initial prompt, leak eval | run 1 on `main` | yes (T-21, `worker_argv`) |
 | [run-3-warm-servers](run-3-warm-servers/project-plan.md) | Protocol, both `--serve` loops, the client, not wired in | run 2 on `main` (the whisper server needs T-21's prompt) | no |
 | [run-4-warm-wiring](run-4-warm-wiring/project-plan.md) | Warm servers wired into dictation and `listen`, `warm_minutes`, timing and memory eval | run 3 on `main` | yes (T-34) |
-| [run-5-undo](run-5-undo/project-plan.md) | Two-type clipboard, `dictate --swap`, the Quick Action, privacy docs | run 4 on `main` | yes (T-40, T-41) |
+| [run-5-undo](run-5-undo/project-plan.md) | Two-type clipboard, `dictate --swap`, the Quick Action, privacy docs | run 1 on `main` (resequenced 2026-09-26 while run 4 waits on the owner) | yes (T-40, T-41) |
 | [run-6-release-ready](run-6-release-ready/project-plan.md) | CHANGELOG and docs, the owner's config block, owner check, every eval on one commit | run 5 on `main` | no |
 
 ## Handoff protocol

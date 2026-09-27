@@ -2640,7 +2640,7 @@ def _wflow_text(services: Path, name: str = "Speak with Vocalize.workflow") -> s
     )
 
 
-def test_integrate_claude_lands_skill_and_four_bundles_on_scratch_home(integrate_env):
+def test_integrate_claude_lands_skill_and_five_bundles_on_scratch_home(integrate_env):
     _home, services, skill_dest, _claude, _pbs = integrate_env
 
     result = CliRunner().invoke(main, ["integrate", "claude", "--yes"])
@@ -2649,7 +2649,7 @@ def test_integrate_claude_lands_skill_and_four_bundles_on_scratch_home(integrate
     assert skill_dest.is_file()
     assert skill_dest.read_bytes() == integrate_module.SKILL_SRC.read_bytes()
     bundles = [p for p in services.iterdir() if p.name.endswith(".workflow")]
-    assert len(bundles) == 4
+    assert len(bundles) == 5
 
 
 def test_integrate_claude_bakes_the_unresolved_which_path(integrate_env):

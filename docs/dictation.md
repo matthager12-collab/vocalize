@@ -507,19 +507,29 @@ under Privacy & Security › Microphone if you want it gone too.
 
 ## Privacy
 
-- **vocalize never stores a transcript.** It exists only in memory
-  between the moment it's transcribed and the moment it reaches your
-  clipboard (or stdout, for `vocalize listen`). No file vocalize writes
-  holds it, and it never appears in a notification — every notification
+- **vocalize never writes a transcript to its own files.** It holds text
+  in memory and delivers it to the clipboard (or stdout, for
+  `vocalize listen`). The clipboard can retain it, as described below.
+  No file vocalize writes holds it, and it never appears in a notification — every notification
   dictation can show is one of a small set of fixed strings baked into the
   code; a transcript literally cannot reach one. The one exception is
-  `--cleanup`, below.
+  Claude Code's cleanup history, below.
+- **Cleanup undo lives on the clipboard.** When cleanup changed a take,
+  your raw words ride along as a second private type,
+  `io.github.vocalize-cli.said`, so "Swap in What I Said" can bring them
+  back. Any app that reads the clipboard can read that type, and a
+  clipboard manager may keep it. The next copy of anything replaces both
+  types, but that is not guaranteed erasure. Nothing is written to a file
+  by this undo. The pair is not authenticated: another app can forge it.
+  Swap sanitizes both texts and checks the clipboard change count.
+- **The `[stt] vocabulary` list is visible to other programs in the
+  process list while whisper runs.** It should hold no secrets.
 - **Recorded audio lives only in a private (0700) temporary directory**,
   deleted the moment a dictation ends, on every exit path — success,
   cancel, or failure. A sweep on the next `listen`/`dictate` clears
   anything a hard kill (`kill -9`, a lost-power crash) left behind after
   24 hours.
-- **The cleanup pass is the one opt-in exception**, and it sends text only.
+- **Cloud cleanup is opt-in**, and it sends text only.
   With `claude-cli` the transcript goes to `claude -p` with every tool
   denied by a wildcard, no MCP server started, and none of your own hooks,
   skills or `CLAUDE.md` loaded (`--setting-sources ""`), so nothing a
@@ -532,13 +542,13 @@ under Privacy & Security › Microphone if you want it gone too.
   — `vocalize: sent to claude-cli` or `vocalize: sent to anthropic` — and
   the clipboard notification says "cleaned up by Claude — sent off this
   Mac". The audio is never part of any call.
-- **`--cleanup` also writes the transcript to Claude Code's own session
+- **The `claude-cli` cleanup backend also writes the transcript to Claude Code's own session
   log**, in full and in plaintext, under
   `~/.claude/projects/<slug>/<uuid>.jsonl` — Claude Code records the
   prompt and stdin of every print-mode run, and vocalize cannot turn that
   off (pointing `CLAUDE_CONFIG_DIR` elsewhere moves the log but loses the
   login). This is why `[stt] cleanup` is off by default: turning it on
-  means accepting that your dictated text is on disk in Claude Code's
+  with `claude-cli` means accepting that your dictated text is on disk in Claude Code's
   history and goes to Anthropic. Everything above about vocalize's own
   files still holds; this file is not one of them.
 - **The microphone grant belongs to the bundle, not to vocalize.** Once

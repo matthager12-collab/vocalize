@@ -21,7 +21,7 @@ def _session(tmp_path, monkeypatch):
 
 def test_cancel_before_delivery_drops_the_take(tmp_path, monkeypatch):
     workdir = _session(tmp_path, monkeypatch)
-    monkeypatch.setattr(dictate, "_finish_take", lambda *_: ("words", False))
+    monkeypatch.setattr(dictate, "_finish_take", lambda *_: ("words", False, "words"))
     monkeypatch.setattr(dictate, "_finish_claim", lambda *_: "live")
     monkeypatch.setattr(dictate, "_stop_file", lambda *_: None)
     monkeypatch.setattr(dictate, "_play", lambda *_: None)
@@ -39,7 +39,7 @@ def test_cancel_before_delivery_drops_the_take(tmp_path, monkeypatch):
 def test_cancel_waits_for_delivery_lock(tmp_path, monkeypatch):
     workdir = _session(tmp_path, monkeypatch)
     entered, release = threading.Event(), threading.Event()
-    monkeypatch.setattr(dictate, "_finish_take", lambda *_: ("words", False))
+    monkeypatch.setattr(dictate, "_finish_take", lambda *_: ("words", False, "words"))
     monkeypatch.setattr(dictate, "_finish_claim", lambda *_: "live")
     monkeypatch.setattr(dictate, "_stop_file", lambda *_: None)
     monkeypatch.setattr(dictate, "_play", lambda *_: None)
