@@ -1212,13 +1212,15 @@ def listen(check_only, list_devices, toggle, cancel, wav, cleanup, verbatim, max
               help="Pause an in-progress dictation.")
 @click.option("--resume", "resume_cmd", is_flag=True,
               help="Resume a paused dictation.")
+@click.option("--swap", "swap_cmd", is_flag=True,
+              help="Swap cleaned dictation with what you said, then paste again.")
 @click.option("--cleanup", is_flag=True,
               help="Tidy the transcript with a language model before copying it.")
 @click.option("--verbatim", is_flag=True,
               help="Keep every word: fix punctuation and casing only.")
 @click.option("--max-seconds", type=click.IntRange(1, 600), default=None,
               help="Stop recording after this many seconds (default: [stt] max_seconds).")
-def dictate_cmd(start_hold, stop_hold, pause_cmd, resume_cmd, cleanup, verbatim, max_seconds) -> None:
+def dictate_cmd(start_hold, stop_hold, pause_cmd, resume_cmd, swap_cmd, cleanup, verbatim, max_seconds) -> None:
     """Start a dictation, or stop the one already running.
 
     \b
@@ -1242,6 +1244,7 @@ def dictate_cmd(start_hold, stop_hold, pause_cmd, resume_cmd, cleanup, verbatim,
             ("--stop", stop_hold),
             ("--pause", pause_cmd),
             ("--resume", resume_cmd),
+            ("--swap", swap_cmd),
         ]
         if val
     ]
@@ -1249,6 +1252,8 @@ def dictate_cmd(start_hold, stop_hold, pause_cmd, resume_cmd, cleanup, verbatim,
         raise click.UsageError(f"Use only one of {', '.join(mutually_exclusive)}.")
     stt = _stt_options(cleanup, verbatim, max_seconds)
     try:
+        if swap_cmd:
+            sys.exit(dictate.swap(stt))
         if pause_cmd:
             sys.exit(dictate.pause(stt))
         if resume_cmd:

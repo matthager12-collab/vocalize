@@ -31,6 +31,7 @@ SKILL_DEST = Path.home() / ".claude" / "skills" / "speak" / "SKILL.md"
 BUNDLE_NAMES = (
     "Speak with Vocalize.workflow",
     "Stop Vocalize.workflow",
+    "Swap in What I Said.workflow",
     "Speak Latest Plan.workflow",
     "Dictate with Vocalize.workflow",
 )
@@ -108,7 +109,7 @@ def _install_one(name: str, substitutions: dict) -> None:
 
 
 def main() -> int:
-    """Copy the four Quick Action bundles into ~/Library/Services with this
+    """Copy the five Quick Action bundles into ~/Library/Services with this
     machine's vocalize/claude/helper paths baked in. 0 on success, 1 on a
     refusal (an unsafe path)."""
     bin_path = str(_resolve_vocalize_bin())
@@ -125,7 +126,7 @@ def main() -> int:
     # it is a non-executable `__main__.py`, and through the legacy
     # `hooks/install_quick_action.py` route it is whatever relative path the
     # user typed, resolved later against the Service's own cwd. Either bakes
-    # four Quick Actions that fail their own `[[ -x "$BIN" ]]` guard.
+    # five Quick Actions that fail their own `[[ -x "$BIN" ]]` guard.
     if not (Path(bin_path).is_absolute() and os.access(bin_path, os.X_OK)):
         print(
             f"Refusing to install: {bin_path!r} is not an executable absolute "
@@ -205,7 +206,7 @@ def _install_skill(*, force: bool) -> str:
 
 def integrate_claude(*, yes: bool) -> int:
     """`vocalize integrate claude`: PATH pre-check, install the `/speak`
-    skill and the four Quick Actions, print the GUI-only steps.
+    skill and the five Quick Actions, print the GUI-only steps.
 
     Returns 1 only on the Quick Action installer's own refusal (an unsafe
     baked path) — every "needs you" item below is reported, not treated as
@@ -243,6 +244,8 @@ def integrate_claude(*, yes: bool) -> int:
         "  Do not assign the D or X chords — the menu-bar app owns those; "
         "Dictate and Stop stay reachable from the Services menu."
     )
+    # Register the new Service with the existing chord-conflict checker.
+    app_module._SERVICES_NAMES["cards.arda.vocalize.swap"] = "Swap in What I Said"
     conflicts = app_module.services_shortcut_conflicts()
     for _, title, chord in conflicts:
         print(
@@ -259,7 +262,7 @@ def integrate_claude(*, yes: bool) -> int:
 
     print()
     print("Summary:")
-    print(f"  installed: /speak skill ({skill_result}), 4 Quick Actions")
+    print(f"  installed: /speak skill ({skill_result}), 5 Quick Actions")
     if skill_result == "kept":
         print("  skipped: /speak skill (rerun with --yes to overwrite the existing file)")
     print(f"  needs you: {'; '.join(needs_you)}")

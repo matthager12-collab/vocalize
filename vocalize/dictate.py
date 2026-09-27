@@ -189,6 +189,9 @@ _NOTIFY_RECORDER_FAILED = "The recorder did not start. Run: vocalize listen --ch
 _NOTIFY_FAILED = "Dictation failed. Run: vocalize listen --check"
 _NOTIFY_CLIPBOARD_FAILED = "Could not copy the dictation to the clipboard."
 _NOTIFY_RESUME_FAILED = "Could not continue the interrupted read."
+_NOTIFY_NO_SWAP = "Nothing to swap: the clipboard holds no dictation."
+_NOTIFY_SWAPPED = "Swapped: paste again to use it."
+_NOTIFY_SWAP_CHANGED = "The clipboard changed; nothing swapped."
 _NOTIFY_MIC_CLOSED = "Microphone closed at the recording limit."
 
 _FIXED_NOTIFICATIONS = frozenset(
@@ -204,6 +207,9 @@ _FIXED_NOTIFICATIONS = frozenset(
         _NOTIFY_CLIPBOARD_FAILED,
         _NOTIFY_RESUME_FAILED,
         _NOTIFY_MIC_CLOSED,
+        _NOTIFY_NO_SWAP,
+        _NOTIFY_SWAPPED,
+        _NOTIFY_SWAP_CHANGED,
     }
 )
 
@@ -1189,8 +1195,52 @@ def copy_to_clipboard(text: str) -> None:
         raise DictationError("Could not reach the clipboard.")
 
 
-def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool]:
-    """(transcript, cleanup_skipped) for the recording in `workdir`.
+def _clipboard(request: dict) -> dict | None:
+    """Exchange JSON with fixed JXA source; text travels only on stdin."""
+    path = Path(__file__).resolve().parent / "assets" / "clipboard.js"
+    try:
+        result = subprocess.run(
+            [_OSASCRIPT, "-l", "JavaScript", str(path)],
+            input=json.dumps(request), capture_output=True, text=True,
+            timeout=_PBCOPY_TIMEOUT, check=False,
+        )
+        if result.returncode != 0 or len(result.stdout.encode("utf-8")) > 1024 * 1024:
+            return None
+        reply = json.loads(result.stdout)
+        return reply if isinstance(reply, dict) else None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, RecursionError):
+        return None
+
+
+def swap(stt: dict) -> int:
+    """Exchange the clipboard pair, refusing a changed or malformed board."""
+    reply = _clipboard({"op": "read"})
+    if reply is None or reply.get("ok") is not True:
+        _notify(_NOTIFY_SWAP_CHANGED if reply and reply.get("reason") == "changed"
+                else _NOTIFY_CLIPBOARD_FAILED)
+        return 0
+    said, plain, change = reply.get("said"), reply.get("plain"), reply.get("change")
+    if not isinstance(said, str) or not said:
+        _notify(_NOTIFY_NO_SWAP)
+        return 0
+    if not isinstance(plain, str) or type(change) is not int:
+        _notify(_NOTIFY_CLIPBOARD_FAILED)
+        return 0
+    result = _clipboard({
+        "op": "write", "plain": _one_line(sanitize(said)),
+        "said": _one_line(sanitize(plain)), "expect": change,
+    })
+    if result is not None and result.get("ok") is True:
+        _notify(_NOTIFY_SWAPPED)
+    elif result is not None and result.get("reason") == "changed":
+        _notify(_NOTIFY_SWAP_CHANGED)
+    else:
+        _notify(_NOTIFY_CLIPBOARD_FAILED)
+    return 0
+
+
+def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool, str | None]:
+    """(transcript, cleanup_skipped, raw) for the recording in `workdir`.
 
     A None transcript means nothing was heard. The take is already claimed
     by `_mark_finishing` before either caller gets here — the claim has to
@@ -1200,16 +1250,17 @@ def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool]:
     _join_segments(workdir)
     take = workdir / _TAKE_NAME
     if _is_silent(take):
-        return None, False
+        return None, False, None
     text = transcribe(take, stt)
     if not text:
-        return None, False
+        return None, False, None
     backend = cleanup_backend(stt)
     if backend == "off":
-        return text, False
+        return text, False, text
     _refresh_claim(workdir)  # transcription is done; the cleanup pass is its own stage
+    raw = text
     text, cleaned = llm.cleanup_transcript(text, backend, bool(stt.get("verbatim")))
-    return text, not cleaned
+    return text, not cleaned, raw
 
 
 def cleanup_backend(stt: dict) -> str:
@@ -1539,7 +1590,7 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
         _play(_SOUND_STOP, stt)
         _refresh_claim(workdir)  # the playback lock is behind us too
         try:
-            text, cleanup_skipped = _finish_take(workdir, stt)
+            text, cleanup_skipped, raw = _finish_take(workdir, stt)
         except DictationError:
             _notify(_NOTIFY_FAILED)
             return 1
@@ -1550,7 +1601,14 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
             if not _session_owns(workdir):
                 return 0
             try:
-                copy_to_clipboard(text)
+                written = None
+                if cleanup_backend(stt) != "off" and not cleanup_skipped and raw != text:
+                    written = _clipboard({
+                        "op": "write", "plain": _one_line(sanitize(text)),
+                        "said": _one_line(sanitize(raw)),
+                    })
+                if written is None or written.get("ok") is not True:
+                    copy_to_clipboard(text)
             except DictationError:
                 _notify(_NOTIFY_CLIPBOARD_FAILED)
                 return 1
@@ -1866,7 +1924,7 @@ def listen(stt: dict, *, wait) -> str | None:
             # away while this one was waiting. There is nothing left to
             # transcribe, and that is not an error worth a traceback.
             return None
-        text, _cleanup_skipped = _finish_take(workdir, stt)
+        text, _cleanup_skipped, _raw = _finish_take(workdir, stt)
         return text
     finally:
         _discard(workdir)
