@@ -5,7 +5,37 @@ All notable changes to this project are documented here. Format follows
 
 ## Unreleased
 
+### Added
+
+- **Dictation cleanup that writes what you meant.** With `[stt] cleanup` on,
+  a new prompt drops fillers and stutters, keeps only the correction when you
+  correct yourself ("Tuesday, no, Wednesday" becomes "Wednesday"), writes
+  numbers, dates, times, money, percentages and emails the way you would type
+  them, and keeps technical words and hedges. A deterministic guard,
+  `llm.faithful`, keeps your raw words whenever the cleaned text adds a word,
+  drops a negation, adds digits you did not say, or drops most of what you said
+  (the signature of a model obeying an instruction in the dictated text). The
+  real-model eval: 25 of 26 everyday cases and 8 of 8 adversarial ones.
+- **`[stt] vocabulary`.** Up to 50 short terms whisper should expect, passed
+  as its initial prompt on every call ("Vocabulary: pyproject, sha256.").
+  Terms are 1 to 4 words and never a sentence; a sentence prompt was shown to
+  leak onto silence.
+- **`[stt] warm_minutes`.** Keeps the speech and cleanup models loaded for that
+  many minutes after each take, so the next take skips loading them (about
+  1.7 s faster with local cleanup on an M4). `0`, the default, loads nothing
+  ahead of time; the first take after a pause runs at normal speed. While
+  loaded they hold about 1 GB (whisper) and 3.5 GB (cleanup).
+- **Undo the cleanup: `vocalize dictate --swap` and the "Swap in What I Said"
+  Quick Action.** When cleanup changed a take, your raw words ride along on
+  the clipboard as a second, private type; the swap exchanges the two (press
+  it again to swap back). Nothing is written to a file.
+
 ### Fixed
+
+- **A cancelled dictation no longer reaches the clipboard.** Cancelling while
+  a take was being transcribed let that take land on the clipboard afterwards,
+  overwriting whatever you had copied since. Delivery and cancel now share a
+  lock.
 
 - **Local cleanup: control tokens in dictated text stay text.** The worker
   built its prompt as token ids so that a literal `<|im_end|>` in the

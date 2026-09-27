@@ -1,0 +1,11 @@
+# T-51: the owner's proposed [stt] block, applied by the owner after release.
+# Merge it into ~/.config/vocalize/config.toml, then run:
+#   vocalize local install --llm
+# The vocabulary below is the plan's public test list; replace it with your
+# own terms (1-4 words each, no sentences, nothing confidential: the list is
+# visible in the process list while whisper runs).
+
+[stt]
+cleanup = "local"
+warm_minutes = 15
+vocabulary = ["pyproject", "repository root", "uv --no-project", "sha256", "resolve_provider_settings", "Kokoro", "ElevenLabs", "MCP", "MaluDB", "Qwen"]
