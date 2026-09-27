@@ -98,3 +98,7 @@ The fix is a deletion bound in `llm.faithful`. Count the raw take's content word
 ## Run 2: the leak eval
 
 2026-09-26, `tests/eval/test_whisper_leak.py` on the reference Mac, with the 11-term vocabulary prompt and `no_context=True`. Three noise clips (RMS 20, 40, 80) and two short `say` takes ("Yes.", "Okay, thanks."), 10 runs each: no vocabulary word in any of the 50 outputs. The one-shot worker gives the same output on every run, unlike S1's long-lived model: noise at RMS 20 gave ".", at 40 "*repeat*", at 80 "*sad*". Those are whisper's own noise transcriptions, present without a prompt too. The short takes came back exactly.
+
+## Run 3: real-model smoke of the warm servers
+
+2026-09-26, on the reference Mac, through `warm.ensure_warm` and `warm.request` with the real models, with a 3 s pause standing in for the user talking. `ensure_warm` for both kinds returned in 0.003 s: the spawn runs off the caller's path. Whisper, warm, on the 12 s jargon clip: 1.43 s. First cleanup request: 3.11 s, because the model was still loading when it arrived. Second cleanup request: 1.22 s. Token ids went straight to `stream_generate` and the numpy array to `transcribe`, with no errors. After `shutdown`, no `--serve` process was left running. Two mutations were caught by the tests: removing the peer-uid check, and removing the watchdog exit.
