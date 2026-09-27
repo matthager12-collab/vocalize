@@ -193,7 +193,9 @@ def test_unavailable_server_returns_within_deadline(monkeypatch, silent):
         def check():
             started = time.monotonic()
             assert warm.request("whisper", {"op": "work"}, {}, 0.15, base) is None
-            assert time.monotonic() - started < 0.2
+            # The request's 0.15 s, plus shutdown's own 0.2 s budget, which it
+            # keeps even when the request used up its deadline (review, run 3).
+            assert time.monotonic() - started < 0.45
             assert controls[-1]["op"] == "shutdown"
         if silent:
             with silent_server(base):
@@ -302,3 +304,46 @@ def test_loading_retry_over_socket_pairs(monkeypatch):
         finally:
             loaded.set()
             timer.join()
+
+
+def test_request_waits_for_a_server_this_take_spawned(monkeypatch):
+    """A short take's stop can arrive before uv has bound the socket. With a
+    spawn pending, request waits for it instead of loading a second model
+    beside it (review, run 3)."""
+    with short_dir() as base:
+        base.chmod(0o700)
+        (base / "whisper.lock").write_text(str(time.monotonic()), encoding="ascii")
+        server = p.Server(base / "whisper.sock", load=lambda: None,
+                          handle=lambda req, cancel: {"ok": True, "text": "late"},
+                          fingerprint={"test": 1}, warm_seconds=20, abandon_seconds=30,
+                          exit_fn=lambda code: None)
+        thread = threading.Thread(target=server.serve, daemon=True)
+        timer = threading.Timer(0.3, thread.start)
+        timer.start()
+        try:
+            reply = warm.request("whisper", {"op": "work"}, {"test": 1}, 3, base)
+            assert reply == {"ok": True, "text": "late"}
+        finally:
+            timer.join()
+            server.stopping = True
+            thread.join(2)
+
+
+def test_request_without_a_pending_spawn_falls_back_at_once():
+    with short_dir() as base:
+        started = time.monotonic()
+        assert warm.request("whisper", {"op": "work"}, {"test": 1}, 3, base) is None
+        assert time.monotonic() - started < 0.5
+
+
+def test_shutdown_is_attempted_even_after_cancel_used_the_deadline(monkeypatch):
+    sent = []
+
+    def exchange(path, payload, deadline, **kwargs):
+        sent.append((payload["op"], deadline - time.monotonic()))
+        raise TimeoutError
+
+    monkeypatch.setattr(warm, "_exchange", exchange)
+    warm._stop(Path("/tmp/vw-none/whisper.sock"), "abc", time.monotonic() - 1)
+    ops = dict(sent)
+    assert "shutdown" in ops and ops["shutdown"] > 0

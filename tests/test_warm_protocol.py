@@ -346,3 +346,33 @@ def test_disconnected_clients_and_loading_over_socket_pairs():
             assert h.call("hello")["state"] == "ready"
         finally:
             loaded.set()
+
+
+def test_the_os_timer_is_armed_only_for_a_real_server(monkeypatch):
+    import os
+    import signal
+
+    calls = []
+    monkeypatch.setattr(signal, "setitimer", lambda which, seconds: calls.append((which, seconds)))
+    kwargs = {"load": lambda: None, "handle": lambda req, cancel: {"ok": True},
+              "fingerprint": {}, "warm_seconds": 1, "abandon_seconds": 1}
+    p.Server("/tmp/vw-x.sock", exit_fn=os._exit, **kwargs)._arm(7)
+    p.Server("/tmp/vw-x.sock", exit_fn=lambda code: None, **kwargs)._arm(7)
+    assert calls == [(signal.ITIMER_REAL, 7)]
+
+
+def test_the_kernel_timer_kills_a_process_python_cannot_interrupt():
+    """SIGALRM's default action needs no Python code to run, so it works
+    while a native call holds the GIL and starves the watchdog thread."""
+    import signal
+    import subprocess
+    import sys
+
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c",
+         "import signal, time; signal.setitimer(signal.ITIMER_REAL, 0.2); time.sleep(10)"],
+        timeout=20, check=False,
+    )
+    assert done.returncode == -signal.SIGALRM
+    assert time.monotonic() - started < 5

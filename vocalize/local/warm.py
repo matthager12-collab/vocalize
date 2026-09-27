@@ -47,6 +47,15 @@ def live(kind, expected_fingerprint, base=None, timeout=0.1) -> dict | None:
     return None
 
 
+def _spawn_pending(path) -> bool:
+    """A spawn recorded in the lock file within _SPAWN_GRACE is still coming up."""
+    try:
+        marker = path.with_suffix(".lock").read_text(encoding="ascii")[:64]
+        return 0 <= time.monotonic() - float(marker) < _SPAWN_GRACE
+    except (OSError, ValueError):
+        return False
+
+
 def _hello(path, deadline):
     """Treat missing, malformed and unresponsive listeners as unavailable."""
     try:
@@ -145,10 +154,13 @@ def release(kind, lease_id, base=None):
 
 
 def _stop(path, ident, deadline):
-    """Retire the listener before fallback, using only the reserved deadline budget."""
+    """Retire the listener before fallback. Shutdown always gets its own 0.2 s,
+    even when cancel used up the request's deadline (review, run 3)."""
     for payload in ([{"op": "cancel", "id": ident}] if ident else []) + [{"op": "shutdown"}]:
         try:
             shutdown = payload["op"] == "shutdown"
+            if shutdown:
+                deadline = max(deadline, time.monotonic() + 0.2)
             _exchange(path, payload, deadline, answer=shutdown)
             if shutdown:
                 while protocol.check_socket_path(path) and time.monotonic() < deadline:
@@ -169,6 +181,12 @@ def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) ->
         work_deadline = deadline - min(0.02, deadline_s / 10)
         path = protocol.socket_path(kind, base)
         while time.monotonic() < work_deadline:
+            if not protocol.check_socket_path(path) and _spawn_pending(path):
+                # The server this take spawned has not bound yet. Falling
+                # back now would load a second copy of the model beside it
+                # (review, run 3), so wait for it within the same deadline.
+                time.sleep(min(0.1, max(0, work_deadline - time.monotonic())))
+                continue
             hello = _exchange(path, {"op": "hello"}, work_deadline)
             if hello.get("ok") is not True:
                 break

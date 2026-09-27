@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import socket
 import stat
 import struct
@@ -211,8 +212,19 @@ class Server:
                     self.exit_fn(3)
                 return
 
+    def _arm(self, seconds):
+        """The kernel's own SIGALRM default kills the process with no Python
+        running: a native call holding the GIL starves the watchdog thread,
+        but not this (review, run 3). Tests inject exit_fn and skip it."""
+        if self.exit_fn is os._exit:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, seconds)
+            except (AttributeError, OSError, ValueError):
+                pass
+
     def _work(self, conn, request, cancelled, done):
         """Own this connection until its model result is sent or discarded."""
+        self._arm(request["deadline_s"] + 10)
         try:
             try:
                 reply = self.handle(request, cancelled)
@@ -224,6 +236,7 @@ class Server:
                 reply = {"ok": False, "error": "failed"}
             self._reply(conn, reply)
         finally:
+            self._arm(0)
             conn.close()
             with self.lock:
                 done.set()
