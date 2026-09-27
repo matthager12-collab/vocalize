@@ -2548,18 +2548,20 @@ def test_the_dialog_waits_for_a_record_a_slow_chunk_has_not_written_yet(
     # nothing and no dialog was ever shown for a read it had just cut off.
     monkeypatch.setattr(interrupted, "_RESUME_GRACE", 3.0)  # the shipped default
     answering(tmp_path, monkeypatch, harness, "button returned:Continue, gave up:false\n")
+    # The wait runs on one injected clock and the record lands 0.3 s into
+    # it. A writer thread against the real clock could be scheduled after
+    # the grace on a loaded runner (CI run 36281227462).
     started = time.time()
-    # A loaded runner: the poll's clock spends the whole grace before the
-    # writer thread is scheduled. CI hit this once (run 36281227462).
-    ticks = iter(range(100))
+    clock, landed = [0.0], []
+
+    def wait(seconds):
+        clock[0] += seconds
+        if clock[0] >= 0.3 and not landed:
+            landed.append(save_read(tmp_path))
+
     monkeypatch.setattr(interrupted, "time", SimpleNamespace(
-        time=time.time, monotonic=lambda: float(next(ticks)), sleep=lambda s: None))
-    landing = threading.Thread(target=lambda: (time.sleep(0.3), save_read(tmp_path)))
-    landing.start()
-    try:
-        dictate._offer_resume(started)
-    finally:
-        landing.join()
+        time=lambda: started + clock[0], monotonic=lambda: clock[0], sleep=wait))
+    dictate._offer_resume(started)
 
     assert resumed == [True]
 
