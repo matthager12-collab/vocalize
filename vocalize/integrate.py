@@ -244,8 +244,6 @@ def integrate_claude(*, yes: bool) -> int:
         "  Do not assign the D or X chords — the menu-bar app owns those; "
         "Dictate and Stop stay reachable from the Services menu."
     )
-    # Register the new Service with the existing chord-conflict checker.
-    app_module._SERVICES_NAMES["cards.arda.vocalize.swap"] = "Swap in What I Said"
     conflicts = app_module.services_shortcut_conflicts()
     for _, title, chord in conflicts:
         print(

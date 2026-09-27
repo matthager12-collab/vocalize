@@ -411,6 +411,7 @@ def override_command(path: Path) -> str:
 _SERVICES_NAMES = {
     "cards.arda.vocalize.dictate": "Dictate with Vocalize",
     "cards.arda.vocalize.stop": "Stop Vocalize",
+    "cards.arda.vocalize.swap": "Swap in What I Said",
 }
 
 
