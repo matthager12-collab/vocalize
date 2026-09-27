@@ -93,6 +93,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--model", required=True, help="Path to a ggml .bin model file")
     parser.add_argument("--language", default="en")
+    parser.add_argument("--initial-prompt", default="")
     parser.add_argument(
         "--beam-size", type=int, default=5, choices=range(1, 9), metavar="N",
         help="1 keeps whisper.cpp's greedy decoder; 2-8 turns on beam search with N beams",
@@ -138,7 +139,9 @@ def _join_segments(texts) -> str:
     return " ".join(part for part in (text.strip() for text in texts) if part)
 
 
-def transcribe(model, wav_path: str, language: str, emit_segments: bool = False) -> dict:
+def transcribe(
+    model, wav_path: str, language: str, initial_prompt: str = "", emit_segments: bool = False
+) -> dict:
     """One transcription attempt -> the reply dict `main` prints. Never raises."""
     error = _check_wav(wav_path)
     if error is not None:
@@ -152,10 +155,13 @@ def transcribe(model, wav_path: str, language: str, emit_segments: bool = False)
 
             try:
                 segments = model.transcribe(
-                    wav_path, language=language, new_segment_callback=_callback
+                    wav_path, language=language, initial_prompt=initial_prompt,
+                    no_context=True, new_segment_callback=_callback
                 )
             except TypeError:
-                segments = model.transcribe(wav_path, language=language)
+                segments = model.transcribe(
+                    wav_path, language=language, initial_prompt=initial_prompt, no_context=True
+                )
                 for seg in segments:
                     _callback(seg)
 
@@ -173,7 +179,9 @@ def transcribe(model, wav_path: str, language: str, emit_segments: bool = False)
                     })
             return {"ok": True, "text": text, "segments": seg_list}
 
-        segments = model.transcribe(wav_path, language=language)
+        segments = model.transcribe(
+            wav_path, language=language, initial_prompt=initial_prompt, no_context=True
+        )
         text = _join_segments(segment.text for segment in segments)
     except Exception as exc:  # noqa: BLE001 -- whisper.cpp can raise anything; report, don't crash
         return {"ok": False, "error": _one_line(exc)}
@@ -218,7 +226,7 @@ def main(argv=None) -> int:
             with tempfile.TemporaryDirectory() as tmp:
                 wav_path = str(Path(tmp) / "selftest.wav")
                 _write_selftest_wav(wav_path)
-                reply = transcribe(model, wav_path, args.language or "en")
+                reply = transcribe(model, wav_path, args.language or "en", "")
         except Exception as exc:  # noqa: BLE001 -- the point is to report, not to crash
             print(f"whisper: selftest failed: {_one_line(exc)}", file=sys.stderr)
             return 1
@@ -228,7 +236,9 @@ def main(argv=None) -> int:
         print("ok")
         return 0
 
-    print(json.dumps(transcribe(model, args.transcribe, args.language, emit_segments=args.segments)))
+    print(json.dumps(transcribe(
+        model, args.transcribe, args.language, args.initial_prompt, emit_segments=args.segments
+    )))
     return 0
 
 
