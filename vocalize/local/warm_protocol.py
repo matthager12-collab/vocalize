@@ -222,6 +222,16 @@ class Server:
             except (AttributeError, OSError, ValueError):
                 pass
 
+    def _finish(self, done):
+        """Free the slot. Called before the reply goes out, so a client that
+        asks again the moment it reads the reply is never told busy."""
+        self._arm(0)
+        with self.lock:
+            if not done.is_set():
+                done.set()
+                self.running = None
+                self.idle_since = self.clock()
+
     def _work(self, conn, request, cancelled, done):
         """Own this connection until its model result is sent or discarded."""
         self._arm(request["deadline_s"] + 10)
@@ -234,14 +244,11 @@ class Server:
                 reply = {"ok": False, "error": exc.error}
             except Exception:  # noqa: BLE001 -- contain runtime failures without disclosing private text
                 reply = {"ok": False, "error": "failed"}
+            self._finish(done)
             self._reply(conn, reply)
         finally:
-            self._arm(0)
+            self._finish(done)
             conn.close()
-            with self.lock:
-                done.set()
-                self.running = None
-                self.idle_since = self.clock()
 
     def _dispatch(self, conn, request):
         """Return whether the work thread took ownership of the connection."""

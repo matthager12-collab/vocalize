@@ -376,3 +376,27 @@ def test_the_kernel_timer_kills_a_process_python_cannot_interrupt():
     )
     assert done.returncode == -signal.SIGALRM
     assert time.monotonic() - started < 5
+
+
+def test_the_slot_is_free_before_the_reply_is_sent():
+    """A client that asks again the instant it reads a reply must not be told
+    busy (full-suite flake, run 3): the slot is freed before replying."""
+    seen = []
+
+    class Conn:
+        def settimeout(self, _s):
+            pass
+
+        def sendall(self, _data):
+            seen.append(server.running)
+
+        def close(self):
+            pass
+
+    server = p.Server("/tmp/vw-y.sock", load=lambda: None,
+                      handle=lambda req, cancel: {"ok": True}, fingerprint={},
+                      warm_seconds=1, abandon_seconds=1, exit_fn=lambda code: None)
+    done = threading.Event()
+    server.running = ("id", threading.Event())
+    server._work(Conn(), {"deadline_s": 1}, threading.Event(), done)
+    assert seen == [None]
