@@ -551,6 +551,26 @@ default and a sensible pick.
 - Can't tell Tink from Pop from Glass yet? Set `[stt] cues = "words"` and
   vocalize says "Start.", "Stopped.", "Ready." instead.
 
+### Saying what you meant
+
+Turn on local cleanup and dictation writes what you meant, not just what you
+said: fillers and stutters go, "Tuesday, no, Wednesday" becomes "Wednesday",
+and "nine thirty" becomes "9:30". A deterministic check keeps your own words
+whenever the cleaned text adds, drops or changes too much.
+
+```toml
+[stt]
+cleanup = "local"          # needs: vocalize local install --llm
+vocabulary = ["pyproject", "sha256", "Kokoro"]   # words whisper should expect
+warm_minutes = 15          # keep the models loaded between takes; 0 loads nothing
+```
+
+If cleanup changed a take and you wanted it word for word, run the
+**Swap in What I Said** Quick Action (or `vocalize dictate --swap`), then
+undo and paste again: your raw words were on the clipboard all along, beside
+the cleaned ones. Say "verbatim" as the first word of a take to keep every
+word from the start.
+
 ### `vocalize listen`
 
 `vocalize dictate` (the hotkey's command) is `vocalize listen --toggle`
