@@ -160,7 +160,8 @@ def test_every_exit_releases_original_nonce(session, harness, monkeypatch, warm_
             raise DictationError("failed")
         if outcome == "cancel-during-finish":
             dictate._release_session(session)
-        return (None if outcome == "silence" else TRANSCRIPT), False
+        text = None if outcome == "silence" else TRANSCRIPT
+        return text, False, text
 
     monkeypatch.setattr(dictate, "_finish_take", finish)
     if outcome == "clipboard":
@@ -225,7 +226,7 @@ def test_listen_warms_and_releases(models, harness, monkeypatch, warm_calls, fai
     def finish(*a):
         if fails:
             raise DictationError("failed")
-        return TRANSCRIPT, False
+        return TRANSCRIPT, False, TRANSCRIPT
 
     monkeypatch.setattr(dictate, "_finish_take", finish)
     wait = lambda *a: wait_for(lambda: any(op == "lease" for op, a, kw in warm_calls))
@@ -377,7 +378,7 @@ def test_a_finished_take_warms_the_next_only_with_a_window(
     monkeypatch.setattr(dictate, "_stop_file", lambda *a: None)
     monkeypatch.setattr(dictate, "_play", lambda *a, **kw: None)
     monkeypatch.setattr(dictate, "_notify", lambda *a: None)
-    monkeypatch.setattr(dictate, "_finish_take", lambda *a: ("words", False))
+    monkeypatch.setattr(dictate, "_finish_take", lambda *a: ("words", False, "words"))
     monkeypatch.setattr(dictate, "_session_owns", lambda *a: True)
     monkeypatch.setattr(dictate, "copy_to_clipboard", lambda text: events.append("delivered"))
     monkeypatch.setattr(warm, "ensure_warm", lambda kind, argv, fp, lease_id, **kw:

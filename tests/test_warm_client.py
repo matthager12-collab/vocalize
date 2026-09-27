@@ -381,3 +381,16 @@ def test_ensure_warm_without_a_lease_spawns_without_one():
         warm.ensure_warm("whisper", ["/fake/argv"], {"test": 1}, None, base,
                          spawn=lambda argv, **kw: calls.append(argv))
         assert calls == [["/fake/argv"]]
+
+
+def test_giving_up_on_an_unbound_spawn_tells_it_to_stand_down(monkeypatch):
+    """Falling back while a spawn is still coming up would load two copies:
+    the client leaves a stand-down note the server obeys (run 4 review)."""
+    monkeypatch.setattr(warm, "_LOADING_GRACE", 0.2)
+    with short_dir() as base:
+        base.chmod(0o700)
+        (base / "whisper.lock").write_text(str(time.monotonic()), encoding="ascii")
+        assert warm.request("whisper", {"op": "work"}, {"test": 1}, 3, base) is None
+        note = (base / "whisper.lock").read_text(encoding="ascii")
+        assert note.startswith("stand-down ")
+        assert not warm._spawn_pending(base / "whisper.sock")

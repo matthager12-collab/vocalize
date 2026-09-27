@@ -60,6 +60,25 @@ def _spawn_pending(path) -> bool:
         return False
 
 
+def _stand_down(path) -> None:
+    """Tell a spawn that has not bound yet to exit as soon as it does: this
+    take gave up on it and is falling back, and two copies of a model must
+    not load side by side (run 4 review). The server compares the note's
+    time with its own start, so a later spawn is never told to stand down."""
+    fd = None
+    try:
+        fd = os.open(path.with_suffix(".lock"), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            os.ftruncate(fd, 0)
+            os.write(fd, f"stand-down {time.monotonic()}".encode("ascii"))
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _hello(path, deadline):
     """Treat missing, malformed and unresponsive listeners as unavailable."""
     try:
@@ -226,5 +245,7 @@ def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) ->
     except Exception:  # noqa: BLE001, S110 -- warm failures must be silent and preserve fallback
         pass
     if path is not None:
+        if not protocol.check_socket_path(path) and _spawn_pending(path):
+            _stand_down(path)
         _stop(path, ident, deadline)
     return None

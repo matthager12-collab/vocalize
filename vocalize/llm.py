@@ -405,6 +405,10 @@ def validate_anthropic_key(key: str) -> None:
 # --- the local model ----------------------------------------------------
 
 
+# A warm cleanup that has not answered in this long is not going to; the
+# one-shot fallback then gets the whole feature timeout of its own.
+_WARM_CLEANUP_CAP = 60
+
 # The seam the tests swap for the local backend.
 LOCAL_RUN_SEAM = subprocess.run
 
@@ -430,7 +434,7 @@ def _local(system: str, text: str, timeout: float, max_tokens: int, *,
             reply = warm.request("llm", {
                 "op": "complete", "system": system, "text": text,
                 "max_tokens": min(max_tokens, 1024),
-            }, fingerprint, deadline_s=timeout)
+            }, fingerprint, deadline_s=min(timeout, _WARM_CLEANUP_CAP))
             if (isinstance(reply, dict) and reply.get("ok") is True
                     and isinstance(reply.get("text"), str)):
                 return reply["text"].strip()

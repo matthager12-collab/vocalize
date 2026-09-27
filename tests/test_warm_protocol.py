@@ -447,3 +447,14 @@ def test_the_slot_is_free_before_the_reply_is_sent():
     server.running = ("id", threading.Event())
     server._work(Conn(), {"deadline_s": 1}, threading.Event(), done)
     assert seen == [None]
+
+
+def test_a_server_obeys_a_stand_down_newer_than_its_birth():
+    with Harness() as h:
+        (h.base / "whisper.lock").write_text(f"stand-down {time.monotonic() - 3600}", encoding="ascii")
+        time.sleep(0.3)
+        assert h.thread.is_alive()  # an old note is not for this server
+        (h.base / "whisper.lock").write_text(f"stand-down {time.monotonic()}", encoding="ascii")
+        h.thread.join(1)
+        assert not h.thread.is_alive()
+        assert not h.path.exists()
