@@ -1152,6 +1152,9 @@ def transcribe(wav_path: Path, stt: dict) -> str:
             return sanitize(reply["text"])
     except Exception:  # noqa: BLE001, S110 -- warm reuse must preserve one-shot fallback
         pass
+    # The warm attempt may have used much of the budget; the fallback is a
+    # stage of its own, so the claim must not age out under it (run 4 review).
+    _refresh_claim(wav_path.parent)
     try:
         result = subprocess.run(
             worker_argv(_uv_or_raise(), wav_path, stt),
@@ -1491,7 +1494,6 @@ def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
         _play(_SOUND_START, stt, only="word")
     try:
         pid = _launch_recorder(workdir, stt)
-        _warm_up(workdir, stt)
     except DictationError:
         # Never a relaunch and never a retry: a revoked microphone would
         # turn the hotkey into a silent loop (design § Key flows).
@@ -1513,6 +1515,7 @@ def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
     else:
         _wait_for_audio(workdir)  # "recording" means the microphone is open
     _write_session(workdir, "recording")
+    _warm_up(workdir, stt)  # after the cue: nothing may sit in front of it (run 4 review)
     _spawn_self_stop_watcher(workdir, pid, int(stt.get("max_seconds", 120)), stt)
     _finish_warming()
     return 0
@@ -2021,7 +2024,6 @@ def resume(stt: dict) -> int:
     _record_segment_start(workdir, time.time())
     try:
         pid = _launch_recorder(workdir, stt_seg)
-        _warm_up(workdir, stt)
     except DictationError:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
@@ -2034,6 +2036,7 @@ def resume(stt: dict) -> int:
 
     (workdir / _PAUSED_NAME).unlink(missing_ok=True)
     _write_session(workdir, "recording")
+    _warm_up(workdir, stt)  # after the cue, as in _start
     _spawn_self_stop_watcher(workdir, pid, seg_max, stt)
     _finish_warming()
     return 0
@@ -2060,9 +2063,9 @@ def listen(stt: dict, *, wait) -> str | None:
         audio.stop_playback()
         started = time.time()
         pid = _launch_recorder(workdir, stt)
-        _warm_up(workdir, stt)
         _cue_the_open_microphone(workdir, stt)
         _write_session(workdir, "recording")
+        _warm_up(workdir, stt)
         try:
             wait(started + float(stt["max_seconds"]))
         except KeyboardInterrupt:
