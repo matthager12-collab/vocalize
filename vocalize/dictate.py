@@ -1349,7 +1349,10 @@ def _finish_warming() -> None:
 
 
 def _warm_up(workdir: Path, stt: dict) -> None:
-    """Keep spec building and even a stalled warm client off the microphone path."""
+    """At a take's start, hold whatever warm server is already up, so it
+    cannot expire mid-take. Never spawns (DEC-050: the owner chose loading
+    after a take, because loading during one made short takes slower).
+    Keeps spec building and a stalled client off the microphone path."""
     try:
         nonce = _session_nonce(workdir)
         if nonce is None:
@@ -1363,8 +1366,8 @@ def _warm_up(workdir: Path, stt: dict) -> None:
                     try:
                         if _session_nonce(workdir) != nonce:
                             return
-                        warm.ensure_warm(kind, argv, fingerprint, nonce, env=env)
-                        # A cancel may have released while ensure_warm was still running.
+                        warm.lease(kind, fingerprint, nonce)
+                        # A cancel may have released while the lease was being taken.
                         if _session_nonce(workdir) != nonce:
                             warm.release(kind, nonce)
                     except Exception:  # noqa: BLE001, S110 -- best effort per model
@@ -1376,6 +1379,25 @@ def _warm_up(workdir: Path, stt: dict) -> None:
         thread.start()
         _WARMING.append(thread)
     except Exception:  # noqa: BLE001, S110 -- thread creation must not break dictation
+        pass
+
+
+def _warm_after(stt: dict) -> None:
+    """After a take, start whatever is not already warm, so the next take
+    within `[stt] warm_minutes` skips the load (DEC-050). 0, the default,
+    loads nothing. Runs after delivery, so the user never waits on it; each
+    spawn is bounded by ensure_warm."""
+    try:
+        if int(stt.get("warm_minutes") or 0) <= 0:
+            return
+        from .local import warm
+
+        for kind, argv, env, fingerprint in _warm_specs(stt):
+            try:
+                warm.ensure_warm(kind, argv, fingerprint, None, env=env)
+            except Exception:  # noqa: BLE001, S110 -- best effort per model
+                pass
+    except Exception:  # noqa: BLE001, S110 -- warming must never break dictation
         pass
 
 
@@ -1696,6 +1718,7 @@ def _cancel(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
     finally:
         _discard(workdir)
         _warm_down(nonce)
+        _warm_after(stt)
     _play(_SOUND_STOP, stt)
     _notify(_NOTIFY_CANCELLED)
     return 0
@@ -1747,6 +1770,7 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
     finally:
         _discard(workdir)
         _warm_down(nonce)
+        _warm_after(stt)
 
 
 def cancel(stt: dict) -> int:
@@ -2056,6 +2080,7 @@ def listen(stt: dict, *, wait) -> str | None:
     finally:
         _discard(workdir)
         _warm_down(nonce)
+        _warm_after(stt)
 
 
 def transcribe_wav(path: Path, stt: dict) -> str | None:

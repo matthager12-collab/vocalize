@@ -152,97 +152,104 @@ def test_warm_timing_memory_and_canaries(tmp_path, monkeypatch):
     clip = jargon_clip(tmp_path)
     system = llm.CLEANUP_PROMPT.rstrip() + "\n\n" + llm.DATA_BOUNDARY
     waits, samples, bases = {}, {}, []
+    vocabulary = config.vocabulary_prompt(VOCABULARY)
     # Short paths are required for sockaddr_un on macOS. TemporaryDirectory is 0700.
     with tempfile.TemporaryDirectory(prefix="vw-", dir="/tmp") as root:
         try:
-            for seconds in (1, 3, 10):
-                base = Path(root) / str(seconds)
-                bases.append(base)
-                specs = dictate._warm_specs(stt, base=base)
-                assert {s[0] for s in specs} == {"whisper", "llm"}, "both models must be ready"
-                fingerprints = {kind: fp for kind, argv, env, fp in specs}
-
-                def request(kind, payload, *, fingerprints=fingerprints, base=base):
-                    reply = warm.request(kind, payload, fingerprints[kind], deadline_s=60, base=base)
-                    assert reply and reply.get("ok") is True and isinstance(reply.get("text"), str)
-                    return reply["text"]
-
-                def transcribe(path, prompt):
-                    return request("whisper", {"op": "transcribe", "wav": str(path),
-                                               "language": stt["language"], "initial_prompt": prompt})
-
-                def complete(text):
-                    return request("llm", {"op": "complete", "system": system,
-                                           "text": text, "max_tokens": 1024})
-
-                def take(label, length, *, specs=specs, base=base):
-                    lease = f"eval-{label}"
-                    t0 = time.monotonic()
-                    for kind, argv, env, fingerprint in specs:
-                        warm.ensure_warm(kind, argv, fingerprint, lease, base=base, env=env)
-                    time.sleep(max(0, length - (time.monotonic() - t0)))
-                    stop = time.monotonic()
-                    try:
-                        text = transcribe(clip, config.vocabulary_prompt(VOCABULARY))
-                        assert text.strip(), "jargon transcription was empty"
-                        assert complete(text).strip(), "jargon cleanup was empty"
-                        waits[label] = time.monotonic() - stop
-                        print(f"{label}: wait after stop = {waits[label]:.3f} s", flush=True)
-                    finally:
-                        for kind in ("whisper", "llm"):
-                            warm.release(kind, lease, base=base)
-
-                memory = MemorySamples()
-                memory.thread.start()
-                try:
-                    take(f"{seconds}s", seconds)
-                    if seconds == 10:
-                        take("back-to-back-1", 0)
-                        take("back-to-back-2", 0)
-                        assert "zebracanary" in complete("Remember zebracanary.").lower()
-                        second = complete("The meeting starts tomorrow.")
-                        assert "zebracanary" not in second.lower()
-                        print("LLM canary crossings = 0", flush=True)
-                        jargon = transcribe(clip, config.vocabulary_prompt(VOCABULARY))
-                        assert "pyproject" in jargon.lower(), "jargon clip did not establish the canary"
-                        noise = tmp_path / "noise.wav"
-                        write_noise(noise, rms=40, seed=40)
-                        assert "pyproject" not in transcribe(noise, "").lower()
-                        print("Whisper canary crossings = 0", flush=True)
-                finally:
-                    memory.finish()
-                    samples[seconds] = memory.samples
-                shutdown([base])
-
-            # Real one-shot workers, with the warm endpoint intentionally absent.
+            # 1. Today's path, with no warm endpoint anywhere: the baseline.
             missing = Path(root) / "missing"
             monkeypatch.setattr(warm_protocol, "warm_dir", lambda base=None: Path(base) if base else missing)
+            # The faster of two runs: the first pays for a cold page cache,
+            # which would flatter every warm number compared with it.
+            runs = []
+            for _ in range(2):
+                start = time.monotonic()
+                text = dictate.transcribe(clip, stt)
+                assert text.strip()
+                assert llm._local(system, text, 60, 1024, warm_ok=False)
+                runs.append(time.monotonic() - start)
+            one_shot = min(runs)
+            print(f"one-shot = {one_shot:.3f} s (runs {runs[0]:.3f}, {runs[1]:.3f})", flush=True)
+
+            # 2. DEC-050's first take after idle: warm paths tried, nothing
+            # there, so it must cost what today costs.
             start = time.monotonic()
             text = dictate.transcribe(clip, stt)
-            assert text.strip()
-            assert llm._local(system, text, 60, 1024, warm_ok=False)
-            one_shot = time.monotonic() - start
-            print(f"one-shot = {one_shot:.3f} s", flush=True)
+            assert llm._local(system, text, 60, 1024, warm_ok=True)
+            waits["cold first take"] = time.monotonic() - start
+            print(f"cold first take = {waits['cold first take']:.3f} s", flush=True)
 
-            all_samples = [sample for scenario in samples.values() for sample in scenario]
+            base = Path(root) / "warm"
+            bases.append(base)
+            specs = dictate._warm_specs(stt, base=base)
+            assert {s[0] for s in specs} == {"whisper", "llm"}, "both models must be ready"
+            fingerprints = {kind: fp for kind, argv, env, fp in specs}
+
+            def request(kind, payload):
+                reply = warm.request(kind, payload, fingerprints[kind], deadline_s=60, base=base)
+                assert reply and reply.get("ok") is True and isinstance(reply.get("text"), str)
+                return reply["text"]
+
+            def transcribe(path, prompt):
+                return request("whisper", {"op": "transcribe", "wav": str(path),
+                                           "language": stt["language"], "initial_prompt": prompt})
+
+            def complete(text):
+                return request("llm", {"op": "complete", "system": system,
+                                       "text": text, "max_tokens": 1024})
+
+            def take(label):
+                stop = time.monotonic()
+                text = transcribe(clip, vocabulary)
+                assert text.strip(), "jargon transcription was empty"
+                assert complete(text).strip(), "jargon cleanup was empty"
+                waits[label] = time.monotonic() - stop
+                print(f"{label}: wait after stop = {waits[label]:.3f} s", flush=True)
+
+            memory = MemorySamples()
+            memory.thread.start()
+            try:
+                # 3. What `_warm_after` does once a take is delivered: spawn
+                # both, unleased, so they idle out after the window.
+                for kind, argv, env, fingerprint in specs:
+                    warm.ensure_warm(kind, argv, fingerprint, None, base=base, env=env)
+                time.sleep(1.0)  # the next take lands while both still load
+                take("take 1 s after the last")
+                take("back-to-back-1")
+                take("back-to-back-2")
+                assert "zebracanary" in complete("Remember zebracanary.").lower()
+                second = complete("The meeting starts tomorrow.")
+                assert "zebracanary" not in second.lower()
+                print("LLM canary crossings = 0", flush=True)
+                jargon = transcribe(clip, vocabulary)
+                assert "pyproject" in jargon.lower(), "jargon clip did not establish the canary"
+                noise = tmp_path / "noise.wav"
+                write_noise(noise, rms=40, seed=40)
+                assert "pyproject" not in transcribe(noise, "").lower()
+                print("Whisper canary crossings = 0", flush=True)
+            finally:
+                memory.finish()
+                samples["warm"] = memory.samples
+            shutdown([base])
+
+            all_samples = samples["warm"]
             assert all_samples, "no memory samples collected"
             peaks = {kind: max(p[kind] for _, p in all_samples) for kind in ("whisper", "llm")}
             together = max(sum(p.values()) for _, p in all_samples)
-            for seconds, scenario in samples.items():
-                count = max(c["llm"] for c, _ in scenario)
-                print(f"{seconds}s take: maximum LLM processes = {count}", flush=True)
-                assert count == 1, "missing or duplicate LLM server"
+            count = max(c["llm"] for c, _ in all_samples)
+            print(f"maximum LLM processes = {count}", flush=True)
+            assert count == 1, "missing or duplicate LLM server"
             for kind, peak in peaks.items():
                 print(f"{kind} physical footprint peak = {peak:.3f} GB", flush=True)
                 assert peak > 0, f"no {kind} memory measurement"
             print(f"combined physical footprint peak = {together:.3f} GB", flush=True)
             for label, duration in waits.items():
                 print(f"{label}: saving over one-shot = {one_shot - duration:.3f} s", flush=True)
-            assert waits["3s"] <= 5.0
-            assert waits["10s"] <= 5.0
-            assert max(waits["back-to-back-1"], waits["back-to-back-2"]) <= 4.5
-            assert all(one_shot - waits[label] >= 1.5 for label in
-                       ("3s", "10s", "back-to-back-1", "back-to-back-2"))
+            # DEC-050's gates: never slower than today (0.3 s of noise
+            # allowed), and at least 1.0 s faster once warm.
+            assert waits["cold first take"] <= one_shot + 0.3
+            assert waits["take 1 s after the last"] <= one_shot + 0.3
+            assert all(one_shot - waits[label] >= 1.0 for label in ("back-to-back-1", "back-to-back-2"))
             assert peaks["llm"] <= 3.6
             assert peaks["whisper"] <= 1.0
             assert together <= 4.6

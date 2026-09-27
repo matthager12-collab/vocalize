@@ -18,6 +18,7 @@ The owner decided the goal's scope, speed over RAM, and the undo. On 2026-09-26 
 | DEC-047 | What memory and speed does a release have to meet? | Decided | Physical footprint, not RSS: LLM at most 3.6 GB, whisper at most 1.0 GB; warm wait after stop at most 5.0 s and at least 1.5 s faster than one-shot | R1 |
 | DEC-048 | Where is the control-token defect fixed? | Decided | Pass token ids to `generate` directly; the plan's first task unless a separate fix merges first | R1 |
 | DEC-049 | Whom do the warm servers trust? | Decided | The user's own uid only; same-uid processes are out of scope, stated in the docs | R2 |
+| DEC-050 | When do the warm models load? | Decided | A (owner) — after a take, only when `warm_minutes` > 0; a take start only leases what is already up | R3 |
 
 ---
 
@@ -369,3 +370,37 @@ The summary's "under 1.5 GB per worker" is replaced by these. `llm_manifest.MIN_
 
 **Applied to**:
 - [plan.md](plan.md) § Phase 0
+
+---
+
+## Round 3 (run 4's eval, 2026-09-26)
+
+### DEC-050: When do the warm models load?
+
+**Question**: Run 4's eval missed DEC-047's "at least 1.5 s faster" gate. Loading both models when a take starts saved only 1.1 to 1.4 s, and made a 1 s take 1.8 s slower, because the stop arrived while both were still loading (spike-notes § Run 4). When should they load?
+
+**Date**: 2026-09-26
+**Decided by**: the owner ("Go with run 4 A")
+**Status**: Decided
+
+**Context**: What is left once the models are warm is mostly cleanup generation. The load is worth hiding only for the next take, not the current one.
+
+| Option | Description | Trade-offs |
+|---|---|---|
+| A | Load after a take finishes, only when `warm_minutes` > 0, and keep them for that window. A take start only leases a server that is already up | Never slower than today. Back-to-back takes are faster. The default of 0 loads nothing |
+| B | Keep loading at take start, relax the gate to 1.0 s | Usually 1.1 to 1.4 s faster, but short first takes are slower |
+| C | Drop warm servers | Simplest; loses the saving |
+
+**Recommendation**: A.
+
+**Decision**: A.
+- `dictate._warm_up` (at take start, resume and `listen`) only calls `warm.lease` on a live, matching server, so it cannot expire mid-take. It never spawns.
+- `dictate._warm_after`, in `_stop`'s, `_cancel`'s and `listen`'s cleanup after delivery, calls `warm.ensure_warm` with no lease when `warm_minutes` > 0. The servers then idle out after the window.
+- A stop that finds a server still loading waits for it; that measured no slower than today.
+
+**Consequences**: DEC-047's speed gates become: every take at most today's time plus 0.3 s of noise (the cold first take, and a take landing while the servers load), and back-to-back takes at least 1.0 s faster. Measured with a best-of-two baseline of 5.57 s: the cold first take was 5.45 s, the take during loading 5.26 s, and back-to-back 3.90 s (1.67 s faster). The memory gates are unchanged and passed (0.90, 3.54 and 4.44 GB). DEC-038's "load while the user talks" and DEC-044's "start never waits" now apply to leasing only. DEC-043's 10 s grace at 0 no longer matters, since 0 spawns nothing.
+
+**Applied to**:
+- `vocalize/dictate.py` (`_warm_up`, `_warm_after`), `vocalize/local/warm.py` (`lease`; `ensure_warm` without a lease)
+- `tests/eval/test_warm_timing.py` (the new gates), `tests/test_dictate_warm.py`, `tests/test_warm_client.py`
+- [spike-notes.md](spike-notes.md) § Run 4

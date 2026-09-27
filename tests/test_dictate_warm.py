@@ -45,6 +45,7 @@ def models(tmp_path, monkeypatch):
 def warm_calls(monkeypatch):
     calls = []
     monkeypatch.setattr(warm, "ensure_warm", lambda *a, **kw: calls.append(("ensure", a, kw)))
+    monkeypatch.setattr(warm, "lease", lambda *a, **kw: calls.append(("lease", a, kw)))
     monkeypatch.setattr(warm, "release", lambda *a, **kw: calls.append(("release", a, kw)))
     monkeypatch.setattr(warm, "request", lambda *a, **kw: None)
     return calls
@@ -74,7 +75,7 @@ def test_start_warms_after_recorder(models, session, harness, monkeypatch, clean
     monkeypatch.setattr(dictate, "_launch_recorder", lambda *a: order.append("recorder") or 123)
     monkeypatch.setattr(dictate, "_cue_the_open_microphone", lambda *a: None)
     monkeypatch.setattr(dictate, "_spawn_self_stop_watcher", lambda *a: None)
-    monkeypatch.setattr(warm, "ensure_warm", lambda kind, *a, **kw: order.append(kind))
+    monkeypatch.setattr(warm, "lease", lambda kind, *a, **kw: order.append(kind))
     assert dictate._start(session, stt(cleanup=cleanup)) == 0
     wait_for(lambda: len(order) == len(kinds) + 1)
     assert order == ["recorder", *kinds]
@@ -92,7 +93,7 @@ def test_start_never_waits_for_slow_warming(models, session, harness, monkeypatc
         time.sleep(5)
         finished.set()
 
-    monkeypatch.setattr(warm, "ensure_warm", slow)
+    monkeypatch.setattr(warm, "lease", slow)
     monkeypatch.setattr(dictate, "_launch_recorder", lambda *a: marks.append("mic") or 123)
     monkeypatch.setattr(dictate, "_cue_the_open_microphone",
                         lambda *a: marks.append(("cue", time.monotonic() - started)))
@@ -211,8 +212,8 @@ def test_resume_reuses_nonce(models, session, harness, monkeypatch, warm_calls):
     monkeypatch.setattr(dictate, "_wait_for_audio", lambda *a: None)
     monkeypatch.setattr(dictate, "_spawn_self_stop_watcher", lambda *a: None)
     assert dictate.resume(stt()) == 0
-    wait_for(lambda: any(op == "ensure" for op, a, kw in warm_calls))
-    assert warm_calls[0][1][3] == nonce
+    wait_for(lambda: any(op == "lease" for op, a, kw in warm_calls))
+    assert warm_calls[0][1][2] == nonce  # lease(kind, fingerprint, lease_id)
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -227,13 +228,13 @@ def test_listen_warms_and_releases(models, harness, monkeypatch, warm_calls, fai
         return TRANSCRIPT, False
 
     monkeypatch.setattr(dictate, "_finish_take", finish)
-    wait = lambda *a: wait_for(lambda: any(op == "ensure" for op, a, kw in warm_calls))
+    wait = lambda *a: wait_for(lambda: any(op == "lease" for op, a, kw in warm_calls))
     if fails:
         with pytest.raises(DictationError):
             dictate.listen(stt(), wait=wait)
     else:
         assert dictate.listen(stt(), wait=wait) == TRANSCRIPT
-    nonce = next(a[3] for op, a, kw in warm_calls if op == "ensure")
+    nonce = next(a[2] for op, a, kw in warm_calls if op == "lease")
     assert [(a[0], a[1]) for op, a, kw in warm_calls if op == "release"] == [("whisper", nonce), ("llm", nonce)]
 
 
@@ -258,7 +259,7 @@ def test_hold_start_is_covered(models, recorder, warm_calls):
     recorder()
     assert dictate.start_hold(stt()) == 0
     try:
-        wait_for(lambda: any(op == "ensure" for op, a, kw in warm_calls))
+        wait_for(lambda: any(op == "lease" for op, a, kw in warm_calls))
     finally:
         dictate.cancel(stt())
 
@@ -291,7 +292,7 @@ def test_cancel_during_warm_up_releases_late_lease(models, session, monkeypatch,
         assert (kind, lease) == ("whisper", nonce)
         released.set()
 
-    monkeypatch.setattr(warm, "ensure_warm", slow)
+    monkeypatch.setattr(warm, "lease", slow)
     monkeypatch.setattr(warm, "release", release)
     dictate._warm_up(session, stt(cleanup="local"))
     try:
@@ -324,7 +325,7 @@ def test_failed_whisper_warm_up_still_attempts_llm(models, session, monkeypatch)
             done.set()
         raise RuntimeError("private")
 
-    monkeypatch.setattr(warm, "ensure_warm", broken)
+    monkeypatch.setattr(warm, "lease", broken)
     dictate._warm_up(session, stt(cleanup="local"))
     assert done.wait(1)
     assert calls == ["whisper", "llm"]
@@ -346,9 +347,48 @@ def test_start_lets_a_quick_warm_up_finish_before_it_returns(models, session, ha
         time.sleep(0.2)
         spawned.append(args[0])
 
-    monkeypatch.setattr(warm, "ensure_warm", quick)
+    monkeypatch.setattr(warm, "lease", quick)
     monkeypatch.setattr(dictate, "_launch_recorder", lambda *a: 123)
     monkeypatch.setattr(dictate, "_cue_the_open_microphone", lambda *a: None)
     monkeypatch.setattr(dictate, "_spawn_self_stop_watcher", lambda *a: None)
     assert dictate._start(session, stt()) == 0
     assert spawned == ["whisper"]  # done by the time _start returned
+
+
+# --- DEC-050: models load after a take, never during one -----------------
+
+
+def test_start_never_spawns_a_server(models, session, harness, monkeypatch, warm_calls):
+    monkeypatch.setattr(dictate, "_launch_recorder", lambda *a: 123)
+    monkeypatch.setattr(dictate, "_cue_the_open_microphone", lambda *a: None)
+    monkeypatch.setattr(dictate, "_spawn_self_stop_watcher", lambda *a: None)
+    assert dictate._start(session, stt(cleanup="local")) == 0
+    assert not any(op == "ensure" for op, a, kw in warm_calls)
+    assert {a[0] for op, a, kw in warm_calls if op == "lease"} == {"whisper", "llm"}
+
+
+@pytest.mark.parametrize("minutes", [0, 15])
+def test_a_finished_take_warms_the_next_only_with_a_window(
+    models, harness, monkeypatch, warm_calls, minutes
+):
+    """With warm_minutes 0 nothing ever loads. Otherwise the servers start
+    after delivery, unleased, so they idle out after the window."""
+    events = []
+    monkeypatch.setattr(dictate, "_stop_file", lambda *a: None)
+    monkeypatch.setattr(dictate, "_play", lambda *a, **kw: None)
+    monkeypatch.setattr(dictate, "_notify", lambda *a: None)
+    monkeypatch.setattr(dictate, "_finish_take", lambda *a: ("words", False))
+    monkeypatch.setattr(dictate, "_session_owns", lambda *a: True)
+    monkeypatch.setattr(dictate, "copy_to_clipboard", lambda text: events.append("delivered"))
+    monkeypatch.setattr(warm, "ensure_warm", lambda kind, argv, fp, lease_id, **kw:
+                        events.append(("ensure", kind, lease_id)))
+    workdir = dictate.CACHE_DIR / "take"
+    workdir.mkdir(parents=True, exist_ok=True)
+    settings = stt(cleanup="local")
+    settings["warm_minutes"] = minutes
+    assert dictate._stop(workdir, None, 0, settings) == 0
+    if minutes == 0:
+        assert events == ["delivered"]
+    else:
+        assert events[0] == "delivered"
+        assert sorted(events[1:]) == [("ensure", "llm", None), ("ensure", "whisper", None)]
