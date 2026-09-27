@@ -105,7 +105,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--transcribe", metavar="WAV", help="Path to a 16 kHz mono 16-bit WAV")
     mode.add_argument("--selftest", action="store_true", help="Load the model and say one word")
-    return parser.parse_args(argv)
+    mode.add_argument("--serve", action="store_true", help="Keep the model on a private socket")
+    parser.add_argument("--socket", help="Private Unix socket path")
+    parser.add_argument("--warm-seconds", type=float, default=0)
+    parser.add_argument("--abandon-seconds", type=float, default=1860)
+    parser.add_argument("--lease", default=None)
+    args = parser.parse_args(argv)
+    if args.serve and not args.socket:
+        parser.error("--serve requires --socket")
+    return args
 
 
 def _model_kwargs(beam_size: int) -> dict:
@@ -202,8 +210,96 @@ def _write_selftest_wav(path: str) -> None:
         writer.writeframes(samples.tobytes())
 
 
+def _warm_protocol():
+    """Load the shared stdlib transport without importing the host package."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "warm_protocol", Path(__file__).with_name("warm_protocol.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _pcm_array(frames):
+    """Convert checked PCM inside uv's runtime; host tests need no numpy."""
+    import numpy as np
+
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _warm_transcribe(model, request, cancelled):
+    """Validate and consume the same open file, preventing path replacement races."""
+    import os
+    import stat
+
+    if request.get("op") != "transcribe" or not all(
+        isinstance(request.get(key, ""), str) for key in ("wav", "language", "initial_prompt")
+    ):
+        return {"ok": False, "error": "bad-request"}
+    try:
+        fd = os.open(request["wav"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 200 * 1024**2:
+                return {"ok": False, "error": "bad-request"}
+            with wave.open(source, "rb") as reader:
+                got = (reader.getnchannels(), reader.getsampwidth(), reader.getframerate())
+                size = reader.getnframes() * 2
+                if got != _EXPECTED_FORMAT or size > info.st_size:
+                    return {"ok": False, "error": "bad-request"}
+                frames = reader.readframes(reader.getnframes())
+                if len(frames) != size:
+                    return {"ok": False, "error": "bad-request"}
+    except (OSError, ValueError, KeyError, wave.Error, EOFError):
+        return {"ok": False, "error": "bad-request"}
+    if cancelled.is_set():
+        return {"ok": False, "error": "failed"}
+    segments = model.transcribe(
+        _pcm_array(frames), language=request.get("language", "en"),
+        initial_prompt=request.get("initial_prompt", ""), no_context=True,
+    )
+    if cancelled.is_set():
+        return {"ok": False, "error": "failed"}
+    return {"ok": True, "text": _join_segments(segment.text for segment in segments)}
+
+
+def _serve_server(args, **options):
+    """Expose lifecycle seams without installing a model in the host interpreter."""
+    from pathlib import Path
+
+    protocol = _warm_protocol()
+    model = None
+
+    def load():
+        nonlocal model
+        model = _model_class()(args.model, n_threads=_N_THREADS, **_model_kwargs(args.beam_size))
+
+    return protocol.Server(
+        args.socket, load=load,
+        handle=lambda request, cancelled: _warm_transcribe(model, request, cancelled),
+        warm_seconds=args.warm_seconds, abandon_seconds=args.abandon_seconds,
+        initial_lease=args.lease,
+        fingerprint=protocol.fingerprint(Path(__file__), "pywhispercpp==1.5.1", args.model),
+        **options,
+    )
+
+
+def serve(args):
+    """Keep serve failures private; the caller always has the one-shot fallback."""
+    try:
+        _serve_server(args).serve()
+    except Exception:  # noqa: BLE001 -- contain runtime failures without disclosing private text
+        return 2
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.serve:
+        return serve(args)
 
     try:
         model = _model_class()(
