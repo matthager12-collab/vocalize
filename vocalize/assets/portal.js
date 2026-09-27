@@ -1609,9 +1609,9 @@ function sttCard(data) {
     field(
       "Keep models loaded, minutes",
       warmMinutes,
-      "0 unloads about 10 seconds after a take. A longer time keeps Whisper and, " +
-        "with local cleanup, the language model loaded, holding about 1 GB for " +
-        "Whisper and about 3.3 GB for cleanup."
+      "Minutes to keep the models loaded after each take, so the next take " +
+        "skips loading them. 0 loads nothing ahead of time. While loaded they " +
+        "hold about 1 GB for Whisper and, with local cleanup, about 3.5 GB more."
     )
   );
   fields.push({ key: "warm_minutes", box: warmMinutes, initial: asText(data.stt.warm_minutes), number: true });

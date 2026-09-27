@@ -369,3 +369,23 @@ def test_a_server_stuck_loading_is_given_up_on(monkeypatch):
             assert time.monotonic() - started < 1.0
         finally:
             never.set()
+
+
+def test_lease_holds_a_live_server_and_never_spawns():
+    with Harness() as h:
+        assert warm.lease("whisper", h.server.fingerprint, "take", h.base) is True
+        assert "take" in h.server.leases
+        assert warm.lease("whisper", {"other": 1}, "take-2", h.base) is False
+    with short_dir() as base:
+        started = time.monotonic()
+        assert warm.lease("whisper", {"test": 1}, "take", base) is False
+        assert time.monotonic() - started < 0.3
+        assert not (base / "whisper.lock").exists()  # nothing tried to spawn
+
+
+def test_ensure_warm_without_a_lease_spawns_without_one():
+    with short_dir() as base:
+        calls = []
+        warm.ensure_warm("whisper", ["/fake/argv"], {"test": 1}, None, base,
+                         spawn=lambda argv, **kw: calls.append(argv))
+        assert calls == [["/fake/argv"]]
