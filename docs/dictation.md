@@ -285,6 +285,8 @@ model = "large-v3-turbo-q5_0"
 language = "en"
 input_device = ""
 cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local"
+warm_minutes = 0     # unload about 10 seconds after a take; 1-240 keeps models loaded longer
+                    # holds about 1 GB for Whisper, plus 3.3 GB with local cleanup
 verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
 paste = false        # paste after copying — see Auto-paste
 max_seconds = 120
@@ -304,6 +306,7 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 | `paste` | `true` / `false` | `false` | paste into the app you dictated in, after copying — see [Auto-paste](#auto-paste) |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `max_take_seconds` | integer, 60–7200 | `1800` | caps the entire paused-and-resumed take; `max_seconds` stays per segment |
+| `warm_minutes` | integer, 0–240 | `0` | `0` unloads about 10 seconds after a take. A longer time keeps Whisper and, with local cleanup, the language model loaded, holding about 1 GB for Whisper and about 3.3 GB for cleanup. |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
 | `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
 | `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
