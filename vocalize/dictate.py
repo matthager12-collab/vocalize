@@ -1139,6 +1139,20 @@ def transcribe(wav_path: Path, stt: dict) -> str:
     dur = _wav_duration(wav_path)
     timeout = _transcribe_timeout(dur)
     try:
+        from .local import warm, warm_protocol
+
+        fingerprint = warm_protocol.fingerprint(
+            manifest.worker_path(), manifest.RUNTIME_PACKAGE, manifest.model_path(model),
+        )
+        reply = warm.request("whisper", {
+            "op": "transcribe", "wav": str(wav_path), "language": stt["language"],
+            "initial_prompt": config.vocabulary_prompt(stt.get("vocabulary") or []),
+        }, fingerprint, deadline_s=timeout)
+        if isinstance(reply, dict) and reply.get("ok") is True and isinstance(reply.get("text"), str):
+            return sanitize(reply["text"])
+    except Exception:  # noqa: BLE001, S110 -- warm reuse must preserve one-shot fallback
+        pass
+    try:
         result = subprocess.run(
             worker_argv(_uv_or_raise(), wav_path, stt),
             capture_output=True, text=True, check=False,
@@ -1276,6 +1290,107 @@ def cleanup_backend(stt: dict) -> str:
     return backend or "off"
 
 
+# --- warm servers -----------------------------------------------------
+
+
+def _warm_specs(stt: dict, *, base: Path | None = None) -> list[tuple]:
+    """Independent, best-effort spawn specs; base isolates the real-model eval."""
+    specs = []
+    for kind in ("whisper", "llm"):
+        try:
+            from .local import install, llm_manifest, warm_protocol, whisper_manifest
+
+            settings = _checked(stt)
+            window = ["--warm-seconds", str(60 * settings["warm_minutes"]),
+                      "--abandon-seconds", str(settings["max_take_seconds"] + 60)]
+            serve = ["--serve", "--socket", str(warm_protocol.socket_path(kind, base))]
+            env = None
+            if kind == "whisper":
+                manifest = whisper_manifest
+                model = manifest.model_path(settings["model"])
+                if not model.is_file():
+                    continue
+                argv = [_uv_or_raise(), "run", "--no-project", "--python", manifest.PYTHON_VERSION,
+                        "--with", manifest.RUNTIME_PACKAGE, str(manifest.worker_path()), *serve,
+                        "--model", str(model), "--language", settings["language"],
+                        "--beam-size", str(settings["beam_size"]), *window]
+            else:
+                manifest = llm_manifest
+                if cleanup_backend(settings) != "local" or not install.installed(
+                    manifest, install_hint="vocalize local install --llm",
+                )[0]:
+                    continue
+                model = manifest.MODEL_DIR / "model.safetensors"
+                argv = [_uv_or_raise(), *manifest.runtime_argv()]
+                once = argv.index("--once")
+                argv[once:once + 1] = [*serve, *window]
+                env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+            fingerprint = warm_protocol.fingerprint(
+                manifest.worker_path(), manifest.RUNTIME_PACKAGE, model,
+            )
+            specs.append((kind, argv, env, fingerprint))
+        except Exception:  # noqa: BLE001, S110 -- one broken spec must not suppress the other
+            pass
+    return specs
+
+
+# The warm-up thread of this process, if any. The CLI calls sys.exit the
+# moment `_start` returns, which would kill a daemon thread mid-spawn, so
+# `_start` and `resume` give it a bounded join at their very end.
+_WARMING: list[threading.Thread] = []
+_WARM_JOIN = 1.0
+
+
+def _finish_warming() -> None:
+    """Let the warm-up spawn before this short-lived process exits. The
+    microphone is already open and cued, so this wait is invisible."""
+    while _WARMING:
+        _WARMING.pop().join(_WARM_JOIN)
+
+
+def _warm_up(workdir: Path, stt: dict) -> None:
+    """Keep spec building and even a stalled warm client off the microphone path."""
+    try:
+        nonce = _session_nonce(workdir)
+        if nonce is None:
+            return
+
+        def start():
+            try:
+                from .local import warm
+
+                for kind, argv, env, fingerprint in _warm_specs(stt):
+                    try:
+                        if _session_nonce(workdir) != nonce:
+                            return
+                        warm.ensure_warm(kind, argv, fingerprint, nonce, env=env)
+                        # A cancel may have released while ensure_warm was still running.
+                        if _session_nonce(workdir) != nonce:
+                            warm.release(kind, nonce)
+                    except Exception:  # noqa: BLE001, S110 -- best effort per model
+                        pass
+            except Exception:  # noqa: BLE001, S110 -- background failures stay silent
+                pass
+
+        thread = threading.Thread(target=start, daemon=True)
+        thread.start()
+        _WARMING.append(thread)
+    except Exception:  # noqa: BLE001, S110 -- thread creation must not break dictation
+        pass
+
+
+def _warm_down(nonce: str | None) -> None:
+    if nonce is None:
+        return
+    for kind in ("whisper", "llm"):
+        try:
+            from .local import warm
+
+            warm.release(kind, nonce)
+        except Exception:  # noqa: BLE001, S110 -- release both even when one fails
+            pass
+
+
 # --- the toggle state machine -----------------------------------------
 
 
@@ -1354,6 +1469,7 @@ def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
         _play(_SOUND_START, stt, only="word")
     try:
         pid = _launch_recorder(workdir, stt)
+        _warm_up(workdir, stt)
     except DictationError:
         # Never a relaunch and never a retry: a revoked microphone would
         # turn the hotkey into a silent loop (design § Key flows).
@@ -1376,6 +1492,7 @@ def _start(workdir: Path, stt: dict, *, cue: bool = True) -> int:
         _wait_for_audio(workdir)  # "recording" means the microphone is open
     _write_session(workdir, "recording")
     _spawn_self_stop_watcher(workdir, pid, int(stt.get("max_seconds", 120)), stt)
+    _finish_warming()
     return 0
 
 
@@ -1555,13 +1672,16 @@ def _clear_wedged_session(stt: dict, message: str, code: int) -> int:
 
 def _fail(workdir: Path, stt: dict, message: str) -> int:
     """Clear the dictation, say why, and exit 1. Never a relaunch."""
+    nonce = _session_nonce(workdir)
     _discard(workdir)
+    _warm_down(nonce)
     _play(_SOUND_STOP, stt)
     _notify(message)
     return 1
 
 
 def _cancel(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
+    nonce = _session_nonce(workdir)
     _mark_finishing(workdir)  # this take is being disposed of: refuse presses
     try:
         if pid is None and time.time() - started < _START_GRACE:
@@ -1575,12 +1695,14 @@ def _cancel(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
                 _wait_for_exit(pid, _segment_start(workdir, started), stt)
     finally:
         _discard(workdir)
+        _warm_down(nonce)
     _play(_SOUND_STOP, stt)
     _notify(_NOTIFY_CANCELLED)
     return 0
 
 
 def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
+    nonce = _session_nonce(workdir)
     _mark_finishing(workdir)  # before the wait and the Pop, both of which block
     try:
         _stop_file(workdir)
@@ -1612,10 +1734,8 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
             except DictationError:
                 _notify(_NOTIFY_CLIPBOARD_FAILED)
                 return 1
-            if stt.get("paste"):
-                nonce = _session_nonce(workdir)
-                if nonce is not None:
-                    _write_copied_marker(nonce)
+            if stt.get("paste") and nonce is not None:
+                _write_copied_marker(nonce)
             _play(_SOUND_DONE, stt)
             if cleanup_skipped:
                 _notify(_NOTIFY_COPIED_RAW)
@@ -1626,6 +1746,7 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
         return 0
     finally:
         _discard(workdir)
+        _warm_down(nonce)
 
 
 def cancel(stt: dict) -> int:
@@ -1649,7 +1770,9 @@ def cancel(stt: dict) -> int:
             # A transcription is running in another process. Release the
             # claim so the hotkey works again, but leave that process its
             # directory: it owns the take and removes it in its own `finally`.
+            nonce = _session_nonce(workdir)
             _release_session(workdir)
+            _warm_down(nonce)
             _play(_SOUND_STOP, stt)
             _notify(_NOTIFY_CANCELLED)
             return 0
@@ -1874,6 +1997,7 @@ def resume(stt: dict) -> int:
     _record_segment_start(workdir, time.time())
     try:
         pid = _launch_recorder(workdir, stt_seg)
+        _warm_up(workdir, stt)
     except DictationError:
         _play(_SOUND_STOP, stt)
         _notify(_NOTIFY_RECORDER_FAILED)
@@ -1887,6 +2011,7 @@ def resume(stt: dict) -> int:
     (workdir / _PAUSED_NAME).unlink(missing_ok=True)
     _write_session(workdir, "recording")
     _spawn_self_stop_watcher(workdir, pid, seg_max, stt)
+    _finish_warming()
     return 0
 
 
@@ -1905,11 +2030,13 @@ def listen(stt: dict, *, wait) -> str | None:
         raise DictationError(
             "A dictation is already in progress. Stop it with: vocalize listen --cancel"
         )
+    nonce = _session_nonce(workdir)
     try:
         _sweep_stale_workdirs()
         audio.stop_playback()
         started = time.time()
         pid = _launch_recorder(workdir, stt)
+        _warm_up(workdir, stt)
         _cue_the_open_microphone(workdir, stt)
         _write_session(workdir, "recording")
         try:
@@ -1928,6 +2055,7 @@ def listen(stt: dict, *, wait) -> str | None:
         return text
     finally:
         _discard(workdir)
+        _warm_down(nonce)
 
 
 def transcribe_wav(path: Path, stt: dict) -> str | None:

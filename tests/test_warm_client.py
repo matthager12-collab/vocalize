@@ -355,3 +355,17 @@ def test_shutdown_is_attempted_even_after_cancel_used_the_deadline(monkeypatch):
     warm._stop(Path("/tmp/vw-none/whisper.sock"), "abc", time.monotonic() - 1)
     ops = dict(sent)
     assert "shutdown" in ops and ops["shutdown"] > 0
+
+
+def test_a_server_stuck_loading_is_given_up_on(monkeypatch):
+    """A server that never finishes loading must not hold a take for the whole
+    transcription deadline: after _LOADING_GRACE it is shut down (run 4)."""
+    monkeypatch.setattr(warm, "_LOADING_GRACE", 0.3)
+    never = threading.Event()
+    with Harness(load=lambda: never.wait(5)) as h:
+        started = time.monotonic()
+        try:
+            assert warm.request("whisper", {"op": "work"}, h.server.fingerprint, 5, h.base) is None
+            assert time.monotonic() - started < 1.0
+        finally:
+            never.set()

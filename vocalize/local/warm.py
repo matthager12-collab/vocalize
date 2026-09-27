@@ -18,6 +18,10 @@ from vocalize.local import warm_protocol as protocol
 # A detached uv process needs time to bind. Keep the reservation across
 # short-lived CLI processes, without ever treating a wrapper PID as a worker.
 _SPAWN_GRACE = 10.0
+# A server still "loading" this long after the first try is treated as
+# stuck: shut it down and fall back, rather than hold a take for the whole
+# transcription deadline.
+_LOADING_GRACE = 20.0
 
 
 def _exchange(path, payload, deadline, *, answer=True):
@@ -180,7 +184,8 @@ def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) ->
         # Reserve a small part of the same deadline for fallback control messages.
         work_deadline = deadline - min(0.02, deadline_s / 10)
         path = protocol.socket_path(kind, base)
-        while time.monotonic() < work_deadline:
+        give_up = min(work_deadline, time.monotonic() + _LOADING_GRACE)
+        while time.monotonic() < give_up:
             if not protocol.check_socket_path(path) and _spawn_pending(path):
                 # The server this take spawned has not bound yet. Falling
                 # back now would load a second copy of the model beside it

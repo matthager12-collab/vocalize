@@ -1600,6 +1600,22 @@ function sttCard(data) {
   );
   fields.push({ key: "cleanup", box: cleanup, initial: asText(data.stt.cleanup) });
 
+  var warmMinutes = textBox(data.stt.warm_minutes);
+  warmMinutes.type = "number";
+  warmMinutes.min = "0";
+  warmMinutes.max = "240";
+  warmMinutes.step = "1";
+  box.appendChild(
+    field(
+      "Keep models loaded, minutes",
+      warmMinutes,
+      "0 unloads about 10 seconds after a take. A longer time keeps Whisper and, " +
+        "with local cleanup, the language model loaded, holding about 1 GB for " +
+        "Whisper and about 3.3 GB for cleanup."
+    )
+  );
+  fields.push({ key: "warm_minutes", box: warmMinutes, initial: asText(data.stt.warm_minutes), number: true });
+
   var device = textBox(data.stt.input_device);
   box.appendChild(
     field(

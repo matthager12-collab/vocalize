@@ -68,6 +68,7 @@ KNOWN_STT_KEYS = (
     "verbatim",
     "max_take_seconds",
     "vocabulary",
+    "warm_minutes",
 )
 
 # Where a dictation's cleanup pass runs. `off` is the default: a press must
@@ -97,6 +98,7 @@ STT_DEFAULTS = {
     "beam_size": 5,
     "max_take_seconds": 1800,
     "vocabulary": [],
+    "warm_minutes": 0,
 }
 
 # The recorder self-stops at max_seconds and `dictate` backstops it, so this
@@ -419,6 +421,13 @@ def _validate_stt_table(value, path: Path) -> None:
             f"Invalid stt.cues {cues!r} in {path}. Expected one of: "
             f"{', '.join(STT_CUE_MODES)}."
         )
+
+    if "warm_minutes" in value:
+        minutes = value["warm_minutes"]
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 0 <= minutes <= 240:
+            raise ConfigError(
+                f"Invalid stt.warm_minutes in {path}: expected an integer between 0 and 240."
+            )
 
     vocabulary = value.get("vocabulary")
     if vocabulary is not None:

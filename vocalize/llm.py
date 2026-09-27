@@ -290,7 +290,7 @@ def _complete(system: str, text: str, *, feature: str, backend: str) -> str | No
         return None
     # No egress() call: local means nothing left the machine.
     return _guarded(
-        feature, lambda: _local(system, text, timeout, max_tokens)
+        feature, lambda: _local(system, text, timeout, max_tokens, warm_ok=(feature == "cleanup"))
     )
 
 
@@ -409,7 +409,8 @@ def validate_anthropic_key(key: str) -> None:
 LOCAL_RUN_SEAM = subprocess.run
 
 
-def _local(system: str, text: str, timeout: float, max_tokens: int) -> str | None:
+def _local(system: str, text: str, timeout: float, max_tokens: int, *,
+           warm_ok: bool = False) -> str | None:
     """Run the on-device LLM via ``uv run --offline``.
 
     The request goes on stdin as JSON; the transcript never appears in
@@ -417,6 +418,24 @@ def _local(system: str, text: str, timeout: float, max_tokens: int) -> str | Non
     """
     from . import local as local_module
     from .local import llm_manifest
+
+    if warm_ok:
+        try:
+            from .local import warm, warm_protocol
+
+            fingerprint = warm_protocol.fingerprint(
+                llm_manifest.worker_path(), llm_manifest.RUNTIME_PACKAGE,
+                llm_manifest.MODEL_DIR / "model.safetensors",
+            )
+            reply = warm.request("llm", {
+                "op": "complete", "system": system, "text": text,
+                "max_tokens": min(max_tokens, 1024),
+            }, fingerprint, deadline_s=timeout)
+            if (isinstance(reply, dict) and reply.get("ok") is True
+                    and isinstance(reply.get("text"), str)):
+                return reply["text"].strip()
+        except Exception:  # noqa: BLE001, S110 -- preserve the existing one-shot fallback
+            pass
 
     uv = local_module.uv_path()
     if not uv:
