@@ -106,8 +106,13 @@ def recv(sock, deadline):
 
 
 def peer_uid(sock) -> int | None:
-    """Fail closed when macOS cannot authenticate a connected peer."""
+    """The connected peer's uid, or None (fail closed). macOS answers with
+    LOCAL_PEERCRED (a struct xucred, uid at offset 4); Linux, where CI runs,
+    with SO_PEERCRED (a struct ucred of pid, uid, gid)."""
     try:
+        if hasattr(socket, "SO_PEERCRED"):
+            size = struct.calcsize("3i")
+            return struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size))[1]
         return struct.unpack_from("=I", sock.getsockopt(0, 0x001, 256), 4)[0]
     except (OSError, ValueError, struct.error):
         return None
