@@ -199,11 +199,109 @@ def parse_args(argv=None) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="One request on stdin, one reply on stdout")
     mode.add_argument("--selftest", action="store_true", help="Load the model and run a fixed cleanup")
-    return parser.parse_args(argv)
+    mode.add_argument("--serve", action="store_true", help="Keep the model on a private socket")
+    parser.add_argument("--socket", help="Private Unix socket path")
+    parser.add_argument("--warm-seconds", type=float, default=0)
+    parser.add_argument("--abandon-seconds", type=float, default=1860)
+    parser.add_argument("--lease", default=None)
+    args = parser.parse_args(argv)
+    if args.serve and not args.socket:
+        parser.error("--serve requires --socket")
+    return args
+
+
+def _warm_protocol():
+    """Load the shared stdlib transport without importing the host package."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "warm_protocol", Path(__file__).with_name("warm_protocol.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _warm_complete(mlx, model, tokenizer, request, cancelled, clock):
+    """Stream ids without a prompt cache, checking cancellation between tokens."""
+    if request.get("op") != "complete" or not all(
+        isinstance(request.get(key), str) for key in ("system", "text")
+    ):
+        return {"ok": False, "error": "bad-request"}
+    tokens = request.get("max_tokens", 1024)
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
+        return {"ok": False, "error": "bad-request"}
+    deadline = clock() + request.get("deadline_s", 60)
+    ids = _build_prompt_ids(tokenizer, request["system"], request["text"])
+    pieces = []
+    stream = mlx.stream_generate(model, tokenizer, prompt=ids, max_tokens=min(tokens, 1024))
+    try:
+        while True:
+            if cancelled.is_set() or clock() >= deadline:
+                return {"ok": False, "error": "failed"}
+            try:
+                piece = next(stream)
+            except StopIteration:
+                break
+            if cancelled.is_set() or clock() >= deadline:
+                return {"ok": False, "error": "failed"}
+            pieces.append(piece.text)
+    finally:
+        if hasattr(stream, "close"):
+            stream.close()
+    text = "".join(pieces).strip()
+    if not text or ("<think>" in text and "</think>" not in text):
+        return {"ok": False, "error": "failed"}
+    return {"ok": True, "text": text}
+
+
+def _serve_server(args, **options):
+    """Share the standalone transport and expose time for deterministic tests."""
+    import os
+    import time
+    from pathlib import Path
+
+    if any(os.environ.get(key) != "1" for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")):
+        raise ValueError("offline runtime required")
+    protocol = _warm_protocol()
+    mlx = model = tokenizer = None
+    clock = options.get("clock", time.monotonic)
+
+    def load():
+        nonlocal mlx, model, tokenizer
+        if _check_config(args.model_dir) is not None:
+            raise ValueError("invalid model config")
+        mlx = _mlx()
+        model, tokenizer = mlx.load(args.model_dir, tokenizer_config={"trust_remote_code": False})
+
+    return protocol.Server(
+        args.socket, load=load,
+        handle=lambda request, cancelled: _warm_complete(
+            mlx, model, tokenizer, request, cancelled, clock
+        ),
+        warm_seconds=args.warm_seconds, abandon_seconds=args.abandon_seconds,
+        initial_lease=args.lease,
+        fingerprint=protocol.fingerprint(
+            Path(__file__), "mlx-lm==0.31.3", Path(args.model_dir) / "model.safetensors"
+        ),
+        **options,
+    )
+
+
+def serve(args):
+    """Fail closed on offline or startup errors without printing private data."""
+    try:
+        _serve_server(args).serve()
+    except Exception:  # noqa: BLE001 -- contain runtime failures without disclosing private text
+        return 2
+    return 0
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.serve:
+        return serve(args)
 
     # Config check runs before anything is loaded.
     error = _check_config(args.model_dir)
