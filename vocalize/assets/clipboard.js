@@ -38,7 +38,10 @@ function run() {
             return JSON.stringify({ok: false, reason: 'error'});
         }
         const after = Number(board.changeCount);
-        if (after !== owned) {
+        // A swap expects exactly one change (ours) since its read: anything
+        // more means another app wrote in the window, which NSPasteboard
+        // cannot make atomic. Report it rather than claim success.
+        if (after !== owned || ('expect' in request && owned !== request.expect + 1)) {
             return JSON.stringify({ok: false, reason: 'changed'});
         }
         return JSON.stringify({ok: true, change: after});
