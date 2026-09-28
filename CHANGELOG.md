@@ -32,6 +32,9 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **Notes record the version that wrote them.** The `vocalize:` field in a
+  note's frontmatter was a literal `"0.14.0"`; it now comes from the running
+  version.
 - **A cancelled dictation no longer reaches the clipboard.** Cancelling while
   a take was being transcribed let that take land on the clipboard afterwards,
   overwriting whatever you had copied since. Delivery and cancel now share a
