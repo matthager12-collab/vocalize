@@ -4,7 +4,6 @@ import os
 import queue
 import shutil
 import socket
-import sys
 import tempfile
 import threading
 import time
@@ -14,13 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from vocalize.local import warm_protocol as p
-
-# The warm servers serve local models that only run on macOS (mlx on Apple
-# Silicon, whisper.cpp with Metal). These socket tests hung or failed on the
-# Linux CI runner (2026-09-26) in ways not reproduced on macOS; they run on
-# the reference Mac in run 3's validate-exit.sh, and the Linux behaviour is
-# tracked as its own task rather than hidden.
-pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="warm servers are macOS-only")
 
 
 class Clock:
@@ -287,6 +279,21 @@ def test_cleanup_preserves_replacement_socket():
             h.server.stopping = True
             h.thread.join(1)
             assert h.path.exists()
+
+
+def test_the_socket_appears_only_once_listening(monkeypatch):
+    """A client that sees the path must be able to connect. The path used to
+    exist between bind and listen, so a connect there was refused (Linux CI,
+    2026-09-27). A slow listen widens that window to make it certain."""
+    listen = socket.socket.listen
+
+    def slow_listen(sock, *args):
+        time.sleep(0.3)
+        listen(sock, *args)
+
+    monkeypatch.setattr(socket.socket, "listen", slow_listen)
+    with Harness() as h:
+        assert h.call("hello")["ok"]
 
 
 @pytest.mark.parametrize("seconds", [-1, float("nan"), float("inf"), "60", True])
