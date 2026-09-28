@@ -299,6 +299,35 @@ def test_the_socket_appears_only_once_listening(monkeypatch):
         assert h.call("hello")["ok"]
 
 
+@pytest.mark.parametrize("occupant", ["listener", "file", "symlink"])
+def test_serve_never_replaces_what_holds_the_path(monkeypatch, occupant):
+    """The socket is linked, never renamed, into place: whatever holds the
+    path keeps it, even a listener the stale check missed in a race, and no
+    pending name is left behind."""
+    base = Path(tempfile.mkdtemp(prefix="vw", dir="/tmp"))
+    path = base / "whisper.sock"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as live:
+            if occupant == "listener":
+                live.bind(str(path))
+                live.listen(1)
+                monkeypatch.setattr(p, "check_socket_path", lambda _path: False)
+            elif occupant == "file":
+                path.write_text("kept")
+            else:
+                path.symlink_to(base / "elsewhere")
+            before = path.lstat().st_ino
+            server = p.Server(path, load=lambda: None, handle=lambda *a: {"ok": True},
+                              fingerprint={}, warm_seconds=1, abandon_seconds=1,
+                              exit_fn=lambda code: None)
+            with pytest.raises(FileExistsError):
+                server.serve()
+            assert path.lstat().st_ino == before
+            assert os.listdir(base) == ["whisper.sock"]
+    finally:
+        shutil.rmtree(base)
+
+
 @pytest.mark.parametrize("seconds", [-1, float("nan"), float("inf"), "60", True])
 def test_invalid_deadlines_are_refused(seconds):
     with PairHarness() as h, socket.socket() as conn, pytest.raises(p.ProtocolError):
