@@ -149,10 +149,12 @@ sentence. (Presses closer than half a second apart are the key being
 *held* — macOS repeats a Service shortcut at the key-repeat rate — and are
 ignored, so a cancel is "press, a beat, press".) So is
 `vocalize listen --cancel`, from a terminal, at any point
-— including while a take is being transcribed. (The transcription that was
-already running keeps its own copy of the recording and finishes normally;
-`--cancel` only releases the hotkey so your next press starts a fresh
-dictation instead of being told "still transcribing.")
+— including while a take is being transcribed. A take cancelled while it
+is transcribing never reaches the clipboard: vocalize checks for the cancel
+right before it writes, so whatever you copied next stays put. `--cancel`
+also releases the hotkey, so your next press starts a fresh dictation
+instead of being told "still transcribing." A press of the hotkey itself
+while a take is transcribing is refused, not a cancel (see below).
 
 **A third press while a take is transcribing is refused**: a Pop, and
 "Still transcribing the last dictation." This is deliberate — vocalize
