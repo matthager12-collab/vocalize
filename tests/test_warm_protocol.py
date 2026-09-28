@@ -4,7 +4,6 @@ import os
 import queue
 import shutil
 import socket
-import sys
 import tempfile
 import threading
 import time
@@ -14,13 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from vocalize.local import warm_protocol as p
-
-# The warm servers serve local models that only run on macOS (mlx on Apple
-# Silicon, whisper.cpp with Metal). These socket tests hung or failed on the
-# Linux CI runner (2026-09-26) in ways not reproduced on macOS; they run on
-# the reference Mac in run 3's validate-exit.sh, and the Linux behaviour is
-# tracked as its own task rather than hidden.
-pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="warm servers are macOS-only")
 
 
 class Clock:
@@ -251,8 +243,11 @@ def test_fingerprint_changes_with_bytes_and_size(tmp_path):
 
 
 def test_peer_credentials_fail_closed(monkeypatch):
-    peer = SimpleNamespace(getsockopt=lambda *args: b"\0" * 4 + os.getuid().to_bytes(4, "little"))
-    assert p.peer_uid(peer) == os.getuid()
+    # A real pair, not faked bytes: the kernel answers in its own shape
+    # (xucred on macOS, ucred on Linux), and a fake had only macOS's.
+    ours, theirs = socket.socketpair()
+    with ours, theirs:
+        assert p.peer_uid(ours) == os.getuid()
     assert p.peer_uid(SimpleNamespace(getsockopt=lambda *args: b"")) is None
     with PairHarness() as h:
         monkeypatch.setattr(p, "peer_uid", lambda conn: None)
@@ -287,6 +282,50 @@ def test_cleanup_preserves_replacement_socket():
             h.server.stopping = True
             h.thread.join(1)
             assert h.path.exists()
+
+
+def test_the_socket_appears_only_once_listening(monkeypatch):
+    """A client that sees the path must be able to connect. The path used to
+    exist between bind and listen, so a connect there was refused (Linux CI,
+    2026-09-27). A slow listen widens that window to make it certain."""
+    listen = socket.socket.listen
+
+    def slow_listen(sock, *args):
+        time.sleep(0.3)
+        listen(sock, *args)
+
+    monkeypatch.setattr(socket.socket, "listen", slow_listen)
+    with Harness() as h:
+        assert h.call("hello")["ok"]
+
+
+@pytest.mark.parametrize("occupant", ["listener", "file", "symlink"])
+def test_serve_never_replaces_what_holds_the_path(monkeypatch, occupant):
+    """The socket is linked, never renamed, into place: whatever holds the
+    path keeps it, even a listener the stale check missed in a race, and no
+    pending name is left behind."""
+    base = Path(tempfile.mkdtemp(prefix="vw", dir="/tmp"))
+    path = base / "whisper.sock"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as live:
+            if occupant == "listener":
+                live.bind(str(path))
+                live.listen(1)
+                monkeypatch.setattr(p, "check_socket_path", lambda _path: False)
+            elif occupant == "file":
+                path.write_text("kept")
+            else:
+                path.symlink_to(base / "elsewhere")
+            before = path.lstat().st_ino
+            server = p.Server(path, load=lambda: None, handle=lambda *a: {"ok": True},
+                              fingerprint={}, warm_seconds=1, abandon_seconds=1,
+                              exit_fn=lambda code: None)
+            with pytest.raises(FileExistsError):
+                server.serve()
+            assert path.lstat().st_ino == before
+            assert os.listdir(base) == ["whisper.sock"]
+    finally:
+        shutil.rmtree(base)
 
 
 @pytest.mark.parametrize("seconds", [-1, float("nan"), float("inf"), "60", True])
