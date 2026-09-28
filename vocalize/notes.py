@@ -25,7 +25,7 @@ import time
 import wave
 from pathlib import Path
 
-from . import config, dictate, llm
+from . import __version__, config, dictate, llm
 from .exceptions import VocalizeError
 
 ALLOWLISTED_SUFFIXES = {".m4a", ".mp3", ".wav", ".aif", ".aiff", ".caf", ".txt"}
@@ -222,7 +222,7 @@ def _render_frontmatter(
         f"summarized_by: {json.dumps(summarized_by)}",
         f"left_machine: {'true' if left_machine else 'false'}",
         'trust: "untrusted-transcript"',
-        'vocalize: "0.14.0"',
+        f"vocalize: {json.dumps(__version__)}",
         "---",
     ]
     return "\n".join(lines) + "\n"
