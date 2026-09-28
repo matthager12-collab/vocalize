@@ -1,6 +1,12 @@
 ---
 name: speak
-description: Speak the latest response, a file, a web page, the clipboard, or pasted text aloud with vocalize
+description: >-
+  Speak the latest response, a file, a web page, the clipboard, or pasted text
+  aloud with vocalize, locally. Inputs: nothing (the latest response), a file
+  path, a URL, "clip", "say <text>", or pasted text. A web page is fetched and
+  digested before it is spoken. Use when asked to speak, read aloud, or listen
+  to something. Do NOT use to summarise a page or file in chat without speaking
+  it, or to write or edit the text being read.
 argument-hint: "[path | url | say <text> | clip | <pasted text>]"
 allowed-tools: Write, Agent, Bash(vocalize:*), Bash(wc:*), Bash(ls:*), Bash(pbpaste:*)
 ---
