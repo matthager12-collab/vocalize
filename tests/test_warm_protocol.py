@@ -243,8 +243,11 @@ def test_fingerprint_changes_with_bytes_and_size(tmp_path):
 
 
 def test_peer_credentials_fail_closed(monkeypatch):
-    peer = SimpleNamespace(getsockopt=lambda *args: b"\0" * 4 + os.getuid().to_bytes(4, "little"))
-    assert p.peer_uid(peer) == os.getuid()
+    # A real pair, not faked bytes: the kernel answers in its own shape
+    # (xucred on macOS, ucred on Linux), and a fake had only macOS's.
+    ours, theirs = socket.socketpair()
+    with ours, theirs:
+        assert p.peer_uid(ours) == os.getuid()
     assert p.peer_uid(SimpleNamespace(getsockopt=lambda *args: b"")) is None
     with PairHarness() as h:
         monkeypatch.setattr(p, "peer_uid", lambda conn: None)
