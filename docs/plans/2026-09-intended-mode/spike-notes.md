@@ -134,3 +134,17 @@ After the owner chose DEC-050 A (load after a take), the same eval with a best-o
 - peaks 0.90, 3.54 and 4.44 GB
 - one LLM process, no canary crossing, no server left.
 Every DEC-050 gate passed.
+
+## Owner check
+
+2026-09-28, the owner on the reference Mac, vocalize 0.15.0 built from `main` at `bc90542`, with the T-51 block applied (`cleanup = "local"`, `warm_minutes = 15`, the ten-term vocabulary) and the local model verified by `vocalize local install --llm`.
+
+- **Found first:** the first two rounds ran vocalize 0.13.1, not 0.15.0. The app's `VocalizeBinary` default pointed at the `hold-to-talk` worktree's `.venv`, left over from earlier testing, so `warm_minutes` and `vocabulary` were "unknown config key" and cleanup was skipped. The default was deleted and the app restarted; the checks below ran on 0.15.0.
+- **1. Jargon: pass.** "Read the pyproject at the repository root, run uv --no-project, check sha256, then call resolve_provider_settings." Every vocabulary term came out right. The S1 paragraph's exact text is not in the repo, so this sentence stood in for it.
+- **2. Self-correction: pass.** "Move the stand-up to Wednesday at 9:30."
+- **3. Swap in What I Said: pass.**
+- **4. Warm second take: pass.** "Definitely a lot faster."
+- **5. Cancel while transcribing: pass**, on the second attempt. The first attempt cancelled with a hotkey press, which is refused while a take transcribes, so the take delivered; the check was re-run with `vocalize listen --cancel` and the clipboard kept what was copied. `docs/dictation.md` still described the pre-DEC-045 behaviour and was corrected in the same change as this note.
+
+Released as 0.15.0 the same day: suite 2,540 passed, 6 skipped with an isolated `HOME`; ruff clean; the artifacts' scrub clean; PyPI's sha256 digests equal the local build (wheel `0ac29120…cbed`, sdist `d7fe905f…7d57`); a fresh venv installs 0.15.0 from PyPI. Three tests fail when run with the owner's real `HOME`, because they read `~/.config/vocalize/config.toml` and a live warm server: a test-isolation gap, not a product fault.
+
