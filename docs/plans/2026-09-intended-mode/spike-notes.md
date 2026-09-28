@@ -109,3 +109,28 @@ Review of run 3 (Gemini 3.1 Pro), then the fixes:
 - **A kernel timer backs the watchdog thread.** `setitimer(ITIMER_REAL)` runs with no SIGALRM handler installed, so the kernel ends a server whose native call holds the GIL.
 - **Found through a full-suite flake:** the server freed its work slot only after replying, so an immediate second request was told "busy". The slot is now freed before the reply.
 After the fixes, the real-model smoke gave the same timings, and the run 3 exit script passed 10 of 10 twice in a row.
+
+## Run 4: the timing eval misses one DEC-047 gate
+
+2026-09-26, `tests/eval/test_warm_timing.py` on the reference Mac, with real warm servers spawned by `dictate._warm_specs`, the S1 jargon clip, and the P2-revised cleanup prompt. The wait after the stop is whisper plus cleanup:
+
+| Take | Warm | One-shot, same run | Saving |
+|---|---|---|---|
+| 1 s (servers still loading) | 6.81 s | 5.04 s | -1.77 s |
+| 3 s | 3.83 s | 5.04 s | 1.21 s |
+| 10 s | 3.90 s | 5.04 s | 1.14 s |
+| back-to-back 1 | 3.66 s | 5.04 s | 1.38 s |
+| back-to-back 2 | 3.63 s | 5.04 s | 1.41 s |
+
+Physical footprint peaks: whisper 0.90 GB, LLM 3.54 GB, both at once 4.44 GB. All are within DEC-047. The canaries did not cross takes, and no `--serve` process was left.
+
+Gates: every wait at most 5.0 s (passed), back-to-back at most 4.5 s (passed), memory (passed). **At least 1.5 s faster than one-shot: failed.** The saving is 1.1 to 1.4 s when warm, and the 1 s take is 1.8 s slower, because both servers load at once while the stop waits. One-shot is faster than S3 measured (5.0 s, not 6.0 to 6.6 s) because the model files and the uv environments are hot in the page cache. What is left is mostly cleanup generation, about 2.3 s for this 50-word take, which warm servers cannot remove. Per the choreography's stop rule, run 4 stops here, and the numbers go to the owner.
+
+After the owner chose DEC-050 A (load after a take), the same eval with a best-of-two one-shot baseline gave:
+- one-shot 5.57 s (runs 5.89 and 5.57)
+- cold first take 5.45 s
+- a take 1 s after the last, with the servers still loading, 5.26 s
+- back-to-back 3.90 and 3.91 s: 1.67 s faster
+- peaks 0.90, 3.54 and 4.44 GB
+- one LLM process, no canary crossing, no server left.
+Every DEC-050 gate passed.

@@ -91,6 +91,8 @@ check "T-34 wiring tests" bash -c 'test -f tests/test_dictate_warm.py && "$PY" -
 check "T-35 warm_minutes key known" grep -q '"warm_minutes"' vocalize/config.py
 check "T-35 warm_minutes tests" bash -c 'test -f tests/test_stt_warm_minutes.py && "$PY" -m pytest -q -p no:cacheprovider tests/test_stt_warm_minutes.py'
 check "T-36 timing and memory gate (real models)" env VOCALIZE_EVAL=1 bash -c "test -f tests/eval/test_warm_timing.py && $PY -m pytest -q -p no:cacheprovider -m eval tests/eval/test_warm_timing.py"
+check "DEC-049 boundary documented" grep -qi "talk to the warm servers" docs/dictation.md
+check "DEC-050: take start leases, never spawns" "$PY" -c "import inspect; from vocalize import dictate; src = inspect.getsource(dictate._warm_up); assert 'ensure_warm' not in src and 'warm.lease' in src"
 check "no warm server left running after the eval" bash -c 'test -f tests/eval/test_warm_timing.py && ! pgrep -f -- "_worker.py.*--serve"'
 check "lint clean" ruff check .
 check "whole unit suite green" "$PY" -m pytest -q -p no:cacheprovider

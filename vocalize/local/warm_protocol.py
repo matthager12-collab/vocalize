@@ -166,6 +166,9 @@ class Server:
         self.lock = threading.Lock()
         self.running = None
         self.stopping = False
+        # Wall-clock-free birth time, comparable with a client's stand-down
+        # note: time.monotonic is system-wide on macOS.
+        self.born = time.monotonic()
 
     @staticmethod
     def _id(value):
@@ -216,6 +219,20 @@ class Server:
                 if not done.is_set():
                     self.exit_fn(3)
                 return
+
+    def _stood_down(self) -> bool:
+        """A client that gave up waiting for this spawn and fell back leaves
+        "stand-down <monotonic>" in the lock file; exit rather than load a
+        second copy beside the fallback (run 4 review)."""
+        try:
+            fd = os.open(self.path.with_suffix(".lock"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                note = os.read(fd, 64).decode("ascii")
+            finally:
+                os.close(fd)
+            return note.startswith("stand-down ") and float(note.split()[1]) > self.born
+        except (OSError, ValueError, IndexError, UnicodeDecodeError):
+            return False
 
     def _arm(self, seconds):
         """The kernel's own SIGALRM default kills the process with no Python
@@ -358,7 +375,7 @@ class Server:
                 finally:
                     pending.unlink()
                 listener.settimeout(0.1)
-                while not self.stopping and not self._expired():
+                while not self.stopping and not self._expired() and not self._stood_down():
                     self._accept(listener)
         finally:
             try:

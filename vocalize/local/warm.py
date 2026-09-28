@@ -18,6 +18,10 @@ from vocalize.local import warm_protocol as protocol
 # A detached uv process needs time to bind. Keep the reservation across
 # short-lived CLI processes, without ever treating a wrapper PID as a worker.
 _SPAWN_GRACE = 10.0
+# A server still "loading" this long after the first try is treated as
+# stuck: shut it down and fall back, rather than hold a take for the whole
+# transcription deadline.
+_LOADING_GRACE = 20.0
 
 
 def _exchange(path, payload, deadline, *, answer=True):
@@ -56,6 +60,25 @@ def _spawn_pending(path) -> bool:
         return False
 
 
+def _stand_down(path) -> None:
+    """Tell a spawn that has not bound yet to exit as soon as it does: this
+    take gave up on it and is falling back, and two copies of a model must
+    not load side by side (run 4 review). The server compares the note's
+    time with its own start, so a later spawn is never told to stand down."""
+    fd = None
+    try:
+        fd = os.open(path.with_suffix(".lock"), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            os.ftruncate(fd, 0)
+            os.write(fd, f"stand-down {time.monotonic()}".encode("ascii"))
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _hello(path, deadline):
     """Treat missing, malformed and unresponsive listeners as unavailable."""
     try:
@@ -74,7 +97,8 @@ def _ensure(kind, spawn_argv, expected, lease_id, base, env, spawn, deadline):
         protocol.ensure_private_dir(path.parent)
         reply = _hello(path, min(deadline, time.monotonic() + 0.1))
         if reply and reply.get("ok") is True and reply.get("fingerprint") == expected:
-            _exchange(path, {"op": "lease", "id": lease_id}, deadline)
+            if lease_id is not None:
+                _exchange(path, {"op": "lease", "id": lease_id}, deadline)
             return
         fd = os.open(path.with_suffix(".lock"),
                      os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -86,7 +110,8 @@ def _ensure(kind, spawn_argv, expected, lease_id, base, env, spawn, deadline):
         reply = _hello(path, min(deadline, time.monotonic() + 0.05))
         if reply and reply.get("ok") is True:
             if reply.get("fingerprint") == expected:
-                _exchange(path, {"op": "lease", "id": lease_id}, deadline)
+                if lease_id is not None:
+                    _exchange(path, {"op": "lease", "id": lease_id}, deadline)
                 return
             _exchange(path, {"op": "shutdown"}, deadline)
             # Let the old listener unlink before the new worker tries to bind.
@@ -115,7 +140,8 @@ def _ensure(kind, spawn_argv, expected, lease_id, base, env, spawn, deadline):
                 return
         if time.monotonic() >= deadline:
             return
-        spawn([*spawn_argv, "--lease", lease_id], start_new_session=True,
+        lease = ["--lease", lease_id] if lease_id is not None else []
+        spawn([*spawn_argv, *lease], start_new_session=True,
               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
               cwd=tempfile.gettempdir(), close_fds=True, env=env)
         os.lseek(fd, 0, os.SEEK_SET)
@@ -142,6 +168,20 @@ def ensure_warm(kind, spawn_argv: list[str], expected_fingerprint, lease_id, bas
         thread.join(0.23)
     except Exception:  # noqa: BLE001, S110 -- warm failures must be silent and preserve fallback
         pass
+
+
+def lease(kind, expected_fingerprint, lease_id, base=None) -> bool:
+    """Hold a live, matching server for this take; never spawn one (DEC-050).
+    Bounded to 0.2 s. False when nothing warm is there to hold."""
+    try:
+        path = protocol.socket_path(kind, base)
+        deadline = time.monotonic() + 0.2
+        reply = _hello(path, deadline)
+        if not (reply and reply.get("ok") is True and reply.get("fingerprint") == expected_fingerprint):
+            return False
+        return _exchange(path, {"op": "lease", "id": lease_id}, deadline).get("ok") is True
+    except Exception:  # noqa: BLE001 -- warm failures must be silent and preserve fallback
+        return False
 
 
 def release(kind, lease_id, base=None):
@@ -180,7 +220,8 @@ def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) ->
         # Reserve a small part of the same deadline for fallback control messages.
         work_deadline = deadline - min(0.02, deadline_s / 10)
         path = protocol.socket_path(kind, base)
-        while time.monotonic() < work_deadline:
+        give_up = min(work_deadline, time.monotonic() + _LOADING_GRACE)
+        while time.monotonic() < give_up:
             if not protocol.check_socket_path(path) and _spawn_pending(path):
                 # The server this take spawned has not bound yet. Falling
                 # back now would load a second copy of the model beside it
@@ -204,5 +245,7 @@ def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) ->
     except Exception:  # noqa: BLE001, S110 -- warm failures must be silent and preserve fallback
         pass
     if path is not None:
+        if not protocol.check_socket_path(path) and _spawn_pending(path):
+            _stand_down(path)
         _stop(path, ident, deadline)
     return None

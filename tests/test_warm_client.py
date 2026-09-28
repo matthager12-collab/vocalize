@@ -347,3 +347,50 @@ def test_shutdown_is_attempted_even_after_cancel_used_the_deadline(monkeypatch):
     warm._stop(Path("/tmp/vw-none/whisper.sock"), "abc", time.monotonic() - 1)
     ops = dict(sent)
     assert "shutdown" in ops and ops["shutdown"] > 0
+
+
+def test_a_server_stuck_loading_is_given_up_on(monkeypatch):
+    """A server that never finishes loading must not hold a take for the whole
+    transcription deadline: after _LOADING_GRACE it is shut down (run 4)."""
+    monkeypatch.setattr(warm, "_LOADING_GRACE", 0.3)
+    never = threading.Event()
+    with Harness(load=lambda: never.wait(5)) as h:
+        started = time.monotonic()
+        try:
+            assert warm.request("whisper", {"op": "work"}, h.server.fingerprint, 5, h.base) is None
+            assert time.monotonic() - started < 1.0
+        finally:
+            never.set()
+
+
+def test_lease_holds_a_live_server_and_never_spawns():
+    with Harness() as h:
+        assert warm.lease("whisper", h.server.fingerprint, "take", h.base) is True
+        assert "take" in h.server.leases
+        assert warm.lease("whisper", {"other": 1}, "take-2", h.base) is False
+    with short_dir() as base:
+        started = time.monotonic()
+        assert warm.lease("whisper", {"test": 1}, "take", base) is False
+        assert time.monotonic() - started < 0.3
+        assert not (base / "whisper.lock").exists()  # nothing tried to spawn
+
+
+def test_ensure_warm_without_a_lease_spawns_without_one():
+    with short_dir() as base:
+        calls = []
+        warm.ensure_warm("whisper", ["/fake/argv"], {"test": 1}, None, base,
+                         spawn=lambda argv, **kw: calls.append(argv))
+        assert calls == [["/fake/argv"]]
+
+
+def test_giving_up_on_an_unbound_spawn_tells_it_to_stand_down(monkeypatch):
+    """Falling back while a spawn is still coming up would load two copies:
+    the client leaves a stand-down note the server obeys (run 4 review)."""
+    monkeypatch.setattr(warm, "_LOADING_GRACE", 0.2)
+    with short_dir() as base:
+        base.chmod(0o700)
+        (base / "whisper.lock").write_text(str(time.monotonic()), encoding="ascii")
+        assert warm.request("whisper", {"op": "work"}, {"test": 1}, 3, base) is None
+        note = (base / "whisper.lock").read_text(encoding="ascii")
+        assert note.startswith("stand-down ")
+        assert not warm._spawn_pending(base / "whisper.sock")

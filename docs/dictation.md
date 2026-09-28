@@ -285,6 +285,8 @@ model = "large-v3-turbo-q5_0"
 language = "en"
 input_device = ""
 cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local"
+warm_minutes = 0     # 0 loads nothing ahead; 1-240 keeps models loaded that long after each take
+                    # holds about 1 GB for Whisper, plus 3.3 GB with local cleanup
 verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
 paste = false        # paste after copying — see Auto-paste
 max_seconds = 120
@@ -304,6 +306,7 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 | `paste` | `true` / `false` | `false` | paste into the app you dictated in, after copying — see [Auto-paste](#auto-paste) |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `max_take_seconds` | integer, 60–7200 | `1800` | caps the entire paused-and-resumed take; `max_seconds` stays per segment |
+| `warm_minutes` | integer, 0–240 | `0` | Minutes to keep the models loaded after each take, so the next take skips loading them (about 1.7 s faster with local cleanup on the reference Mac). `0`, the default, loads nothing ahead of time. The first take after a pause runs at normal speed. While loaded they hold about 1 GB for Whisper and about 3.5 GB for cleanup. |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
 | `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
 | `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
@@ -551,6 +554,7 @@ under Privacy & Security › Microphone if you want it gone too.
   with `claude-cli` means accepting that your dictated text is on disk in Claude Code's
   history and goes to Anthropic. Everything above about vocalize's own
   files still holds; this file is not one of them.
+- **Warm models answer only you, but any program running as you can talk to the warm servers.** With `[stt] warm_minutes` above 0, Whisper and the cleanup model stay loaded after a take, listening on private sockets in `~/.cache/vocalize/warm/` (the folder 0700, the sockets 0600, and the server checks the caller's user id). Another program running as your user can reach them, as it can already read your clipboard, where every transcript lands. Nothing they handle is written to disk or logged.
 - **The microphone grant belongs to the bundle, not to vocalize.** Once
   you allow "Vocalize Recorder", anything running as you can launch
   `~/.cache/vocalize/bin/Vocalize Recorder.app` with its own `--out` and
