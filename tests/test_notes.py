@@ -179,7 +179,9 @@ def test_every_segment_sanitized_and_trust_key_present(notes_env, tmp_path, monk
 
     # Trust key present
     assert 'trust: "untrusted-transcript"' in content
-    assert 'vocalize: "0.14.0"' in content
+    # The running version, not a literal that goes stale at every release.
+    from vocalize import __version__
+    assert f'vocalize: "{__version__}"' in content
     assert 'type: "recording"' in content
     assert 'license: "personal-use"' in content
 
