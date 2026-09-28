@@ -360,11 +360,20 @@ class Server:
                             self.path.unlink()
                         else:
                             raise ProtocolError("failed")
-                listener.bind(str(self.path))
-                info = self.path.lstat()
-                identity = (info.st_dev, info.st_ino)
-                self.path.chmod(0o600)
-                listener.listen(8)
+                # Link a pending name into place only once listening, so a
+                # client that sees the path can connect (it was refused between
+                # bind and listen). link, unlike rename, never replaces a live
+                # listener. The pid adds at most 3 bytes to the 100-byte cap.
+                pending = self.path.with_suffix(f".{os.getpid()}")
+                listener.bind(str(pending))
+                try:
+                    info = pending.lstat()
+                    identity = (info.st_dev, info.st_ino)
+                    pending.chmod(0o600)
+                    listener.listen(8)
+                    os.link(pending, self.path)
+                finally:
+                    pending.unlink()
                 listener.settimeout(0.1)
                 while not self.stopping and not self._expired() and not self._stood_down():
                     self._accept(listener)
