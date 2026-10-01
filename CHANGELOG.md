@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- **Tables read aloud with clear pauses.** A table now opens with its size
+  and column names, reads each row as its own numbered paragraph with a full
+  stop between cells ("Row 1: Plan A. Cost: $5. Time: 2 weeks."), and closes
+  with "End of table." Every engine pauses at a paragraph break and a full
+  stop, so rows and columns are audibly separate.
+
 ## 0.15.0 - 2026-09-28
 
 ### Added

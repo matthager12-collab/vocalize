@@ -62,7 +62,7 @@ RULE_CASES = [
     # 19. Nested list item
     ("- a\n  - b\n- c", "First, a.\n\nSub-item, b.\n\nSecond, c."),
     # 20. Table
-    ("| Q1 | Revenue |\n|---|---|\n| Jan | 4.2M |", "Table with 1 row. For Jan: Revenue is 4.2M."),
+    ("| Q1 | Revenue |\n|---|---|\n| Jan | 4.2M |", "Table with 1 row and 2 columns: Q1, Revenue.\n\nRow 1: Jan. Revenue: 4.2M.\n\nEnd of table."),
     # 21. Inline code, bold, italic, HTML tag
     ("Run `pip install` now.", "Run pip install now."),
     ("a<br>b", "a b"),
@@ -212,7 +212,7 @@ def test_row_with_more_cells_than_headers_keeps_the_extra_value():
         "| Ada  | 34  | London |\n"
     )
     result = flatten_markdown(md)
-    assert "column 3 is London" in result
+    assert "Column 3: London." in result
 
 
 def test_row_with_fewer_cells_than_headers_speaks_what_is_present():
@@ -222,8 +222,8 @@ def test_row_with_fewer_cells_than_headers_speaks_what_is_present():
         "| Ada  | 34  |\n"
     )
     result = flatten_markdown(md)
-    assert "For Ada: Age is 34." in result
-    assert "City is" not in result
+    assert "Row 1: Ada. Age: 34." in result
+    assert "City:" not in result
 
 
 def test_duplicate_header_names_do_not_drop_columns():
@@ -244,7 +244,7 @@ def test_single_dash_separator_is_a_table():
         "| Revenue | 4.2m |\n"
     )
     result = flatten_markdown(md)
-    assert "For Revenue: Q1 is 4.2m." in result
+    assert "Row 1: Revenue. Q1: 4.2m." in result
     assert "|" not in result
 
 
@@ -255,7 +255,7 @@ def test_single_row_table_is_grammatical():
         "| Q1      | 4.2M    |\n"
     )
     result = flatten_markdown(md)
-    assert "Table with 1 row." in result
+    assert "Table with 1 row and 2 columns" in result
     assert "1 rows" not in result
 
 
@@ -341,3 +341,30 @@ def test_split_for_synthesis_hard_slices_a_single_unbroken_run():
     assert len(chunks) == 3
     assert all(0 < len(chunk) <= 9500 for chunk in chunks)
     assert "".join(chunks) == text
+
+
+def test_table_rows_are_separate_paragraphs_with_landmarks():
+    # Each row its own paragraph so every engine pauses between rows; a full
+    # stop between cells so it pauses between columns; an end line so the
+    # listener hears where the table stops and prose resumes.
+    md = (
+        "Before.\n\n"
+        "| Option | Cost | Time |\n"
+        "|---|---|---|\n"
+        "| Plan A | $5 | 2 weeks |\n"
+        "| Plan B | | 3 days |\n\n"
+        "After."
+    )
+    assert flatten_markdown(md) == (
+        "Before.\n\n"
+        "Table with 2 rows and 3 columns: Option, Cost, Time.\n\n"
+        "Row 1: Plan A. Cost: $5. Time: 2 weeks.\n\n"
+        "Row 2: Plan B. Time: 3 days.\n\n"
+        "End of table.\n\n"
+        "After."
+    )
+
+
+def test_table_cell_punctuation_is_not_doubled():
+    md = "| Q | Answer |\n|---|---|\n| Ready? | Yes. |\n"
+    assert "Row 1: Ready? Answer: Yes.\n" in flatten_markdown(md)

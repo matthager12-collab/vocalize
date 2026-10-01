@@ -113,7 +113,7 @@ def test_speak_file_reads_from_path(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert out_file.exists()
-    assert "Table with 1 row." in captured_text[0]
+    assert "Table with 1 row and 2 columns" in captured_text[0]
     assert "|" not in captured_text[0]
 
 

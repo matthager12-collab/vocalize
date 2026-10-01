@@ -61,39 +61,54 @@ def _is_table_start(lines: list[str], i: int) -> bool:
     return len(_split_table_row(header)) == len(_split_table_row(sep))
 
 
-def _flatten_table(lines: list[str], start: int) -> tuple[str, int]:
+def _flatten_table(
+    lines: list[str], start: int, speech: dict[str, Any]
+) -> tuple[str, int]:
     """Convert a markdown table starting at `start` into spoken prose.
 
     Returns (spoken_text, index_of_first_line_after_table).
+
+    The inline rules run per cell, not over the assembled text: a value such
+    as "Plan A" would otherwise end "A. Cost:" and the initials rule would
+    eat the full stop that makes the pause between cells.
     """
-    headers = _split_table_row(lines[start])
+    def sentence(text: str) -> str:
+        text = text.rstrip(" ,;:")
+        return text if text.endswith((".", "?", "!")) else text + "."
+
+    def cells(line: str) -> list[str]:
+        return [_apply_inline_rules(cell, speech) for cell in _split_table_row(line)]
+
+    headers = cells(lines[start])
     i = start + 2  # skip header + separator row
     rows: list[list[str]] = []
     while i < len(lines) and "|" in lines[i] and lines[i].strip():
-        rows.append(_split_table_row(lines[i]))
+        rows.append(cells(lines[i]))
         i += 1
 
     if not rows:
         return "", i
 
+    # Speech has no grid, so the listener needs landmarks. Every engine pauses
+    # at punctuation and most at a paragraph break: the shape and column names
+    # come first, then one numbered paragraph per row, a colon between each
+    # header and its value and a full stop between cells, then a closing line.
     noun = "row" if len(rows) == 1 else "rows"
-    sentences = [f"Table with {len(rows)} {noun}."]
-    for row in rows:
+    columns = [h for h in headers if h]
+    intro = f"Table with {len(rows)} {noun} and {len(headers)} columns"
+    paragraphs = [f"{intro}: {', '.join(columns)}." if columns else f"{intro}."]
+    for number, row in enumerate(rows, start=1):
         label = row[0] if row else ""
-        parts = []
-        for idx, value in enumerate(row):
-            if idx == 0:
-                continue
+        sentences = [sentence(f"Row {number}: {label}" if label else f"Row {number}")]
+        for idx, value in enumerate(row[1:], start=1):
             if not value:
                 continue
-            header = headers[idx] if idx < len(headers) else f"column {idx + 1}"
-            parts.append(f"{header} is {value}")
-        if parts:
-            sentences.append(f"For {label}: " + "; ".join(parts) + ".")
-        else:
-            sentences.append(f"{label}.")
+            header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
+            sentences.append(sentence(f"{header}: {value}"))
+        paragraphs.append(" ".join(sentences))
+    paragraphs.append("End of table.")
 
-    return " ".join(sentences), i
+    return "\n\n".join(paragraphs), i
 
 
 def _strip_inline_markdown(text: str) -> str:
@@ -414,9 +429,9 @@ def flatten_markdown(text: str, speech: dict[str, Any] | None = None) -> str:
 
         # Table
         if _is_table_start(raw_lines, i):
-            spoken, i = _flatten_table(raw_lines, i)
+            spoken, i = _flatten_table(raw_lines, i, speech)
             if spoken:
-                blocks.append(_apply_inline_rules(spoken, speech))
+                blocks.append(spoken)
             continue
 
         # Setext heading: Line followed by === or ---

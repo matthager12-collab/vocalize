@@ -51,7 +51,9 @@ all.
 `vocalize` fixes the part of that problem that's actually fixable without a
 vision model: a preprocessing pass (`vocalize/preprocess.py`) rewrites
 markdown into short, declarative sentences *before* it ever reaches the TTS
-API — tables become "for X, Y is Z" sentences, bullets become "First, ...
+API — a table is announced with its size and column names, each row is read
+as its own numbered paragraph ("Row 1: Plan A. Cost: $5."), and "End of
+table." marks where it stops; bullets become "First, ...
 Second, ...", links keep their text and drop the URL, and fenced code blocks
 are replaced with a spoken placeholder instead of being read character by
 character. It's a text transform, so it's fully unit tested without any
