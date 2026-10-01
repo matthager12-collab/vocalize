@@ -148,7 +148,12 @@ def _no_real_model_cache(monkeypatch, tmp_path):
     specifically-shaped directory still overrides this with its own
     monkeypatch, applied after this one.
     """
-    from vocalize.local import kokoro_manifest, parakeet_manifest, piper_manifest, whisper_manifest
+    from vocalize.local import (
+        kokoro_manifest,
+        parakeet_manifest,
+        piper_manifest,
+        whisper_manifest,
+    )
 
     monkeypatch.setattr(kokoro_manifest, "MODEL_DIR", tmp_path / "default-kokoro-cache")
     monkeypatch.setattr(whisper_manifest, "MODEL_DIR", tmp_path / "default-whisper-cache")
