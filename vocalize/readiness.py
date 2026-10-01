@@ -119,6 +119,15 @@ def _polly_row(file_config: dict, *, in_chain: bool = True) -> Row:
     return Row("polly", "ok", f"credentials from {status}", "")
 
 
+def _piper_row() -> Row:
+    from .providers import piper as piper_provider  # lazy import, no cycle risk
+
+    ready, reason = piper_provider.installed()
+    if ready:
+        return Row("piper", "ok", "installed and ready", "")
+    return Row("piper", "warn", reason, "vocalize local install --piper")
+
+
 def _kokoro_row() -> Row:
     from .providers import kokoro as kokoro_provider  # lazy import, no cycle risk
 
@@ -514,6 +523,8 @@ def _make_probe(name: str, file_config: dict, *, in_chain: bool = True) -> Calla
         return lambda: _polly_row(file_config, in_chain=in_chain)
     if name == "kokoro":
         return _kokoro_row
+    if name == "piper":
+        return _piper_row
     if name == "say":
         return lambda: Row("say", "ok", "local, no credentials needed", "")
     # Not one of the known provider shapes (a hand-edited or future config).

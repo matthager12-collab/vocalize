@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- **Piper, an opt-in on-device voice.** `vocalize local install --piper
+  [--voice lessac|ryan]`, then `--provider piper`. Pinned runtime and voice
+  files, each voice's licence shown before download, engine run as a separate
+  process. Kokoro remains the default.
+
 ## 0.15.0 - 2026-09-28
 
 ### Added

@@ -29,7 +29,7 @@ from .exceptions import AuthError, VocalizeError
 
 # Local providers first: this tuple is only ever iterated, and its order is
 # the order `usage`, `status` and the portal list providers in (DEC-022).
-PROVIDER_NAMES = ("kokoro", "say", "elevenlabs", "openai", "google", "polly")
+PROVIDER_NAMES = ("kokoro", "piper", "say", "elevenlabs", "openai", "google", "polly")
 
 PROVIDER_LABELS = {
     "elevenlabs": "ElevenLabs",
@@ -38,6 +38,7 @@ PROVIDER_LABELS = {
     "polly": "Amazon Polly",
     "say": "macOS say",
     "kokoro": "Kokoro (local)",
+    "piper": "Piper (local)",
     "anthropic": "Anthropic",
 }
 

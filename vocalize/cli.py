@@ -724,7 +724,7 @@ def _count_unit(name: str) -> str:
     return "characters"
 
 
-_LOCAL_PROVIDERS = ("say", "kokoro")
+_LOCAL_PROVIDERS = ("say", "kokoro", "piper")
 
 
 def _ledger_line(name: str, file_config: dict) -> str:
@@ -1292,7 +1292,7 @@ def auth_login(from_stdin, provider) -> None:
             "profile) — nothing to store. Check them with: "
             "vocalize auth status --provider polly"
         )
-    if provider in ("say", "kokoro"):
+    if provider in ("say", "kokoro", "piper"):
         label = PROVIDER_LABELS.get(provider, provider)
         raise click.ClickException(f"{label} is local and needs no credentials.")
 
@@ -1358,7 +1358,7 @@ def _provider_status_line(name: str, file_config: dict | None = None) -> str:
         return f"polly: {polly_credential_status(profile)}"
     if name == "say":
         return "say: local, no credentials"
-    return "kokoro: local provider (see: vocalize local status)"
+    return f"{name}: local provider (see: vocalize local status)"
 
 
 @auth.command("status")
@@ -1734,6 +1734,10 @@ def _require_uv(uv: str | None) -> str:
     help="Install the on-device language model for cleanup and summaries.",
 )
 @click.option(
+    "--piper", is_flag=True,
+    help="Install the Piper on-device voice (GPL engine, runs as a separate process) instead of Kokoro.",
+)
+@click.option(
     "--force", is_flag=True,
     help="Skip the RAM check (--llm only).",
 )
@@ -1741,10 +1745,23 @@ def _require_uv(uv: str | None) -> str:
     "--model", "model_name", default=None, metavar="NAME",
     help="Which speech-to-text model to install (--stt only; default: large-v3-turbo-q5_0).",
 )
-def local_install(yes, stt, llm, force, model_name) -> None:
+@click.option(
+    "--voice", "voice_name", default=None, metavar="NAME",
+    help="Which Piper voice to install (--piper only; default: lessac).",
+)
+def local_install(yes, stt, llm, piper, force, model_name, voice_name) -> None:
     """Download and verify a local runtime's model files, then warm it."""
     if stt and llm:
         raise click.ClickException("--stt and --llm are mutually exclusive")
+    if piper and (stt or llm):
+        raise click.ClickException("--piper cannot be combined with --stt or --llm")
+    if voice_name is not None and not piper:
+        raise click.ClickException("--voice only applies together with --piper")
+    if piper:
+        if force or model_name is not None:
+            raise click.ClickException("--force and --model do not apply to --piper")
+        _install_piper(yes, voice_name)
+        return
     if stt:
         if force:
             raise click.ClickException("--force only applies together with --llm")
@@ -1822,6 +1839,74 @@ def _install_kokoro(yes: bool) -> None:
         ) from exc
 
     click.echo('Kokoro installed. Try: vocalize speak "hello" --provider kokoro')
+
+
+_PIPER_INSTALL_HINT = "vocalize local install --piper"
+
+
+def _install_piper(yes: bool, voice_name: str | None) -> None:
+    from . import local as local_module
+    from .local import install as install_module
+    from .local import piper_manifest as manifest
+    from .providers import piper as provider
+
+    uv = _require_uv(local_module.uv_path())
+    voice = voice_name or manifest.DEFAULT_VOICE
+    if voice not in manifest.VOICES:
+        raise click.ClickException(
+            f"unknown voice {voice!r}; choose one of: {', '.join(manifest.VOICES)}"
+        )
+    entries = manifest.voice_files(voice)
+
+    ready, _ = provider.installed(voice)
+    if ready:
+        click.echo(f"Piper voice {voice} is already installed.")
+        return
+
+    total = sum(entry["size"] for entry in entries)
+    click.echo("Piper speaks entirely on this machine — no text ever leaves it.")
+    click.echo("")
+    click.echo(f"This will download {_human_readable_size(total)} of voice files:")
+    for entry in entries:
+        click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
+        click.echo(f"    {entry['url']}")
+    click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo("")
+    click.echo(f"Voice licence: {manifest.VOICE_LICENCES[voice]}.")
+    click.echo("It will also have uv fetch, into its own cache (about 100 MB):")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo("  (the engine is GPL-3.0-or-later; vocalize runs it as a separate program)")
+    click.echo("")
+
+    if not yes and not click.confirm("Download and install now?", default=False):
+        click.echo("Aborted, nothing downloaded.")
+        sys.exit(1)
+
+    for entry in entries:
+        if install_module.file_is_verified(entry, manifest=manifest):
+            click.echo(f"  {entry['name']}: already verified, skipping")
+            continue
+        click.echo(f"Downloading {entry['name']}...")
+        try:
+            install_module.download_file(
+                entry["url"], manifest.MODEL_DIR / entry["name"],
+                entry["size"], entry["sha256"], progress=_download_progress(),
+            )
+        except install_module.InstallError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"  verified {entry['name']} (sha256 matches).")
+
+    install_module.write_stamp(manifest=manifest, files=entries)
+
+    click.echo("Warming the runtime...")
+    try:
+        install_module.selftest(uv, manifest=manifest)
+    except install_module.InstallError as exc:
+        raise click.ClickException(
+            f"The voice files are installed, but the Piper runtime would not start: {exc}"
+        ) from exc
+
+    click.echo('Piper installed. Try: vocalize speak "hello" --provider piper')
 
 
 def _build_recorder_step(install_module) -> None:
@@ -2062,6 +2147,8 @@ def local_status() -> None:
 
     _status_kokoro(uv)
     click.echo("")
+    _status_piper(uv)
+    click.echo("")
     _status_stt(uv)
     click.echo("")
     _status_llm(uv)
@@ -2097,6 +2184,19 @@ def _status_kokoro(uv: str | None) -> None:
         click.echo("Kokoro's model files are ready, but uv is missing.")
     else:
         click.echo(f"Kokoro is not usable: {reason}")
+
+
+def _status_piper(uv: str | None) -> None:
+    from .local import piper_manifest as manifest
+    from .providers import piper as provider
+
+    click.echo("Piper (text-to-speech, opt-in):")
+    click.echo(f"  Voice directory: {manifest.MODEL_DIR}")
+    for voice in manifest.VOICES:
+        ready, reason = provider.installed(voice)
+        click.echo(f"  {voice}: {'ready' if ready else reason}")
+    if not uv:
+        click.echo("  uv is missing, so Piper cannot run.")
 
 
 def _status_stt(uv: str | None) -> None:

@@ -317,6 +317,7 @@ failure now degrades to the always-free `say` instead of erroring out.
 | `polly` | your normal AWS credentials (env, `~/.aws/credentials`, a profile, or a role) — vocalize stores none of it | `[providers.polly]` | 2,900 chars | Standard 5M/month ongoing; Neural 1M/month for 12 months, then $4–$16/million | `boto3` installed + AWS credentials discoverable |
 | `say` | none | `[providers.say]` | none (one call, any length) | free, offline | macOS with the `say` binary |
 | `kokoro` | none | `[providers.kokoro]` | 400 chars per streamed piece | free, offline, one-time ~354 MB download | `uv` + `vocalize local install` done |
+| `piper` | none | `[providers.piper]` | 400 chars per streamed piece | free, offline, one-time ~64 MB download | `uv` + `vocalize local install --piper` done |
 
 **Fallback rules**, decided by typed errors, not string-matching:
 
@@ -458,6 +459,22 @@ reports what's present, missing, or unverified.
 
 Use it for one read with `--provider kokoro`, or add it to your chain in
 `config.toml`.
+
+**Piper** is a second, opt-in on-device voice: smaller and faster than
+Kokoro (about 0.8 s against 3 to 5 s for a short read, half the memory on
+an M-series Mac), though most listeners find Kokoro more natural.
+
+```bash
+vocalize local install --piper            # voice: lessac
+vocalize local install --piper --voice ryan
+```
+
+It downloads one voice (about 63 MB) from a pinned Hugging Face revision and
+shows that voice's licence first. Both voices are non-commercial, and
+vocalize never bundles one. The engine (`piper-tts`, GPL-3.0-or-later) is
+never imported: each piece runs as a separate `python -m piper` program under
+`uv run`, binary wheels only, with the text on stdin. Use it with
+`--provider piper`, or put it in your chain. Kokoro stays the default.
 
 Long text streams: it's broken into ~400-character pieces, and playback
 starts after the first one is ready — roughly 20–25 seconds of speech —
