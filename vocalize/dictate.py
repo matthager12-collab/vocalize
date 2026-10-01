@@ -1117,6 +1117,60 @@ def worker_argv(uv: str, wav_path: Path, stt: dict) -> list[str]:
     ]
 
 
+PARAKEET_INSTALL_HINT = "vocalize local install --stt --engine parakeet"
+
+
+def engine_for(stt: dict) -> str:
+    """Which engine transcribes: "parakeet" or "whisper".
+
+    "auto" (the default) picks Parakeet only where it can run and is
+    installed, so a machine that never installed it keeps using whisper.
+    """
+    from .local import install, parakeet_manifest
+
+    engine = (stt or {}).get("engine", "auto")
+    if engine != "auto":
+        return engine
+    if parakeet_manifest.supported() and install.installed(parakeet_manifest)[0]:
+        return "parakeet"
+    return "whisper"
+
+
+def _transcribe_parakeet(wav_path: Path) -> str:
+    """One-shot: the worker prints a single JSON line. No warm server."""
+    from .local import install
+    from .local import parakeet_manifest as manifest
+
+    if not manifest.supported():
+        raise DictationError("Parakeet needs an Apple Silicon Mac. Use [stt] engine = \"whisper\".")
+    ready, reason = install.installed(manifest, install_hint=PARAKEET_INSTALL_HINT)
+    if not ready:
+        raise DictationError(f"Speech-to-text model parakeet: {reason}")
+
+    timeout = _transcribe_timeout(_wav_duration(wav_path))
+    try:
+        result = subprocess.run(
+            [_uv_or_raise(), *manifest.runtime_argv(), "--transcribe", str(wav_path)],
+            capture_output=True, text=True, check=False, timeout=timeout,
+            cwd=tempfile.gettempdir(),  # never the caller's project directory
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DictationError("Transcription timed out.") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DictationError(f"Could not run the transcriber: {exc}") from exc
+    if result.returncode != 0:
+        raise DictationError("The transcriber failed to run.")
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    try:
+        reply = json.loads(lines[-1])
+    except (IndexError, ValueError) as exc:
+        raise DictationError("The transcriber did not answer.") from exc
+    if not isinstance(reply, dict) or not reply.get("ok"):
+        raise DictationError("The transcriber could not read the recording.")
+    text = reply.get("text")
+    return sanitize(text) if isinstance(text, str) else ""
+
+
 def transcribe(wav_path: Path, stt: dict) -> str:
     """The transcript of one WAV. Raises DictationError on any failure."""
     from .local import install
@@ -1127,6 +1181,8 @@ def transcribe(wav_path: Path, stt: dict) -> str:
     # must be a DictationError with a message, never a KeyError out of the
     # allowlist lookup below and up through the CLI as a traceback.
     stt = _checked(stt)
+    if engine_for(stt) == "parakeet":
+        return _transcribe_parakeet(wav_path)
     model = stt["model"]
     ready, reason = install.installed(
         manifest,
@@ -1309,6 +1365,8 @@ def _warm_specs(stt: dict, *, base: Path | None = None) -> list[tuple]:
             serve = ["--serve", "--socket", str(warm_protocol.socket_path(kind, base))]
             env = None
             if kind == "whisper":
+                if engine_for(settings) == "parakeet":
+                    continue  # nothing to keep warm: Parakeet runs one-shot
                 manifest = whisper_manifest
                 model = manifest.model_path(settings["model"])
                 if not model.is_file():

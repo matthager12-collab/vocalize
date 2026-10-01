@@ -160,9 +160,9 @@ _STT_INSTALL_ACTION = "vocalize local install --stt"
 
 
 def _installed_stt_models() -> list[str]:
-    from .local import install, whisper_manifest
+    from .local import install, parakeet_manifest, whisper_manifest
 
-    return [
+    models = [
         model
         for model in whisper_manifest.MODELS
         if install.installed(
@@ -171,6 +171,11 @@ def _installed_stt_models() -> list[str]:
             install_hint=_STT_INSTALL_ACTION,
         )[0]
     ]
+    if parakeet_manifest.supported() and install.installed(
+        parakeet_manifest, install_hint=_STT_INSTALL_ACTION
+    )[0]:
+        models.insert(0, "parakeet")
+    return models
 
 
 def _recorder_is_built() -> bool:

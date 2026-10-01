@@ -11,6 +11,13 @@ All notable changes to this project are documented here. Format follows
   [--voice lessac|ryan]`, then `--provider piper`. Pinned runtime and voice
   files, each voice's licence shown before download, engine run as a separate
   process. Kokoro remains the default.
+- **Parakeet, the default speech-to-text engine on Apple Silicon.**
+  `vocalize local install --stt` now installs it there (`--engine whisper`
+  for the old engine). `[stt] engine` is `auto`, `parakeet` or `whisper`;
+  `auto` uses Parakeet only when it is installed, so existing whisper installs
+  keep working. Pinned weights and runtime, binary wheels only, run as a
+  one-shot worker with no ffmpeg and no network. `[stt] vocabulary` does not
+  apply to it.
 
 ## 0.15.0 - 2026-09-28
 

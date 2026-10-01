@@ -56,6 +56,7 @@ OVERFLOW_MODES = ("truncate", "ask", "never")
 
 # Keys allowed inside the [stt] table (DEC-006, design § [stt] config table).
 KNOWN_STT_KEYS = (
+    "engine",
     "model",
     "language",
     "input_device",
@@ -82,7 +83,12 @@ STT_CUE_MODES = ("sounds", "words", "both")
 
 # `paste` was reserved by DEC-006 and did nothing through 0.13.0; from
 # 0.13.1 `dictate._stop` honours it (design § Auto-paste).
+# "auto" uses Parakeet on an Apple Silicon Mac where it is installed and
+# whisper everywhere else; "parakeet" and "whisper" pin one engine.
+STT_ENGINES = ("auto", "parakeet", "whisper")
+
 STT_DEFAULTS = {
+    "engine": "auto",
     # turbo q5_0: the first model that kept "the merge" as two words on the
     # owner's voice (issue #4), no slower than small.en on an M4 and only
     # ~90 MB more resident. small.en stays the lighter choice for a slow Mac.
@@ -339,6 +345,12 @@ def _validate_stt_table(value, path: Path) -> None:
     for key in value:
         if key not in KNOWN_STT_KEYS:
             _warn(f"vocalize: unknown config key {key!r} in [stt] in {path}")
+
+    engine = value.get("engine")
+    if engine is not None and engine not in STT_ENGINES:
+        raise ConfigError(
+            f"Invalid stt.engine {engine!r} in {path}. Known: {', '.join(STT_ENGINES)}"
+        )
 
     model = value.get("model")
     if model is not None and model not in whisper_manifest.MODELS:

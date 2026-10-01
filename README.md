@@ -488,8 +488,11 @@ mid-sentence the same as any other provider.
 
 Everything above turns text into speech. Dictation runs the other way:
 press a hotkey, speak, press it again, and the words land on your
-clipboard. It's [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via
-[`pywhispercpp`](https://github.com/absadiki/pywhispercpp), entirely
+clipboard. On an Apple Silicon Mac it's NVIDIA's Parakeet via
+[`parakeet-mlx`](https://github.com/senstella/parakeet-mlx); everywhere else,
+and for anyone who prefers it, it's
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) via
+[`pywhispercpp`](https://github.com/absadiki/pywhispercpp). Both are entirely
 on-device — nothing you say leaves the Mac unless you turn on `--cleanup`
 (below), and even then only the *transcript* goes anywhere, never the audio.
 
@@ -500,7 +503,14 @@ vocalize local install --stt
 ```
 
 A separate opt-in from Kokoro's `vocalize local install` — nothing here is
-downloaded or built until you run this. It:
+downloaded or built until you run this. On Apple Silicon it installs
+**Parakeet** (about 2.5 GB, weights CC-BY-4.0, pinned and hash-checked); pass
+`--engine whisper` for whisper.cpp instead. `[stt] engine = "auto"` (the
+default) uses Parakeet when it's installed and whisper otherwise; set
+`"parakeet"` or `"whisper"` to pin one. On a six-clip test of one speaker
+Parakeet made about half the errors of whisper `large-v3-turbo-q5_0` and kept
+product names intact, at about 1.4 s a clip. It ignores `[stt] vocabulary`
+and `beam_size`, which are whisper settings. For whisper the install:
 
 1. Downloads one whisper.cpp model (`large-v3-turbo-q5_0` by default, ~547 MB) from a
    pinned Hugging Face revision, verified against a pinned sha256 before

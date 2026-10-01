@@ -1746,15 +1746,21 @@ def _require_uv(uv: str | None) -> str:
     help="Which speech-to-text model to install (--stt only; default: large-v3-turbo-q5_0).",
 )
 @click.option(
+    "--engine", "engine_name", type=click.Choice(["parakeet", "whisper"]), default=None,
+    help="Which speech-to-text engine to install (--stt only; default: parakeet on Apple Silicon, else whisper).",
+)
+@click.option(
     "--voice", "voice_name", default=None, metavar="NAME",
     help="Which Piper voice to install (--piper only; default: lessac).",
 )
-def local_install(yes, stt, llm, piper, force, model_name, voice_name) -> None:
+def local_install(yes, stt, llm, piper, force, model_name, voice_name, engine_name) -> None:
     """Download and verify a local runtime's model files, then warm it."""
     if stt and llm:
         raise click.ClickException("--stt and --llm are mutually exclusive")
     if piper and (stt or llm):
         raise click.ClickException("--piper cannot be combined with --stt or --llm")
+    if engine_name is not None and not stt:
+        raise click.ClickException("--engine only applies together with --stt")
     if voice_name is not None and not piper:
         raise click.ClickException("--voice only applies together with --piper")
     if piper:
@@ -1765,7 +1771,15 @@ def local_install(yes, stt, llm, piper, force, model_name, voice_name) -> None:
     if stt:
         if force:
             raise click.ClickException("--force only applies together with --llm")
-        _install_stt(yes, model_name)
+        from .local import parakeet_manifest
+
+        engine = engine_name or ("parakeet" if parakeet_manifest.supported() else "whisper")
+        if engine == "parakeet":
+            if model_name is not None:
+                raise click.ClickException("--model only applies to --engine whisper")
+            _install_parakeet(yes)
+        else:
+            _install_stt(yes, model_name)
         return
     if llm:
         if model_name is not None:
@@ -2020,6 +2034,76 @@ def _install_stt(yes: bool, model_name: str | None) -> None:
     click.echo(f"Speech-to-text installed ({model}). Try: vocalize listen --check")
 
 
+def _install_parakeet(yes: bool) -> None:
+    from . import local as local_module
+    from .local import install as install_module
+    from .local import parakeet_manifest as manifest
+
+    if not manifest.supported():
+        raise click.ClickException(
+            "Parakeet runs on Apple Silicon only. Use: vocalize local install --stt --engine whisper"
+        )
+    uv = _require_uv(local_module.uv_path())
+
+    ready, _ = install_module.installed(manifest, install_hint=_STT_INSTALL_HINT)
+    if ready:
+        click.echo("Parakeet is already installed. Re-warming the runtime...")
+        try:
+            install_module.selftest(uv, manifest=manifest)
+        except install_module.InstallError as exc:
+            raise click.ClickException(
+                f"The model files are installed, but the speech-to-text runtime would not start: {exc}"
+            ) from exc
+        _build_recorder_step(install_module)
+        click.echo("Parakeet is ready.")
+        return
+
+    total = sum(entry["size"] for entry in manifest.FILES)
+    click.echo("Speech-to-text runs entirely on this machine — no audio or text ever leaves it.")
+    click.echo("")
+    click.echo(f"This will download {_human_readable_size(total)} of model files:")
+    for entry in manifest.FILES:
+        click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
+        click.echo(f"    {entry['url']}")
+    click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo("")
+    click.echo("Weights: NVIDIA parakeet-tdt-0.6b-v2, CC-BY-4.0 (attribution required).")
+    click.echo("It will also have uv fetch, into its own cache:")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI (binary wheels only)")
+    click.echo("")
+
+    if not yes and not click.confirm("Download and install now?", default=False):
+        click.echo("Aborted, nothing downloaded.")
+        sys.exit(1)
+
+    for entry in manifest.FILES:
+        if install_module.file_is_verified(entry, manifest=manifest):
+            click.echo(f"  {entry['name']}: already verified, skipping")
+            continue
+        click.echo(f"Downloading {entry['name']}...")
+        try:
+            install_module.download_file(
+                entry["url"], manifest.MODEL_DIR / entry["name"],
+                entry["size"], entry["sha256"], progress=_download_progress(),
+            )
+        except install_module.InstallError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"  verified {entry['name']} (sha256 matches).")
+
+    install_module.write_stamp(manifest=manifest)
+
+    click.echo("Warming the runtime (pays a one-time compile)...")
+    try:
+        install_module.selftest(uv, manifest=manifest)
+    except install_module.InstallError as exc:
+        raise click.ClickException(
+            f"The model files are installed, but the speech-to-text runtime would not start: {exc}"
+        ) from exc
+
+    _build_recorder_step(install_module)
+    click.echo("Speech-to-text installed (parakeet). Try: vocalize listen --check")
+
+
 def _install_llm(yes: bool, force: bool) -> None:
     from . import local as local_module
 
@@ -2149,6 +2233,8 @@ def local_status() -> None:
     click.echo("")
     _status_piper(uv)
     click.echo("")
+    _status_parakeet(uv)
+    click.echo("")
     _status_stt(uv)
     click.echo("")
     _status_llm(uv)
@@ -2197,6 +2283,19 @@ def _status_piper(uv: str | None) -> None:
         click.echo(f"  {voice}: {'ready' if ready else reason}")
     if not uv:
         click.echo("  uv is missing, so Piper cannot run.")
+
+
+def _status_parakeet(uv: str | None) -> None:
+    from .local import install as install_module
+    from .local import parakeet_manifest as manifest
+
+    click.echo("Parakeet (speech-to-text, the default on Apple Silicon):")
+    if not manifest.supported():
+        click.echo("  not available: needs an Apple Silicon Mac")
+        return
+    click.echo(f"  Model directory: {manifest.MODEL_DIR}")
+    ready, reason = install_module.installed(manifest, install_hint=_STT_INSTALL_HINT)
+    click.echo("  ready" if ready and uv else f"  {reason or 'uv is missing'}")
 
 
 def _status_stt(uv: str | None) -> None:
