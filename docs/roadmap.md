@@ -1,29 +1,28 @@
 # Roadmap
 
-Future work, with the research behind each item. Status legend: **planned** = analysed, decisions pending, nothing built; **spiked** = feasibility measured; **building**; **shipped**.
+Vocalize does two things on your Mac: text to speech and speech to text.
+Version 1.0 is the first release that is local only.
 
-| Item | Status | Tracking | Research |
-|---|---|---|---|
-| Hotkey-triggered local dictation (voice → text via a local Whisper model, Quick Action toggle, clipboard output, optional cleanup) | **shipped** in 0.10.0, usable from 0.10.1 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) · [plan](plans/2026-09-next-features/plan.md) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-dictation-design.md) · [voicebox findings](research/2026-09-01-voicebox-findings.md) |
-| `vocalize status` one-screen readiness check | **shipped** in 0.10.0 | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) |
-| Spoken cues for dictation (`[stt] cues = "words"`: "start" / "stopped" / "ready" instead of, or as well as, the sounds) | **shipped** in 0.10.2 | — | owner request, 2026-09-02 |
-| Cue timing: the "talk now" cue must follow the *open* microphone and never be recorded (recorder warms the input, reports ready, waits for a `go` marker; `dictate` plays the cue, then touches `go`) | planned | [#2](https://github.com/matthager12-collab/vocalize/issues/2) | first live use of 0.10.2: people talk after "Start." and lose the first word |
-| Transcript cleanup: drop restatements, false starts and filler by default, with a spoken keyword that turns it off for a verbatim dictation | planned | [#3](https://github.com/matthager12-collab/vocalize/issues/3) | owner, 2026-09-03: "one of the problems with these vocalization tools is that they don't do a good job of that" |
-| Words run together in fast speech (`"toget"` for `"to get"`) — whisper.cpp is loaded with greedy sampling and no beam search | planned | [#4](https://github.com/matthager12-collab/vocalize/issues/4) | observed live on 0.10.2 |
-| Config portal (`vocalize portal`, stdlib local web page on top of the same readiness rows) | planned — runs 7–10 of the [plan](plans/2026-09-next-features/plan.md) | [#1](https://github.com/matthager12-collab/vocalize/issues/1) | [analysis](next-features-analysis.md) · [full design](research/2026-09-01-config-portal-design.md) |
-| Full app (menu-bar, hotkeys, setup), better models per RAM tier, local-first default, recorded notes, in-app keys | **in progress** — 0.12.0 shipped 2026-09-07 (local-first, keychain, Keys tab); 0.13.0 shipped 2026-09-08 (menu-bar app, doctor, integrate claude, Setup tab); 0.13.1 and 0.14.0 to come | [plan](plans/2026-09-app-roadmap/plan.md) · [choreography](plans/2026-09-app-roadmap/choreography.md) | [app roadmap analysis](research/2026-09-04-app-roadmap-analysis.md) (2026-09-04) |
-| Pause and resume, playback and recording | **planned** — DEC-036 and DEC-037 decided 2026-09-07; runs 11b and 15b | [plan](plans/2026-09-app-roadmap/plan.md) · [choreography](plans/2026-09-app-roadmap/choreography.md) | owner, 2026-09-07: missed in every requirement |
+## In 1.0
 
-## Decisions (2026-09-01, closed 2026-09-02)
+| Area | What ships |
+|---|---|
+| Text to speech | Kokoro (default), Piper (opt-in) and macOS `say` (fallback); Markdown and tables rewritten for listening; pause, resume and stop |
+| Dictation | Parakeet or Whisper; optional on-device cleanup; hold-to-talk; auto-paste |
+| Transcription | `vocalize transcribe` for audio and text files |
+| Settings | `vocalize portal`, a settings page on your Mac |
+| Menu-bar app | Keyboard shortcuts for dictation, speaking the selection and stopping |
 
-1. The dictation spike ran ([results](plans/2026-09-next-features/spike-2026-09-01.md)); Whisper `small.en` is the default.
-2. `vocalize status` first (0.10.0); the portal follows as 0.11.0.
-3. Hotkey chord ⌃⌥⌘D, set by the user in System Settings.
+## Being evaluated
 
-## Deferred on purpose
+These are considered for larger Macs. Each is added only after a review of
+the package and a passing measurement:
 
-Hold-to-talk (needs an event tap + Input Monitoring, ~6 h), auto-paste (Accessibility, ~2 h, belongs in the recorder bundle), Apple STT mode (~1.5 h), menu-bar agent (~12 h), local-LLM cleanup, resident/pre-warmed STT worker (only if the spike shows >2.5 s overhead), a native SwiftUI/Tauri app.
+- Qwen3-ASR 1.7B, for more accurate speech to text
+- Parakeet v3, for languages other than English
+- A larger speech-out model
 
-## Sequencing suggestion
+## Not planned
 
-Dictation first (the spike decides the engine, then ~20 h), portal or `status` second.
+- Online voices or hosted models. Users who need them can stay on 0.15.
+- Windows and Linux.

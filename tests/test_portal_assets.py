@@ -281,24 +281,6 @@ def test_the_page_asks_the_server_for_voices_and_ships_no_list_of_its_own():
     assert "String(voice.name)" in script
 
 
-def test_the_keys_hint_names_the_command_that_removes_a_key():
-    """The page can remove a key since 0.12.0, and the hint still names the
-    terminal command that does the same — it used to send the user to
-    Keychain Access, a GUI that knows nothing about vocalize. There are
-    four `vocalize` entries in there, named only by username slug, and a
-    keychain delete that is denied shows nothing. `auth logout` reads the
-    entry back and refuses to claim a removal it cannot verify, so that is
-    the command the sentence has to name. Cross-checked against the CLI, so
-    a renamed command fails here rather than in a user's terminal."""
-    from vocalize.cli import main
-
-    script = JS.read_text(encoding="utf-8")
-    logout = main.commands["auth"].commands["logout"]
-
-    assert "Keychain Access" not in script
-    assert "vocalize auth logout --provider <name>" in script
-    assert logout.name == "logout"
-    assert "provider" in {param.name for param in logout.params}
 
 
 def test_the_sidebar_maps_a_row_to_a_button_by_name_and_never_by_its_action():
@@ -322,31 +304,11 @@ def test_every_tab_has_a_panel():
     script = JS.read_text(encoding="utf-8")
     page = HTML.read_text(encoding="utf-8")
 
-    for name in ("chain", "providers", "keys", "usage", "local", "setup"):
+    for name in ("chain", "providers", "local", "setup"):
         assert f'id="panel-{name}"' in page
         assert f"renderers.{name} = function" in script
 
 
-def test_an_api_key_has_nowhere_to_leak_to():
-    """The Keys tab handles a secret, and three sinks would spill it.
-
-    A `<form>` with no action submits to the current URL as a GET, which
-    puts the key in the address bar, in history, and in the one place this
-    server refuses to read a secret from. `localStorage` outlives the tab
-    and every later portal on this origin. And a key typed into a field the
-    browser offers to remember is a key in the browser's password store.
-    """
-    script = JS.read_text(encoding="utf-8")
-    page = HTML.read_text(encoding="utf-8")
-
-    assert "<form" not in page.lower()
-    assert 'createElement("form")' not in script
-    assert 'el("form"' not in script
-    assert "localStorage" not in script
-    assert 'keyBox.type = "password"' in script
-    # "off" is the value Safari and Chrome ignore on a password field.
-    assert 'keyBox.autocomplete = "new-password"' in script
-    assert 'autocomplete = "off"' not in script.split("function keyCard")[1].split("\n}\n")[0]
 
 
 def test_the_readiness_list_keeps_its_role_under_list_style_none():
@@ -363,12 +325,9 @@ def test_the_readiness_list_keeps_its_role_under_list_style_none():
     "scenario",
     [
         "race",
-        "keys",
         "fatal",
         "lists",
         "voices",
-        "keystate",
-        "keyslots",
         "sidebar",
         "setup",
         "setup_progress",
@@ -415,3 +374,12 @@ def test_a_config_write_can_only_go_out_with_a_fingerprint():
     assert not direct.search(script)
     for route in ('"/api/chain"', '"/api/stt"', '"/api/provider/" + name'):
         assert script.count(route) == 1, f"{route} is written from exactly one place"
+
+
+def test_portal_has_only_local_processing_controls():
+    script = JS.read_text(encoding="utf-8")
+    html = HTML.read_text(encoding="utf-8")
+    for removed in ("/api/auth/", "anthropic", "claude-cli", "elevenlabs", "monthly_chars"):
+        assert removed not in script
+    assert 'id="tab-keys"' not in html
+    assert 'id="tab-usage"' not in html

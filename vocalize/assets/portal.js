@@ -31,7 +31,7 @@ var STALE =
  * keeps an open page alive with room to spare; it is also how long the page
  * can take to notice the CLI stopping, which is short enough to feel
  * immediate. `/api/state` is NOT polled on a timer: it costs up to two 2 s
- * probe batches and can wake a keychain dialog. It is fetched on load,
+ * local probe batches. It is fetched on load,
  * after every successful write, and when the user asks. */
 var PING_MS = 30000;
 
@@ -506,76 +506,19 @@ document.addEventListener("DOMContentLoaded", boot);
  *  difference between "free and offline" and "billed per character"
  *  decides the order, so it is said there rather than implied. */
 var COST = {
-  elevenlabs: "Paid. Every character comes out of your ElevenLabs plan.",
-  openai: "Paid. Billed to your OpenAI account.",
-  google: "Paid. Billed to your Google Cloud project.",
-  polly: "Paid. Billed to your AWS account.",
   say: "Free. The voice built into macOS. Works with no network.",
   kokoro: "Free. Runs on this Mac once installed. Works with no network."
 };
 
 /** The speech-to-text models, allowlisted by the server too. */
 // `config.STT_CLEANUP_BACKENDS`, in its order.
-var STT_CLEANUP = ["off", "local", "claude-cli", "anthropic"];
+var STT_CLEANUP = ["off", "local"];
 
 var STT_MODELS = ["base.en", "small.en", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0"];
 
-/** Where a stored API key was found. Eight values, not five: "checking"
- *  means the probe thread is still going and a later poll may answer,
- *  "error" means it finished by raising and never will. */
-var KEY_SOURCE = {
-  keychain: "In the system keychain",
-  environment: "In the environment",
-  ".env file": "In a .env file",
-  "not found": "No key found",
-  checking: "Still checking — press Re-check to look again",
-  error: "The check for this key failed",
-  "not applicable": "Needs no API key"
-};
-
-/** The three sources that mean a key is there. */
-var KEY_STORED = ["keychain", "environment", ".env file"];
-
-function hasKey(entry) {
-  return Boolean(entry.key) && KEY_STORED.indexOf(entry.key.source) !== -1;
-}
-
-/** One line at the top of a provider's card: is there a key. `masked`
- *  arrives from the server already masked and is shown as given; nothing
- *  typed on this page is ever put into this line. With `linkToKeys`, a
- *  missing key gets a way to the Keys tab. */
-function keyStatus(name, entry, linkToKeys) {
-  var key = entry.key || { source: "error", masked: null };
-  var line = el("p", "key-status");
-  if (key.source === "not applicable") {
-    line.textContent =
-      name === "polly"
-        ? "Uses AWS credentials, not a key — set them in your shell or ~/.aws."
-        : "No key needed";
-  } else if (hasKey(entry)) {
-    line.textContent = "Key stored" + (key.masked ? " · starts with " + key.masked : "");
-  } else if (key.source === "not found") {
-    line.className = "key-status none";
-    line.textContent = linkToKeys ? "No key stored — " : "No key stored";
-    if (linkToKeys) {
-      var go = button("add one on the Keys tab", function () {
-        selectTab("keys");
-      });
-      go.className = "link";
-      line.appendChild(go);
-    }
-  } else {
-    line.textContent = KEY_SOURCE[key.source] || key.source; // checking, error
-  }
-  return line;
-}
-
-// --- small builders ---------------------------------------------------
 
 var uid = 0;
 
-/** A labelled control. Every input on this page goes through here, so
- *  every input has a real label bound to it by id. */
 function field(text, control, hint, extra) {
   uid += 1;
   control.id = "f" + uid;
@@ -1020,7 +963,6 @@ function providerCard(data, name, entry) {
   var status = el("p", "status");
   var fields = [];
 
-  box.appendChild(keyStatus(name, entry, true));
 
   // This provider's own trouble, in the CLI's words. `settings: null` is
   // the shape that comes with it — there is nothing to edit until it is
@@ -1050,17 +992,6 @@ function providerCard(data, name, entry) {
     fields.push({ key: "speed", box: speed, initial: asText(entry.settings.speed), number: true });
   }
 
-  var budget = numberBox(entry.budget, 0, null, "1");
-  box.appendChild(
-    field(
-      "Monthly budget (characters)",
-      budget,
-      "vocalize refuses this provider once the month's characters pass this. " +
-        "Empty means no limit."
-    )
-  );
-  fields.push({ key: "monthly_chars", box: budget, initial: asText(entry.budget), number: true });
-
   var actions = el("div", "actions");
   var keep = button("Save " + entry.label, async function () {
     var settings = changed(fields, status);
@@ -1084,8 +1015,8 @@ function providerCard(data, name, entry) {
   audio.controls = true;
   audio.hidden = true;
   var listen = button("Preview", async function () {
-    // One click, one synthesis: on a paid provider this is billed, and the
-    // server holds a lock for 30 s before it refuses a second one, so the
+    // One click, one local synthesis. The server holds a lock for
+    // 30 seconds before refusing a second request, so the
     // button stays disabled for the whole request rather than queueing.
     listen.disabled = true;
     status.textContent = "Speaking the preview sentence…";
@@ -1119,241 +1050,6 @@ function providerCard(data, name, entry) {
 }
 
 // --- Keys -------------------------------------------------------------
-
-/* The slots this tab lists: `data.keys` (every slot that stores a key —
- * the Anthropic one is a key without being a voice), each reshaped to the
- * card's `{label, key}` form; a server without it falls back to the
- * provider entries, which carry the same `key` object. */
-function keySlots(data) {
-  var slots = {};
-  if (data.keys) {
-    Object.keys(data.keys).forEach(function (name) {
-      var slot = data.keys[name];
-      slots[name] = {
-        label: slot.label,
-        key: { source: slot.source, masked: slot.masked, validated: slot.validated || null },
-        // A slot that is also a voice provider has a voice list to refresh
-        // after its key changes; the Anthropic slot has none to ask for.
-        voice: !!(data.providers && data.providers[name])
-      };
-    });
-    return slots;
-  }
-  return data.providers;
-}
-
-renderers.keys = function (panel, data) {
-  panel.replaceChildren(el("h2", null, "API keys"));
-  var slots = keySlots(data);
-  var stored = Object.keys(slots).filter(function (name) {
-    return hasKey(slots[name]);
-  });
-  panel.appendChild(
-    el(
-      "p",
-      "summary",
-      stored.length
-        ? stored.length +
-            (stored.length === 1 ? " key stored: " : " keys stored: ") +
-            stored
-              .map(function (name) {
-                return slots[name].label;
-              })
-              .join(", ")
-        : "No keys stored yet"
-    )
-  );
-  panel.appendChild(
-    el(
-      "p",
-      "hint",
-      "A key is checked with the provider before it is stored in the system " +
-        "keychain, so saving one takes a few seconds. vocalize never shows a " +
-        "stored key again. Remove forgets one here; " +
-        "vocalize auth logout --provider <name> does the same from a terminal. " +
-        "Anthropic is the dictation cleanup and notes backend, not a voice."
-    )
-  );
-  Object.keys(slots).forEach(function (name) {
-    panel.appendChild(keyCard(name, slots[name]));
-  });
-};
-
-function keyCard(name, entry) {
-  var box = card(entry.label);
-  var source = entry.key.source;
-  box.appendChild(keyStatus(name, entry, false));
-  if (hasKey(entry)) box.appendChild(el("p", "hint", KEY_SOURCE[source]));
-  // The stamp is the keychain item's comment, written when the key was
-  // last checked with the provider (macOS only) — a date, never the key.
-  if (entry.key.validated) {
-    box.appendChild(el("p", "hint stamp", "Last checked with " + entry.label + " on " + entry.key.validated + "."));
-  }
-
-  if (source === "not applicable") return box;
-
-  var status = el("p", "status");
-  // No <form> anywhere on this page. A form with no action submits to the
-  // current URL as a GET, which would put the API key in the address bar,
-  // in history, and in the one place the server refuses to read a secret.
-  var keyBox = el("input");
-  keyBox.type = "password";
-  // "new-password", not "off": Safari and Chrome ignore "off" on a password
-  // field and offer to save what was typed; "new-password" is the value
-  // both honour, and neither fills it from the browser's store.
-  keyBox.autocomplete = "new-password";
-  keyBox.spellcheck = false;
-  box.appendChild(
-    field(
-      entry.label + " API key",
-      keyBox,
-      "Paste it here (copy from the provider's console, then Cmd-V). It is " +
-        "checked with " + entry.label + " and stored in the keychain, or " +
-        "only checked. Clear your clipboard afterwards: copy something else."
-    )
-  );
-
-  var actions = el("div", "actions");
-  // Check a key without storing it — the answer is a verdict, and the
-  // server keeps nothing. A good key stays in the field so "Store this
-  // key" is the next click; a refused one is cleared like a refused store.
-  var test = button("Test without storing", async function () {
-    var key = keyBox.value;
-    if (!key) {
-      status.textContent = "Paste the key first.";
-      return;
-    }
-    test.disabled = true;
-    keyBox.disabled = true;
-    status.textContent = "Checking the key with " + entry.label + "…";
-    var result = await api("POST", "/api/auth/test/" + name, { key: key });
-    key = null;
-    test.disabled = false;
-    keyBox.disabled = false;
-    if (!result.ok) {
-      // A refusal from this portal (a malformed key, 4xx) clears the field;
-      // a check that could not happen (the provider unreachable, 502)
-      // keeps it, so the retry is one click.
-      if (result.status < 500) keyBox.value = "";
-      status.textContent = "";
-      if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
-      return;
-    }
-    if (!result.data.valid) keyBox.value = "";
-    status.textContent = result.data.message;
-  });
-  test.disabled = dead;
-  actions.appendChild(test);
-  var keep = button("Store this key", async function () {
-    var key = keyBox.value;
-    if (!key) {
-      status.textContent = "Paste the key first.";
-      return;
-    }
-    keep.disabled = true;
-    keyBox.disabled = true;
-    status.textContent = "Checking the key with " + entry.label + "…";
-    var result = await api("POST", "/api/auth/login", { provider: name, key: key });
-    key = null;
-    keep.disabled = false;
-    keyBox.disabled = false;
-    keyBox.value = ""; // stored or refused, the key does not stay in the DOM
-    if (!result.ok) {
-      // The server's wording, scrubbed of the key on its side. The key
-      // itself is never put into a message here.
-      status.textContent = "";
-      if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
-      return;
-    }
-    if (entry.voice !== false) askVoices(name); // the list on file was fetched without this key, or with another
-    await poll(); // the masked state and the readiness rows both move, and an older poll shows neither
-    setFlash("keys", result.data.message);
-    renderPanel("keys");
-  });
-  keep.disabled = dead;
-  actions.appendChild(keep);
-  // Only a key in the keychain can be forgotten from here; one from the
-  // environment or a .env file is the shell's to remove. Two clicks: the
-  // first arms the button, so a slip does not cost a key.
-  if (source === "keychain") {
-    var armed = false;
-    var drop = button("Remove stored key", async function () {
-      if (!armed) {
-        armed = true;
-        drop.textContent = "Really remove it?";
-        return;
-      }
-      drop.disabled = true;
-      status.textContent = "Removing…";
-      var result = await api("POST", "/api/auth/remove/" + name, {});
-      drop.disabled = false;
-      if (!result.ok) {
-        status.textContent = "";
-        if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
-        return;
-      }
-      if (entry.voice !== false) askVoices(name); // the list on file was fetched with the key just removed
-      await poll();
-      setFlash("keys", result.data.message);
-      renderPanel("keys");
-    });
-    drop.disabled = dead;
-    actions.appendChild(drop);
-  }
-  box.appendChild(actions);
-  box.appendChild(status);
-  return box;
-}
-
-// --- Usage ------------------------------------------------------------
-
-renderers.usage = function (panel, data) {
-  panel.replaceChildren(el("h2", null, "This month"));
-  panel.appendChild(
-    el(
-      "p",
-      "hint",
-      "Characters vocalize has spoken through each provider this month, from " +
-        "its own ledger. Set a budget on the Providers tab."
-    )
-  );
-
-  var table = el("table", "grid");
-  var head = el("tr");
-  ["Provider", "Used", "Budget", "Left"].forEach(function (title, index) {
-    var cell = el("th", index ? "num" : null, title);
-    cell.scope = "col";
-    head.appendChild(cell);
-  });
-  var thead = el("thead");
-  thead.appendChild(head);
-  table.appendChild(thead);
-
-  var body = el("tbody");
-  Object.keys(data.providers).forEach(function (name) {
-    var entry = data.providers[name];
-    var row = el("tr", entry.exhausted ? "fail" : null);
-    var head_ = el("th", null, entry.label);
-    head_.scope = "row";
-    row.appendChild(head_);
-    row.appendChild(el("td", "num", number(entry.used)));
-    row.appendChild(el("td", "num", entry.budget === null ? "no limit" : number(entry.budget)));
-    row.appendChild(
-      el(
-        "td",
-        "num",
-        entry.budget === null
-          ? "—"
-          : entry.exhausted
-            ? "out of budget"
-            : number(Math.max(0, entry.budget - entry.used))
-      )
-    );
-    body.appendChild(row);
-  });
-  table.appendChild(body);
-  panel.appendChild(table);
-};
 
 // --- Local ------------------------------------------------------------
 
@@ -1513,17 +1209,6 @@ function installStt(pressed) {
   startInstall({ target: "stt", model: sttChoice }, pressed);
 }
 
-function openKeys() {
-  selectTab("keys");
-}
-
-/* What the sidebar can do about a readiness row, looked up by the row's
- * NAME — never by reading its action, which is text from a probe and is
- * shown, not interpreted. `state` narrows an entry to the one row state it
- * fits: a provider row is "fail" with no key and "warn" over budget, and
- * only the first is the Keys tab's to fix. A `why` entry is a job this page
- * cannot do — a terminal, a TTY, or a macOS dialog — and says so under the
- * command. A name not here shows its action as text and nothing else. */
 var ROW_ACTIONS = {
   kokoro: {
     label: "Install Kokoro",
@@ -1535,14 +1220,8 @@ var ROW_ACTIONS = {
   "stt model": { label: "Install speech to text", run: installStt },
   recorder: { label: "Install speech to text", run: installStt },
   "input device": { state: "warn", label: "Install speech to text", run: installStt },
-  elevenlabs: { state: "fail", label: "Open Keys", run: openKeys },
-  openai: { state: "fail", label: "Open Keys", run: openKeys },
-  google: { state: "fail", label: "Open Keys", run: openKeys },
   microphone: {
     why: "This page cannot ask macOS for the microphone. Run it in a terminal, or use System Settings."
-  },
-  polly: {
-    why: "AWS credentials are set in a terminal or in ~/.aws. This page does not store them."
   }
 };
 
@@ -1594,8 +1273,7 @@ function sttCard(data) {
       "Cleanup",
       cleanup,
       "What tidies a dictated take after transcription. off keeps the words " +
-        "as spoken; local runs on this Mac; claude-cli and anthropic send the transcript off this " +
-        "Mac and say so on stderr. The anthropic one needs a key on the Keys tab."
+        "as spoken; local cleans it up using the installed model on this Mac."
     )
   );
   fields.push({ key: "cleanup", box: cleanup, initial: asText(data.stt.cleanup) });

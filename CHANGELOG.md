@@ -5,13 +5,57 @@ All notable changes to this project are documented here. Format follows
 
 ## Unreleased
 
+This release makes Vocalize local only. It does two things, text to speech
+and speech to text, and every model runs on your Mac. If you use cloud
+voices, keys or summaries, stay on 0.15:
+`uv tool install 'vocalize-cli==0.15.0'`.
+
+### Removed
+
+- **Cloud voices.** ElevenLabs, OpenAI, Google Cloud TTS and Amazon Polly are
+  gone. The voice chain holds only `kokoro`, `piper` and `say`.
+- **API keys and accounts.** `vocalize auth`, the Keys tab of the settings
+  page and every credential lookup are gone. Vocalize no longer reads any
+  key, and it does not delete keys you stored before.
+- **Usage budgets.** `vocalize usage` and the monthly character budgets are
+  gone.
+- **Summaries.** `vocalize summarize-text`, the summaries in `vocalize notes`,
+  the note templates, the summary choices in the Speak Quick Action and the
+  digest modes of the `/speak` skill are gone. Optional on-device cleanup of
+  dictation stays.
+- **Hosted cleanup.** Dictation cleanup runs only with the on-device model
+  (`[stt] cleanup = "local"`) or not at all.
+
 ### Changed
 
-- **Tables read aloud with clear pauses.** A table now opens with its size
-  and column names, reads each row as its own numbered paragraph with a full
-  stop between cells ("Row 1: Plan A. Cost: $5. Time: 2 weeks."), and closes
-  with "End of table." Every engine pauses at a paragraph break and a full
-  stop, so rows and columns are audibly separate.
+- **`vocalize notes` is now `vocalize transcribe`.** It writes a transcript
+  with no summary. `vocalize notes` still works as a hidden alias and ignores
+  `--template` and `--summarizer off`. The `[notes]` config table is read as
+  `[transcribe]`. Files a 0.15 run already processed are not transcribed
+  again.
+- **Old config files still load.** A setting that no longer exists, such as
+  a cloud provider table, a cloud entry in `chain` or
+  `cleanup = "claude-cli"`, prints a notice once and is ignored. The chain
+  falls back to local engines and cleanup to `off`. A bad value for a
+  setting that still exists is still an error.
+- **Engines run offline.** Every engine starts with
+  `uv run --offline --no-python-downloads` and an environment that passes on
+  no keys or tokens. If one cannot start, the error tells you to run
+  `vocalize local install` again. Only `vocalize local install` downloads.
+- **Tables are read row by row.** A table is announced with its size and
+  column names, each row is read as its own numbered paragraph
+  ("Row 1: Plan A. Cost: $5."), and "End of table." marks where it stops.
+
+### Added
+
+- **Parakeet for dictation.** On Apple Silicon, `vocalize local install --stt`
+  installs Parakeet (`--engine whisper` for Whisper). `[stt] engine` is
+  `auto`, `parakeet` or `whisper`; `auto` uses Parakeet only when it is
+  installed, so existing Whisper installs keep working.
+- **Piper, an optional voice.** `vocalize local install --piper
+  [--voice lessac|ryan]`, then `--provider piper`. Each voice's licence is
+  shown before the download, and Piper runs as a separate program. Kokoro
+  stays the default.
 
 ## 0.15.0 - 2026-09-28
 

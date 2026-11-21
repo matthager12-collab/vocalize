@@ -90,7 +90,7 @@ class Record(NamedTuple):
 
 # What the read was being spoken with, kept so the continuation is the
 # same read rather than a new one in the config-default voice. Never a
-# credential: `_run_tts`'s overrides dict also carries `api_key`, and only
+# unrelated configuration: the allowlist below keeps only resumable fields, and only
 # these four names are ever copied out of it.
 SETTING_KEYS = ("voice_id", "model_id", "speed", "chunk_chars")
 
@@ -144,8 +144,8 @@ def _read_private(path: Path) -> bytes:
     """The file itself, never what a symlink at that path points at.
 
     These three names are guessable, and the text goes on to be *spoken* —
-    through a cloud provider, for most of the chain. A symlink planted here
-    would make that a read-aloud of whatever it pointed at, so the record is
+    through the local speech engine. A symlink planted here would make
+    that a read-aloud of whatever it pointed at, so the record is
     only ever read as the plain file this module wrote.
     """
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -339,8 +339,8 @@ def wait_for_record(since: float) -> Record | None:
     the user has already been asked about or a previous pause.
 
     One look is not an answer. The stopped read writes its record when the
-    provider call it was inside returns, which on a cloud provider can be
-    ten seconds after the player died — long after a short stop has
+    provider call it was inside returns, which can happen
+    after the player died — long after a short stop has
     finished — and a record that lands late is never offered at all if we
     do not wait. So this waits, briefly and only when there is something to
     wait for: a stop that found nothing playing leaves its marker unclaimed,

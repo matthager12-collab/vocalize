@@ -130,7 +130,7 @@ def test_selftest_and_runtime_differ_only_by_offline_and_mode():
     only_selftest = selftest - runtime
     only_runtime = runtime - selftest
     assert only_selftest == {"--selftest"}, f"selftest-only: {only_selftest}"
-    assert only_runtime == {"--offline", "--once"}, f"runtime-only: {only_runtime}"
+    assert only_runtime == {"--offline", "--no-python-downloads", "--once"}, f"runtime-only: {only_runtime}"
 
 
 def test_runtime_package_is_recorded():

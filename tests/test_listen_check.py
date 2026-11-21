@@ -447,7 +447,7 @@ def test_the_dictate_command_passes_the_cleanup_flag_through(monkeypatch):
 
     CliRunner().invoke(main, ["dictate", "--cleanup", "--verbatim", "--max-seconds", "45"])
 
-    assert calls[0]["cleanup"] == "claude-cli"  # a bare --cleanup keeps its 0.10 meaning
+    assert calls[0]["cleanup"] == "local"
     assert calls[0]["verbatim"] is True
     assert calls[0]["max_seconds"] == 45
 

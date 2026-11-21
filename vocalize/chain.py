@@ -1,28 +1,8 @@
-"""Try each provider in turn until one of them speaks.
+"""Try local speech providers in order, preserving streaming stop semantics.
 
-The chain is the whole point of multi-provider vocalize: a failure that
-one provider can't recover from is usually a failure the next one never
-has. What counts as "try the next one" is decided by the typed errors in
-exceptions.py, not by string matching, and every fallthrough is announced
-on stderr — silently switching vendor is the behaviour nobody wants.
-
-Two gates run before a provider is allowed to spend anything:
-
-* `check(settings)` — offline availability (a key, a binary, a dependency).
-* the ledger — this month's local budget, and whether the provider already
-  answered with a quota error. Both are measured against the WHOLE text
-  before the first chunk, so a long read can't creep past the budget one
-  chunk at a time.
-
-Streaming (Kokoro) inverts the usual order: pieces are handed to
-`on_chunk` as they finish so playback overlaps rendering. Once the first
-piece has played, a later failure can no longer fall through to another
-provider — you can't un-hear the first half of a document.
-
-`on_chunk(path)` gets a file inside a temporary directory that lives only
-until `run` returns, so a caller that plays it asynchronously must take
-its own copy (the CLI does). Returning False from it means the user
-stopped: `run` raises PlaybackStopped.
+The complete chain is checked before any provider is loaded. Failures can fall
+back only among Kokoro, Piper and macOS say. Once playback starts, a subsequent
+failure never restarts the read on another provider.
 """
 
 from __future__ import annotations
@@ -31,15 +11,18 @@ import tempfile
 from pathlib import Path
 
 from . import audio as audio_module
-from . import auth, cache, ledger, providers
-from .config import budget_for, resolve_provider_settings
+from . import cache, ledger, providers
+from .config import (
+    _validate_chain,
+    config_path,
+    reject_retired_settings,
+    resolve_provider_settings,
+)
 from .exceptions import (
     ConfigError,
     PlaybackStopped,
-    ProviderAuthError,
     ProviderContentError,
     ProviderError,
-    ProviderQuotaError,
     ProviderTransientError,
     ProviderUnavailableError,
     TTSRequestError,
@@ -52,11 +35,11 @@ from .tts import DEFAULT_CACHE_DIR
 _MAX_RESPLIT_PASSES = 12
 
 # Errors that mean "this provider can't do it, ask the next one".
-_SKIPPABLE = (ProviderUnavailableError, ProviderAuthError, ProviderTransientError)
+_SKIPPABLE = (ProviderUnavailableError, ProviderTransientError)
 
 
 def _count(text: str, provider) -> int:
-    """What this provider's quota counts: UTF-8 bytes (Google) or characters."""
+    """Count synthesized input units for local usage statistics."""
     if getattr(provider, "COUNT_UNIT", "chars") == "bytes":
         return len(text.encode("utf-8"))
     return len(text)
@@ -65,28 +48,6 @@ def _count(text: str, provider) -> int:
 def _reason(exc: ProviderError, name: str) -> str:
     """The error's message without the provider prefix it already carries."""
     return str(exc).removeprefix(f"{name}: ")
-
-
-def _budget_gate(name: str, provider, text: str, file_config: dict) -> None:
-    """Raise ProviderUnavailableError when this month's local budget is spent.
-
-    Unavailable rather than Quota on purpose: a local budget is our own
-    limit, and marking the provider exhausted for it would outlive the
-    budget the user could raise a minute later.
-    """
-    used, exhausted = ledger.status(name)
-    if exhausted:
-        raise ProviderUnavailableError(name, "out of quota until next month")
-
-    budget = budget_for(name, file_config)
-    if budget is None:
-        return
-    needed = _count(text, provider)
-    if used + needed > budget:
-        raise ProviderUnavailableError(
-            name,
-            f"local budget reached ({used + needed:,}/{budget:,} chars this month)",
-        )
 
 
 def _fit_bytes(chunks: list[str], max_bytes: int) -> list[str]:
@@ -194,8 +155,7 @@ def _speak(
                         )
                     audio = provider.synthesize(chunk, settings, **call_kwargs)
                     cache.put(chunk, settings, audio, cache_dir, ext)
-                    # Cache hits cost the provider nothing, so they count
-                    # nothing — the ledger tracks spend, not playback.
+                    # Count synthesized characters, excluding cache hits.
                     ledger.record(name, _count(chunk, provider))
             except ProviderError as exc:
                 if started:
@@ -246,22 +206,10 @@ def run(
     """
     overrides = dict(overrides or {})
     overrides = {k: v for k, v in overrides.items() if v is not None}
-    api_key = overrides.pop("api_key", None)
-    if api_key and chain[0] != "elevenlabs":
-        # Only the key-holding providers have a login to suggest; say,
-        # kokoro and polly have no key slot to point at at all.
-        env_var = auth.PROVIDER_ENV_VARS.get(chain[0])
-        if env_var:
-            raise ConfigError(
-                f"--api-key only applies to ElevenLabs, but the chain starts with "
-                f"{chain[0]!r}. Use `vocalize auth login --provider {chain[0]}` "
-                f"or set {env_var}."
-            )
-        label = auth.PROVIDER_LABELS.get(chain[0], chain[0])
-        raise ConfigError(
-            f"{label} takes no API key; --api-key only applies to ElevenLabs, "
-            f"but the chain starts with {chain[0]!r}."
-        )
+    _validate_chain(chain, config_path())
+    reject_retired_settings(file_config)
+    if "api_key" in overrides:
+        raise ConfigError("Hosted inference credentials are unsupported; --api-key was removed")
 
     failures: list[tuple[str, str]] = []
     kokoro_missing = False
@@ -271,12 +219,10 @@ def run(
         settings = resolve_provider_settings(
             name, file_config, primary=primary, **(overrides if primary else {})
         )
-        # --api-key is ElevenLabs' alone; nothing else takes the kwarg.
-        call_kwargs = {"api_key": api_key} if (primary and api_key) else {}
+        call_kwargs = {}
 
         try:
             provider.check(settings, **call_kwargs)
-            _budget_gate(name, provider, text, file_config)
             audio = _speak(
                 name, provider, settings, text,
                 chunk_chars=chunk_chars, cache_dir=cache_dir, echo=echo,
@@ -284,10 +230,6 @@ def run(
             )
         except ProviderContentError:
             raise  # a misconfigured voice is a bug to fix, not one to route around
-        except ProviderQuotaError as exc:
-            ledger.mark_exhausted(name)
-            failures.append((name, _reason(exc, name)))
-            echo(_skip_message(exc, chain, index))
         except _SKIPPABLE as exc:
             if primary and name == "kokoro" and isinstance(exc, ProviderUnavailableError):
                 kokoro_missing = True

@@ -3,7 +3,7 @@
 This is the full guide to vocalize's dictation feature: what it is, how to
 install and use it, every `[stt]` config key, and troubleshooting keyed on
 the exact messages `vocalize listen --check` prints. The README's
-[Dictation](../README.md#dictation-speech-to-text) section is the short
+[Dictation](../README.md#dictation) section is the short
 version; this is the long one.
 
 ## What it is
@@ -12,13 +12,19 @@ Dictation runs the opposite direction from the rest of vocalize: instead of
 turning text into speech, it turns your voice into text. Press a hotkey,
 speak, press it again, and the transcript lands on your clipboard.
 
-It's built on [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via
-the [`pywhispercpp`](https://github.com/absadiki/pywhispercpp) bindings,
-running entirely on your Mac. Nothing about a dictation — the audio or the
-words — leaves the machine, with one narrow, opt-in exception: turning on
-`[stt] cleanup` sends the *transcript* (never the audio) to
-`claude -p --model haiku` to fix punctuation and casing. See
+Everything runs on your Mac. Nothing about a dictation — the audio or the
+words — leaves the machine, including the optional cleanup step. See
 [Privacy](#privacy) below for the full accounting.
+
+Two speech-to-text engines are available:
+
+| Engine | Runtime | When to use it |
+|---|---|---|
+| Parakeet | `parakeet-mlx` | The default on Apple Silicon. English |
+| Whisper | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via [`pywhispercpp`](https://github.com/absadiki/pywhispercpp) | Other languages, the `[stt] vocabulary` list, smaller Macs, and `vocalize transcribe` |
+
+`[stt] engine` chooses between them: `auto` (the default) uses Parakeet when
+it is installed and Whisper otherwise.
 
 Two things had to be true for this to work at all, and they shape
 everything else in this doc:
@@ -27,7 +33,7 @@ everything else in this doc:
   bare Python script or shell command launched from a Quick Action has
   none, so dictation ships its own small compiled `.app` — **Vocalize
   Recorder** — whose only job is to own that permission.
-- **Whisper.cpp needs a model file and a Python runtime vocalize doesn't
+- **Each engine needs a model file and a Python runtime vocalize doesn't
   normally carry.** Both are opt-in, downloaded and built only when you run
   `vocalize local install --stt`, exactly like Kokoro's opt-in local voice.
 
@@ -37,11 +43,13 @@ everything else in this doc:
 vocalize local install --stt
 ```
 
-Nothing is downloaded or compiled until you run this. In order, it:
+On Apple Silicon this installs Parakeet; add `--engine whisper` to install
+Whisper instead (run both commands to have both). Nothing is downloaded or
+compiled until you run this. In order, it:
 
 1. **Prints the plan and asks to confirm** (skip with `--yes`): which model,
-   its size, its source URL, and where it will land
-   (`~/.cache/vocalize/models/whisper/`).
+   its size, its source URL, and where it will land (under
+   `~/.cache/vocalize/models/`).
 2. **Downloads the model** and verifies it against a pinned sha256 before
    keeping it. A mismatch deletes the file and refuses — nothing
    unverified is ever installed.
@@ -50,18 +58,17 @@ Nothing is downloaded or compiled until you run this. In order, it:
    under `~/.cache/vocalize/bin/`, then ad-hoc signs it with the hardened
    runtime on. This is a few seconds of compile, not a download.
 4. **Warms the runtime.** The selftest transcribes a half-second of
-   generated tone under `uv run --no-project --python 3.12 --with
-   pywhispercpp==1.5.1`, which pays whisper.cpp's one-time Metal shader
-   compile (~8 seconds on the reference Mac) here, during install — never
+   generated tone in the engine's pinned runtime, which pays the one-time
+   Metal shader compile (several seconds) here, during install — never
    during an actual dictation.
 
-Model choices, by `--model`:
+Whisper model choices, by `--model`:
 
 | Model | Download size | Notes |
 |---|---|---|
 | `base.en` | ~141 MB | fastest, least accurate |
 | `small.en` | ~465 MB | the lighter choice for a slow Mac; mishears more jargon |
-| `large-v3-turbo-q5_0` (default) | ~547 MB | the most accurate at this size and the first model to keep "the merge" as two words on the owner's voice ([#4](https://github.com/matthager12-collab/vocalize/issues/4)); no slower than `small.en` on an M4 |
+| `large-v3-turbo-q5_0` (default) | ~547 MB | the most accurate at this size and the first model to keep "the merge" as two words in testing ([#4](https://github.com/matthager12-collab/vocalize/issues/4)); no slower than `small.en` on an M4 |
 | `large-v3-turbo-q8_0` | ~834 MB | the same turbo model with 8-bit weights: the least-lossy turbo, for machines with 16 GB or more |
 
 ```bash
@@ -107,7 +114,7 @@ Prefer the Quick Action instead?
 python3 hooks/install_quick_action.py
 ```
 
-installs (or re-installs) all four Quick Actions, including **"Dictate
+installs (or re-installs) all five Quick Actions, including **"Dictate
 with Vocalize"** — a no-input Service, so it never appears in a text
 selection's right-click menu, only in the global list. Assign it a
 keyboard shortcut:
@@ -128,7 +135,7 @@ touching System Settings at all, whichever way you trigger it.
 
 - Any read vocalize was playing stops first, and the process that was
   speaking remembers exactly where (see
-  [Interrupted reads and `resume`](#interrupted-reads-and-resume)).
+  [Interrupted reads and `resume`](#pausing-interrupted-reads-and-resume)).
 - A Tink plays and the recorder starts listening.
 
 **Speak.**
@@ -232,7 +239,7 @@ vocalize listen --cancel            # discard a dictation in progress
 vocalize listen --wav clip.wav      # transcribe a file instead of recording
 vocalize listen --check             # microphone + install readiness (see below)
 vocalize listen --list-devices      # input device names for [stt] input_device
-vocalize listen --cleanup           # tidy the transcript with Claude first
+vocalize listen --cleanup           # tidy the transcript with the local model first
 vocalize listen --max-seconds 30    # cap this one recording
 ```
 
@@ -267,13 +274,13 @@ with: afconvert -f WAVE -d LEI16@16000 -c 1 <in> <out>
 transcription primitive, not a stand-in for a live dictation.
 
 **`--cleanup`** applies only to a live recording (`--toggle`/`dictate`, or
-plain `listen`). It sends the transcript — never the audio — to
-`claude -p --model haiku --disallowedTools '*'` with a 120-second timeout
-and a fixed prompt telling the model the text is data to clean, not
+plain `listen`). It passes the transcript — never the audio — to the
+on-device cleanup model (see [Local cleanup model](#local-cleanup-model))
+with a fixed prompt telling the model the text is data to clean, not
 instructions to follow (dictated text that happens to read like a command
-is still just cleaned, never acted on). A timeout, a non-zero exit, or
-empty output falls back to the raw transcript, and the clipboard
-notification says so: "Dictation copied to the clipboard (cleanup
+is still just cleaned, never acted on). A failure, a timeout, or a result
+that strays from what you said falls back to the raw transcript, and the
+clipboard notification says so: "Dictation copied to the clipboard (cleanup
 skipped)."
 
 **`--max-seconds N`** (1–600) overrides `[stt] max_seconds` for this one
@@ -283,10 +290,11 @@ invocation.
 
 ```toml
 [stt]
+engine = "auto"     # "auto" | "parakeet" | "whisper"
 model = "large-v3-turbo-q5_0"
 language = "en"
 input_device = ""
-cleanup = "off"      # "off" | "claude-cli" | "anthropic" | "local"
+cleanup = "off"      # "off" | "local"
 warm_minutes = 0     # 0 loads nothing ahead; 1-240 keeps models loaded that long after each take
                     # holds about 1 GB for Whisper, plus 3.3 GB with local cleanup
 verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
@@ -300,15 +308,17 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 
 | Key | Type / allowlist | Default | Notes |
 |---|---|---|---|
+| `engine` | `auto`, `parakeet`, `whisper` | `auto` | `auto` uses Parakeet when it is installed, otherwise Whisper |
 | `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` | must already be installed (`vocalize local install --stt --model …`) |
 | `language` | a whisper.cpp language code (`en`, `es`, `fr`, `de`, …) | `en` | an `.en` model (both `base.en` and `small.en`) is English-only regardless of this setting — pairing one with a non-`en` language is a `ConfigError` |
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable only, can't start with `-` | `""` | see [The input-device gotcha](#the-input-device-gotcha) |
-| `cleanup` | `off`, `claude-cli`, `anthropic`, `local` | `off` | where the cleanup pass runs. `claude-cli` is `claude -p` on your Claude Code subscription (shares its usage pool, and Claude Code logs the run); `anthropic` is the Messages API with a stored key and a monthly character budget; `local` runs a language model on your machine — nothing leaves it ([install it first](#local-cleanup-model)). Older configs' `true` / `false` still work: `true` means `claude-cli` |
+| `cleanup` | `off`, `local` | `off` | on-device cleanup only; an older value such as `true` or a hosted choice prints a notice and is read as `off` |
 | `verbatim` | `true` / `false` | `false` | keep every word; the default pass also drops restatements, false starts and filler ([#3](https://github.com/matthager12-collab/vocalize/issues/3)). Saying "verbatim" as the first word of a take does the same for that take |
 | `paste` | `true` / `false` | `false` | paste into the app you dictated in, after copying — see [Auto-paste](#auto-paste) |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `max_take_seconds` | integer, 60–7200 | `1800` | caps the entire paused-and-resumed take; `max_seconds` stays per segment |
 | `warm_minutes` | integer, 0–240 | `0` | Minutes to keep the models loaded after each take, so the next take skips loading them (about 1.7 s faster with local cleanup on the reference Mac). `0`, the default, loads nothing ahead of time. The first take after a pause runs at normal speed. While loaded they hold about 1 GB for Whisper and about 3.5 GB for cleanup. |
+| `vocabulary` | a list of short terms | `[]` | words Whisper should expect, such as names and jargon; letters, digits, spaces and `_ . - + / @ # :` only |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
 | `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
 | `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
@@ -347,7 +357,7 @@ vocalize dictate --resume
 - **Mechanics:** `vocalize dictate --pause` cleanly stops the recorder, trims the start cue from that segment, renames it to `take.NNN.wav`, and records a private `paused` marker (`0600`). `vocalize dictate --resume` relaunches a fresh recorder with remaining budget `max(1, min(max_seconds, remaining))`.
 - **Budgets:** `--max` remains per-segment (1–600 s). `[stt] max_take_seconds` (default `1800` seconds, bounded 60–7200) caps the entire take, and at most 20 segments are allowed.
 - **Joining:** When the recording finishes, segments are joined losslessly in numeric order with 0.25 s of silence inserted at each seam to prevent whisper from merging words across pauses.
-- **Privacy:** Every segment lives strictly inside the private per-take temporary directory (`0700`) and is wiped upon transcription or cancellation. Segments never reach the notes folder.
+- **Privacy:** Every segment lives strictly inside the private per-take temporary directory (`0700`) and is wiped upon transcription or cancellation. Segments never reach the transcripts folder.
 - **Stop chord:** When `[app] stop_hotkey = "pause"`, pressing the stop shortcut pauses a live recording, or resumes a paused recording.
 
 ### The input-device gotcha
@@ -390,7 +400,7 @@ failures for a feature nobody asked for.
 
 | Row | `ok` means | `warn`/`fail` means |
 |---|---|---|
-| `stt model` | at least one whisper.cpp model verifies on disk | none installed — `vocalize local install --stt` |
+| `stt model` | at least one speech-to-text model verifies on disk | none installed — `vocalize local install --stt` |
 | `recorder` | Vocalize Recorder is built | not built — same fix |
 | `microphone` | the last `listen --check` saw `authorized` | `denied` (fail, fix in System Settings), not yet asked (warn), or unknown (warn) |
 | `input device` | the configured (or default) device is actually present | the configured device isn't connected, or macOS reports no input device at all |
@@ -403,8 +413,7 @@ config portal polling it) never opens an app or prompts for permission on
 its own.
 
 Exit code is 0 when every row — providers and dictation both — is `ok`,
-and 1 otherwise, so it composes with `&&` the same way `vocalize usage`'s
-sibling commands do.
+and 1 otherwise, so it composes with `&&` in a script.
 
 ## Pausing, interrupted reads, and `resume`
 
@@ -418,8 +427,7 @@ vocalize resume --forget   # discard the saved read
 
 Starting a dictation always stops whatever vocalize was reading aloud
 first — you can't record over your own voice being played back — but it
-doesn't throw the rest of that read away (DEC-003 in the project's design
-history). The process that was speaking is the only one that knows exactly
+doesn't throw the rest of that read away. The process that was speaking is the only one that knows exactly
 what it was playing and how far in it got, so it writes that down before
 it exits.
 
@@ -488,7 +496,7 @@ cleanup = "local"
 ```
 
 Or use `--cleanup` on the command line — if the local model is installed,
-bare `--cleanup` prefers it over `claude-cli` automatically.
+bare `--cleanup` selects the local model.
 
 ```bash
 vocalize local status      # check whether the model is installed
@@ -503,7 +511,7 @@ vocalize local uninstall --llm   # remove the model files
 vocalize local uninstall --stt
 ```
 
-Removes the model file(s) under `~/.cache/vocalize/models/whisper/` and
+Removes the speech-to-text model files under `~/.cache/vocalize/models/` and
 the recorder bundle under `~/.cache/vocalize/bin/`. It asks first (skip
 with `--yes`) and does nothing if there's nothing to remove. **The
 microphone permission grant is not touched** — it lives in System
@@ -517,8 +525,7 @@ under Privacy & Security › Microphone if you want it gone too.
   `vocalize listen`). The clipboard can retain it, as described below.
   No file vocalize writes holds it, and it never appears in a notification — every notification
   dictation can show is one of a small set of fixed strings baked into the
-  code; a transcript literally cannot reach one. The one exception is
-  Claude Code's cleanup history, below.
+  code; a transcript literally cannot reach one.
 - **Cleanup undo lives on the clipboard.** When cleanup changed a take,
   your raw words ride along as a second private type,
   `io.github.vocalize-cli.said`, so "Swap in What I Said" can bring them
@@ -534,29 +541,8 @@ under Privacy & Security › Microphone if you want it gone too.
   cancel, or failure. A sweep on the next `listen`/`dictate` clears
   anything a hard kill (`kill -9`, a lost-power crash) left behind after
   24 hours.
-- **Cloud cleanup is opt-in**, and it sends text only.
-  With `claude-cli` the transcript goes to `claude -p` with every tool
-  denied by a wildcard, no MCP server started, and none of your own hooks,
-  skills or `CLAUDE.md` loaded (`--setting-sources ""`), so nothing a
-  dictated sentence could ask for has anything to act with; it runs from
-  the system temporary directory, so the session never adopts whatever
-  project you happen to be standing in, and any stored Anthropic key is
-  removed from its environment so the subscription is what pays. With
-  `anthropic` the transcript is the body of one Messages API call with a
-  stored key. Either way one line lands on stderr the moment text leaves
-  — `vocalize: sent to claude-cli` or `vocalize: sent to anthropic` — and
-  the clipboard notification says "cleaned up by Claude — sent off this
-  Mac". The audio is never part of any call.
-- **The `claude-cli` cleanup backend also writes the transcript to Claude Code's own session
-  log**, in full and in plaintext, under
-  `~/.claude/projects/<slug>/<uuid>.jsonl` — Claude Code records the
-  prompt and stdin of every print-mode run, and vocalize cannot turn that
-  off (pointing `CLAUDE_CONFIG_DIR` elsewhere moves the log but loses the
-  login). This is why `[stt] cleanup` is off by default: turning it on
-  with `claude-cli` means accepting that your dictated text is on disk in Claude Code's
-  history and goes to Anthropic. Everything above about vocalize's own
-  files still holds; this file is not one of them.
-- **Warm models answer only you, but any program running as you can talk to the warm servers.** With `[stt] warm_minutes` above 0, Whisper and the cleanup model stay loaded after a take, listening on private sockets in `~/.cache/vocalize/warm/` (the folder 0700, the sockets 0600, and the server checks the caller's user id). Another program running as your user can reach them, as it can already read your clipboard, where every transcript lands. Nothing they handle is written to disk or logged.
+- **Cleanup is local only.** If local cleanup cannot complete, you get the raw transcript. Transcripts are treated as data, never as instructions.
+- **Clipboard and private temporary data still need care.** Other software running as the same OS user can access local clipboard or files; use the configured retention controls and do not place private artifacts in synced folders unintentionally.
 - **The microphone grant belongs to the bundle, not to vocalize.** Once
   you allow "Vocalize Recorder", anything running as you can launch
   `~/.cache/vocalize/bin/Vocalize Recorder.app` with its own `--out` and
@@ -679,8 +665,8 @@ instead:
    Text › "Dictate with Vocalize" — if it isn't listed at all, re-run
    `python3 hooks/install_quick_action.py` and look again (Services
    sometimes needs the registry refresh the installer triggers).
-2. **The Quick Action was installed before `vocalize`, `claude`, or a
-   helper script moved** — the installer bakes absolute paths in at
+2. **The Quick Action was installed before `vocalize` or a helper script
+   moved** — the installer bakes absolute paths in at
    install time. Re-run the installer.
 3. **Speech-to-text was never installed.** `vocalize listen --check` will
    say so plainly (exit 1).

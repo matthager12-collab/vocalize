@@ -1,185 +1,128 @@
-"""Local monthly usage tracking per provider — the reactive half of budgets.
+"""Local synthesis counts. Historical hosted records are not used or deleted.
 
-Cloud providers don't stop billing at a free tier, so `chain.run` checks
-this ledger before spending on a paid provider and records every
-successful chunk after. A provider that comes back with a quota error
-gets `mark_exhausted` so the rest of the chain — and the rest of the
-calendar month — skips straight past it without another network call.
-
-Reading and writing never raise. Losing the count for one request is a
-rounding error; refusing to speak because a JSON file is corrupt or a
-directory is read-only would be the actual bug.
+Counts are informational, never authorization or spending controls. Files are
+bounded private JSON, read without following symlinks and replaced atomically.
 """
-
 from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-# tts.py imports cache/config/exceptions only, never this module, so this is
-# a plain one-way import — no cycle to guard against.
+from .auth import PROVIDER_NAMES
+from .exceptions import ConfigError
 from .tts import DEFAULT_CACHE_DIR
 
 LEDGER_NAME = "usage.json"
-
-
-def _short_reason(exc: BaseException) -> str:
-    """One line, fit for a stderr warning rather than a traceback."""
-    text = str(exc).strip()
-    return text.splitlines()[0] if text else type(exc).__name__
+_MAX_BYTES = 1024 * 1024
 
 
 def path(cache_dir: Path | None = None) -> Path:
-    """Where the ledger lives, or would live."""
     return (cache_dir if cache_dir is not None else DEFAULT_CACHE_DIR) / LEDGER_NAME
 
 
-def load(cache_dir: Path | None = None) -> dict:
-    """The ledger's parsed content, or `{}` for missing/corrupt/wrong-shape.
+def _provider(provider):
+    if provider not in PROVIDER_NAMES:
+        raise ConfigError("Usage is available only for local providers")
 
-    A missing file is the normal first-run state and stays silent. Anything
-    else unreadable — bad permissions, broken JSON, an unexpected top-level
-    shape — gets one stderr line and the same empty result, so a caller
-    never has to tell "nothing yet" apart from "couldn't read it".
-    """
-    p = path(cache_dir)
+
+def _warn_unreadable():
+    print("vocalize: local usage ledger unavailable", file=sys.stderr)
+
+
+def load(cache_dir: Path | None = None) -> dict:
     try:
-        raw = p.read_text(encoding="utf-8")
+        target = path(cache_dir)
+        if any(p.is_symlink() for p in (target, *target.parents)):
+            raise ValueError
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.getuid() or info.st_mode & 0o077
+                    or info.st_size > _MAX_BYTES):
+                raise ValueError
+            data = json.loads(stream.read(_MAX_BYTES + 1))
+        if not isinstance(data, dict) or not isinstance(data.get("months"), dict):
+            raise TypeError
+        for month, providers in data["months"].items():
+            if not isinstance(month, str) or not isinstance(providers, dict):
+                raise TypeError
+            for entry in providers.values():
+                if not isinstance(entry, dict) or type(entry.get("chars", 0)) is not int or entry.get("chars", 0) < 0:
+                    raise ValueError
+        return data
     except FileNotFoundError:
         return {}
-    except OSError as exc:
-        _warn_unreadable(_short_reason(exc))
+    except (OSError, ValueError, TypeError, RecursionError):
+        _warn_unreadable()
         return {}
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        _warn_unreadable(_short_reason(exc))
-        return {}
-
-    if not isinstance(data, dict) or not isinstance(data.get("months"), dict):
-        _warn_unreadable("unexpected shape")
-        return {}
-    return data
-
-
-def _warn_unreadable(reason: str) -> None:
-    print(
-        f"vocalize: usage ledger unreadable ({reason}); starting fresh",
-        file=sys.stderr,
-    )
 
 
 def _now() -> datetime:
-    # tz-aware-then-local, not a naive datetime.now(): same wall-clock
-    # value, but satisfies the "don't call now() without a tz" lint rule.
     return datetime.now(timezone.utc).astimezone()
 
 
 def month_key(now: datetime | None = None) -> str:
-    """Local-time `YYYY-MM` for `now` (or the current moment)."""
     return (now or _now()).strftime("%Y-%m")
 
 
-def _previous_month_key(now: datetime | None = None) -> str:
-    dt = now or _now()
-    year, month = dt.year, dt.month
-    if month == 1:
-        year, month = year - 1, 12
-    else:
-        month -= 1
-    return f"{year:04d}-{month:02d}"
-
-
-def status(
-    provider: str, cache_dir: Path | None = None, now: datetime | None = None
-) -> tuple[int, bool]:
-    """(chars spoken this month, exhausted) for `provider`. Zeros when unseen."""
-    data = load(cache_dir)
-    entry = data.get("months", {}).get(month_key(now), {}).get(provider, {})
-    return entry.get("chars", 0), entry.get("exhausted", False)
+def status(provider: str, cache_dir: Path | None = None, now: datetime | None = None) -> tuple[int, bool]:
+    """Local synthesized characters; exhaustion is always false."""
+    _provider(provider)
+    entry = load(cache_dir).get("months", {}).get(month_key(now), {}).get(provider, {})
+    return entry.get("chars", 0), False
 
 
 def all_status(cache_dir: Path | None = None, now: datetime | None = None) -> dict:
-    """{provider: {"chars": int, "exhausted": bool}} for the current month only."""
+    month = load(cache_dir).get("months", {}).get(month_key(now), {})
+    return {name: {"chars": entry.get("chars", 0), "exhausted": False}
+            for name, entry in month.items() if name in PROVIDER_NAMES}
+
+
+def record(provider: str, chars: int, cache_dir: Path | None = None, now: datetime | None = None) -> None:
+    _provider(provider)
+    if type(chars) is not int or chars < 0:
+        raise ValueError("Character count must be a nonnegative integer")
     data = load(cache_dir)
-    month = data.get("months", {}).get(month_key(now), {})
-    return {
-        provider: {"chars": v.get("chars", 0), "exhausted": v.get("exhausted", False)}
-        for provider, v in month.items()
-    }
-
-
-def _prune(months: dict, now: datetime | None) -> None:
-    """Drop every month but the current one and the one before it."""
-    keep = {month_key(now), _previous_month_key(now)}
-    for key in list(months):
-        if key not in keep:
-            del months[key]
-
-
-def _month_entry(data: dict, provider: str, now: datetime | None) -> dict:
-    """The mutable {"chars", "exhausted"} dict for `provider` this month.
-
-    Mutates `data` in place to create the version/months/month/provider
-    scaffolding as needed — callers save `data` right after.
-    """
+    if not data and path(cache_dir).exists():
+        return  # preserve corrupt/legacy bytes for explicit user disposition
     data.setdefault("version", 1)
-    months = data.setdefault("months", {})
-    month = months.setdefault(month_key(now), {})
-    return month.setdefault(provider, {"chars": 0, "exhausted": False})
-
-
-def record(
-    provider: str,
-    chars: int,
-    cache_dir: Path | None = None,
-    now: datetime | None = None,
-) -> None:
-    """Add `chars` to `provider`'s count for the current month."""
-    if chars < 0:
-        raise ValueError(f"chars must not be negative, got {chars}")
-
-    data = load(cache_dir)
-    entry = _month_entry(data, provider, now)
-    entry["chars"] = entry.get("chars", 0) + chars
-    _prune(data["months"], now)
+    month = data.setdefault("months", {}).setdefault(month_key(now), {})
+    entry = month.setdefault(provider, {"chars": 0})
+    entry["chars"] += chars
     _save(data, cache_dir)
 
 
-def mark_exhausted(
-    provider: str, cache_dir: Path | None = None, now: datetime | None = None
-) -> None:
-    """Flag `provider` as over budget for the rest of the calendar month."""
-    data = load(cache_dir)
-    entry = _month_entry(data, provider, now)
-    entry["exhausted"] = True
-    _prune(data["months"], now)
-    _save(data, cache_dir)
-
-
-def _save(data: dict, cache_dir: Path | None) -> None:
-    """Atomic write: tmp file, 0600, `os.replace`. Never raises.
-
-    # ponytail: read-modify-write, last writer wins; two concurrent runs
-    # can lose one request's count. Upgrade path: fcntl.flock.
-    """
-    p = path(cache_dir)
-    tmp = p.with_name(p.name + ".tmp")
+def _save(data, cache_dir):
+    # Informational counts remain last-writer-wins; capture authorization never
+    # relies on this ledger. No automatic pruning of historical hosted records.
+    target = path(cache_dir)
+    temporary = None
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.chmod(0o600)
-        os.replace(tmp, p)
-    except OSError as exc:
-        print(
-            f"vocalize: budget tracking unavailable ({_short_reason(exc)})",
-            file=sys.stderr,
-        )
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if any(p.is_symlink() for p in (target, *target.parents)):
+            raise ValueError
+        if target.exists() and (not target.is_file() or target.stat().st_nlink != 1):
+            raise ValueError
+        payload = json.dumps(data).encode()
+        if len(payload) > _MAX_BYTES:
+            raise ValueError
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary = tempfile.mkstemp(prefix=".usage-", dir=target.parent)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except (OSError, ValueError):
+        _warn_unreadable()
+    finally:
+        if temporary is not None:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                pass

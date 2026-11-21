@@ -175,7 +175,7 @@ def selftest_argv(model_dir: Path | None = None) -> list[str]:
     This is the **online** version: uv may populate its cache on the
     first run.  Every later ``_local`` call uses ``runtime_argv`` which
     carries ``--offline``.  A test asserts the two differ in exactly
-    that flag.
+    the offline flags.
     """
     base = MODEL_DIR if model_dir is None else model_dir
     return [
@@ -190,14 +190,14 @@ def selftest_argv(model_dir: Path | None = None) -> list[str]:
 
 def runtime_argv(model_dir: Path | None = None) -> list[str]:
     """The argv every runtime call uses — identical to ``selftest_argv``
-    but with ``--offline`` and ``--once`` instead of ``--selftest``.
+    but with offline/no-Python-download flags and ``--once`` instead of ``--selftest``.
 
     ``--offline`` tells uv to refuse network access; the install selftest
     already populated the cache.
     """
     base = MODEL_DIR if model_dir is None else model_dir
     return [
-        "run", "--no-project", "--offline",
+        "run", "--no-project", "--offline", "--no-python-downloads",
         "--python", PYTHON_VERSION,
         "--with", RUNTIME_PACKAGE,
         str(worker_path()),

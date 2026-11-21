@@ -1,4 +1,5 @@
 import subprocess
+import traceback
 from pathlib import Path
 
 import pytest
@@ -98,16 +99,36 @@ def test_a_dangerous_voice_never_reaches_the_process(fake_say, voice):
     assert fake_say == []  # rejected before anything was run
 
 
-def test_a_failing_say_reports_its_first_stderr_line(monkeypatch):
+def test_a_failing_say_does_not_relay_private_stderr(monkeypatch):
+    secret = "SYNTHETIC_PRIVATE_INPUT"
     def fake_run(argv, **kwargs):
         return subprocess.CompletedProcess(
-            argv, 1, stdout="", stderr="Voice not found\nsecond line\n"
+            argv, 1, stdout="", stderr=secret + "\nforged: success\n"
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(ProviderTransientError, match="say: Voice not found"):
-        say.synthesize("hi", Settings(voice_id=None))
+    with pytest.raises(ProviderTransientError) as err:
+        say.synthesize(secret, Settings(voice_id=None))
+    assert secret not in str(err.value)
+    assert "forged" not in str(err.value)
+
+
+@pytest.mark.parametrize("failure", [
+    OSError, subprocess.SubprocessError,
+    lambda message: subprocess.TimeoutExpired(message, 1, stderr=message),
+])
+def test_start_failure_does_not_expose_exception_text(monkeypatch, failure):
+    secret = "SYNTHETIC_PRIVATE_INPUT"
+    def fail(*args, **kwargs):
+        raise failure(secret + "\nforged: success")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(ProviderTransientError) as err:
+        say.synthesize(secret, Settings(voice_id=None))
+    rendered = "".join(traceback.format_exception(err.value))
+    assert secret not in rendered
+    assert "forged: success" not in rendered
 
 
 def test_an_empty_output_file_is_a_failure(monkeypatch):

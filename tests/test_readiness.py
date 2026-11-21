@@ -18,7 +18,6 @@ from click.testing import CliRunner
 
 import vocalize.readiness as readiness_module
 from vocalize import app as app_module
-from vocalize import ledger
 from vocalize.cli import main
 from vocalize.readiness import Row, readiness
 
@@ -56,56 +55,6 @@ def test_say_row_is_always_ok():
     assert len(llm) == 1
 
 
-def test_missing_key_yields_fail_row(monkeypatch, fake_keychain):
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    rows = readiness({"chain": ["elevenlabs"]})
-    row = rows[0]
-    assert row.name == "elevenlabs"
-    assert row.state == "fail"
-    assert "no API key" in row.detail
-    assert "auth login" in row.action
-
-
-def test_env_var_key_never_touches_keychain(monkeypatch, fake_keychain):
-    """Design contract: key_source checks the env var first, so a key
-    supplied via ELEVENLABS_API_KEY must never reach stored_key/the keychain.
-    """
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key-value")
-    calls: list[str] = []
-    original_stored_key = readiness_module.auth.stored_key
-
-    def spy(provider="elevenlabs"):
-        calls.append(provider)
-        return original_stored_key(provider)
-
-    monkeypatch.setattr("vocalize.auth.stored_key", spy)
-
-    rows = readiness({"chain": ["elevenlabs"]})
-
-    assert calls == []
-    assert rows[0].state == "ok"
-    assert rows[0].detail.startswith("key from environment")
-
-
-def test_polly_row_ok_from_environment(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
-    rows = readiness({"chain": ["polly"]})
-    assert rows[0] == Row("polly", "ok", "credentials from environment", "")
-
-
-def test_polly_row_fail_when_not_configured(monkeypatch):
-    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
-    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
-    monkeypatch.setattr(
-        "vocalize.providers.polly._profile_in_credentials_file", lambda profile: False
-    )
-    rows = readiness({"chain": ["polly"]})
-    row = rows[0]
-    assert row.state == "fail"
-    assert "AWS credentials" in row.detail
-
-
 def test_kokoro_row_ok_when_installed(monkeypatch):
     monkeypatch.setattr("vocalize.providers.kokoro.installed", lambda model_dir=None: (True, ""))
     rows = readiness({"chain": ["kokoro"]})
@@ -123,19 +72,6 @@ def test_kokoro_row_warn_when_not_installed(monkeypatch):
     assert row.action == "vocalize local install"
 
 
-def test_budget_exhausted_yields_warn(monkeypatch):
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    ledger.record("elevenlabs", 1000)  # DEFAULT_CACHE_DIR is tmp_path via the autouse fixture
-    file_config = {
-        "chain": ["elevenlabs"],
-        "providers": {"elevenlabs": {"monthly_chars": 500}},
-    }
-    rows = readiness(file_config)
-    row = rows[0]
-    assert row.state == "warn"
-    assert "budget exhausted" in row.detail
-
-
 def test_raising_probe_yields_warn_row():
     def boom():
         raise RuntimeError("kaboom")
@@ -145,29 +81,6 @@ def test_raising_probe_yields_warn_row():
     row = next(r for r in rows if r.name == "boom")
     assert row.state == "warn"
     assert "RuntimeError" in row.detail
-
-
-def test_raising_probe_never_leaks_exception_message(monkeypatch, tmp_path, fake_keychain):
-    """A probe's exception message is untrusted (_PROBES is an open registry
-    future callers register into) and must never reach Row.detail or
-    `vocalize status` output — only the exception type may show.
-    """
-    secret = "sk-canary-0123456789abcdef"  # synthetic test value, not a real key
-
-    def boom():
-        raise RuntimeError(f"upstream said: Authorization: Bearer {secret}")
-
-    readiness_module._PROBES["boom"] = boom
-    rows = readiness({"chain": ["say"]})
-    row = next(r for r in rows if r.name == "boom")
-    assert secret not in row.detail
-    assert "RuntimeError" in row.detail
-
-    _isolate_config(monkeypatch, tmp_path)
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    runner = CliRunner()
-    result = runner.invoke(main, ["status", "--json"])
-    assert secret not in result.output
 
 
 def test_blocked_probe_yields_warn_within_timeout():
@@ -216,8 +129,8 @@ def test_registry_accepts_a_name_not_in_provider_names():
 def test_unknown_provider_in_chain_never_raises():
     rows = readiness({"chain": ["not-a-real-provider"]})
     row = rows[0]
-    assert row.name == "not-a-real-provider"
-    assert row.state == "warn"
+    assert row.name == "chain"
+    assert row.state == "fail"
 
 
 def test_bad_vocalize_chain_env_var_degrades_to_a_row_never_raises(monkeypatch):
@@ -245,26 +158,13 @@ def test_status_json_still_valid_with_bad_vocalize_chain_env_var(monkeypatch, tm
     assert rows and rows[0]["state"] == "fail"
 
 
-def test_stale_provider_dropped_when_chain_changes(monkeypatch, fake_keychain):
-    """A provider removed from the chain must not keep showing up forever,
-    computed from the stale file_config it was last seen with (T-10: one
-    row per chain link, for the *current* chain).
-    """
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    rows = readiness({"chain": ["elevenlabs"]})
-    assert [row.name for row in rows if row.name != "llm model"] == ["elevenlabs"]
-
-    rows = readiness({"chain": ["say"]})
-    assert [row.name for row in rows if row.name != "llm model"] == ["say"]
-
-
 def test_stale_pruning_leaves_non_provider_names_alone():
     """Non-provider names are the design's stated test/verification seam and
     must never be pruned just because they aren't in the current chain.
     """
     readiness_module._PROBES["hand-registered"] = lambda: Row("hand-registered", "ok", "", "")
     readiness({"chain": ["say"]})
-    readiness({"chain": ["elevenlabs"]})
+    readiness({"chain": ["kokoro"]})
     assert "hand-registered" in readiness_module._PROBES
 
 
@@ -281,82 +181,6 @@ def test_process_exits_promptly_with_a_probe_still_blocked():
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=10, check=False
     )
     assert result.returncode == 0, result.stderr
-
-
-def test_status_json_has_row_shape(monkeypatch, tmp_path, fake_keychain):
-    _isolate_config(monkeypatch, tmp_path)
-    # An all-ok chain, named explicitly: the default now starts with Kokoro,
-    # which is a warn row on a machine with no model and would exit 1.
-    monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    # The LLM row is always present; mark it installed so exit code is 0.
-    from vocalize.local import install as install_module
-    _original = install_module.installed
-    def _fake_installed(manifest, **kw):
-        from vocalize.local import llm_manifest
-        if manifest is llm_manifest:
-            return (True, "")
-        return _original(manifest, **kw)
-    monkeypatch.setattr(install_module, "installed", _fake_installed)
-    runner = CliRunner()
-    result = runner.invoke(main, ["status", "--json"])
-    assert result.exit_code == 0, result.output
-    rows = json.loads(result.output)
-    assert rows
-    for row in rows:
-        assert set(row) == {"name", "state", "detail", "action"}
-
-
-def test_status_never_prints_the_api_key_value(monkeypatch, tmp_path, fake_keychain):
-    """Synthetic secret canary: status only ever reports *where* a key came
-    from (key_source), never the key itself, in either output mode.
-    """
-    _isolate_config(monkeypatch, tmp_path)
-    secret = "sk-canary-0123456789abcdef"  # synthetic test value, not a real key
-    monkeypatch.setenv("ELEVENLABS_API_KEY", secret)
-    runner = CliRunner()
-
-    result_json = runner.invoke(main, ["status", "--json"])
-    assert secret not in result_json.output
-
-    result_plain = runner.invoke(main, ["status"])
-    assert secret not in result_plain.output
-
-
-def test_status_exit_code_zero_when_all_ok(monkeypatch, tmp_path, fake_keychain):
-    _isolate_config(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")  # an all-ok chain, named
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    # The LLM row is always present; mark it installed so exit code is 0.
-    from vocalize.local import install as install_module
-    _original = install_module.installed
-    def _fake_installed(manifest, **kw):
-        from vocalize.local import llm_manifest
-        if manifest is llm_manifest:
-            return (True, "")
-        return _original(manifest, **kw)
-    monkeypatch.setattr(install_module, "installed", _fake_installed)
-    runner = CliRunner()
-    result = runner.invoke(main, ["status"])
-    assert result.exit_code == 0
-
-
-def test_status_exit_code_one_when_a_row_fails(monkeypatch, tmp_path, fake_keychain):
-    _isolate_config(monkeypatch, tmp_path)
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    runner = CliRunner()
-    result = runner.invoke(main, ["status"])
-    assert result.exit_code == 1
-
-
-def test_status_plain_output_names_each_provider(monkeypatch, tmp_path, fake_keychain):
-    _isolate_config(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_CHAIN", "elevenlabs,say")  # an all-ok chain, named
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    runner = CliRunner()
-    result = runner.invoke(main, ["status"])
-    assert "elevenlabs" in result.output
-    assert "say" in result.output
 
 
 def test_llm_model_row_when_installed(monkeypatch):
@@ -381,8 +205,7 @@ def test_llm_model_row_ram_gate_names_measured_and_required(monkeypatch):
     row = _row(readiness({"chain": ["say"]}), "llm model")
     assert row.state == "warn"
     assert "8.0 GB RAM, needs 12.0 GB" in row.detail
-    assert "claude-cli or anthropic instead" in row.detail
-
+    assert "disable cleanup until a compatible local model is installed" in row.detail
 
 
 # --- the dictation rows (T-45) ----------------------------------------
@@ -804,7 +627,7 @@ def test_hostile_app_status_word_never_reaches_a_row_detail_unchanged(monkeypatc
 # --- doctor -----------------------------------------------------------
 
 _DOCTOR_ONLY_NAMES = (
-    "cli path", "uv", "swiftc", "claude", "shebang", "hammerspoon",
+    "cli path", "uv", "swiftc", "shebang", "hammerspoon",
     "services shortcut", "cli start-up", "app bundle", "notes folder",
 )
 
@@ -836,75 +659,6 @@ def test_doctor_includes_every_provider_regardless_of_chain(_no_real_tools):
     assert set(PROVIDER_NAMES) <= names
 
 
-def test_doctor_unconfigured_providers_outside_chain_are_ok(
-    monkeypatch, fake_keychain, _no_real_tools
-):
-    """Issue #9: providers outside the resolved chain with no key stored
-    report ok with detail 'not in your chain; no key stored' instead of fail."""
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
-    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
-    monkeypatch.setattr(
-        "vocalize.providers.polly._profile_in_credentials_file", lambda profile: False
-    )
-
-    rows = readiness_module.doctor_rows({"chain": ["say"]})
-
-    for provider in ("elevenlabs", "openai", "google", "polly"):
-        row = _row(rows, provider)
-        assert row.state == "ok", f"{provider} should be ok"
-        assert row.detail == "not in your chain; no key stored"
-        assert row.action == ""
-
-
-def test_doctor_unconfigured_provider_in_chain_fails(
-    monkeypatch, fake_keychain, _no_real_tools
-):
-    """A provider that IS in the chain keeps failing when unconfigured."""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
-    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
-    monkeypatch.setattr(
-        "vocalize.providers.polly._profile_in_credentials_file", lambda profile: False
-    )
-
-    rows = readiness_module.doctor_rows({"chain": ["openai", "say"]})
-
-    openai_row = _row(rows, "openai")
-    assert openai_row.state == "fail"
-    assert "no API key configured" in openai_row.detail
-    assert "auth login" in openai_row.action
-
-    for provider in ("elevenlabs", "google", "polly"):
-        row = _row(rows, provider)
-        assert row.state == "ok"
-        assert row.detail == "not in your chain; no key stored"
-
-
-def test_doctor_unused_provider_with_stored_key_warns(
-    monkeypatch, fake_keychain, _no_real_tools
-):
-    """An unused provider outside the chain with credentials stored warns
-    so stale keys are noticed."""
-    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
-
-    rows = readiness_module.doctor_rows({"chain": ["say"]})
-
-    openai_row = _row(rows, "openai")
-    assert openai_row.state == "warn"
-    assert openai_row.detail == "key from environment (not in your chain)"
-
-    polly_row = _row(rows, "polly")
-    assert polly_row.state == "warn"
-    assert polly_row.detail == "credentials from environment (not in your chain)"
-
-
 def test_doctor_includes_stt_rows_even_when_never_set_up(_no_real_tools):
     rows = readiness_module.doctor_rows({})
     names = {row.name for row in rows}
@@ -927,7 +681,7 @@ def test_doctor_appends_the_toolchain_rows_in_order(_no_real_tools):
 
 def test_doctor_never_raises_when_a_probe_blows_up(monkeypatch, tmp_path, _no_real_tools):
     monkeypatch.setattr(
-        "vocalize.config._validate_notes_table",
+        "vocalize.config._validate_transcribe_table",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     rows = readiness_module.doctor_rows({})
@@ -997,18 +751,6 @@ def test_swiftc_row_fails_when_xcrun_is_missing(monkeypatch):
     row = readiness_module._swiftc_row()
     assert row.state == "fail"
     assert row.action == "xcode-select --install"
-
-
-def test_claude_row_ok_on_path(monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/claude")
-    assert readiness_module._claude_row().state == "ok"
-
-
-def test_claude_row_warns_off_path(monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    row = readiness_module._claude_row()
-    assert row.state == "warn"
-    assert "not on PATH" in row.detail
 
 
 def test_shebang_row_ok_when_the_interpreter_exists(monkeypatch, tmp_path):

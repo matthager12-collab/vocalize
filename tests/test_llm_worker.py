@@ -204,7 +204,7 @@ def test_selftest_and_runtime_argv_differ_only_by_offline_and_mode():
     only_selftest = selftest - runtime
     only_runtime = runtime - selftest
     assert only_selftest == {"--selftest"}
-    assert only_runtime == {"--offline", "--once"}
+    assert only_runtime == {"--offline", "--no-python-downloads", "--once"}
 
 
 # --- check_config gate --------------------------------------------------

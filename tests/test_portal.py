@@ -34,8 +34,6 @@ from vocalize import app as app_module
 from vocalize import portal as portal_module
 from vocalize import wizard
 from vocalize.exceptions import (
-    MissingAPIKeyError,
-    ProviderAuthError,
     ProviderError,
     ProviderUnavailableError,
 )
@@ -460,72 +458,6 @@ def _write_config(tmp_path, text: str) -> None:
     (directory / "config.toml").write_text(text, encoding="utf-8")
 
 
-def test_state_reports_rows_chain_settings_budgets_keys_and_stt(portal, tmp_path):
-    _write_config(
-        tmp_path,
-        'chain = ["say", "kokoro"]\n'
-        "[providers.elevenlabs]\nmonthly_chars = 5000\nvoice = \"abc\"\n"
-        '[stt]\nmodel = "base.en"\n',
-    )
-    _exchange(portal)
-    payload = _body(portal.route("GET", "/api/state", _authed(portal)))
-
-    assert payload["chain"] == ["say", "kokoro"]
-    assert payload["chain_source"] == "config file"  # the tier, not just a string
-    assert {r["name"] for r in payload["rows"]} >= {"say", "kokoro"}
-    assert all({"name", "state", "detail", "action"} == set(r) for r in payload["rows"])
-    assert payload["providers"]["elevenlabs"]["budget"] == 5000
-    assert payload["providers"]["elevenlabs"]["settings"]["voice"] == "abc"
-    assert payload["providers"]["say"]["in_chain"] is True
-    assert payload["providers"]["openai"]["in_chain"] is False
-    assert payload["stt"]["model"] == "base.en"
-    assert payload["stt"]["max_seconds"] == 120  # defaults filled in
-    assert payload["config_error"] is None
-    # The page edits this exact file, so the path is the payload, not decoration.
-    assert payload["config_path"] == str(
-        tmp_path / "config-home" / "vocalize" / "config.toml"
-    )
-
-
-def test_state_reports_the_key_source_without_the_key(portal, monkeypatch, tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
-    monkeypatch.setenv("ELEVENLABS_API_KEY", secret)
-    _write_config(tmp_path, 'chain = ["elevenlabs"]\n')
-    _exchange(portal)
-    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
-
-    assert status == 200
-    assert secret.encode() not in raw
-    key = json.loads(raw)["providers"]["elevenlabs"]["key"]
-    assert key["source"] == "environment"
-    assert key["masked"] == "sk-a…"
-
-
-def test_state_never_reproduces_a_short_key_whole(portal, monkeypatch, tmp_path):
-    """APP-SECRETS: the environment path is masked with no validation of what
-    is in the variable, so a truncated paste used to come back in full on the
-    Keys tab — the one screen the design treats as safe to screenshot."""
-    secret = "abc"
-    monkeypatch.setenv("ELEVENLABS_API_KEY", secret)
-    _write_config(tmp_path, 'chain = ["elevenlabs"]\n')
-    _exchange(portal)
-
-    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
-
-    assert status == 200
-    key = json.loads(raw)["providers"]["elevenlabs"]["key"]
-    assert key["source"] == "environment"
-    assert key["masked"] == "…"
-    assert secret.encode() not in raw
-
-
-def test_state_reports_no_key_mechanism_for_local_providers(portal):
-    _exchange(portal)
-    payload = _body(portal.route("GET", "/api/state", _authed(portal)))
-    assert payload["providers"]["say"]["key"] == {"source": "not applicable", "masked": None}
-    assert payload["providers"]["kokoro"]["key"]["source"] == "not applicable"
-
-
 def test_state_reports_the_app_key_from_status_dict(portal, monkeypatch):
     """/api/state's `app` key is app.status_dict() verbatim (design §
     Readiness, doctor and the Setup tab) — stubbed here so the test asserts
@@ -613,33 +545,6 @@ def test_state_ten_polls_against_a_blocked_probe_start_one_thread(portal):
             status, _, _ = portal.route("GET", "/api/state", _authed(portal))
             assert status == 200
         assert started == [1]
-    finally:
-        release.set()
-
-
-def test_state_blocked_key_probe_reports_checking_and_returns(portal, monkeypatch):
-    """The same guarantee for the key previews, which read the keychain."""
-    release = threading.Event()
-    started = []
-
-    def wedged(name):
-        started.append(name)
-        release.wait(10)
-        return readiness_module.Row(f"key {name}", "keychain", "sk-a…", "")
-
-    monkeypatch.setattr(portal_module, "_key_row", wedged)
-    _exchange(portal)
-    try:
-        payload = _body(portal.route("GET", "/api/state", _authed(portal)))
-        for _ in range(9):
-            portal.route("GET", "/api/state", _authed(portal))
-
-        assert payload["providers"]["elevenlabs"]["key"] == {
-            "source": "checking",
-            "masked": None,
-        }
-        # One thread per key slot, however often the page polls.
-        assert sorted(started) == ["anthropic", "elevenlabs", "google", "openai"]
     finally:
         release.set()
 
@@ -1003,36 +908,6 @@ def test_oversized_body_over_the_socket_meets_the_host_pin():
         served.stop()
 
 
-def test_state_survives_a_malformed_ledger_entry(portal, monkeypatch):
-    """One broken provider is that provider's error, not a dead page."""
-
-    def broken(name):
-        if name == "elevenlabs":
-            raise TypeError("'list' object is not a mapping")
-        return 0, False
-
-    monkeypatch.setattr(portal_module.ledger, "status", broken)
-    _exchange(portal)
-    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
-    payload = json.loads(raw)
-
-    assert status == 200
-    assert payload["providers"]["elevenlabs"]["error"]
-    assert payload["providers"]["say"]["error"] is None  # the rest still render
-
-
-def test_state_failed_key_probe_is_reported_not_left_checking(portal, monkeypatch):
-    """A probe that raised is finished; reporting it as "checking" spins."""
-
-    def broken(name):
-        raise RuntimeError("keychain is on fire")
-
-    monkeypatch.setattr(portal_module, "_key_row", broken)
-    _exchange(portal)
-    payload = _body(portal.route("GET", "/api/state", _authed(portal)))
-    assert payload["providers"]["elevenlabs"]["key"] == {"source": "error", "masked": None}
-
-
 def test_stop_closes_the_listening_socket():
     """Not "the collector gets round to it": stop() releases the port."""
     served = Portal(idle_timeout=300)
@@ -1284,25 +1159,6 @@ def test_a_genuine_handler_bug_still_prints_its_traceback(capsys):
     assert "ValueError: a real bug in the handler" in capsys.readouterr().err
 
 
-def test_state_reports_a_keychain_key_source_masked(portal, fake_keychain, monkeypatch, tmp_path):
-    """The keychain branch of the preview, not only the environment one."""
-    secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    auth = portal_module.auth
-    fake_keychain[(auth.SERVICE, auth.PROVIDER_USERNAMES["elevenlabs"])] = secret
-    _write_config(tmp_path, 'chain = ["elevenlabs"]\n')
-    _exchange(portal)
-
-    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
-
-    assert status == 200
-    assert secret.encode() not in raw
-    assert json.loads(raw)["providers"]["elevenlabs"]["key"] == {
-        "source": "keychain",
-        "masked": "sk-a…",
-    }
-
-
 def test_state_renders_a_config_value_json_cannot_serialize(portal, tmp_path):
     """TOML has types json does not, and `[providers.*]` values pass unchecked.
 
@@ -1323,7 +1179,7 @@ def test_state_renders_a_config_value_json_cannot_serialize(portal, tmp_path):
 
 
 def test_state_reports_a_wrong_provider_voice_type_in_config_error(portal, tmp_path):
-    _write_config(tmp_path, 'chain = ["say"]\n[providers.elevenlabs]\nvoice = 12345\n')
+    _write_config(tmp_path, 'chain = ["say"]\n[providers.kokoro]\nvoice = 12345\n')
     _exchange(portal)
 
     status, _, raw = portal.route("GET", "/api/state", _authed(portal))
@@ -1339,7 +1195,7 @@ def test_writing_a_provider_voice_type_that_is_not_a_string_is_400(portal, tmp_p
     fingerprint = json.loads(portal.route("GET", "/api/state", _authed(portal))[2])["fingerprint"]
 
     status, _, raw = portal.route(
-        "POST", "/api/provider/elevenlabs", _authed(portal),
+        "POST", "/api/provider/kokoro", _authed(portal),
         json.dumps({"settings": {"voice": 12345}, "fingerprint": fingerprint}).encode(),
     )
 
@@ -1371,44 +1227,6 @@ def test_a_bug_in_route_is_a_500_not_a_dropped_connection(monkeypatch):
         conn.close()
     finally:
         served.stop()
-
-
-def test_state_wedged_key_probes_are_joined_against_one_deadline(monkeypatch):
-    """Three blocked keychain reads cost one timeout per poll, not three."""
-    blocked = threading.Event()  # released in the finally: three daemon threads
-    monkeypatch.setattr(portal_module, "_key_row", lambda name: blocked.wait())
-    made = Portal(probe_timeout=0.5)
-    made.port = PORT
-    _exchange(made)
-
-    try:
-        start = time.monotonic()
-        payload = _body(made.route("GET", "/api/state", _authed(made)))
-        elapsed = time.monotonic() - start
-
-        assert payload["providers"]["elevenlabs"]["key"]["source"] == "checking"
-        assert elapsed < 1.0, f"three wedged key probes took {elapsed:.2f}s of a 0.5s budget"
-    finally:
-        blocked.set()
-
-
-def test_state_two_unrelated_provider_failures_are_both_reported(portal, monkeypatch):
-    """One error slot, and `or` used to keep the first and drop the second."""
-
-    def broken_settings(name, *args, **kwargs):
-        raise TypeError("settings blew up")
-
-    def broken_ledger(name):
-        raise ValueError("ledger blew up")
-
-    monkeypatch.setattr(portal_module.config, "resolve_provider_settings", broken_settings)
-    monkeypatch.setattr(portal_module.ledger, "status", broken_ledger)
-    _exchange(portal)
-
-    payload = _body(portal.route("GET", "/api/state", _authed(portal)))
-
-    error = payload["providers"]["elevenlabs"]["error"]
-    assert "TypeError" in error and "ValueError" in error
 
 
 # --- writes: the compare-and-swap fingerprint --------------------------
@@ -1514,27 +1332,6 @@ def test_writing_the_chain_saves_it_and_returns_a_fresh_fingerprint(portal, tmp_
     # The page writes again without polling, so the fingerprint has to be
     # the one the file now holds.
     assert body["fingerprint"] == _on_the_wire(wizard.fingerprint_config(path))
-
-
-def test_writing_the_chain_keeps_every_other_key_and_table(portal, tmp_path):
-    """The merge base is a fresh read, not the page's view of the file."""
-    _write_config(
-        tmp_path,
-        'chain = ["say"]\nspeed = 1.1\n'
-        '[stt]\nmodel = "base.en"\n'
-        '[providers.elevenlabs]\nvoice = "abc"\nmonthly_chars = 5000\n',
-    )
-    _exchange(portal)
-    status, _ = _post(
-        portal, "/api/chain", {"order": ["kokoro"], "fingerprint": _fingerprint(portal)}
-    )
-
-    assert status == 200
-    text = _config_file(tmp_path).read_text()
-    assert "speed = 1.1" in text
-    assert '[stt]' in text and 'model = "base.en"' in text
-    assert "[providers.elevenlabs]" in text
-    assert 'voice = "abc"' in text and "monthly_chars = 5000" in text
 
 
 def test_writing_with_a_stale_fingerprint_is_409_and_changes_nothing(portal, tmp_path):
@@ -1757,36 +1554,14 @@ def test_the_fingerprint_crosses_the_wire_with_mtime_ns_as_a_string(portal, tmp_
 # --- POST /api/provider/<name> ----------------------------------------
 
 
-def test_writing_one_provider_setting_keeps_the_rest_of_the_file(portal, tmp_path):
-    _write_config(
-        tmp_path,
-        'chain = ["say"]\n'
-        '[providers.elevenlabs]\nvoice = "abc"\nmonthly_chars = 5000\n'
-        '[providers.openai]\nvoice = "nova"\n',
-    )
-    _exchange(portal)
-    status, _ = _post(
-        portal,
-        "/api/provider/elevenlabs",
-        {"settings": {"voice": "xyz"}, "fingerprint": _fingerprint(portal)},
-    )
-
-    assert status == 200
-    text = _config_file(tmp_path).read_text()
-    assert 'voice = "xyz"' in text
-    assert "monthly_chars = 5000" in text  # the provider's other keys
-    assert 'voice = "nova"' in text  # and every other provider's table
-    assert 'chain = ["say"]' in text
-
-
 def test_writing_null_clears_a_provider_key_and_then_its_table(portal, tmp_path):
     """A cleared key is removed, never written as the string "None"."""
-    _write_config(tmp_path, '[providers.elevenlabs]\nvoice = "abc"\nmodel = "m"\n')
+    _write_config(tmp_path, '[providers.kokoro]\nvoice = "abc"\nmodel = "m"\n')
     _exchange(portal)
 
     status, _ = _post(
         portal,
-        "/api/provider/elevenlabs",
+        "/api/provider/kokoro",
         {"settings": {"voice": None}, "fingerprint": _fingerprint(portal)},
     )
     assert status == 200
@@ -1796,7 +1571,7 @@ def test_writing_null_clears_a_provider_key_and_then_its_table(portal, tmp_path)
 
     status, _ = _post(
         portal,
-        "/api/provider/elevenlabs",
+        "/api/provider/kokoro",
         {"settings": {"model": None}, "fingerprint": _fingerprint(portal)},
     )
     assert status == 200
@@ -1807,13 +1582,13 @@ def test_writing_null_clears_a_provider_key_and_then_its_table(portal, tmp_path)
 
 def test_writing_an_unknown_provider_key_is_400_and_saves_nothing(portal, tmp_path):
     """The CLI only warns on stderr, which a page cannot see."""
-    _write_config(tmp_path, '[providers.elevenlabs]\nvoice = "abc"\n')
+    _write_config(tmp_path, '[providers.kokoro]\nvoice = "abc"\n')
     _exchange(portal)
     before = _config_file(tmp_path).read_bytes()
 
     status, body = _post(
         portal,
-        "/api/provider/elevenlabs",
+        "/api/provider/kokoro",
         {"settings": {"voise": "typo"}, "fingerprint": _fingerprint(portal)},
     )
 
@@ -1827,30 +1602,15 @@ def test_writing_a_provider_speed_out_of_range_uses_the_cli_wording(portal, tmp_
     _exchange(portal)
     status, body = _post(
         portal,
-        "/api/provider/elevenlabs",
+        "/api/provider/kokoro",
         {"settings": {"speed": 99}, "fingerprint": _fingerprint(portal)},
     )
 
     assert status == 400
     assert body["error"] == (
-        f"Invalid speed 99.0 from 'speed' in [providers.elevenlabs] in "
+        f"Invalid speed 99.0 from 'speed' in [providers.kokoro] in "
         f"{_config_file(tmp_path)}: must be between 0.7 and 1.2."
     )
-
-
-@pytest.mark.parametrize("budget", [-1, 1.5, True, "1000"])
-def test_writing_a_bad_monthly_chars_uses_the_cli_wording(portal, tmp_path, budget):
-    _write_config(tmp_path, 'chain = ["say"]\n')
-    _exchange(portal)
-    status, body = _post(
-        portal,
-        "/api/provider/elevenlabs",
-        {"settings": {"monthly_chars": budget}, "fingerprint": _fingerprint(portal)},
-    )
-
-    assert status == 400
-    assert body["error"].startswith("Invalid monthly_chars ")
-    assert "non-negative integer" in body["error"]
 
 
 @pytest.mark.parametrize("voice", [12345, ["a"], "x" * 201, "a\x00b", True])
@@ -1864,7 +1624,7 @@ def test_writing_an_unusable_provider_value_is_400_without_echoing_it(
 
     status, _, body = portal.route(
         "POST",
-        "/api/provider/elevenlabs",
+        "/api/provider/kokoro",
         _authed(portal),
         json.dumps({"settings": {"voice": voice}, "fingerprint": _fingerprint(portal)}).encode(),
     )
@@ -1998,140 +1758,14 @@ def test_writing_a_bad_stt_value_is_400_and_changes_nothing(portal, tmp_path, se
 CANARY = "sk-canary-9f3aaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
-@pytest.fixture
-def no_network_validate(monkeypatch):
-    """`auth.login` without the API call it makes to check a key."""
-    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: None)
-
-
-def test_the_login_response_never_contains_the_key(
-    portal, fake_keychain, no_network_validate
-):
-    _exchange(portal)
-    status, headers, body = portal.route(
-        "POST",
-        "/api/auth/login",
-        _authed(portal),
-        json.dumps({"provider": "elevenlabs", "key": CANARY}).encode(),
-    )
-
-    assert status == 200
-    assert CANARY.encode() not in body
-    assert CANARY not in json.dumps(headers)
-    assert CANARY not in json.dumps(json.loads(body))
-    # ...and the test is not green because nothing happened:
-    assert CANARY in fake_keychain.values()
-
-
-def test_a_rejected_key_is_scrubbed_out_of_the_error(portal, monkeypatch):
-    """Defence in depth over `auth.login`'s own scrub, for a second author."""
-    def leaky(key, provider):
-        raise portal_module.VocalizeError(f"HTTP 401 for key {key}")
-
-    monkeypatch.setattr(portal_module.auth, "login", leaky)
-    _exchange(portal)
-    status, _, body = portal.route(
-        "POST",
-        "/api/auth/login",
-        _authed(portal),
-        json.dumps({"provider": "elevenlabs", "key": CANARY}).encode(),
-    )
-
-    assert status == 400
-    assert CANARY.encode() not in body
-    assert b"[key]" in body
-
-
-def test_the_login_route_never_logs_the_key(capsys, fake_keychain, monkeypatch):
-    """Over a real socket: http.server's own logging is the thing at risk."""
-    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: None)
-    served = Portal(idle_timeout=300)
-    served.start()
-    try:
-        token = served._token
-        body = json.dumps({"provider": "elevenlabs", "key": CANARY}).encode()
-        raw = _raw(
-            served.port,
-            b"POST /api/auth/login HTTP/1.1\r\nHost: "
-            + served.origin.encode()
-            + b"\r\n"
-            + TOKEN_HEADER.encode()
-            + b": "
-            + token.encode()
-            + b"\r\nContent-Length: "
-            + str(len(body)).encode()
-            + b"\r\n\r\n"
-            + body,
-        )
-        assert b" 200 " in raw
-        assert b"sk-canary" not in raw
-        captured = capsys.readouterr()
-        assert "sk-canary" not in captured.out
-        assert "sk-canary" not in captured.err
-    finally:
-        served.stop()
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"provider": "polly", "key": CANARY},
-        {"provider": "say", "key": CANARY},
-        {"provider": "kokoro", "key": CANARY},
-        {"provider": "elevenlabs", "key": ""},
-        {"provider": "elevenlabs", "key": 7},
-        {"provider": "elevenlabs", "key": None},
-        {"provider": "elevenlabs"},
-    ],
-)
-def test_a_login_that_cannot_store_a_key_is_400_and_stores_nothing(
-    portal, fake_keychain, no_network_validate, payload
-):
-    _exchange(portal)
-    status, _ = _post(portal, "/api/auth/login", payload)
-
-    assert status == 400
-    assert not fake_keychain
-
-
-def test_a_login_for_an_unknown_provider_is_404_without_reflecting_it(
-    portal, fake_keychain
-):
-    """The name comes from the body here, where a mis-wired form could
-    put the key itself in it."""
-    _exchange(portal)
-    status, _, body = portal.route(
-        "POST",
-        "/api/auth/login",
-        _authed(portal),
-        json.dumps({"provider": CANARY, "key": CANARY}).encode(),
-    )
-
-    assert status == 404
-    assert b"sk-canary" not in body
-    assert not fake_keychain
-
-
-def test_the_login_route_writes_no_config_file(portal, tmp_path, fake_keychain, no_network_validate):
-    """It stores a key. It has no fingerprint and touches no config."""
-    _exchange(portal)
-    status, _ = _post(portal, "/api/auth/login", {"provider": "elevenlabs", "key": CANARY})
-
-    assert status == 200
-    assert not _config_file(tmp_path).exists()
-
-
 # --- the write routes' shared shape -----------------------------------
 
 
 #: Every write route this run built, with a body that would otherwise work.
 _WRITE_ROUTES = (
     ("/api/chain", {"order": ["say"]}),
-    ("/api/provider/elevenlabs", {"settings": {"voice": "abc"}}),
+    ("/api/provider/kokoro", {"settings": {"voice": "abc"}}),
     ("/api/stt", {"settings": {"model": "base.en"}}),
-    ("/api/auth/login", {"provider": "elevenlabs", "key": CANARY}),
-    ("/api/auth/test/anthropic", {"key": CANARY}),
-    ("/api/auth/remove/anthropic", {}),
 )
 
 
@@ -2260,9 +1894,9 @@ def test_an_unplanned_exception_in_a_write_is_not_turned_into_a_400(portal, monk
     ("path", "settings", "read_back"),
     [
         (
-            "/api/provider/elevenlabs",
+            "/api/provider/kokoro",
             {"voice": 'a"] [providers.say] voice = "pwned'},
-            lambda cfg: cfg["providers"]["elevenlabs"]["voice"],
+            lambda cfg: cfg["providers"]["kokoro"]["voice"],
         ),
         (
             "/api/stt",
@@ -2369,7 +2003,9 @@ def test_a_preview_answers_with_the_audio_and_its_content_type(
         assert headers[name] == value
 
 
-def test_an_unrecognised_audio_ext_is_served_as_bytes_not_guessed(portal, fake_provider):
+def test_an_unrecognised_audio_ext_is_served_as_bytes_not_guessed(portal, fake_provider, monkeypatch):
+    from vocalize import chain
+    monkeypatch.setattr(chain, "run", lambda *a, **kw: (b"audio", "kokoro", "flac"))
     """With `nosniff` a wrong Content-Type is worse than an honest one."""
     fake_provider.AUDIO_EXT = "flac"
     _exchange(portal)
@@ -2453,7 +2089,7 @@ def test_a_preview_of_an_unknown_provider_is_404_without_echoing_it(portal, fake
     assert fake_provider.calls == []
 
 
-@pytest.mark.parametrize("name", ["..", "say%2F..%2Fgoogle", "", "SAY", "a" * 33])
+@pytest.mark.parametrize("name", ["..", "say%2F..%2Fpiper", "", "SAY", "a" * 33])
 def test_a_preview_path_the_pattern_refuses_never_reaches_the_handler(
     portal, fake_provider, name
 ):
@@ -2507,47 +2143,6 @@ def test_a_preview_uses_the_test_audio_cache_and_not_the_real_one(portal, fake_p
     assert any(cache_dir.rglob("*")), "the preview wrote nothing to the test cache"
 
 
-def test_a_budget_capped_preview_is_refused_in_the_chains_own_words(
-    portal, fake_provider, tmp_path
-):
-    from vocalize import chain as chain_module
-
-    _write_config(tmp_path, 'chain = ["say"]\n\n[providers.say]\nmonthly_chars = 5\n')
-    _exchange(portal)
-
-    status, _headers, body = _preview(portal)
-
-    file_config = portal_module.config.load_config_file()
-    with pytest.raises(portal_module.VocalizeError) as expected:
-        chain_module._budget_gate(
-            "say", fake_provider, portal_module.PREVIEW_TEXT, file_config
-        )
-    assert status == 402
-    assert json.loads(body)["error"] == str(expected.value)
-    assert fake_provider.calls == []
-
-
-def test_an_exhausted_provider_is_refused_before_it_is_asked(portal, fake_provider):
-    from vocalize import ledger
-
-    ledger.mark_exhausted("say")
-    _exchange(portal)
-
-    status, _headers, body = _preview(portal)
-
-    assert status == 402
-    assert "quota" in json.loads(body)["error"]
-    assert fake_provider.calls == []
-
-
-def test_a_provider_under_its_budget_is_not_refused(portal, fake_provider, tmp_path):
-    """The gate cannot be satisfied by refusing everything."""
-    _write_config(tmp_path, 'chain = ["say"]\n\n[providers.say]\nmonthly_chars = 100000\n')
-    _exchange(portal)
-
-    assert _preview(portal)[0] == 200
-
-
 def test_a_failed_preview_is_502_and_one_short_line(portal, fake_provider):
     from vocalize.exceptions import ProviderTransientError
 
@@ -2571,7 +2166,7 @@ def test_a_single_line_upstream_body_is_capped_not_dropped(portal, fake_provider
     """The honest guarantee, pinned so nobody reads a stronger one into it.
 
     `_one_line` cuts to one line and caps at 200 characters. A provider that
-    wraps a one-line upstream body — `elevenlabs.py` builds exactly that —
+    wraps a one-line upstream body — `kokoro.py` builds exactly that —
     has that body cut at the cap and no sooner, so the cap is the bound and
     the line-cut is not a filter.
     """
@@ -3350,32 +2945,6 @@ def test_the_lockout_message_makes_no_claim_about_the_users_own_settings(portal)
 # --- the security canaries for T-63's two surfaces ---------------------
 
 
-def test_a_preview_never_carries_a_stored_key_anywhere(
-    portal, fake_provider, fake_keychain, monkeypatch, capsys
-):
-    """APP-SECRETS on the preview path: a failure is one line, not the key.
-
-    The canary is seeded in both places `chain.run` actually resolves a key
-    from — the keychain and the environment variable — so the assertion has
-    something to catch rather than only something to miss.
-    """
-    from vocalize.exceptions import ProviderTransientError
-
-    fake_keychain[("vocalize", "elevenlabs-api-key")] = CANARY
-    monkeypatch.setenv("ELEVENLABS_API_KEY", CANARY)
-    fake_provider.error = ProviderTransientError("elevenlabs", "the upstream said no")
-    _exchange(portal)
-
-    status, headers, body = _preview(portal, "elevenlabs")
-
-    assert status == 502
-    assert CANARY.encode() not in body
-    assert CANARY not in json.dumps(headers)
-    captured = capsys.readouterr()
-    assert CANARY not in captured.out
-    assert CANARY not in captured.err
-
-
 def test_the_model_that_reaches_the_runtime_argv_is_the_allowlisted_one(
     portal, fake_install
 ):
@@ -3399,7 +2968,7 @@ def test_the_model_that_reaches_the_runtime_argv_is_the_allowlisted_one(
 # network, a keychain or a subprocess.
 
 
-def _voices(portal, name: str = "elevenlabs", query: str = ""):
+def _voices(portal, name: str = "kokoro", query: str = ""):
     return portal.route("GET", f"/api/voices/{name}{query}", _authed(portal))
 
 
@@ -3413,22 +2982,7 @@ def test_the_voices_route_is_in_the_token_route_table():
     assert ("GET", "/api/voices/kokoro") in _TOKEN_ROUTES
 
 
-def test_a_voice_list_answers_the_providers_voices_and_says_they_are_live(portal, fake_provider):
-    _exchange(portal)
-
-    status, headers, body = _voices(portal, "elevenlabs")
-
-    assert status == 200
-    assert json.loads(body) == {
-        "voices": [{"id": "v1", "name": "Rachel"}, {"id": "v2", "name": "Adam"}],
-        "source": "live",
-    }
-    assert fake_provider.listed == 1
-    for name, value in portal_module.SECURITY_HEADERS.items():
-        assert headers[name] == value
-
-
-@pytest.mark.parametrize("name", ["say", "kokoro", "openai"])
+@pytest.mark.parametrize("name", ["say", "kokoro", "piper"])
 def test_a_list_that_needs_no_network_is_called_built_in(portal, fake_provider, name):
     _exchange(portal)
 
@@ -3441,12 +2995,12 @@ def test_a_list_that_needs_no_network_is_called_built_in(portal, fake_provider, 
 def test_a_second_request_is_a_cache_hit_and_says_so(portal, fake_provider):
     _exchange(portal)
 
-    first = json.loads(_voices(portal, "elevenlabs")[2])
-    second = json.loads(_voices(portal, "elevenlabs")[2])
+    first = json.loads(_voices(portal, "kokoro")[2])
+    second = json.loads(_voices(portal, "kokoro")[2])
 
     assert fake_provider.listed == 1
-    assert first["source"] == "live"
-    assert second["source"] == "cached"
+    assert first["source"] == "builtin"
+    assert second["source"] == "builtin"
     assert second["voices"] == first["voices"]
 
 
@@ -3474,7 +3028,7 @@ def test_a_voice_entry_is_reduced_to_a_string_id_and_name(portal, fake_provider)
     ]
     _exchange(portal)
 
-    voices = json.loads(_voices(portal, "elevenlabs")[2])["voices"]
+    voices = json.loads(_voices(portal, "kokoro")[2])["voices"]
 
     assert voices == [
         {"id": "ok", "name": "Fine"},
@@ -3501,7 +3055,7 @@ def test_two_simultaneous_requests_make_one_provider_call(fake_provider):
     answers = {}
 
     def ask(label):
-        answers[label] = _voices(portal, "elevenlabs")
+        answers[label] = _voices(portal, "kokoro")
 
     first = threading.Thread(target=ask, args=("first",), daemon=True)
     first.start()
@@ -3520,7 +3074,8 @@ def test_two_simultaneous_requests_make_one_provider_call(fake_provider):
     assert fake_provider.listed == 1
 
 
-def test_a_request_after_a_timed_out_listing_joins_the_running_call(portal, fake_provider):
+def test_a_request_after_a_timed_out_listing_joins_the_running_call(portal, fake_provider, monkeypatch):
+    monkeypatch.setattr(portal_module, "BUILTIN_VOICES_TIMEOUT", 0.2)
     """The registry layer, on its own: the first request gave up at
     `probe_timeout` and its thread is still on the call. The next request
     joins that thread rather than opening a second connection — the case the
@@ -3535,15 +3090,15 @@ def test_a_request_after_a_timed_out_listing_joins_the_running_call(portal, fake
 
     fake_provider.list_voices = blocking_list
 
-    assert _voices(portal, "elevenlabs")[0] == 502
-    assert _voices(portal, "elevenlabs")[0] == 502
+    assert _voices(portal, "kokoro")[0] == 502
+    assert _voices(portal, "kokoro")[0] == 502
     release.set()
     # The one thread finishes and fills the cache; the next request is a hit.
     deadline = time.monotonic() + 5
-    while portal._voice_lists.get("elevenlabs") is None and time.monotonic() < deadline:
+    while portal._voice_lists.get("kokoro") is None and time.monotonic() < deadline:
         time.sleep(0.01)
 
-    assert _voices(portal, "elevenlabs")[0] == 200
+    assert _voices(portal, "kokoro")[0] == 200
     assert fake_provider.listed == 1
 
 
@@ -3558,8 +3113,8 @@ def test_requests_for_one_provider_serialize_on_its_own_lock(fake_provider):
     def ask(name):
         answers[name] = _voices(portal, name)
 
-    with portal._voice_locks["elevenlabs"]:
-        waiting = threading.Thread(target=ask, args=("elevenlabs",), daemon=True)
+    with portal._voice_locks["kokoro"]:
+        waiting = threading.Thread(target=ask, args=("kokoro",), daemon=True)
         waiting.start()
         waiting.join(0.3)
         assert waiting.is_alive(), "a request did not wait for the lock on its provider"
@@ -3568,13 +3123,14 @@ def test_requests_for_one_provider_serialize_on_its_own_lock(fake_provider):
         assert answers["say"][0] == 200, "another provider's list was held up"
     waiting.join(5)
 
-    assert answers["elevenlabs"][0] == 200
+    assert answers["kokoro"][0] == 200
     assert fake_provider.listed == 2
 
 
 def test_a_blocked_provider_is_502_within_the_bound_and_the_portal_still_answers(
-    portal, fake_provider
+    portal, fake_provider, monkeypatch
 ):
+    monkeypatch.setattr(portal_module, "BUILTIN_VOICES_TIMEOUT", 0.2)
     """`probe_timeout` is the bound — the readiness probes' own — and a
     listing that outlives it answers the fixed line while the thread it left
     behind is a daemon nobody waits for."""
@@ -3589,7 +3145,7 @@ def test_a_blocked_provider_is_502_within_the_bound_and_the_portal_still_answers
     fake_provider.list_voices = blocking_list
     started = time.monotonic()
 
-    status, headers, body = _voices(portal, "elevenlabs")
+    status, headers, body = _voices(portal, "kokoro")
     elapsed = time.monotonic() - started
 
     assert status == 502
@@ -3620,13 +3176,13 @@ def test_an_offline_listing_gets_a_longer_budget_than_a_network_probe(portal, fa
     _exchange(portal)
 
     assert _voices(portal, "say")[0] == 200
-    assert _voices(portal, "elevenlabs")[0] == 502
+    assert _voices(portal, "kokoro")[0] == 200
 
 
 @pytest.mark.parametrize(
     "error",
     [
-        ProviderError("elevenlabs", "HTTP 500\n<html>quota and trace</html>"),
+        ProviderError("kokoro", "HTTP 500\n<html>quota and trace</html>"),
         RuntimeError("unplanned, with upstream text in it"),
     ],
     ids=["provider-error", "unplanned"],
@@ -3637,7 +3193,7 @@ def test_a_listing_that_fails_is_502_with_one_fixed_line(portal, fake_provider, 
     fake_provider.list_error = error
     _exchange(portal)
 
-    status, _headers, body = _voices(portal, "elevenlabs")
+    status, _headers, body = _voices(portal, "kokoro")
 
     assert status == 502
     assert json.loads(body) == {"error": portal_module.VOICES_FAILED}
@@ -3658,75 +3214,15 @@ def test_a_failed_listing_is_not_cached(portal, fake_provider):
     status, _headers, body = _voices(portal)
 
     assert status == 200
-    assert json.loads(body)["source"] == "live"
+    assert json.loads(body)["source"] == "builtin"
     assert fake_provider.listed == 2
 
 
-@pytest.mark.parametrize(
-    "make_error",
-    [
-        lambda: ProviderError("elevenlabs", f"rejected header {CANARY}"),
-        lambda: RuntimeError(f"LocalProtocolError: Illegal header value b'{CANARY}'"),
-    ],
-    ids=["provider-error", "unplanned"],
-)
-def test_a_voice_list_never_carries_a_stored_key_anywhere(
-    portal, fake_provider, fake_keychain, monkeypatch, capsys, make_error
-):
-    """APP-SECRETS: the key is in the keychain and the environment, the
-    provider's failure quotes it, and it reaches neither the body, the
-    headers nor the terminal."""
-    fake_keychain[("vocalize", "elevenlabs-api-key")] = CANARY
-    monkeypatch.setenv("ELEVENLABS_API_KEY", CANARY)
-    fake_provider.list_error = make_error()
-    _exchange(portal)
-
-    status, headers, body = _voices(portal, "elevenlabs")
-
-    assert status == 502
-    assert CANARY.encode() not in body
-    assert CANARY[:12].encode() not in body
-    assert CANARY not in json.dumps(headers)
-    captured = capsys.readouterr()
-    assert CANARY[:12] not in captured.out
-    assert CANARY[:12] not in captured.err
-
-
-@pytest.mark.parametrize(
-    ("name", "seam"),
-    [
-        ("elevenlabs", "vocalize.tts.build_client"),
-        ("google", "vocalize.providers._http.request"),
-    ],
-)
-def test_no_key_is_a_state_not_an_error_and_makes_no_call(portal, monkeypatch, name, seam):
-    """The REAL module, an empty keychain and no env var: `require_key`
-    raises before the client is built or a request is made, and the page
-    gets a reason to show beside the field rather than a red banner."""
-    for variable in portal_module.auth.PROVIDER_ENV_VARS.values():
-        monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setattr(seam, _raise)
-    _exchange(portal)
-
-    status, _headers, body = _voices(portal, name)
-
-    assert status == 200
-    payload = json.loads(body)
-    assert payload["voices"] == []
-    assert payload["source"] == "unavailable"
-    assert "API key" in payload["reason"]
-    assert "\n" not in payload["reason"]
-    assert not payload["reason"].startswith(f"{name}:")
-    # A field hint, not the terminal's three sentences about commands: the
-    # page shows this beside the voice box, whole.
-    assert len(payload["reason"]) <= 80
-    assert payload["reason"].endswith(".")
-    assert "vocalize" not in payload["reason"]
 
 
 def test_an_unavailable_answer_is_not_cached(portal, fake_provider):
     """It is the state before a key is stored, and it clears when one is."""
-    fake_provider.list_error = ProviderUnavailableError("elevenlabs", "no key")
+    fake_provider.list_error = ProviderUnavailableError("kokoro", "no key")
     _exchange(portal)
     assert json.loads(_voices(portal)[2])["source"] == "unavailable"
 
@@ -3734,7 +3230,7 @@ def test_an_unavailable_answer_is_not_cached(portal, fake_provider):
     status, _headers, body = _voices(portal)
 
     assert status == 200
-    assert json.loads(body)["source"] == "live"
+    assert json.loads(body)["source"] == "builtin"
     assert fake_provider.listed == 2
 
 
@@ -3751,7 +3247,7 @@ def test_a_voice_list_for_an_unknown_provider_is_404_and_calls_nothing(portal, f
 
 @pytest.mark.parametrize(
     "name",
-    ["../etc", "/etc/passwd", "say\x00", "a" * 40, "SAY", "kokoro/../say", "say%2F..%2Fgoogle", ""],
+    ["../etc", "/etc/passwd", "say\x00", "a" * 40, "SAY", "kokoro/../say", "say%2F..%2Fpiper", ""],
 )
 def test_a_voices_path_the_pattern_refuses_never_reaches_a_module(portal, monkeypatch, name):
     """APP-PATH: `_PARAMETERIZED`'s regex is the validation. A name it refuses
@@ -3803,164 +3299,6 @@ def test_a_query_string_cannot_alter_the_listing(portal, fake_provider):
     assert json.loads(body)["voices"] == fake_provider.voices
 
 
-def test_the_google_listing_url_is_the_modules_constant_whatever_the_request(
-    portal, monkeypatch
-):
-    """APP-SSRF: the real module over a recording HTTP helper."""
-    monkeypatch.setenv("GOOGLE_API_KEY", CANARY)
-    seen = []
-
-    def record(method, url, *, headers, **kwargs):
-        seen.append((method, url, headers))
-        return 200, json.dumps({"voices": [{"name": "en-US-Neural2-F", "languageCodes": ["en-US"]}]}).encode()
-
-    monkeypatch.setattr("vocalize.providers._http.request", record)
-    _exchange(portal)
-
-    status, _headers, body = _voices(portal, "google", "?url=https://evil.example/&name=x")
-
-    assert status == 200
-    assert json.loads(body)["voices"] == [{"id": "en-US-Neural2-F", "name": "en-US-Neural2-F (en-US)"}]
-    assert seen == [("GET", "https://texttospeech.googleapis.com/v1/voices", {"X-goog-api-key": CANARY})]
-    assert CANARY.encode() not in body
-
-
-def test_the_elevenlabs_client_is_built_from_the_key_alone(portal, monkeypatch):
-    """APP-SSRF: the SDK client takes the key and nothing from the request;
-    its endpoint is the SDK's own default."""
-    monkeypatch.setenv("ELEVENLABS_API_KEY", CANARY)
-    built = []
-
-    class _Voice:
-        voice_id = "21m00"
-        name = "Rachel"
-
-    class _Client:
-        class voices:
-            @staticmethod
-            def search(**_kwargs):
-                return [_Voice()]
-
-    def build_client(api_key):
-        built.append(api_key)
-        return _Client()
-
-    monkeypatch.setattr("vocalize.tts.build_client", build_client)
-    _exchange(portal)
-
-    status, _headers, body = _voices(portal, "elevenlabs", "?base_url=https://evil.example")
-
-    assert status == 200
-    assert json.loads(body) == {"voices": [{"id": "21m00", "name": "Rachel"}], "source": "live"}
-    assert built == [CANARY]
-
-
-def test_the_polly_client_is_built_from_default_settings_alone(portal, monkeypatch):
-    """APP-SSRF: boto3's endpoint comes from the region, and the region and
-    profile the module passes are `Settings()`'s defaults, never the request's."""
-    from vocalize.providers import polly
-
-    got = []
-
-    class _Polly:
-        @staticmethod
-        def describe_voices(**kwargs):
-            got.append(kwargs)
-            return {"Voices": [{"Id": "Matthew", "Name": "Matthew", "LanguageCode": "en-US", "SupportedEngines": ["neural"]}]}
-
-    def client(settings):
-        got.append((settings.profile, settings.region))
-        return _Polly()
-
-    monkeypatch.setattr(polly, "_client", client)
-    _exchange(portal)
-
-    status, _headers, body = _voices(portal, "polly", "?region=evil&profile=other")
-
-    assert status == 200
-    assert json.loads(body)["voices"] == [{"id": "Matthew", "name": "Matthew (en-US; neural)"}]
-    assert got == [(None, None), {}]
-
-
-def test_say_kokoro_and_openai_list_with_the_http_helper_broken(portal, monkeypatch):
-    """The three offline lists, through the REAL modules, with every way onto
-    the network raising. `say -v ?` is a subprocess and is faked too, so this
-    holds off a Mac."""
-    import subprocess
-
-    from vocalize.providers import say
-
-    monkeypatch.setattr("vocalize.providers._http.request", _raise)
-    monkeypatch.setattr("vocalize.providers._http.urlopen", _raise)
-    monkeypatch.setattr(
-        say,
-        "_run",
-        lambda argv: subprocess.CompletedProcess(
-            argv, 0, stdout="Alex                en_US    # Hello\nSamantha            en_US    # Hi\n", stderr=""
-        ),
-    )
-    _exchange(portal)
-
-    for name in ("say", "kokoro", "openai"):
-        status, _headers, body = _voices(portal, name)
-        assert status == 200, name
-        payload = json.loads(body)
-        assert payload["source"] == "builtin", name
-        assert payload["voices"], name
-        assert all(set(voice) == {"id", "name"} for voice in payload["voices"]), name
-
-
-@pytest.mark.parametrize(
-    ("name", "cli_message", "cause", "sentence"),
-    [
-        (
-            "elevenlabs",
-            str(MissingAPIKeyError("elevenlabs")),
-            MissingAPIKeyError("elevenlabs"),
-            "No API key is stored for this provider yet.",
-        ),
-        (
-            "polly",
-            "needs boto3 — install it with: pip install 'vocalize-cli[polly]'",
-            ImportError("No module named 'boto3'"),
-            "This provider's optional package is not installed.",
-        ),
-        (
-            "polly",
-            "AWS credentials not usable",
-            None,
-            "No usable AWS credentials were found on this machine.",
-        ),
-        (
-            "kokoro",
-            "uv is not installed — see https://docs.astral.sh/uv/ then run: vocalize local install",
-            None,
-            "This provider is not set up on this machine yet.",
-        ),
-    ],
-    ids=["no-key", "no-boto3", "no-aws-credentials", "anything-else"],
-)
-def test_an_unavailable_reason_is_one_short_sentence_per_cause(
-    portal, fake_provider, name, cli_message, cause, sentence
-):
-    """The module's message is written for a terminal — three sentences that
-    name commands — and the page showed it cut at 200 characters, mid-word.
-    The server maps the cause to one line that fits beside a field."""
-    error = ProviderUnavailableError(name, cli_message)
-    error.__cause__ = cause
-    fake_provider.list_error = error
-    _exchange(portal)
-
-    payload = json.loads(_voices(portal, name)[2])
-
-    assert payload["source"] == "unavailable"
-    assert payload["reason"] == sentence
-    assert len(sentence) <= 80
-    assert sentence.endswith(".")
-    assert "vocalize" not in sentence
-    assert "pip " not in sentence
-
-
 def test_a_blank_voice_id_is_dropped_and_a_padded_one_is_trimmed(portal, fake_provider):
     """A whitespace-only id passed the shape check and became an empty
     option in the picker; a padded one would be offered but saved padded."""
@@ -3977,296 +3315,44 @@ def test_a_blank_voice_id_is_dropped_and_a_padded_one_is_trimmed(portal, fake_pr
     assert voices == [{"id": "v1", "name": "Rachel"}, {"id": "v2", "name": "v2"}]
 
 
-def test_storing_a_key_evicts_that_providers_remembered_list(
-    portal, fake_provider, fake_keychain, no_network_validate
-):
-    """The remembered list was fetched with the old key. A key stored on the
-    Keys tab may be another account's, and the page asks again right after
-    a store — that ask must be a fresh call, not the old account's voices."""
-    _exchange(portal)
-    assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "live"
-    assert json.loads(_voices(portal, "google")[2])["source"] == "live"
-    fake_provider.voices = [{"id": "new", "name": "New"}]
-
-    status, _ = _post(portal, "/api/auth/login", {"provider": "elevenlabs", "key": CANARY})
-    assert status == 200
-    stored = json.loads(_voices(portal, "elevenlabs")[2])
-    other = json.loads(_voices(portal, "google")[2])
-
-    assert stored == {"voices": [{"id": "new", "name": "New"}], "source": "live"}
-    assert other["source"] == "cached", "only the provider whose key changed is asked again"
-    assert fake_provider.listed == 3
-
-
-def test_a_refused_key_leaves_the_remembered_list_alone(
-    portal, fake_provider, fake_keychain, monkeypatch
-):
-    """The provider rejected the key, so nothing was stored and nothing changed:
-    the list on file is still the one the working key fetched."""
-
-    def refuse(*_args, **_kwargs):
-        raise ProviderAuthError("elevenlabs", "invalid or missing API key")
-
-    monkeypatch.setattr(portal_module.auth, "validate_key", refuse)
-    _exchange(portal)
-    assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "live"
-
-    status, _ = _post(portal, "/api/auth/login", {"provider": "elevenlabs", "key": CANARY})
-    assert status == 400
-    assert not fake_keychain
-
-    assert json.loads(_voices(portal, "elevenlabs")[2])["source"] == "cached"
-    assert fake_provider.listed == 1
-
-
 # --- the Anthropic key slot: state, login, test, remove ------------------
 
 
-ANTHROPIC_USERNAME = "anthropic-api-key"
 
 
-def test_anthropic_state_lists_every_key_slot_without_a_key(portal, fake_keychain):
-    """`keys` is the Keys tab's listing: one entry per slot that stores a
-    key, the Anthropic one included, with the stamp and never the key.
-    `providers` stays the chain's set, so the other tabs see no new voice."""
-    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
-    _exchange(portal)
-    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
-
-    assert status == 200
-    assert CANARY.encode() not in raw
-    payload = json.loads(raw)
-    assert tuple(payload["keys"]) == portal_module.auth.KEY_SLOTS
-    assert "anthropic" not in payload["providers"]
-    slot = payload["keys"]["anthropic"]
-    assert slot == {"label": "Anthropic", "source": "keychain", "masked": "sk-c…", "validated": None}
-    assert payload["keys"]["elevenlabs"]["source"] == "not found"
-    assert set(payload["providers"]["elevenlabs"]["key"]) == {"source", "masked"}
 
 
-def test_anthropic_login_stores_under_its_own_username(portal, fake_keychain, no_network_validate):
-    _exchange(portal)
-    status, headers, body = portal.route(
-        "POST",
-        "/api/auth/login",
-        _authed(portal),
-        json.dumps({"provider": "anthropic", "key": CANARY}).encode(),
-    )
-
-    assert status == 200
-    assert CANARY.encode() not in body
-    assert CANARY not in json.dumps(headers)
-    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
-    assert len(fake_keychain) == 1
-
-
-def test_anthropic_test_without_storing_leaves_the_keychain_untouched(
-    portal, fake_keychain, no_network_validate
-):
-    _exchange(portal)
-    status, headers, body = portal.route(
-        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": CANARY}).encode()
-    )
-
-    assert status == 200
-    assert CANARY.encode() not in body
-    assert CANARY not in json.dumps(headers)
-    assert json.loads(body) == {
-        "ok": True,
-        "valid": True,
-        "message": "Anthropic accepted the key. Nothing was stored.",
-    }
-    assert not fake_keychain
-
-
-def test_anthropic_test_without_storing_reports_a_bad_key_without_it(portal, fake_keychain, monkeypatch):
-    def leaky(key, provider):
-        raise portal_module.VocalizeError(f"HTTP 401 for key {key}")
-
-    monkeypatch.setattr(portal_module.auth, "validate_key", leaky)
-    _exchange(portal)
-    status, _, body = portal.route(
-        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": CANARY}).encode()
-    )
-
-    assert status == 200
-    assert CANARY.encode() not in body
-    payload = json.loads(body)
-    assert payload["valid"] is False
-    assert "[key]" in payload["message"]
-    assert not fake_keychain
-
-
-@pytest.mark.parametrize("key", ["sk-ant-abc\x00def", "sk-ant-abc def", "sk-ant-\u00a0"])
-def test_anthropic_test_refuses_a_control_character_key_before_any_request(
-    portal, fake_keychain, monkeypatch, key
-):
-    def never(*_a, **_k):
-        raise AssertionError("the provider was called with a malformed key")
-
-    monkeypatch.setattr(portal_module.auth, "validate_key", never)
-    _exchange(portal)
-    status, _, body = portal.route(
-        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": key}).encode()
-    )
-
-    assert status == 400
-    assert key.encode() not in body
-    assert b"control characters" in body
-    assert not fake_keychain
-
-
-@pytest.mark.parametrize("payload", [{}, {"key": ""}, {"key": 7}, {"key": None}])
-def test_anthropic_test_without_a_key_is_400(portal, no_network_validate, payload):
-    _exchange(portal)
-    status, body = _post(portal, "/api/auth/test/anthropic", payload)
-
-    assert status == 400
-    assert "nothing was tested" in body["error"]
-
-
-def test_anthropic_remove_reports_the_read_back(portal, fake_keychain):
-    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
-    fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] = "sk-other-0000000000000000"
-    _exchange(portal)
-    status, _, body = portal.route("POST", "/api/auth/remove/anthropic", _authed(portal), b"{}")
-
-    assert status == 200
-    assert CANARY.encode() not in body
-    assert json.loads(body)["removed"] is True
-    assert (portal_module.auth.SERVICE, ANTHROPIC_USERNAME) not in fake_keychain
-    assert fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")].startswith("sk-other")
-
-    status, body = _post(portal, "/api/auth/remove/anthropic", {})
-    assert status == 200
-    assert body["removed"] is False
-
-
-def test_anthropic_remove_that_is_denied_is_a_400_not_a_claim(portal, fake_keychain):
-    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
-    fake_keychain.deny_delete = True
-    _exchange(portal)
-    status, _, body = portal.route("POST", "/api/auth/remove/anthropic", _authed(portal), b"{}")
-
-    assert status == 400
-    assert CANARY.encode() not in body
-    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
-
-
-@pytest.mark.parametrize("path", ["/api/auth/remove/say", "/api/auth/remove/polly", "/api/auth/remove/nope"])
-def test_remove_of_an_unknown_slot_is_404_without_reflecting_it(portal, fake_keychain, path):
-    fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] = CANARY
-    _exchange(portal)
-    status, _, body = portal.route("POST", path, _authed(portal), b"{}")
-
+@pytest.mark.parametrize("path", ["/api/auth/login", "/api/auth/test/anthropic", "/api/auth/remove/elevenlabs"])
+def test_removed_credential_routes_refuse_without_echoing_secrets(portal, path, capsys):
+    canary = "synthetic-key-canary\nFORGED LOG ENTRY"
+    status, _, body = portal.route("POST", path, _authed(portal), json.dumps({"key": canary}).encode())
     assert status == 404
-    assert b"nope" not in body
-    assert fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] == CANARY
+    assert b"synthetic-key-canary" not in body
+    captured = capsys.readouterr()
+    assert canary not in captured.out + captured.err
 
 
-@pytest.mark.parametrize("path", ["/api/auth/test/say", "/api/auth/test/kokoro", "/api/auth/test/nope"])
-def test_anthropic_test_of_an_unknown_slot_is_404(portal, fake_keychain, monkeypatch, path):
-    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: pytest.fail("called"))
-    _exchange(portal)
-    status, _, body = portal.route("POST", path, _authed(portal), json.dumps({"key": CANARY}).encode())
-
+@pytest.mark.parametrize("path", ["/api/provider/elevenlabs", "/api/voices/openai", "/api/voices/polly/preview"])
+def test_cloud_portal_engine_is_not_dispatchable(portal, path, monkeypatch):
+    from vocalize import providers
+    monkeypatch.setattr(providers, "get", lambda *a: pytest.fail("provider reached"))
+    method = "GET" if path == "/api/voices/openai" else "POST"
+    status, _, _ = portal.route(method, path, _authed(portal), b"{}")
     assert status == 404
-    assert CANARY.encode() not in body
-    assert b"nope" not in body
 
 
-@pytest.mark.parametrize("path", ["/api/auth/remove/anthropic", "/api/auth/test/anthropic"])
-def test_anthropic_routes_need_the_session_token(portal, fake_keychain, path):
-    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
-    status, _, body = portal.route("POST", path, _headers(), json.dumps({"key": CANARY}).encode())
-
-    assert status == 403  # the portal's answer to a missing token
-    assert CANARY.encode() not in body
-    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
+def test_local_portal_state_has_no_credentials_or_usage(portal):
+    data = _body(portal.route("GET", "/api/state", _authed(portal)))
+    assert set(data["providers"]) == {"kokoro", "piper", "say"}
+    assert "keys" not in data
+    for entry in data["providers"].values():
+        assert not {"key", "budget", "used", "exhausted"} & entry.keys()
 
 
-def test_anthropic_test_route_never_logs_the_key(capsys, fake_keychain, monkeypatch):
-    """Over a real socket, like the login route: http.server's own logging."""
-    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: None)
-    served = Portal(idle_timeout=300)
-    served.start()
-    try:
-        body = json.dumps({"key": CANARY}).encode()
-        raw = _raw(
-            served.port,
-            b"POST /api/auth/test/anthropic HTTP/1.1\r\nHost: "
-            + served.origin.encode()
-            + b"\r\n"
-            + TOKEN_HEADER.encode()
-            + b": "
-            + served._token.encode()
-            + b"\r\nContent-Length: "
-            + str(len(body)).encode()
-            + b"\r\n\r\n"
-            + body,
-        )
-        assert b" 200 " in raw
-        assert b"sk-canary" not in raw
-        captured = capsys.readouterr()
-        assert "sk-canary" not in captured.out
-        assert "sk-canary" not in captured.err
-        assert not fake_keychain
-    finally:
-        served.stop()
-
-
-def test_anthropic_remove_with_an_unreadable_keychain_is_a_400_not_nothing_stored(portal, fake_keychain):
-    """`stored_key` flattens a locked keychain into None; a user revoking a
-    leaked key must not be told nothing is stored while it still is."""
-    fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] = CANARY
-    fake_keychain.deny_read = True
-    _exchange(portal)
-    status, _, body = portal.route("POST", "/api/auth/remove/anthropic", _authed(portal), b"{}")
-
+@pytest.mark.parametrize("backend", ["claude-cli", "anthropic"])
+def test_portal_rejects_hosted_cleanup_without_writing(portal, tmp_path, backend):
+    status, _, _ = portal.route("POST", "/api/stt", _authed(portal), json.dumps({
+        "fingerprint": "absent", "settings": {"cleanup": backend}
+    }).encode())
     assert status == 400
-    assert CANARY.encode() not in body
-    assert b"Could not read the keychain" in body
-    assert fake_keychain[(portal_module.auth.SERVICE, ANTHROPIC_USERNAME)] == CANARY
-
-
-def test_anthropic_test_reports_an_unreachable_provider_as_502_not_a_refusal(
-    portal, fake_keychain, monkeypatch
-):
-    def down(key, provider):
-        raise portal_module.ProviderTransientError("anthropic", f"HTTP 503 checking {key}")
-
-    monkeypatch.setattr(portal_module.auth, "validate_key", down)
-    _exchange(portal)
-    status, _, body = portal.route(
-        "POST", "/api/auth/test/anthropic", _authed(portal), json.dumps({"key": CANARY}).encode()
-    )
-
-    assert status == 502
-    assert CANARY.encode() not in body
-    assert b"[key]" in body and b"Could not reach Anthropic" in body
-    assert not fake_keychain
-
-
-def test_anthropic_test_refuses_an_oversized_key_before_any_request(portal, fake_keychain, monkeypatch):
-    monkeypatch.setattr(portal_module.auth, "validate_key", lambda *a, **k: pytest.fail("called"))
-    _exchange(portal)
-    status, body = _post(portal, "/api/auth/test/anthropic", {"key": "k" * 513})
-
-    assert status == 400
-    assert "longer than any provider" in body["error"]
-    assert not fake_keychain
-
-
-def test_state_reports_an_unreadable_keychain_as_error_not_missing(portal, fake_keychain, monkeypatch):
-    for name in portal_module.auth.PROVIDER_ENV_VARS.values():
-        monkeypatch.delenv(name, raising=False)
-    fake_keychain[(portal_module.auth.SERVICE, "elevenlabs-api-key")] = CANARY
-    fake_keychain.deny_read = True
-    _exchange(portal)
-    status, _, raw = portal.route("GET", "/api/state", _authed(portal))
-
-    assert status == 200
-    assert CANARY.encode() not in raw
-    payload = json.loads(raw)
-    assert payload["providers"]["elevenlabs"]["key"] == {"source": "error", "masked": None}
-    assert payload["keys"]["anthropic"]["source"] == "error"
+    assert not portal_module.config.config_path().exists()

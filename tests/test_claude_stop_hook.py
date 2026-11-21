@@ -278,20 +278,24 @@ def test_main_speaks_dash_led_text(monkeypatch, tmp_path):
     # And prove it against the real parser rather than our idea of it: the
     # same argv tail must get PAST argument parsing. Exit code 2 would mean
     # click rejected the bullet as an unknown option.
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    # --provider pins the chain to ElevenLabs so the run stops at the key
-    # stage instead of falling through to `say` and speaking for real.
+    # Stop at the synthesis boundary after real argument parsing. Never
+    # spawn a model or player to test the dash separator.
+    import vocalize.cli as cli_module
+
+    def unavailable(*args, **kwargs):
+        raise TTSRequestError("Synthetic unavailable local model")
+
+    monkeypatch.setattr(cli_module, "_run_tts", unavailable)
     result = CliRunner().invoke(
         vocalize_cli,
-        ["speak", "--max-chars", "500", "--no-play", "--provider", "elevenlabs",
+        ["speak", "--max-chars", "500", "--no-play", "--provider", "kokoro",
          "--", "- Fixed the parser"],
     )
 
     assert result.exit_code != 2
-    assert "No such option" not in result.output
-    # Parsing succeeded, so it runs on and fails at the API-key stage instead.
     assert isinstance(result.exception, TTSRequestError)
-    assert "No ElevenLabs API key found" in str(result.exception)
+    assert str(result.exception) == "Synthetic unavailable local model"
+    assert "No such option" not in result.output
 
 
 def test_nonzero_exit_is_logged_to_stderr(monkeypatch, tmp_path, capsys):

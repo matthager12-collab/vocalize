@@ -2,14 +2,14 @@
 
 `vocalize status` (and, in 0.11.0, the config portal polling it) needs to
 know at a glance whether each configured provider can actually be used
-right now. Some checks — a keychain read chief among them — can block on a
+right now. Some checks — a native runtime probe, for example — can block on a
 macOS permission dialog, so every probe runs on its own daemon thread,
 joined with a timeout. A probe still stuck when the timeout elapses gets a
 "still checking" row instead of hanging the caller.
 
 Daemon threads, not a ThreadPoolExecutor: a pool's workers are joined at
 interpreter exit, which would hang `vocalize status` forever on a wedged
-keychain call. A plain daemon thread lets the process exit with the probe
+native call. A plain daemon thread lets the process exit with the probe
 still running.
 
 A module-level registry keeps at most one in-flight thread per row name:
@@ -20,7 +20,6 @@ thread total, never one per poll.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -30,18 +29,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
-from . import app, auth, config, ledger
+from . import app, auth, config
 from .exceptions import VocalizeError
-
-# Providers authenticated by a single stored/env API key — see
-# auth.PROVIDER_ENV_VARS / PROVIDER_USERNAMES. Polly, say and kokoro each
-# get their own probe below.
-_CREDENTIAL_PROVIDERS = ("elevenlabs", "openai", "google")
 
 #: The detail on the row a probe that is still running gets. Named because
 #: callers have to tell "no answer yet" from "the probe raised" — see
 #: portal._key_info.
-STILL_CHECKING = "still checking — a slow probe, or a keychain dialog, may be waiting"
+STILL_CHECKING = "still checking — a local runtime probe may be waiting"
 
 
 class Row(NamedTuple):
@@ -74,49 +68,13 @@ _inflight: dict[str, _Slot] = {}
 _lock = threading.Lock()
 
 
-def _credential_row(name: str, file_config: dict, *, in_chain: bool = True) -> Row:
-    source = auth.key_source(None, name)
-    if source == "not found":
-        if not in_chain:
-            return Row(name, "ok", "not in your chain; no key stored", "")
-        return Row(
-            name, "fail", "no API key configured",
-            f"run: vocalize auth login --provider {name}",
-        )
+def _piper_row() -> Row:
+    from .providers import piper as piper_provider  # lazy import, no cycle risk
 
-    detail = f"key from {source}"
-    if not in_chain:
-        return Row(name, "warn", f"{detail} (not in your chain)", "")
-
-    budget = config.budget_for(name, file_config)
-    if budget is not None:
-        used, exhausted = ledger.status(name)
-        detail += f"; {used:,}/{budget:,} characters this month"
-        if exhausted or used >= budget:
-            return Row(
-                name, "warn", f"{detail} (budget exhausted)",
-                "raise monthly_chars in config, or wait for next month",
-            )
-    return Row(name, "ok", detail, "")
-
-
-def _polly_row(file_config: dict, *, in_chain: bool = True) -> Row:
-    profile = (
-        config.provider_table("polly", file_config).get("profile")
-        or os.environ.get("AWS_PROFILE")
-        or "default"
-    )
-    status = auth.polly_credential_status(profile)
-    if status == "not configured":
-        if not in_chain:
-            return Row("polly", "ok", "not in your chain; no key stored", "")
-        return Row(
-            "polly", "fail", "no AWS credentials found",
-            "set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or configure ~/.aws/credentials",
-        )
-    if not in_chain:
-        return Row("polly", "warn", f"credentials from {status} (not in your chain)", "")
-    return Row("polly", "ok", f"credentials from {status}", "")
+    ready, reason = piper_provider.installed()
+    if ready:
+        return Row("piper", "ok", "installed and ready", "")
+    return Row("piper", "warn", reason, "vocalize local install --piper")
 
 
 def _kokoro_row() -> Row:
@@ -151,9 +109,9 @@ _STT_INSTALL_ACTION = "vocalize local install --stt"
 
 
 def _installed_stt_models() -> list[str]:
-    from .local import install, whisper_manifest
+    from .local import install, parakeet_manifest, whisper_manifest
 
-    return [
+    models = [
         model
         for model in whisper_manifest.MODELS
         if install.installed(
@@ -162,6 +120,11 @@ def _installed_stt_models() -> list[str]:
             install_hint=_STT_INSTALL_ACTION,
         )[0]
     ]
+    if parakeet_manifest.supported() and install.installed(
+        parakeet_manifest, install_hint=_STT_INSTALL_ACTION
+    )[0]:
+        models.insert(0, "parakeet")
+    return models
 
 
 def _recorder_is_built() -> bool:
@@ -201,7 +164,7 @@ def _llm_model_row() -> Row:
         return Row("llm model", "ok", "installed and ready", "")
 
     # When the model is not installed, check whether the machine has
-    # enough RAM — if not, the reason names the figures and the cloud
+    # enough RAM — if not, the reason names the figures and the local
     # alternatives.
     ram = local_module.physical_ram_bytes()
     if ram is not None and ram < llm_manifest.MIN_RAM_BYTES:
@@ -211,7 +174,7 @@ def _llm_model_row() -> Row:
         required = _human_readable_size(llm_manifest.MIN_RAM_BYTES)
         return Row(
             "llm model", "warn",
-            f"{measured} RAM, needs {required}; use claude-cli or anthropic instead",
+            f"{measured} RAM, needs {required}; disable cleanup until a compatible local model is installed",
             "",
         )
     return Row("llm model", "warn", reason, _LLM_INSTALL_ACTION)
@@ -403,14 +366,6 @@ def _swiftc_row() -> Row:
     return Row("swiftc", "fail", "swiftc not found", "xcode-select --install")
 
 
-def _claude_row() -> Row:
-    if shutil.which("claude"):
-        return Row("claude", "ok", "claude on PATH", "")
-    return Row(
-        "claude", "warn",
-        "not on PATH; /speak summaries and claude-cli cleanup unavailable", "",
-    )
-
 
 def _shebang_row() -> Row:
     """Does the running console script's interpreter still exist.
@@ -508,12 +463,10 @@ def _notes_folder_row(file_config: dict) -> Row:
 
 
 def _make_probe(name: str, file_config: dict, *, in_chain: bool = True) -> Callable[[], Row]:
-    if name in _CREDENTIAL_PROVIDERS:
-        return lambda: _credential_row(name, file_config, in_chain=in_chain)
-    if name == "polly":
-        return lambda: _polly_row(file_config, in_chain=in_chain)
     if name == "kokoro":
         return _kokoro_row
+    if name == "piper":
+        return _piper_row
     if name == "say":
         return lambda: Row("say", "ok", "local, no credentials needed", "")
     # Not one of the known provider shapes (a hand-edited or future config).
@@ -572,7 +525,7 @@ def run_probes(probes: list[tuple[str, Callable[[], Row]]], timeout: float) -> l
 
     All of them are started before any of them is joined, and they share
     one deadline. Joining each in turn instead costs `len(probes) x
-    timeout` whenever a keychain dialog is up — and the portal pays that on
+    timeout` whenever a native probe is blocked — and the portal pays that on
     every poll, not once.
     """
     started = [(name, *_start_probe(name, probe)) for name, probe in probes]
@@ -685,7 +638,6 @@ def doctor_rows(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
         ("cli path", _cli_path_row),
         ("uv", _uv_row),
         ("swiftc", _swiftc_row),
-        ("claude", _claude_row),
         ("shebang", _shebang_row),
         ("hammerspoon", _hammerspoon_row),
         ("services shortcut", lambda: _services_shortcut_row(file_config)),

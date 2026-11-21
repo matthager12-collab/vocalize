@@ -7,7 +7,7 @@ its own Python 3.12, the weights live in ~/.cache/vocalize/models, and
 both arrive only when the user runs `vocalize local install`.
 
 Until then `check()` fails with the command to run, and the chain treats
-that as "try the next provider" — the same as a missing API key.
+that as "try the next local provider".
 
 The model takes ~0.8 s to load and the worker peaks around 760 MB of RAM
 (measured on an M4, 2026-09-07; the ONNX file itself is 326 MB), so the worker is
@@ -34,7 +34,10 @@ from ..exceptions import (
 )
 from ..local import install as install_module
 from ..local import kokoro_manifest as manifest
-from ..local import uv_path  # re-exported: `provider.uv_path()` stays public API
+from ..local import (
+    runtime,
+    uv_path,  # re-exported: `provider.uv_path()` stays public API
+)
 
 NAME = "kokoro"
 AUDIO_EXT = "wav"
@@ -123,8 +126,8 @@ class _Session:
         try:
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
-        except (OSError, ValueError) as exc:
-            raise ProviderTransientError(NAME, "the worker stopped accepting text") from exc
+        except (OSError, ValueError):
+            raise ProviderTransientError(NAME, "the worker stopped accepting text") from None
 
         try:
             line = self._replies.get(timeout=_REQUEST_TIMEOUT)
@@ -134,7 +137,11 @@ class _Session:
             ) from None
 
         if line is None:
-            raise ProviderTransientError(NAME, "the worker exited")
+            # Its stderr is discarded, so an uncached offline runtime looks
+            # like any early exit: name the way out, never retry online.
+            raise ProviderTransientError(
+                NAME, f"the worker exited; if {runtime.reinstall_hint()}"
+            )
 
         try:
             reply = json.loads(line)
@@ -171,7 +178,7 @@ def _argv(voice: str, speed: float, language: str, uv: str) -> list[str]:
     # uv project and REPLACES its .venv with a uv-managed one. The worker
     # must only ever get the ephemeral --with environment.
     return [
-        uv, "run", "--no-project",
+        uv, "run", "--no-project", "--offline", "--no-python-downloads",
         "--python", manifest.PYTHON_VERSION,
         "--with", manifest.RUNTIME_PACKAGE,
         str(manifest.worker_path()),
@@ -206,17 +213,21 @@ def _session_for(voice: str, speed: float, language: str) -> _Session:
         )
 
     try:
-        # stderr is left attached to the terminal: uv's first-run progress
-        # is worth seeing, and an unread stderr pipe can wedge the worker.
+        # Diagnostics may quote private input. Discard them without an unread
+        # pipe that could block the resident worker.
         proc = SESSION_SEAM(
             _argv(voice, speed, language, uv),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             cwd=tempfile.gettempdir(),  # never the caller's project dir
+            env=runtime.environment(),  # allowlisted, offline, no credentials
         )
-    except OSError as exc:
-        raise ProviderTransientError(NAME, f"could not start the worker: {exc}") from exc
+    except (OSError, subprocess.SubprocessError):
+        raise ProviderTransientError(
+            NAME, "could not start the worker; check the local Kokoro runtime"
+        ) from None
 
     _session = _Session(key, proc)
     return _session
@@ -250,13 +261,14 @@ def synthesize(text: str, settings: Settings) -> bytes:
             raise
 
         if not reply.get("ok"):
-            error = str(reply.get("error") or "synthesis failed")
-            raise ProviderTransientError(NAME, error)
+            raise ProviderTransientError(
+                NAME, "synthesis failed; check the installed local Kokoro model"
+            )
 
         try:
             audio = out.read_bytes()
-        except OSError as exc:
-            raise ProviderTransientError(NAME, "the worker wrote no audio") from exc
+        except OSError:
+            raise ProviderTransientError(NAME, "the worker wrote no audio") from None
 
     if not audio:
         raise ProviderTransientError(NAME, "the worker produced no audio")

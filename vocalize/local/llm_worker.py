@@ -1,4 +1,4 @@
-"""LLM cleanup/summary worker.  Runs under uv, never imported by vocalize.
+"""LLM cleanup worker.  Runs under uv, never imported by vocalize.
 
 This file ships inside the vocalize package but is not part of it: uv
 executes it with its own Python 3.12 and its own copy of mlx-lm, so
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 # Error strings are clipped rather than passed through: an exception is
@@ -190,7 +191,7 @@ def _generate(mlx_lm_mod, model, tokenizer, prompt_ids: list[int], max_tokens: i
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="llm_worker",
-        description="On-device LLM cleanup/summary worker.  Never imported by vocalize.",
+        description="On-device LLM cleanup worker.  Never imported by vocalize.",
     )
     parser.add_argument(
         "--model-dir", required=True,
@@ -258,7 +259,6 @@ def _warm_complete(mlx, model, tokenizer, request, cancelled, clock):
 
 def _serve_server(args, **options):
     """Share the standalone transport and expose time for deterministic tests."""
-    import os
     import time
     from pathlib import Path
 
@@ -283,7 +283,8 @@ def _serve_server(args, **options):
         warm_seconds=args.warm_seconds, abandon_seconds=args.abandon_seconds,
         initial_lease=args.lease,
         fingerprint=protocol.fingerprint(
-            Path(__file__), "mlx-lm==0.31.3", Path(args.model_dir) / "model.safetensors"
+            Path(__file__), "mlx-lm==0.31.3", Path(args.model_dir) / "model.safetensors",
+            runtime_identity=os.environ.get("_VOCALIZE_RUNTIME_IDENTITY"),
         ),
         **options,
     )

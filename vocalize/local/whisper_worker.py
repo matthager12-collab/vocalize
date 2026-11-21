@@ -268,6 +268,7 @@ def _warm_transcribe(model, request, cancelled):
 
 def _serve_server(args, **options):
     """Expose lifecycle seams without installing a model in the host interpreter."""
+    import os
     from pathlib import Path
 
     protocol = _warm_protocol()
@@ -282,7 +283,10 @@ def _serve_server(args, **options):
         handle=lambda request, cancelled: _warm_transcribe(model, request, cancelled),
         warm_seconds=args.warm_seconds, abandon_seconds=args.abandon_seconds,
         initial_lease=args.lease,
-        fingerprint=protocol.fingerprint(Path(__file__), "pywhispercpp==1.5.1", args.model),
+        fingerprint=protocol.fingerprint(
+            Path(__file__), "pywhispercpp==1.5.1", args.model,
+            runtime_identity=os.environ.get("_VOCALIZE_RUNTIME_IDENTITY"),
+        ),
         **options,
     )
 

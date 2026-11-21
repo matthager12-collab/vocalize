@@ -36,8 +36,7 @@ socket anywhere near it. `_Handler` is a thin shell that reads a request
 off the wire, calls `route()`, and writes the answer back — so every
 security property above is testable as a function call.
 
-Writes (`POST /api/chain`, `/api/provider/<name>`, `/api/stt`,
-`/api/auth/login`) are compare-and-swap (DEC-005): `/api/state` hands the
+Writes (`POST /api/chain`, `/api/provider/<name>`, `/api/stt`) are compare-and-swap (DEC-005): `/api/state` hands the
 page the config file's fingerprint, taken *before* the values that go with
 it are parsed, every write hands that fingerprint back, and a file that
 moved in between is refused with 409 rather than clobbered. On the wire the
@@ -57,14 +56,11 @@ this project that does not take the machine-wide playback lock (design §
 Playback). Previews are serialized on one *module* lock — Kokoro's
 resident worker is process-global — and the wait for it is bounded, so a
 held-down preview button answers 503 rather than queueing one handler
-thread and one paid synthesis per click (DEC-018).
+thread and one local synthesis per click (DEC-018).
 
-`GET /api/voices/<name>` is the provider module's own `list_voices()`,
-run through readiness' probe registry so a keychain read or a network call
-that hangs costs `probe_timeout` and a daemon thread, never a stuck page,
-and so two requests for one provider join one call. A list is kept for the
-life of the object; a failure answers one fixed line, because the SDK's
-error text is where a rejected key gets echoed.
+`GET /api/voices/<name>` reads a local engine's voice list through the
+bounded readiness probe registry. Lists are cached for the portal session;
+provider diagnostics are replaced with a fixed error message.
 
 `POST /api/local/install/start` runs the download off the request thread
 and `GET /api/local/install/status` returns the progress dict the page
@@ -78,7 +74,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import re
 import secrets
 import sys
@@ -89,12 +84,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import app, auth, config, ledger, readiness, wizard
+from . import app, auth, config, readiness, wizard
 from .exceptions import (
     ConfigChangedError,
-    MissingAPIKeyError,
-    ProviderError,
-    ProviderTransientError,
     ProviderUnavailableError,
     VocalizeError,
 )
@@ -125,10 +117,6 @@ _OVERSIZED = b"\0" * (MAX_BODY + 1)
 
 #: Per-probe budget for `/api/state`, matching `vocalize status`.
 STATE_TIMEOUT = 2.0
-
-#: The five words `auth.key_source` can return. Anything else out of a key
-#: probe means the probe did not finish — see `_key_info`.
-_KEY_SOURCES = ("flag", "environment", ".env file", "keychain", "not found")
 
 #: `style-src` is spelled out because `default-src 'self'` does not cover an
 #: inline `<style>` element — "self" is a source for *fetched* stylesheets,
@@ -189,7 +177,7 @@ PREVIEW_TEXT = "This is how vocalize will sound."
 PREVIEW_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4"}
 
 #: The same audio cache `vocalize speak` uses — that is the point: a preview
-#: of a voice you then read with is already rendered and paid for. Named
+#: of a voice you then read with is already rendered. Named
 #: here rather than left to `chain.run`'s default because that default is
 #: bound at def time, so a test has nothing else to point elsewhere.
 CACHE_DIR = DEFAULT_CACHE_DIR
@@ -202,13 +190,8 @@ _preview_lock = threading.Lock()
 #: How long a preview waits for the one in front of it. Bounded rather than
 #: unbounded: `_Handler.timeout` is a *socket* timeout and never reclaims a
 #: thread parked on a lock, so an unbounded wait lets a held-down preview
-#: button pile up one handler thread — and one paid synthesis — per click.
+#: button pile up one handler thread — and one local synthesis — per click.
 PREVIEW_WAIT = 30.0
-
-#: The providers whose `list_voices()` is a network call, so the page can say
-#: "live". The other three list offline — `say` from the system, kokoro from
-#: its manifest, openai from a constant — and are "builtin".
-LIVE_VOICE_LISTS = frozenset({"elevenlabs", "google", "polly"})
 
 #: The budget an offline listing gets, in place of `probe_timeout`. The state
 #: probes' two seconds are a *network* budget; `say -v '?'` is a subprocess
@@ -252,15 +235,13 @@ _PLACEHOLDER_JS = "// The vocalize config portal script is not built yet.\n"
 # path separator, a traversal sequence or a control character.
 _PARAMETERIZED = (
     (re.compile(r"^/api/provider/([a-z0-9_-]{1,32})$"), "/api/provider/*"),
-    (re.compile(r"^/api/auth/remove/([a-z0-9_-]{1,32})$"), "/api/auth/remove/*"),
-    (re.compile(r"^/api/auth/test/([a-z0-9_-]{1,32})$"), "/api/auth/test/*"),
     (re.compile(r"^/api/voices/([a-z0-9_-]{1,32})/preview$"), "/api/voices/*/preview"),
     (re.compile(r"^/api/voices/([a-z0-9_-]{1,32})$"), "/api/voices/*"),
 )
 
 
 def _normalize(path: str) -> tuple[str, str | None]:
-    """`/api/provider/google` -> `("/api/provider/*", "google")`.
+    """`/api/provider/kokoro` -> `("/api/provider/*", "kokoro")`.
 
     A path matching no pattern comes back unchanged with no name, so a
     provider name is the only route parameter that exists and it is
@@ -286,11 +267,8 @@ ROUTES: tuple[tuple[str, str, str], ...] = (
     ("GET", "/api/state", "token"),
     ("GET", "/api/ping", "token"),
     ("POST", "/api/chain", "token"),
-    ("POST", "/api/provider/elevenlabs", "token"),
+    ("POST", "/api/provider/kokoro", "token"),
     ("POST", "/api/stt", "token"),
-    ("POST", "/api/auth/login", "token"),
-    ("POST", "/api/auth/remove/anthropic", "token"),
-    ("POST", "/api/auth/test/anthropic", "token"),
     ("GET", "/api/voices/kokoro", "token"),
     ("POST", "/api/voices/kokoro/preview", "token"),
     ("POST", "/api/local/install/start", "token"),
@@ -324,81 +302,6 @@ def _header(headers, name: str) -> str:
     return (value or "").strip()
 
 
-def _key_row(name: str) -> readiness.Row:
-    """Where this provider's key comes from, and a preview safe to display.
-
-    Returned as a `Row` so it can run through readiness' one-in-flight-probe
-    registry (design § Readiness aggregation) — reading a key can block on a
-    macOS keychain dialog, and the portal polls `/api/state`. This is not a
-    status row and never reaches `vocalize status`: `state` carries the
-    `key_source` word and `detail` the masked preview.
-    """
-    source = auth.key_source(None, name)
-    if source == "not found":
-        # key_source flattens "could not look" into "not found"; a locked
-        # keychain must not render every stored key as absent.
-        status, _reason = auth.probe_keychain(name)
-        if status == "error":
-            return readiness.Row(f"key {name}", "error", "keychain unavailable", "")
-    if source == "keychain":
-        key = auth.stored_key(name) or ""
-    elif source in ("environment", ".env file"):
-        key = os.environ.get(auth.PROVIDER_ENV_VARS.get(name, ""), "")
-    else:
-        # "flag" cannot happen here (no flag reaches the portal) and
-        # "not found" has nothing to preview.
-        key = ""
-    # The validation stamp rides in `action`: this is a probe row, never a
-    # status row, and the stamp is read from the item's comment, not its
-    # secret (0.12.0, macOS only; empty elsewhere).
-    stamp = (auth.validated_on(name) or "") if source == "keychain" else ""
-    return readiness.Row(f"key {name}", source, auth.masked(key) if key else "", stamp)
-
-
-def _key_info(row: readiness.Row) -> dict:
-    """`{"source", "masked", "validated"}` from one key probe's row."""
-    if row.state in _KEY_SOURCES:
-        return {"source": row.state, "masked": row.detail or None, "validated": row.action or None}
-    # `_join_probe`'s own row: still-checking means the probe thread is alive
-    # and the next poll may answer. Anything else is a probe that finished
-    # by raising, and a page that renders that as "checking" spins forever.
-    if row.detail == readiness.STILL_CHECKING:
-        return {"source": "checking", "masked": None, "validated": None}
-    return {"source": "error", "masked": None, "validated": None}
-
-
-def _key_states(timeout: float) -> dict[str, dict]:
-    """Every provider's key state, the whole batch inside one `timeout`.
-
-    Through readiness' probe registry, which keeps at most one in-flight
-    probe per name, so a wedged keychain leaks one thread however often the
-    page polls. In one `run_probes` call rather than one call per name:
-    a keychain dialog wedges all three key providers at once, and joining
-    them in turn cost three timeouts on every poll.
-    """
-    names = [
-        name
-        for name in auth.PROVIDER_NAMES
-        if name in auth.PROVIDER_ENV_VARS or name in auth.PROVIDER_USERNAMES
-    ]
-    # The Anthropic slot holds a key without being a voice (auth.KEY_SLOTS).
-    names += [slot for slot in auth.KEY_SLOTS if slot not in names]
-    rows = readiness.run_probes(
-        [(f"key {name}", lambda n=name: _key_row(n)) for name in names], timeout
-    )
-    states = {
-        name: {"source": "not applicable", "masked": None, "validated": None}
-        for name in auth.PROVIDER_NAMES
-    }
-    states.update(zip(names, (_key_info(row) for row in rows)))
-    return states
-
-
-def _key_public(state: dict) -> dict:
-    """The `providers.<name>.key` shape the page has always rendered."""
-    return {"source": state["source"], "masked": state["masked"]}
-
-
 def _fault(exc: BaseException) -> str:
     """The message for a failure we planned for, the type for one we did not.
 
@@ -409,34 +312,18 @@ def _fault(exc: BaseException) -> str:
 
 
 def _add_error(entry: dict, exc: BaseException) -> None:
-    """Record a failure without dropping one already recorded.
-
-    Settings, budget and ledger fail for unrelated reasons and the page
-    needs to see both; `entry["error"] or ...` silently kept the first one
-    and threw the second away.
-    """
+    """Record a local settings error without dropping an earlier one."""
     fault = _fault(exc)
     entry["error"] = f"{entry['error']}; {fault}" if entry["error"] else fault
 
 
-def _provider_state(name: str, file_config: dict, chain: list[str], key: dict) -> dict:
-    """One provider's entry. Nothing in here may raise.
-
-    A hand-edited `[providers.<name>]`, a ledger file someone put a list in,
-    a probe that blew up — each is *that* provider's problem, and none of
-    them may be the traceback that hides every other provider too. So the
-    guards are `Exception`, not `VocalizeError`: the failures that reach the
-    page are exactly the unplanned ones.
-    """
+def _provider_state(name: str, file_config: dict, chain: list[str]) -> dict:
+    """Resolve one local engine independently, so invalid settings do not hide others."""
     entry: dict = {
         "label": auth.PROVIDER_LABELS.get(name, name),
         "in_chain": name in chain,
-        "budget": None,
-        "used": 0,
-        "exhausted": False,
         "settings": None,
         "error": None,
-        "key": key,
     }
     try:
         settings = config.resolve_provider_settings(
@@ -450,14 +337,7 @@ def _provider_state(name: str, file_config: dict, chain: list[str], key: dict) -
             "model": settings.model_id,
             "speed": settings.speed,
             "language": settings.language,
-            "region": settings.region,
-            "profile": settings.profile,
         }
-    try:
-        entry["budget"] = config.budget_for(name, file_config)
-        entry["used"], entry["exhausted"] = ledger.status(name)
-    except Exception as exc:  # noqa: BLE001 — one provider, not the page
-        _add_error(entry, exc)
     return entry
 
 
@@ -487,30 +367,8 @@ def _payload(body: bytes) -> dict:
     return parsed
 
 
-def _slot_or_404(name) -> str:
-    """`name` if it is a slot that stores a key (auth.PROVIDER_USERNAMES: the
-    key-holding voices plus Anthropic), else 404. Never echoed."""
-    if name not in auth.PROVIDER_USERNAMES:
-        raise _Refused(404, f"Unknown key slot. Known: {', '.join(auth.KEY_SLOTS)}")
-    return name
-
-
-def _login_target_or_404(name) -> str:
-    """The login route's allowlist: a chain provider (the local ones and
-    Polly answer with their own refusals below) or the Anthropic slot."""
-    if name not in auth.PROVIDER_NAMES and name not in auth.KEY_SLOTS:
-        raise _Refused(404, f"Unknown provider. Known: {', '.join(auth.CREDENTIAL_CHOICES)}")
-    return name
-
-
 def _provider_or_404(name) -> str:
-    """`name` if it is a provider, else 404. The allowlist is the check.
-
-    The submitted value is never echoed. On the path routes it is already
-    constrained by `_PARAMETERIZED`'s pattern and is visible in the URL
-    anyway; on `/api/auth/login` it comes out of the request body, where a
-    mis-wired form could put the API key in it.
-    """
+    """Allow local engine names only; never echo rejected names."""
     if name not in auth.PROVIDER_NAMES:
         raise _Refused(404, f"Unknown provider. Known: {', '.join(auth.PROVIDER_NAMES)}")
     return name
@@ -571,23 +429,11 @@ def _settings_from(payload: dict) -> dict:
 
 
 def _provider_value(name: str, key: str, value):
-    """One `[providers.<name>]` value, coerced and shape-checked.
-
-    `speed` goes through the CLI's own coercion with the source phrase
-    `resolve_provider_settings` uses, so a bad one reads exactly as it
-    would from a hand-edited file. `monthly_chars` is passed through for
-    `_validate_providers_table` to judge for the same reason. The rest —
-    voice, model, engine, language, region, profile — the CLI never
-    validates at all, so this is the only check they ever get: the
-    submitted value is never echoed back, because there is no length or
-    content bound on what a page can put in one.
-    """
+    """Validate local speed and short printable engine settings before writing."""
     if key == "speed":
         return config._coerce_speed(
             value, f"'speed' in [providers.{name}] in {config.config_path()}"
         )
-    if key == "monthly_chars":
-        return value
     if (
         not isinstance(value, str)
         or len(value) > 200
@@ -675,23 +521,10 @@ def _uv_or_raise(install_module) -> str:
 
 
 def _unavailable_reason(name: str, exc: ProviderUnavailableError) -> str:
-    """One short sentence for the page, by cause, never the module's text.
-
-    The module's message is written for a terminal: three sentences naming
-    commands, flags and environment variables. The page shows the reason
-    beside the voice field, whole, so it gets one line that fits there. The
-    cause is read off the exception chain — `require_key` raises from
-    `MissingAPIKeyError`, Polly's client from `ImportError` — and Polly is
-    the one provider whose remaining cause is AWS credentials.
-    """
-    cause = exc.__cause__
-    if isinstance(cause, MissingAPIKeyError):
-        return "No API key is stored for this provider yet."
-    if isinstance(cause, ImportError):
-        return "This provider's optional package is not installed."
-    if name == "polly":
-        return "No usable AWS credentials were found on this machine."
-    return "This provider is not set up on this machine yet."
+    """A fixed local setup error, without exposing provider diagnostics."""
+    if isinstance(exc.__cause__, ImportError):
+        return "This local engine's optional package is not installed."
+    return "This local engine is not set up on this machine yet."
 
 
 def _voice_list(name: str) -> dict:
@@ -724,7 +557,7 @@ def _voice_list(name: str) -> dict:
             continue
         label = str(entry.get("name") or "").strip() or voice_id
         voices.append({"id": voice_id[:200], "name": label[:200]})
-    return {"voices": voices, "source": "live" if name in LIVE_VOICE_LISTS else "builtin"}
+    return {"voices": voices, "source": "builtin"}
 
 
 class Portal:
@@ -1011,12 +844,6 @@ class Portal:
             return self._answer(lambda: self._provider(name, body))
         if route_path == "/api/stt":
             return self._answer(lambda: self._stt(body))
-        if route_path == "/api/auth/login":
-            return self._answer(lambda: self._login(body))
-        if route_path == "/api/auth/remove/*":
-            return self._answer(lambda: self._remove(name, body))
-        if route_path == "/api/auth/test/*":
-            return self._answer(lambda: self._test_key(name, body))
         if route_path == "/api/voices/*/preview":
             return self._answer(lambda: self._preview(name))
         if route_path == "/api/voices/*":
@@ -1089,17 +916,7 @@ class Portal:
     # --- read-only state ----------------------------------------------
 
     def _state(self):
-        """Everything the page renders, in one poll.
-
-        Nothing here may block: `readiness()` runs each probe on a daemon
-        thread with a timeout and returns a "still checking" row for one
-        that hangs, and the key previews go through the same registry. A
-        wedged keychain therefore costs one warn row, not a dead page.
-
-        Two batches, each bounded by `probe_timeout` however many probes it
-        holds, so a poll against a keychain dialog costs two timeouts and
-        not one per provider.
-        """
+        """Read current local settings and readiness with bounded probes."""
         # Before the parse, never after it. Everything below describes the
         # file as it is right now; a fingerprint taken at the end would
         # describe a file that changed while the probes ran, and the page
@@ -1125,7 +942,6 @@ class Portal:
             config_error = str(exc)
 
         rows = readiness.readiness(file_config, timeout=self.probe_timeout)
-        keys = _key_states(self.probe_timeout)
 
         try:
             chain = config.resolve_chain(None, file_config)
@@ -1145,14 +961,8 @@ class Portal:
                 "chain": chain,
                 "chain_source": chain_source,
                 "providers": {
-                    name: _provider_state(name, file_config, chain, _key_public(keys[name]))
+                    name: _provider_state(name, file_config, chain)
                     for name in auth.PROVIDER_NAMES
-                },
-                # The Keys tab's own listing: every slot that stores a key,
-                # the Anthropic slot included, with the validation stamp.
-                "keys": {
-                    slot: {"label": auth.PROVIDER_LABELS.get(slot, slot), **keys[slot]}
-                    for slot in auth.KEY_SLOTS
                 },
                 "stt": stt,
                 "app": app.status_dict(),
@@ -1274,122 +1084,11 @@ class Portal:
             data.pop("stt", None)
         return self._saved(data, fingerprint)
 
-    def _login(self, body: bytes):
-        """Store an API key. The key never leaves this method.
-
-        Not in the response, not in a header, not in a log — `log_message`
-        writes nothing, so no request line and therefore no query string is
-        ever recorded. Every error message is scrubbed of the key before it
-        goes back, because the messages we did not write quote what they
-        were given: h11's `LocalProtocolError` echoes a whole header value
-        and `list_voices` wraps it verbatim. This route writes no config
-        and so takes no fingerprint.
-        """
-        payload = _payload(body)
-        name = _login_target_or_404(payload.get("provider"))
-        key = payload.get("key")
-        if not isinstance(key, str) or not key:
-            raise _Refused(400, "No API key given — nothing was stored.")
-
-        # The same two refusals `vocalize auth login` makes before it prompts.
-        if name == "polly":
-            raise _Refused(
-                400,
-                "Polly uses your AWS credentials (env, ~/.aws/credentials, or a "
-                "profile) — nothing to store.",
-            )
-        if name not in auth.PROVIDER_USERNAMES:
-            label = auth.PROVIDER_LABELS.get(name, name)
-            raise _Refused(400, f"{label} is local and needs no credentials.")
-
-        try:
-            message = auth.login(key, name)
-        except VocalizeError as exc:
-            # `from None` drops __cause__ — the chain is exactly where a
-            # leaked key would otherwise still be sitting.
-            raise _Refused(400, auth.scrub(str(exc), key)) from None
-        # The remembered voice list was fetched with the old key, and the
-        # page asks again right after a store: that ask must be a fresh call.
-        with self._lock:
-            self._voice_lists.pop(name, None)
-        return self._reply(200, {"ok": True, "message": auth.scrub(message, key)})
-
-    def _remove(self, name: str | None, body: bytes):
-        """Forget a stored key. `delete_key` reads the entry back, so the
-        answer is a fact: a denied or locked keychain is a 400, not a claim.
-        The body carries nothing, but it is parsed like every other write's:
-        a request that is not a JSON object is refused before anything moves."""
-        name = _slot_or_404(name)
-        _payload(body)
-        status, value = auth.probe_keychain(name)  # not stored_key: that flattens "could not look"
-        if status == "error":
-            raise _Refused(
-                400,
-                f"Could not read the keychain ({value}); nothing was removed. Check it "
-                "manually, and rotate the key if you were revoking a leak.",
-            )
-        if value is None:
-            return self._reply(
-                200, {"ok": True, "removed": False, "message": "No key is stored in the keychain for this provider."}
-            )
-        try:
-            auth.delete_key(name)
-        except VocalizeError as exc:
-            raise _Refused(400, str(exc)) from None
-        with self._lock:
-            self._voice_lists.pop(name, None)
-        return self._reply(
-            200, {"ok": True, "removed": True, "message": "Removed the stored API key from the system keychain."}
-        )
-
-    def _test_key(self, name: str | None, body: bytes):
-        """Check a key with the provider and store nothing.
-
-        The same shape check `login` makes runs first, so a control
-        character never reaches a header; every message going back is
-        scrubbed, because the ones we did not write quote what they were
-        given. `valid` is the only verdict; the key is in nothing returned.
-        """
-        name = _slot_or_404(name)
-        payload = _payload(body)
-        key = payload.get("key")
-        if not isinstance(key, str) or not key:
-            raise _Refused(400, "No API key given — nothing was tested.")
-        try:
-            auth._check_shape(key)
-        except VocalizeError as exc:
-            raise _Refused(400, auth.scrub(str(exc), key)) from None
-        label = auth.PROVIDER_LABELS.get(name, name)
-        try:
-            auth.validate_key(key, name)
-        except (ProviderTransientError, ProviderUnavailableError) as exc:
-            # The check did not happen: not a verdict on the key.
-            raise _Refused(
-                502, auth.scrub(f"Could not reach {label} to check the key: {exc}", key)
-            ) from None
-        except VocalizeError as exc:
-            return self._reply(
-                200, {"ok": True, "valid": False, "message": auth.scrub(str(exc), key)}
-            )
-        return self._reply(
-            200, {"ok": True, "valid": True, "message": f"{label} accepted the key. Nothing was stored."}
-        )
-
     # --- preview ------------------------------------------------------
 
     def _preview(self, name: str | None):
-        """Speak the fixed sentence through one provider, return the bytes.
-
-        Through `chain.run` with the provider forced, exactly as `vocalize
-        speak --provider` does, so the budget gate, the ledger and the
-        audio cache all apply — a capped provider is refused here in the
-        same words as in a terminal, and a repeat click is a cache hit.
-        `run` never plays: it returns the audio, and the browser plays it
-        from a Blob. That is the one sound in this project that does not
-        take the machine-wide playback lock (design § Playback).
-        """
+        """Render a fixed sentence locally and return audio for browser playback."""
         from . import chain as chain_module
-        from . import providers as providers_module
 
         _provider_or_404(name)
         # A fresh read, never a snapshot: `/api/state` re-reads the file on
@@ -1402,16 +1101,6 @@ class Portal:
         if not _preview_lock.acquire(timeout=PREVIEW_WAIT):
             raise _Refused(503, "A preview is already running. Try again in a moment.")
         try:
-            try:
-                # The gate `chain.run` runs anyway, called first so a
-                # refusal can be told apart from a provider that broke:
-                # same call and same words, but a 402 rather than one line
-                # of a multi-provider failure report.
-                chain_module._budget_gate(
-                    name, providers_module.get(name), PREVIEW_TEXT, file_config
-                )
-            except ProviderError as exc:
-                return self._reply(402, {"error": str(exc)})
             try:
                 audio, _spoken, ext = chain_module.run(
                     PREVIEW_TEXT,
@@ -1438,35 +1127,9 @@ class Portal:
     # --- voice lists --------------------------------------------------
 
     def _voices(self, name: str | None):
-        """One provider's voices, listed once and remembered.
-
-        Through readiness' probe registry rather than inline: a listing is
-        a keychain read and then a network call, either of which can hang,
-        and the registry is what already bounds a hang on this server — a
-        daemon thread joined against `probe_timeout`, and one in-flight
-        thread per name, so a request arriving while an earlier listing is
-        still running joins that thread instead of opening a second
-        connection. The probe's exception text goes nowhere: the registry
-        keeps the type name only, and this route answers a fixed line.
-
-        The per-provider lock makes check-then-list atomic, so two requests
-        cannot both find the cache empty and both start. Its wait is
-        bounded by the holder's own budget; the acquire timeout is the belt
-        to that pair of braces. The budget is `probe_timeout` for a live
-        list — a network call, the same bound the state probes get — and at
-        least `BUILTIN_VOICES_TIMEOUT` for an offline one, which is a
-        subprocess or a manifest read and is slower than the network budget
-        allows (see the constant).
-
-        A list, once fetched, is kept for the life of this object and a
-        cache hit says "cached" where the list was "live". "unavailable" is
-        not kept: it is the state before a key is stored, and it should
-        clear when one is — so it is evicted before the next ask.
-        """
+        """Cache local voice lists, serialize requests per engine, and bound slow probes."""
         _provider_or_404(name)
-        budget = self.probe_timeout
-        if name not in LIVE_VOICE_LISTS:
-            budget = max(budget, BUILTIN_VOICES_TIMEOUT)
+        budget = max(self.probe_timeout, BUILTIN_VOICES_TIMEOUT)
         lock = self._voice_locks[name]
         if not lock.acquire(timeout=budget):
             return self._reply(502, {"error": VOICES_FAILED})
@@ -1477,8 +1140,7 @@ class Portal:
                     del self._voice_lists[name]
                     known = None
             if known is not None:
-                source = "cached" if known["source"] == "live" else known["source"]
-                return self._reply(200, {**known, "source": source})
+                return self._reply(200, known)
 
             def probe() -> readiness.Row:
                 listed = _voice_list(name)

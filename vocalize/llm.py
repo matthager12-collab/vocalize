@@ -1,49 +1,21 @@
-"""Language-model calls for dictation cleanup and note summaries.
+"""On-device language-model transcript cleanup. No hosted inference.
 
-One seam, three backends. `_complete` is the only place the backends are
-named, so the data-boundary sentence, the per-feature limits, the egress
-line and the Anthropic budget exist exactly once:
-
-* `claude-cli` — `claude -p` on the owner's Claude Code subscription. Tools
-  denied with a wildcard, no MCP server, no user- or project-scope settings
-  (`--setting-sources ""`: this Mac's own hooks must not run inside a
-  session whose input is microphone-captured text), run from the system
-  temporary directory, and with every `ANTHROPIC_*` variable removed from
-  the environment so a stored API key can never bill through the
-  subscription path. Claude Code still logs the run in its own history —
-  the price of this backend, stated in docs/dictation.md.
-* `anthropic` — the Messages API over `providers._http`, with a stored key,
-  a monthly character budget and the ledger.
-* `local` — the on-device model; it arrives in 0.14.0 and is refused here
-  with a message naming that release, so a newer config never breaks an
-  older binary.
-
-The text under work is DATA: it travels on stdin or in a request body,
-never in an argument list, and the prompt says so once. Model output is
-untrusted text on its way to a clipboard or a file, so it goes through
-`dictate.sanitize` before anyone sees it.
+Text is data on a private local socket or worker stdin, never a shell command.
+The local model has no tool execution capability. Failures retain raw text.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 
-from . import config, ledger
-from .exceptions import (
-    MissingAPIKeyError,
-    ProviderAuthError,
-    ProviderTransientError,
-    VocalizeError,
-)
-from .providers import _http
+from .exceptions import ConfigError
 
-BACKENDS = ("off", "local", "claude-cli", "anthropic")
-CLOUD_BACKENDS = ("claude-cli", "anthropic")
+BACKENDS = ("off", "local")
 
 # Appended once, by `_complete`, to every prompt on every backend.
 DATA_BOUNDARY = (
@@ -81,44 +53,18 @@ VERBATIM_PROMPT = (
 )
 VERBATIM_KEYWORD = "verbatim"
 
-# (timeout seconds, max_tokens) per feature, not per backend: a twenty-second
-# dictation and an hour-long transcript are different jobs.
-_LIMITS = {"cleanup": (300, 4096), "notes": (1800, 8192)}
+# (timeout seconds, max_tokens) per feature, not per backend.
+_LIMITS = {"cleanup": (300, 4096)}
 MAX_TIMEOUT = _LIMITS["cleanup"][0]  # dictate._FINISH_TIMEOUT sums this
 
-ANTHROPIC_MODEL = "claude-haiku-4-5"  # one constant: cost, not capability
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
-ANTHROPIC_VERSION = "2023-06-01"
-
-_CLAUDE_INSTRUCTION = "Process the text below."
-_CLAUDE_FLAGS = (
-    "--disallowedTools", "*",
-    "--strict-mcp-config",  # no MCP server starts for dictated text (DEC-014)
-    "--setting-sources", "",  # nor this user's hooks, skills or CLAUDE.md (review R3)
-)
-# A stored API key must never reach `claude -p`: with one of these set,
-# Claude Code bills the key instead of the subscription and the ledger
-# never sees it.
-_STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
-
 LOCAL_NOT_INSTALLED = 'local model not installed — run: vocalize local install --llm'
-
-# The one seam the tests swap for the claude-cli backend.
-RUN_SEAM = subprocess.run
-
-
-def egress(destination: str) -> None:
-    """The only writer of the line that says text left the machine."""
-    print(f"vocalize: sent to {destination}", file=sys.stderr)
-
 
 def _skipped(feature: str, reason: str) -> None:
     """A fixed word or an exception's class name; never a body or output."""
     print(f"vocalize: {feature} skipped ({reason})", file=sys.stderr)
 
 
-# --- the two jobs -------------------------------------------------------
+# --- the job ----------------------------------------------------------
 
 
 def strip_verbatim_keyword(text: str) -> tuple[str, bool]:
@@ -170,12 +116,19 @@ def _words(text: str) -> list[str]:
 # Spoken words a cleanup legitimately turns into symbols or drops.
 _FILLERS = frozenset(["um", "uh", "er", "ah", "like", "know", "so", "well", "okay", "at", "dot"])
 _CORRECTIONS = ("i mean", "sorry", "actually", "wait", "scratch that", "or rather", ", no,")
+# An aggregate overlap score can accept dropping one decisive qualifier,
+# especially when self-correction permits removing much of the source. Keep
+# these finite lexical qualifiers even then. Ambiguous corrections fall back
+# to raw text; this is not a semantic-equivalence proof or a prompt fix.
+_MEANING_QUALIFIERS = frozenset({"now", "still", "already", "yet", "soon", "probably", "perhaps", "maybe"})
 
 
 def faithful(raw: str, cleaned: str) -> bool:
     """Reject cleanup output that adds words, drops a negation, or drops
     most of what was said: that is an obeyed instruction, not a cleanup."""
     source, result = _words(raw), _words(cleaned)
+    if not (set(source) & _MEANING_QUALIFIERS).issubset(result):
+        return False
     corrected = any(marker in raw.lower() for marker in _CORRECTIONS)
     negations = ("not", "never")
     if not corrected and sum(w in negations for w in result) < sum(w in negations for w in source):
@@ -205,27 +158,15 @@ def faithful(raw: str, cleaned: str) -> bool:
     return True
 
 
-def summarize(text: str, template_text: str, backend: str) -> str | None:
-    """A note body for a transcript, or None. The caller keeps the transcript."""
-    from .dictate import sanitize
-
-    out = _complete(template_text, text, feature="notes", backend=backend)
-    if out is None:
-        return None
-    return sanitize(out) or None
-
-
 # --- the seam -----------------------------------------------------------
 
 
 def _guarded(feature: str, call):
     """Run a backend. Anything it raises keeps the raw text.
 
-    Both backends are narrower than the promise `cleanup_transcript` makes,
-    and an exception escaping this module reaches `dictate._stop`, whose
-    `finally` discards the recording — a failed cleanup must never cost the
-    user their take. Only the class name is reported: a message here can
-    carry the API key the transport was handed.
+    A worker failure must never cost the user the raw transcript. Only
+    the exception class is reported; diagnostic messages can contain private
+    transcript text or environment data.
     """
     try:
         return call()
@@ -236,47 +177,13 @@ def _guarded(feature: str, call):
 
 
 def _complete(system: str, text: str, *, feature: str, backend: str) -> str | None:
-    """Run `text` through `backend` under `system`. None means "keep the raw text".
-
-    The backend is checked for usability *before* the egress line, so
-    "vocalize: sent to …" precedes only a real send.
-    """
-    if backend == "off" or backend not in BACKENDS:
+    """Only explicit local/off backends can reach inference."""
+    if backend not in BACKENDS:
+        raise ConfigError("Unsupported inference backend; choose local or off")
+    if backend == "off":
         return None
     timeout, max_tokens = _LIMITS[feature]
     system = system.rstrip() + "\n\n" + DATA_BOUNDARY
-
-    if backend == "claude-cli":
-        claude = _claude_bin()
-        if not claude:
-            _skipped(feature, "claude is not installed")
-            return None
-        egress(backend)
-        return _guarded(feature, lambda: _claude_cli(claude, system, text, timeout))
-
-    if backend == "anthropic":
-        try:
-            key = config.resolve_provider_key("anthropic")
-        except MissingAPIKeyError:
-            _skipped(feature, "no Anthropic key")
-            return None
-        used, exhausted = ledger.status("anthropic")
-        budget = config.budget_for("anthropic") or 0
-        if exhausted or used + len(text) > budget:
-            print(
-                f"vocalize: anthropic budget reached ({used:,}/{budget:,} characters "
-                f"this month); {feature} skipped",
-                file=sys.stderr,
-            )
-            return None
-        egress(backend)
-        # The budget measures what left the Mac, so it is spent here rather
-        # than on a reply: a failing or rate-limited endpoint would otherwise
-        # never advance it and could be sent take after take.
-        ledger.record("anthropic", len(text))
-        return _guarded(
-            feature, lambda: _anthropic(key, system, text, timeout, max_tokens, feature)
-        )
 
     # --- local: the on-device model, no egress ---------------------------
     from .local import install as install_module
@@ -288,140 +195,85 @@ def _complete(system: str, text: str, *, feature: str, backend: str) -> str | No
     if not ready:
         _skipped(feature, LOCAL_NOT_INSTALLED)
         return None
-    # No egress() call: local means nothing left the machine.
+    # No network or credential resolver exists in this module.
     return _guarded(
         feature, lambda: _local(system, text, timeout, max_tokens, warm_ok=(feature == "cleanup"))
     )
 
 
-# --- claude -p -----------------------------------------------------------
-
-
-def _claude_bin() -> str | None:
-    """Claude's path. `CLAUDE_BIN` is baked in by the Quick Action installer,
-    because a Services environment has almost nothing on PATH."""
-    return os.environ.get("CLAUDE_BIN", "").strip() or shutil.which("claude")
-
-
-def _claude_env() -> dict:
-    env = dict(os.environ)
-    extra = os.environ.get("CLAUDE_EXTRA_PATH", "").strip()
-    if extra:
-        env["PATH"] = extra + os.pathsep + env.get("PATH", "")
-    for name in _STRIP_ENV:
-        env.pop(name, None)
-    return env
-
-
-def _claude_cli(claude: str, system: str, text: str, timeout: float) -> str | None:
-    """The rules travel as an appended system prompt. The user turn is one
-    fixed sentence (`_CLAUDE_INSTRUCTION`) plus the text on stdin — the
-    content shares that turn, so the system prompt is what says it is data."""
-    argv = [
-        claude, "-p", _CLAUDE_INSTRUCTION,
-        "--append-system-prompt", system,
-        "--model", "haiku",
-        *_CLAUDE_FLAGS,
-    ]
-    try:
-        result = RUN_SEAM(
-            argv, input=text, capture_output=True, text=True,
-            timeout=timeout, env=_claude_env(), check=False,
-            cwd=tempfile.gettempdir(),  # never the caller's project directory
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    out = (result.stdout or "").strip()
-    return out or None
-
-
-# --- the Anthropic API ---------------------------------------------------
-
-
-def _anthropic_headers(key: str) -> dict:
-    return {
-        "x-api-key": key,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "content-type": "application/json",
-    }
-
-
-def _anthropic(key, system, text, timeout, max_tokens, feature) -> str | None:
-    body = json.dumps({
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": text}],
-    }).encode("utf-8")
-    try:
-        status, raw = _http.request(
-            "POST", ANTHROPIC_URL, headers=_anthropic_headers(key), body=body,
-            timeout=timeout, provider="anthropic",
-        )
-    except VocalizeError as exc:
-        _skipped(feature, type(exc).__name__)
-        return None
-    if status != 200:
-        _skipped(feature, f"HTTP {status}")  # the body is untrusted text; never echoed
-        return None
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        _skipped(feature, "unreadable reply")
-        return None
-    out = "".join(
-        block.get("text", "") for block in data.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    ).strip()
-    stop = data.get("stop_reason")
-    if stop != "end_turn":
-        # A truncated cleanup would lose the speaker's words; a truncated
-        # summary is still a summary, and says so.
-        if feature == "notes" and out:
-            print("vocalize: summary truncated", file=sys.stderr)
-            return out
-        _skipped(feature, f"stop_reason {stop}" if stop in {
-            "max_tokens", "stop_sequence", "refusal", "pause_turn", "tool_use"
-        } else "stop_reason unexpected")
-        return None
-    return out or None
-
-
-def validate_anthropic_key(key: str) -> None:
-    """The cheapest authenticated call that proves the key works. The body
-    is never read — one fewer place a stray key echo could reach."""
-    status, _ = _http.request(
-        "GET", ANTHROPIC_MODELS_URL, headers=_anthropic_headers(key), provider="anthropic",
-    )
-    if status == 200:
-        return
-    if status in (401, 403):
-        raise ProviderAuthError("anthropic", "the API refused this key")
-    raise ProviderTransientError("anthropic", f"HTTP {status} while checking the key")
-
-
-# --- the local model ----------------------------------------------------
-
-
-# A warm cleanup that has not answered in this long is not going to; the
-# one-shot fallback then gets the whole feature timeout of its own.
 _WARM_CLEANUP_CAP = 60
+_LOCAL_REAP_TIMEOUT = 5
+# speak_options is also a standalone script, so it repeats this private name.
+_SUMMARY_GROUP_OWNER = "_VOCALIZE_SUMMARY_GROUP_OWNER"
+
+
+def _summary_owns_group() -> bool:
+    """Only the helper's direct, isolated CLI may share its cleanup group.
+
+    The marker names the helper, not a public option to disable cleanup. It is
+    not forwarded to workers. Both leader checks exclude inherited markers in
+    ordinary shells and subprocesses.
+    """
+    return (
+        os.environ.get(_SUMMARY_GROUP_OWNER) == str(os.getppid())
+        and os.getpgrp() == os.getpid()
+        and os.getsid(0) == os.getpid()
+    )
+
+
+def _run_local_worker(argv, *, input, timeout, env, cwd, **_run_options):
+    """Run one uv worker, owning its descendants unless Quick Action does.
+
+    A successful launcher can still leave a worker behind. Always close the
+    owned group, including on interruption, without draining child-held pipes.
+    """
+    managed = _summary_owns_group()
+    process = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, cwd=cwd, start_new_session=not managed,
+    )
+    try:
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    finally:
+        if managed:
+            # The outer helper kills this CLI's entire group before returning
+            # or starting fallback speech. Do not detach from that group or
+            # kill our own CLI here, which would defeat its failure handling.
+            process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=_LOCAL_REAP_TIMEOUT)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
 # The seam the tests swap for the local backend.
-LOCAL_RUN_SEAM = subprocess.run
+LOCAL_RUN_SEAM = _run_local_worker
 
 
 def _local(system: str, text: str, timeout: float, max_tokens: int, *,
            warm_ok: bool = False) -> str | None:
-    """Run the on-device LLM via ``uv run --offline``.
+    """Run the on-device LLM in an explicit runtime or legacy offline uv.
 
     The request goes on stdin as JSON; the transcript never appears in
     argv.  The environment carries the offline flags the spike confirmed.
     """
     from . import local as local_module
-    from .local import llm_manifest
+    from .local import llm_manifest, runtime
+
+    try:
+        selected = runtime.selection(llm_manifest.RUNTIME_PACKAGE)
+    except runtime.RuntimeSelectionError:
+        return None
 
     if warm_ok:
         try:
@@ -430,6 +282,7 @@ def _local(system: str, text: str, timeout: float, max_tokens: int, *,
             fingerprint = warm_protocol.fingerprint(
                 llm_manifest.worker_path(), llm_manifest.RUNTIME_PACKAGE,
                 llm_manifest.MODEL_DIR / "model.safetensors",
+                runtime_identity=selected.identity if selected else None,
             )
             reply = warm.request("llm", {
                 "op": "complete", "system": system, "text": text,
@@ -441,20 +294,19 @@ def _local(system: str, text: str, timeout: float, max_tokens: int, *,
         except Exception:  # noqa: BLE001, S110 -- preserve the existing one-shot fallback
             pass
 
-    uv = local_module.uv_path()
-    if not uv:
+    try:
+        argv = runtime.command(
+            llm_manifest, [None if selected else local_module.uv_path(), *llm_manifest.runtime_argv()], selected,
+        )
+    except runtime.RuntimeSelectionError:
         return None
-
-    argv = [uv, *llm_manifest.runtime_argv()]
     request = json.dumps({
         "system": system,
         "text": text,
         "max_tokens": max_tokens,
     })
 
-    env = dict(os.environ)
-    env["HF_HUB_OFFLINE"] = "1"
-    env["TRANSFORMERS_OFFLINE"] = "1"
+    env = runtime.environment(selected)
 
     try:
         result = LOCAL_RUN_SEAM(

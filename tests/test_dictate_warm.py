@@ -112,6 +112,7 @@ def test_specs_keep_runtime_bounds_offline_env_and_fingerprints(models, tmp_path
     specs = dictate._warm_specs(stt(cleanup="local", warm_minutes=15), base=tmp_path)
     assert [spec[0] for spec in specs] == ["whisper", "llm"]
     for kind, argv, env, fingerprint in specs:
+        assert "--offline" in argv and "--no-python-downloads" in argv
         assert argv[argv.index("--socket") + 1] == str(tmp_path / f"{kind}.sock")
         assert argv[argv.index("--warm-seconds") + 1] == "900"
         assert argv[argv.index("--abandon-seconds") + 1] == "1860"
@@ -123,7 +124,7 @@ def test_specs_keep_runtime_bounds_offline_env_and_fingerprints(models, tmp_path
             assert "--offline" in argv
             assert env["HF_HUB_OFFLINE"] == env["TRANSFORMERS_OFFLINE"] == "1"
         else:
-            assert env is None
+            assert env["HF_HUB_OFFLINE"] == env["TRANSFORMERS_OFFLINE"] == "1"
             assert argv[argv.index("--beam-size") + 1] == "5"
 
 
@@ -178,15 +179,13 @@ def test_every_exit_releases_original_nonce(session, harness, monkeypatch, warm_
         assert harness.clipboard() == ""
 
 
-def test_cleanup_uses_warm_but_notes_never_do(models, monkeypatch):
+def test_cleanup_uses_warm(models, monkeypatch):
     requests, runs = [], []
     monkeypatch.setattr(warm, "request", lambda *a, **kw: requests.append((a, kw)) or {"ok": True, "text": TRANSCRIPT})
     monkeypatch.setattr(llm, "LOCAL_RUN_SEAM", lambda *a, **kw: runs.append((a, kw)) or subprocess.CompletedProcess(a, 0, json.dumps({"ok": True, "text": TRANSCRIPT})))
     assert llm.cleanup_transcript(TRANSCRIPT, "local") == (TRANSCRIPT, True)
     assert len(requests) == 1 and runs == []
     assert requests[0][0][1]["system"] == llm.CLEANUP_PROMPT.rstrip() + "\n\n" + llm.DATA_BOUNDARY
-    assert llm.summarize(TRANSCRIPT, "Summarize", "local") == TRANSCRIPT
-    assert len(requests) == 1 and len(runs) == 1
     llm._local("system", TRANSCRIPT, 10, 4096, warm_ok=True)
     assert requests[-1][0][1]["max_tokens"] == 1024
 

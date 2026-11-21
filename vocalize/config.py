@@ -1,14 +1,8 @@
-"""Configuration loading: API key resolution, config file, and defaults.
+"""Local-only configuration.
 
-API key resolution order (first one found wins):
-  1. --api-key flag passed explicitly on the CLI
-  2. ELEVENLABS_API_KEY environment variable
-  3. A .env file in the current directory (loaded via python-dotenv,
-     if it's installed — this is an optional dependency)
-  4. The OS keychain, written by `vocalize auth login`
-
-Voice, model and speed are resolved per setting, in this order:
-  CLI flag > environment variable > config file > built-in default
+Voice/model/speed precedence is flag, environment, provider table, default.
+Settings retired with the cloud providers and the summaries are ignored with
+one stderr notice each (DEC-005); a malformed value for a live key is an error.
 """
 
 from __future__ import annotations
@@ -20,34 +14,30 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import auth
-from .exceptions import ConfigError, MissingAPIKeyError
+from .exceptions import ConfigError
 
-DEFAULT_VOICE = "21m00Tcm4TlvDq8ikWAM"  # "Rachel" — a stock ElevenLabs voice
-DEFAULT_MODEL = "eleven_multilingual_v2"
-DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
+DEFAULT_VOICE = "af_heart"
+DEFAULT_MODEL = ""
+DEFAULT_OUTPUT_FORMAT = "wav"
 
-# The range the ElevenLabs API accepts; 1.0 is normal speed.
+# Supported speech speed range; 1.0 is normal speed.
 SPEED_MIN = 0.7
 SPEED_MAX = 1.2
 
 KNOWN_CONFIG_KEYS = (
-    "voice", "model", "speed", "max_chars", "overflow", "chain", "providers", "stt", "notes", "app", "speech",
+    "max_chars", "overflow", "chain", "providers", "stt", "transcribe", "notes", "app", "speech",
 )
 
 # Keys inside a [providers.<name>] table that become a request field or an
 # argument: short printable strings, or the file is refused (issue #5).
-PROVIDER_TEXT_KEYS = ("voice", "model", "engine", "language", "region", "profile")
+PROVIDER_TEXT_KEYS = ("voice", "model", "language")
 PROVIDER_TEXT_MAX_CHARS = 128
 
 # Keys allowed inside a [providers.<name>] table.
 KNOWN_PROVIDER_KEYS = (
     "voice",
     "model",
-    "engine",
     "language",
-    "region",
-    "profile",
-    "monthly_chars",
     "speed",
 )
 
@@ -56,6 +46,7 @@ OVERFLOW_MODES = ("truncate", "ask", "never")
 
 # Keys allowed inside the [stt] table (DEC-006, design § [stt] config table).
 KNOWN_STT_KEYS = (
+    "engine",
     "model",
     "language",
     "input_device",
@@ -73,16 +64,21 @@ KNOWN_STT_KEYS = (
 
 # Where a dictation's cleanup pass runs. `off` is the default: a press must
 # never surprise with a pause or reworded text. `local` runs the cleanup
-# pass on this Mac. A legacy bool is coerced: true was `claude -p`, false
-# was off.
-STT_CLEANUP_BACKENDS = ("off", "local", "claude-cli", "anthropic")
+# pass on this Mac. Legacy true and the hosted backends become off with a
+# notice (DEC-005); false stays off.
+STT_CLEANUP_BACKENDS = ("off", "local")
 
 # What `cues` may be: the fixed system sounds, spoken words instead, or both.
 STT_CUE_MODES = ("sounds", "words", "both")
 
 # `paste` was reserved by DEC-006 and did nothing through 0.13.0; from
 # 0.13.1 `dictate._stop` honours it (design § Auto-paste).
+# "auto" uses Parakeet on an Apple Silicon Mac where it is installed and
+# whisper everywhere else; "parakeet" and "whisper" pin one engine.
+STT_ENGINES = ("auto", "parakeet", "whisper")
+
 STT_DEFAULTS = {
+    "engine": "auto",
     # turbo q5_0: the first model that kept "the merge" as two words on the
     # owner's voice (issue #4), no slower than small.en on an M4 and only
     # ~90 MB more resident. small.en stays the lighter choice for a slow Mac.
@@ -143,53 +139,6 @@ def vocabulary_prompt(items) -> str:
 DEFAULT_CHAIN = ("kokoro", "say")
 
 
-def _load_dotenv_if_present() -> None:
-    try:
-        from dotenv import load_dotenv  # type: ignore
-    except ImportError:
-        return
-    # Explicit path, not dotenv's default search: bare load_dotenv() walks
-    # up from the install directory, so a console-script install would miss
-    # the user's project .env and could pick up an unrelated one.
-    load_dotenv(dotenv_path=Path.cwd() / ".env")
-
-
-def resolve_provider_key(provider: str, explicit: str | None = None) -> str:
-    """Find `provider`'s API key: flag, env var, .env, then the keychain.
-
-    The keychain comes last on purpose: a project that pins its own key in
-    a .env file must not be overridden by a machine-wide stored one.
-
-    Providers with no key slot at all (Polly authenticates through boto3,
-    `say` needs nothing) fall straight through to MissingAPIKeyError,
-    whose message names the right command for the provider.
-
-    Raises MissingAPIKeyError if none is found.
-    """
-    if explicit:
-        return explicit
-
-    _load_dotenv_if_present()
-
-    env_var = auth.PROVIDER_ENV_VARS.get(provider)
-    if env_var:
-        key = os.environ.get(env_var)
-        if key:
-            return key
-
-    if provider in auth.PROVIDER_USERNAMES:
-        key = auth.stored_key(provider)
-        if key:
-            return key
-
-    raise MissingAPIKeyError(provider)
-
-
-def resolve_api_key(explicit: str | None = None) -> str:
-    """The ElevenLabs key. Kept as the name every existing caller uses."""
-    return resolve_provider_key("elevenlabs", explicit)
-
-
 #: Config warnings already printed. The portal re-reads and re-validates the
 #: file on every `/api/state` poll, so without this one typo writes a stderr
 #: line every few seconds for the life of the process — burying the two
@@ -210,6 +159,132 @@ def config_path() -> Path:
     """Path of the optional TOML config file."""
     base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
     return Path(base) / "vocalize" / "config.toml"
+
+
+# --- retired settings (DEC-005) ------------------------------------------
+#
+# A 0.15 file keeps working: each retired key is ignored with one notice on
+# stderr (stdout is parsed by the menu-bar app), and the next save drops it.
+# A notice names the key path and what to do, never the value, because an
+# old file can hold an API key.
+
+CLOUD_PROVIDER_NAMES = ("elevenlabs", "openai", "google", "polly")
+
+_REMOVE_IT = "nothing leaves this Mac any more; delete it"
+_RETIRED_ROOT_KEYS = {
+    "voice": "set voice in a [providers.kokoro], [providers.piper] or [providers.say] table",
+    "model": "set model in a [providers.kokoro], [providers.piper] or [providers.say] table",
+    "speed": "set speed in a [providers.kokoro], [providers.piper] or [providers.say] table",
+    "api_key": _REMOVE_IT,
+    "api-key": _REMOVE_IT,
+    "endpoint": _REMOVE_IT,
+    "base_url": _REMOVE_IT,
+}
+_RETIRED_PROVIDER_KEYS = (
+    "api_key", "key", "base_url", "endpoint", "region", "profile", "monthly_chars", "engine",
+)
+_RETIRED_TRANSCRIBE_KEYS = ("template", "summarizer")
+_HOSTED_CLEANUP = ("claude-cli", "anthropic")
+
+
+def _migrate(data) -> tuple[dict, list[str]]:
+    """A copy of `data` with retired settings removed, and one notice per key.
+
+    Pure: prints nothing. Values that still have a local meaning migrate:
+    a chain loses its cloud engines (the default chain if none is left),
+    and a hosted dictation cleanup becomes `off`, never `local`.
+    """
+    if not isinstance(data, dict):
+        raise ConfigError("Configuration must be a table")
+    path = config_path()
+    clean = dict(data)
+    notices: list[str] = []
+
+    def retire(key_path: str, advice: str) -> None:
+        notice = f"vocalize: ignoring retired setting {key_path} in {path}: {advice}."
+        if notice not in notices:
+            notices.append(notice)
+
+    for key, advice in _RETIRED_ROOT_KEYS.items():
+        if key in clean:
+            del clean[key]
+            retire(key, advice)
+
+    chain = clean.get("chain")
+    if isinstance(chain, list):
+        kept = [name for name in chain if name not in CLOUD_PROVIDER_NAMES]
+        for name in CLOUD_PROVIDER_NAMES:
+            if name in chain:
+                retire(f"chain entry {name!r}", "cloud engines were removed; it is skipped")
+        if not kept:
+            del clean["chain"]  # the default chain applies
+        elif len(kept) != len(chain):
+            clean["chain"] = kept
+
+    tables = clean.get("providers")
+    if isinstance(tables, dict):
+        kept_tables = {}
+        for name, table in tables.items():
+            if name in CLOUD_PROVIDER_NAMES:
+                retire(f"[providers.{name}]", "cloud engines were removed; delete the table")
+                continue
+            if name in auth.PROVIDER_NAMES and isinstance(table, dict):
+                table = dict(table)
+                for key in _RETIRED_PROVIDER_KEYS:
+                    if key in table:
+                        del table[key]
+                        retire(f"providers.{name}.{key}", _REMOVE_IT)
+            kept_tables[name] = table
+        clean["providers"] = kept_tables
+
+    stt = clean.get("stt")
+    if isinstance(stt, dict) and "cleanup" in stt:
+        cleanup = stt["cleanup"]
+        if cleanup is True or (isinstance(cleanup, str) and cleanup in _HOSTED_CLEANUP):
+            clean["stt"] = {**stt, "cleanup": "off"}
+            retire(
+                "stt.cleanup",
+                "hosted cleanup was removed, so cleanup is off; set it to \"local\" "
+                "to clean up on this Mac",
+            )
+
+    for section in ("notes", "transcribe"):
+        table = clean.get(section)
+        if isinstance(table, dict) and any(key in table for key in _RETIRED_TRANSCRIBE_KEYS):
+            table = dict(table)
+            for key in _RETIRED_TRANSCRIBE_KEYS:
+                if key in table:
+                    del table[key]
+                    retire(f"{section}.{key}", "summaries were removed; delete it")
+            clean[section] = table
+
+    return clean, notices
+
+
+def retired_notices(data) -> list[str]:
+    """The notices `data` would print for its retired settings, without printing."""
+    return _migrate(data)[1]
+
+
+def without_retired_settings(data) -> dict:
+    """`data` without its retired settings, printing nothing (for the writer)."""
+    return _migrate(data)[0]
+
+
+def migrate_retired_settings(data) -> dict:
+    """`data` without its retired settings; each notice printed once per process."""
+    clean, notices = _migrate(data)
+    for notice in notices:
+        _warn(notice)
+    return clean
+
+
+def reject_retired_settings(data) -> None:
+    """Kept for callers of the 0.15 name: warns instead of refusing (DEC-005).
+
+    Raises ConfigError only for a value that is not a table at all.
+    """
+    migrate_retired_settings(data)
 
 
 def load_config_file() -> dict:
@@ -235,6 +310,8 @@ def load_config_file() -> dict:
     except OSError as exc:
         raise ConfigError(f"Could not read config file {path}: {exc}") from exc
 
+    data = migrate_retired_settings(data)
+
     for key in data:
         if key not in KNOWN_CONFIG_KEYS:
             _warn(f"vocalize: unknown config key {key!r} in {path}")
@@ -245,8 +322,9 @@ def load_config_file() -> dict:
         _validate_providers_table(data["providers"], path)
     if "stt" in data:
         _validate_stt_table(data["stt"], path)
-    if "notes" in data:
-        _validate_notes_table(data["notes"], path)
+    for section in ("notes", "transcribe"):
+        if section in data:
+            _validate_transcribe_table(data[section], path, section)
     if "app" in data:
         _validate_app_table(data["app"], path)
     if "speech" in data:
@@ -277,37 +355,23 @@ def _validate_chain(value, path: Path) -> None:
         seen.add(name)
 
 
-def _validate_monthly_chars(value, provider_name: str, path: Path) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ConfigError(
-            f"Invalid monthly_chars {value!r} for provider {provider_name!r} in {path}: "
-            f"expected a non-negative integer."
-        )
-
-
 def _validate_providers_table(value, path: Path) -> None:
     if not isinstance(value, dict) or not all(isinstance(table, dict) for table in value.values()):
         raise ConfigError("config key 'providers' must be a table of provider tables")
 
     for name, table in value.items():
-        if name not in auth.PROVIDER_NAMES and name not in auth.KEY_SLOTS:
-            _warn(
-                f"vocalize: unknown provider {name!r} under 'providers' in {path}. "
-                f"Known: {', '.join(auth.PROVIDER_NAMES + ('anthropic',))}"
-            )
+        _validate_provider_name(name, "provider table")
         for key, val in table.items():
             if key not in KNOWN_PROVIDER_KEYS:
                 _warn(
                     f"vocalize: unknown config key {key!r} in [providers.{name}] in {path}"
                 )
-            if key == "monthly_chars":
-                _validate_monthly_chars(val, name, path)
-            elif key in PROVIDER_TEXT_KEYS:
+            if key in PROVIDER_TEXT_KEYS:
                 _validate_provider_text(key, val, name, path)
 
 
 def _validate_provider_text(key: str, val, name: str, path: Path) -> None:
-    """A provider's voice, model, engine, language, region or profile is a
+    """A provider's voice, model or language is a
     short printable string: it becomes a request field or an argument, so
     an int, a table or a flag-shaped value is refused, not passed along."""
     if (
@@ -339,6 +403,12 @@ def _validate_stt_table(value, path: Path) -> None:
     for key in value:
         if key not in KNOWN_STT_KEYS:
             _warn(f"vocalize: unknown config key {key!r} in [stt] in {path}")
+
+    engine = value.get("engine")
+    if engine is not None and engine not in STT_ENGINES:
+        raise ConfigError(
+            f"Invalid stt.engine {engine!r} in {path}. Known: {', '.join(STT_ENGINES)}"
+        )
 
     model = value.get("model")
     if model is not None and model not in whisper_manifest.MODELS:
@@ -404,10 +474,10 @@ def _validate_stt_table(value, path: Path) -> None:
         _validate_input_device(device, path)
 
     cleanup = value.get("cleanup")
-    if cleanup is not None and not isinstance(cleanup, bool) and cleanup not in STT_CLEANUP_BACKENDS:
+    if cleanup is not None and cleanup is not False and cleanup not in STT_CLEANUP_BACKENDS:
         raise ConfigError(
             f"Invalid stt.cleanup {cleanup!r} in {path}: expected one of "
-            f"{', '.join(STT_CLEANUP_BACKENDS)} (or true/false from older configs)."
+            f"{', '.join(STT_CLEANUP_BACKENDS)} (or false from older configs)."
         )
 
     for key in ("paste", "sounds", "verbatim"):
@@ -507,75 +577,60 @@ def resolve_stt(file_config: dict | None = None) -> dict:
     """
     if file_config is None:
         file_config = load_config_file()
+    file_config = migrate_retired_settings(file_config)
     table = file_config.get("stt") or {}
     _validate_stt_table(table, config_path())
     resolved = dict(STT_DEFAULTS)
     resolved.update({key: table[key] for key in KNOWN_STT_KEYS if key in table})
     if isinstance(resolved["cleanup"], bool):  # 0.10.x wrote true/false
-        resolved["cleanup"] = "claude-cli" if resolved["cleanup"] else "off"
+        resolved["cleanup"] = "off"
     return resolved
 
 
-# --- [notes] --------------------------------------------------------------
+# --- [transcribe] (was [notes]) -------------------------------------------
 #
-# Parsed, validated and rendered from 0.12.0; honoured by `vocalize notes`
-# from 0.14.0. Kept here so a config written for 0.14 round-trips through
-# every earlier writer of the file.
+# `vocalize transcribe` settings (DEC-007). `[notes]` is still read as the
+# table's old name; when both set a key, `[transcribe]` wins. The writer
+# saves it all under `[transcribe]`.
 
-KNOWN_NOTES_KEYS = ("folder", "template", "summarizer", "keep_audio", "model")
-NOTES_SUMMARIZERS = ("local", "claude-cli", "anthropic", "off")
-NOTES_TEMPLATES = ("memo", "meeting", "lecture", "journal")
-NOTES_DEFAULTS = {
+KNOWN_TRANSCRIBE_KEYS = ("folder", "keep_audio", "model")
+TRANSCRIBE_DEFAULTS = {
     "folder": "~/Documents/Vocalize Notes",
-    "template": "memo",
-    "summarizer": "local",  # only claude-cli and anthropic leave the machine
     "keep_audio": False,
     "model": "",  # "" = the [stt] model; else one of whisper_manifest.MODELS
 }
-NOTES_FOLDER_MAX_CHARS = 512
+TRANSCRIBE_FOLDER_MAX_CHARS = 512
+
+# The old names, for callers that have not moved yet.
+KNOWN_NOTES_KEYS = KNOWN_TRANSCRIBE_KEYS
+NOTES_DEFAULTS = TRANSCRIBE_DEFAULTS
+NOTES_FOLDER_MAX_CHARS = TRANSCRIBE_FOLDER_MAX_CHARS
 
 
-def _validate_notes_table(value, path: Path) -> None:
-    """Check the `[notes]` table. Unknown keys warn; bad values raise."""
+def _validate_transcribe_table(value, path: Path, section: str = "transcribe") -> None:
+    """Check a `[transcribe]` or `[notes]` table. Unknown keys warn; bad values raise."""
     if not isinstance(value, dict):
-        raise ConfigError(f"config key 'notes' in {path} must be a table")
+        raise ConfigError(f"config key {section!r} in {path} must be a table")
     for key in value:
-        if key not in KNOWN_NOTES_KEYS:
-            _warn(f"vocalize: unknown config key {key!r} in [notes] in {path}")
+        if key not in KNOWN_TRANSCRIBE_KEYS:
+            _warn(f"vocalize: unknown config key {key!r} in [{section}] in {path}")
 
     folder = value.get("folder")
     if folder is not None and (
         not isinstance(folder, str)
         or not folder.strip()
-        or len(folder) > NOTES_FOLDER_MAX_CHARS
+        or len(folder) > TRANSCRIBE_FOLDER_MAX_CHARS
         or not folder.isprintable()
     ):
         raise ConfigError(
-            f"Invalid notes.folder {folder!r} in {path}: expected a non-empty path."
-        )
-
-    template = value.get("template")
-    if template is not None and (
-        not isinstance(template, str)
-        or not template.isprintable()
-        or (template not in NOTES_TEMPLATES and not template.endswith(".md"))
-        or template.startswith("-")  # a file name that reads as a flag
-    ):
-        raise ConfigError(
-            f"Invalid notes.template {template!r} in {path}: expected one of "
-            f"{', '.join(NOTES_TEMPLATES)} or a path to a .md prompt file."
-        )
-
-    summarizer = value.get("summarizer")
-    if summarizer is not None and summarizer not in NOTES_SUMMARIZERS:
-        raise ConfigError(
-            f"Invalid notes.summarizer {summarizer!r} in {path}: expected one of "
-            f"{', '.join(NOTES_SUMMARIZERS)}."
+            f"Invalid {section}.folder {folder!r} in {path}: expected a non-empty path."
         )
 
     keep = value.get("keep_audio")
     if keep is not None and not isinstance(keep, bool):
-        raise ConfigError(f"Invalid notes.keep_audio {keep!r} in {path}: expected true or false.")
+        raise ConfigError(
+            f"Invalid {section}.keep_audio {keep!r} in {path}: expected true or false."
+        )
 
     model = value.get("model")
     if model is not None:
@@ -583,20 +638,29 @@ def _validate_notes_table(value, path: Path) -> None:
 
         if not isinstance(model, str) or (model != "" and model not in whisper_manifest.MODELS):
             raise ConfigError(
-                f"Invalid notes.model {model!r} in {path}: expected \"\" (the [stt] model) "
+                f"Invalid {section}.model {model!r} in {path}: expected \"\" (the [stt] model) "
                 f"or one of {', '.join(whisper_manifest.MODELS)}."
             )
 
 
-def resolve_notes(file_config: dict | None = None) -> dict:
-    """The `[notes]` settings with defaults filled in, re-validated."""
+def resolve_transcribe(file_config: dict | None = None) -> dict:
+    """The `[transcribe]` settings with defaults filled in, re-validated.
+
+    `[notes]` is read first and `[transcribe]` over it, so the new name wins.
+    """
     if file_config is None:
         file_config = load_config_file()
-    table = file_config.get("notes") or {}
-    _validate_notes_table(table, config_path())
-    resolved = dict(NOTES_DEFAULTS)
-    resolved.update({key: table[key] for key in KNOWN_NOTES_KEYS if key in table})
+    file_config = migrate_retired_settings(file_config)
+    resolved = dict(TRANSCRIBE_DEFAULTS)
+    for section in ("notes", "transcribe"):
+        table = file_config.get(section) or {}
+        _validate_transcribe_table(table, config_path(), section)
+        resolved.update({key: table[key] for key in KNOWN_TRANSCRIBE_KEYS if key in table})
     return resolved
+
+
+#: The table's old name; other modules still call it.
+resolve_notes = resolve_transcribe
 
 
 # --- the [app] table -----------------------------------------------------
@@ -988,6 +1052,9 @@ def resolve_chain(provider: str | None = None, file_config: dict | None = None) 
     if file_config is None:
         file_config = load_config_file()
 
+    file_config = migrate_retired_settings(file_config)
+    if "chain" in file_config:
+        _validate_chain(file_config["chain"], config_path())
     if provider is not None:
         _validate_provider_name(provider, "--provider")
         return [provider]
@@ -1012,7 +1079,7 @@ def resolve_chain(provider: str | None = None, file_config: dict | None = None) 
 
     file_chain = file_config.get("chain")
     if file_chain:
-        return list(file_chain)  # already validated in load_config_file
+        return list(file_chain)
 
     return list(DEFAULT_CHAIN)
 
@@ -1021,10 +1088,11 @@ def chain_source(provider: str | None = None, file_config: dict | None = None) -
     """Which precedence tier resolve_chain would draw its answer from.
 
     For the `vocalize chain` setter to report, e.g., "chain (from config
-    file): elevenlabs, say".
+    file): kokoro, say".
     """
     if file_config is None:
         file_config = load_config_file()
+    file_config = migrate_retired_settings(file_config)
 
     if provider is not None:
         return "flag"
@@ -1039,22 +1107,10 @@ def provider_table(name: str, file_config: dict | None = None) -> dict:
     """The `[providers.<name>]` table, or {} when there isn't one."""
     if file_config is None:
         file_config = load_config_file()
+    _validate_provider_name(name, "provider settings")
+    file_config = migrate_retired_settings(file_config)
+    _validate_providers_table(file_config.get("providers", {}), config_path())
     return (file_config.get("providers") or {}).get(name) or {}
-
-
-# Anthropic is the one budget that is never unlimited by default: a cleanup on
-# every press adds up, and nothing else in the config would say so.
-ANTHROPIC_DEFAULT_BUDGET = 2_000_000
-
-
-def budget_for(name: str, file_config: dict | None = None) -> int | None:
-    """The provider's local monthly character budget, or None for unlimited."""
-    # Presence, not truthiness: an explicit 0 is "spend nothing" on anthropic
-    # and "unlimited" everywhere else, and both are the user's to write.
-    budget = provider_table(name, file_config).get("monthly_chars")
-    if name == "anthropic":
-        return ANTHROPIC_DEFAULT_BUDGET if budget is None else budget
-    return budget or None
 
 
 def _first(*values):
@@ -1070,12 +1126,9 @@ class Settings:
     model_id: str = DEFAULT_MODEL
     output_format: str = DEFAULT_OUTPUT_FORMAT
     speed: float | None = None
-    # Everything below is provider-chain territory and defaults to today's
-    # single-provider behavior, so existing construction sites are unchanged.
+    # Local defaults; hosted provider settings are never reinterpreted.
     provider: str = auth.DEFAULT_PROVIDER
     language: str | None = None
-    region: str | None = None
-    profile: str | None = None
 
 
 def resolve_provider_settings(
@@ -1090,8 +1143,8 @@ def resolve_provider_settings(
     """Build one chain link's Settings.
 
     Per-key precedence: flag > VOCALIZE_VOICE/MODEL/SPEED env > this
-    provider's `[providers.<name>]` table > (ElevenLabs only) the legacy
-    top-level voice/model/speed keys > the provider module's own DEFAULTS.
+    provider's `[providers.<name>]` table > the provider module's defaults.
+    A top-level speed is a retired 0.15 setting and is ignored (DEC-005).
 
     Flags and VOCALIZE_* env vars are the primary provider's alone —
     `primary=False` (every non-first chain link) ignores them and reads
@@ -1105,22 +1158,19 @@ def resolve_provider_settings(
 
     table = provider_table(name, file_config)
     defaults = providers.get(name).DEFAULTS
-    legacy = name == "elevenlabs"
 
     resolved_voice = _first(
         voice_id if primary else None,
         os.environ.get("VOCALIZE_VOICE") if primary else None,
         table.get("voice"),
-        file_config.get("voice") if legacy else None,
         defaults.get("voice"),
     )
 
     resolved_model = _first(
         model_id if primary else None,
         os.environ.get("VOCALIZE_MODEL") if primary else None,
-        _first(table.get("model"), table.get("engine")),
-        file_config.get("model") if legacy else None,
-        _first(defaults.get("model"), defaults.get("engine")),
+        table.get("model"),
+        defaults.get("model", DEFAULT_MODEL),
     )
 
     resolved_speed = None
@@ -1128,11 +1178,14 @@ def resolve_provider_settings(
         (speed if primary else None, "--speed"),
         (os.environ.get("VOCALIZE_SPEED") if primary else None, "VOCALIZE_SPEED"),
         (table.get("speed"), f"'speed' in [providers.{name}] in {config_path()}"),
-        (file_config.get("speed") if legacy else None, f"'speed' in {config_path()}"),
     ):
         if value is not None:
             resolved_speed = _coerce_speed(value, source)
             break
+
+    for key, value in (("voice", resolved_voice), ("model", resolved_model)):
+        if value is not None and value != "":
+            _validate_provider_text(key, value, name, config_path())
 
     return Settings(
         voice_id=resolved_voice,
@@ -1140,8 +1193,6 @@ def resolve_provider_settings(
         speed=resolved_speed,
         provider=name,
         language=_first(table.get("language"), defaults.get("language")),
-        region=table.get("region"),
-        profile=table.get("profile"),
     )
 
 
@@ -1153,11 +1204,10 @@ def resolve_settings(
 ) -> Settings:
     """Build Settings from flag > env var > config file > built-in default.
 
-    The ElevenLabs case of resolve_provider_settings, kept under its own
-    name because every existing caller passes voice/model/speed here.
+    Resolve Kokoro explicitly. Multi-provider callers use resolve_provider_settings.
     """
     return resolve_provider_settings(
-        "elevenlabs",
+        "kokoro",
         file_config,
         voice_id=voice_id,
         model_id=model_id,

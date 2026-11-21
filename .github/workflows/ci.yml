@@ -15,6 +15,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev,dotenv]"
+      - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest -v --cov=vocalize --cov=hooks --cov-report=term-missing

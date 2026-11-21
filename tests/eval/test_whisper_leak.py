@@ -38,7 +38,7 @@ def vocabulary_words():
 @pytest.mark.skipif(os.environ.get("VOCALIZE_EVAL") != "1", reason="set VOCALIZE_EVAL=1")
 def test_vocabulary_does_not_leak_into_unrelated_audio(tmp_path, monkeypatch):
     if not MODEL.is_file():
-        pytest.skip("the large-v3-turbo-q5_0 model is not installed")
+        pytest.fail("the large-v3-turbo-q5_0 model is not installed; evaluation is not qualified")
     # tests/conftest.py points every model dir at tmp_path for unit tests;
     # this eval is the one place that needs the real installed model.
     from vocalize.local import whisper_manifest
@@ -56,15 +56,20 @@ def test_vocabulary_does_not_leak_into_unrelated_audio(tmp_path, monkeypatch):
             path = tmp_path / f"{name}.wav"
             subprocess.run(
                 ["/usr/bin/say", "-o", str(path), "--data-format=LEI16@16000", "--channels=1", words],
-                check=True,
+                check=True, timeout=20,
             )
             clips.append((path.name, path, set(words.lower().replace(",", "").replace(".", "").split())))
+    else:
+        pytest.fail("file-only speech fixture generation requires macOS say")
 
     words = vocabulary_words()
     for name, wav, spoken in clips:
         for run in range(10):
             output = dictate.transcribe(wav, stt)
             print(f"{name} run {run + 1}: {output}")
+            if spoken:
+                assert all(re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", output, re.IGNORECASE)
+                           for word in spoken), f"{name} run {run + 1} did not transcribe its spoken control"
             leaked = [
                 word for word in words - spoken
                 if re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", output, re.IGNORECASE)

@@ -1186,7 +1186,8 @@ def test_local_install_llm_ram_gate_and_force(monkeypatch, tmp_path):
     assert result.exit_code != 0
     assert "8.0 GB of RAM" in result.output
     assert "at least 12.0 GB" in result.output
-    assert "claude-cli" in result.output
+    assert 'cleanup = "off"' in result.output
+    assert "claude-cli" not in result.output
 
     # With --force: passes the RAM gate
     # Fake download and selftest
@@ -1234,4 +1235,3 @@ def test_local_install_llm_and_uninstall_lifecycle(monkeypatch, tmp_path):
     assert res_un.exit_code == 0
     assert "Language model uninstalled." in res_un.output
     assert not model_dir.exists()
-

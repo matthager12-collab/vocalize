@@ -10,6 +10,8 @@ become an argument.
 import json
 import os
 import queue
+import subprocess
+import traceback
 import wave
 
 import pytest
@@ -106,7 +108,7 @@ class FakeWorker:
             return
         if self.behavior == "error":
             self._replies.put(
-                json.dumps({"id": request["id"], "ok": False, "error": "espeak exploded"})
+                json.dumps({"id": request["id"], "ok": False, "error": request["text"] + "\nforged: success"})
                 + "\n"
             )
             return
@@ -320,12 +322,12 @@ def test_the_argv_is_the_uv_invocation_the_worker_expects(with_uv, installed, sp
     # --no-project is a guard, not a nicety: without it uv treats a cwd that
     # holds a pyproject.toml as a project and rebuilds ITS .venv (this bit us
     # live — the repo's 3.14 venv was replaced by a uv-managed 3.12 one).
-    assert argv[:7] == [
-        with_uv, "run", "--no-project",
+    assert argv[:9] == [
+        with_uv, "run", "--no-project", "--offline", "--no-python-downloads",
         "--python", manifest.PYTHON_VERSION,
         "--with", manifest.RUNTIME_PACKAGE,
     ]
-    assert argv[7] == str(manifest.worker_path())
+    assert argv[9] == str(manifest.worker_path())
     assert argv[argv.index("--model") + 1] == str(model)
     assert argv[argv.index("--voices") + 1] == str(voices)
     assert argv[argv.index("--voice") + 1] == "af_heart"
@@ -370,8 +372,31 @@ def test_an_unknown_voice_never_reaches_synthesize(with_uv, installed, spawned):
 def test_a_worker_error_reply_is_transient(with_uv, installed, spawned):
     spawned.behavior["mode"] = "error"
 
-    with pytest.raises(ProviderTransientError, match="espeak exploded"):
-        kokoro.synthesize("hello", settings())
+    with pytest.raises(ProviderTransientError) as err:
+        kokoro.synthesize(SECRET, settings())
+    assert SECRET not in str(err.value)
+    assert "forged" not in str(err.value)
+
+
+def test_worker_stderr_is_discarded(with_uv, installed, spawned):
+    kokoro.synthesize("hello", settings())
+    assert spawned[0].kwargs.get("stderr") == subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("failure", [
+    OSError, subprocess.SubprocessError,
+    lambda message: subprocess.TimeoutExpired(message, 1, stderr=message),
+])
+def test_start_failure_does_not_expose_exception_text(with_uv, monkeypatch, failure):
+    def fail(*args, **kwargs):
+        raise failure(SECRET + "\nforged: success")
+
+    monkeypatch.setattr(kokoro, "SESSION_SEAM", fail)
+    with pytest.raises(ProviderTransientError) as err:
+        kokoro.synthesize(SECRET, settings())
+    rendered = "".join(traceback.format_exception(err.value))
+    assert SECRET not in rendered
+    assert "forged: success" not in rendered
 
 
 def test_a_dead_worker_is_transient_and_the_session_is_dropped(

@@ -1789,7 +1789,7 @@ def test_sounds_can_be_turned_off(recorder, harness):
 def test_the_worker_argv_pins_the_runtime_and_avoids_the_project(monkeypatch):
     argv = dictate.worker_argv("/opt/uv", Path("/tmp/take.wav"), stt())
 
-    assert argv[:4] == ["/opt/uv", "run", "--no-project", "--python"]
+    assert argv[:5] == ["/opt/uv", "run", "--no-project", "--offline", "--no-python-downloads"]
     assert "pywhispercpp==1.5.1" in argv
     assert argv[argv.index("--transcribe") + 1] == "/tmp/take.wav"
     assert argv[argv.index("--language") + 1] == "en"
@@ -1946,17 +1946,17 @@ def test_no_microphone_status_reads_as_no_answer():
 
 
 def test_a_dictation_with_cleanup_on_copies_the_cleaned_text(
-    recorder, transcriber, claude, harness, monkeypatch
+    recorder, transcriber, harness, monkeypatch
 ):
     recorder()
     transcriber()
     # A faithful cleanup (the guard in llm.faithful refuses invented words),
     # still different from the raw transcript so the test can tell them apart.
     cleaned = "Read the pyproject at the repository root, then check the sha256."
-    claude(cleaned)
-    start(cleanup=True)
+    monkeypatch.setattr(dictate.llm, "cleanup_transcript", lambda *a, **k: (cleaned, True))
+    start(cleanup="local")
 
-    assert press_again(monkeypatch, cleanup=True) == 0
+    assert press_again(monkeypatch, cleanup="local") == 0
 
     assert harness.clipboard() == cleaned
     # The one notification that says text left this Mac — fixed text, never the transcript.
@@ -1965,14 +1965,14 @@ def test_a_dictation_with_cleanup_on_copies_the_cleaned_text(
 
 
 def test_a_failed_cleanup_still_copies_and_says_so(
-    recorder, transcriber, claude, harness, monkeypatch
+    recorder, transcriber, harness, monkeypatch
 ):
     recorder()
     transcriber()
-    claude("nope", rc=1)
-    start(cleanup=True)
+    monkeypatch.setattr(dictate.llm, "cleanup_transcript", lambda text, *a, **k: (text, False))
+    start(cleanup="local")
 
-    assert press_again(monkeypatch, cleanup=True) == 0
+    assert press_again(monkeypatch, cleanup="local") == 0
 
     assert harness.clipboard() == TRANSCRIPT
     assert any(dictate._NOTIFY_COPIED_RAW in line for line in harness.notifications())
@@ -2076,11 +2076,13 @@ def test_escape_sequences_in_a_transcript_are_stripped(recorder, transcriber, ha
     assert pasted.startswith("hello ") and pasted.endswith("red world")
 
 
-def test_cleanup_backend_reads_legacy_bools_and_the_enum():
-    assert dictate.cleanup_backend({"cleanup": True}) == "claude-cli"
+def test_cleanup_backend_rejects_hosted_and_ambiguous_legacy_choices():
+    for backend in (True, "claude-cli", "anthropic", "unknown"):
+        with pytest.raises(dictate.DictationError):
+            dictate.cleanup_backend({"cleanup": backend})
     assert dictate.cleanup_backend({"cleanup": False}) == "off"
     assert dictate.cleanup_backend({}) == "off"
-    assert dictate.cleanup_backend({"cleanup": "anthropic"}) == "anthropic"
+    assert dictate.cleanup_backend({"cleanup": "local"}) == "local"
 
 
 def test_sanitizing_keeps_the_punctuation_dictation_actually_produces():
@@ -2353,16 +2355,18 @@ def test_resume_with_an_installed_but_unusable_provider_reports_and_keeps_the_re
     tmp_path, monkeypatch
 ):
     """Resume reports failure and keeps the record if provider is unusable (DEC-036)."""
-    save_read(tmp_path, text="Do not lose this.", provider="elevenlabs")
+    save_read(tmp_path, text="Do not lose this.", provider="kokoro")
     monkeypatch.setattr(cli_module, "play_audio", lambda path: 0)
 
     def unusable_tts(*args, **kwargs):
-        raise TTSRequestError("API key not configured")
+        raise TTSRequestError("Local model is not installed")
 
     monkeypatch.setattr(cli_module, "_run_tts", unusable_tts)
 
     result = CliRunner().invoke(main, ["resume"])
-    assert result.exit_code != 0 or "Error" in result.output or "API key" in result.output
+    assert result.exit_code != 0 or "Error" in result.output
+    assert isinstance(result.exception, TTSRequestError)
+    assert str(result.exception) == "Local model is not installed"
 
     left = interrupted.load()
     assert left is not None

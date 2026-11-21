@@ -5,37 +5,6 @@ class VocalizeError(Exception):
     """Base class for all vocalize errors."""
 
 
-class MissingAPIKeyError(VocalizeError):
-    """Raised when no API key can be found for a provider."""
-
-    def __init__(self, provider: str = "elevenlabs") -> None:
-        self.provider = provider
-        if provider == "elevenlabs":
-            super().__init__(
-                "No ElevenLabs API key found. The easiest fix is `vocalize auth "
-                "login`, which stores one in your system keychain. You can also "
-                "set the ELEVENLABS_API_KEY environment variable, add it to a "
-                ".env file, or pass --api-key on the command line. Get a free key "
-                "at https://elevenlabs.io/app/settings/api-keys"
-            )
-            return
-
-        # Imported at call time: auth imports this module at import time.
-        from .auth import PROVIDER_ENV_VARS, PROVIDER_LABELS
-
-        label = PROVIDER_LABELS.get(provider, provider)
-        env_var = PROVIDER_ENV_VARS.get(provider)
-        env_hint = f", or set {env_var}" if env_var else ""
-        super().__init__(
-            f"No {label} API key found. Run `vocalize auth login --provider "
-            f"{provider}`{env_hint}."
-        )
-
-
-class AuthError(VocalizeError):
-    """Raised when the system keychain cannot be read from or written to."""
-
-
 class ConfigError(VocalizeError):
     """Raised when the config file or one of its values is invalid."""
 
@@ -56,7 +25,7 @@ class ConfigChangedError(ConfigError):
 
 
 class TTSRequestError(VocalizeError):
-    """Raised when the ElevenLabs API call itself fails."""
+    """Raised when local speech synthesis fails."""
 
 
 class ProviderError(TTSRequestError):
@@ -71,20 +40,12 @@ class ProviderError(TTSRequestError):
         super().__init__(f"{provider}: {message}")
 
 
-class ProviderAuthError(ProviderError):
-    """Bad or missing credentials. The chain skips to the next provider."""
-
-
-class ProviderQuotaError(ProviderError):
-    """Out of credit or over budget. Marked exhausted, then skipped."""
-
-
 class ProviderTransientError(ProviderError):
-    """Rate limit, 5xx, or a network wobble. The chain skips to the next."""
+    """Recoverable local worker failure. The chain skips to the next."""
 
 
 class ProviderUnavailableError(ProviderError):
-    """Not usable offline: no key, no binary, no optional dependency."""
+    """Not usable: missing binary, model, or local dependency."""
 
 
 class ProviderContentError(ProviderError):
@@ -97,7 +58,7 @@ class PlaybackStopped(VocalizeError):
     `audio` carries whatever had already been rendered when the stop came
     in, joined into one file, and `audio_ext` its extension. A stop that
     came from a broken player rather than a human is the reason: that
-    audio is paid for, and throwing it away would be the second failure.
+    audio was already rendered and can be retained.
 
     `remaining_text` is the part of the read nobody heard and `provider`
     the one that spoke, so a stop a dictation asked to remember can be
