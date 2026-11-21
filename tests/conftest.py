@@ -69,6 +69,21 @@ def _no_real_config_file(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config-home"))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_home(monkeypatch, tmp_path):
+    """Point HOME at an empty directory for every test.
+
+    This covers what calls `Path.home()` at call time rather than import
+    time — above all the warm-server sockets (`warm_protocol.warm_dir`).
+    On a Mac with warm models alive, a local cleanup test would otherwise
+    send its transcript to the developer's real server, never reach the
+    seam it faked, and could retire that server on the way out. Paths
+    bound at import time (`MODEL_DIR`, `CACHE_DIR`, ...) do not see this;
+    the fixtures below patch those one by one.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
 class _FakeKeychain(dict):
     """The stored entries, plus the switches a test needs to break them."""
 
@@ -143,15 +158,17 @@ def _no_real_model_cache(monkeypatch, tmp_path):
     Autouse for the same reason as the ledger and playback-lock fixtures:
     a test that forgets to override a manifest's MODEL_DIR (or does not
     need to, like a `local status` test focused on the other manifest)
-    would otherwise stat — or worse, delete — the developer's real Kokoro
-    or Whisper model directory. A test that needs a populated or
-    specifically-shaped directory still overrides this with its own
-    monkeypatch, applied after this one.
+    would otherwise stat — or worse, delete — the developer's real Kokoro,
+    Whisper or Qwen model directory. An installed Qwen model also turns a
+    bare `--cleanup` into "local" instead of "claude-cli". A test that
+    needs a populated or specifically-shaped directory still overrides
+    this with its own monkeypatch, applied after this one.
     """
-    from vocalize.local import kokoro_manifest, whisper_manifest
+    from vocalize.local import kokoro_manifest, llm_manifest, whisper_manifest
 
     monkeypatch.setattr(kokoro_manifest, "MODEL_DIR", tmp_path / "default-kokoro-cache")
     monkeypatch.setattr(whisper_manifest, "MODEL_DIR", tmp_path / "default-whisper-cache")
+    monkeypatch.setattr(llm_manifest, "MODEL_DIR", tmp_path / "default-llm-cache")
 
 
 @pytest.fixture(autouse=True)
