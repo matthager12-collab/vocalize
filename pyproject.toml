@@ -5,16 +5,20 @@ build-backend = "hatchling.build"
 [project]
 name = "vocalize-cli"
 dynamic = ["version"]
-description = "A local-first CLI that turns text, markdown, or piped stdin into speech: the on-device Kokoro voice by default, cloud voices optional, with markdown-table-aware preprocessing and Claude Code hooks."
+description = "Local-only speech for macOS: reads text and markdown aloud and turns speech into text, entirely on device."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Mat" }]
-keywords = ["text-to-speech", "local", "kokoro", "cli", "claude-code", "markdown", "elevenlabs"]
+keywords = [
+    "text-to-speech", "speech-to-text", "dictation", "transcription", "local", "offline",
+    "macos", "kokoro", "whisper", "parakeet",
+]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -23,9 +27,7 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
-    "elevenlabs>=2.0",
     "click>=8.1",
-    "keyring>=25",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
@@ -34,8 +36,6 @@ Homepage = "https://github.com/matthager12-collab/vocalize"
 Repository = "https://github.com/matthager12-collab/vocalize"
 
 [project.optional-dependencies]
-dotenv = ["python-dotenv>=1.0"]
-polly = ["boto3>=1.34"]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff", "build", "twine"]
 
 [project.scripts]
@@ -46,6 +46,16 @@ path = "vocalize/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vocalize"]
+
+# The Claude Code hook ships inside the package, so the settings page can
+# install it from a PyPI install too. The repository keeps it in hooks/.
+[tool.hatch.build.targets.wheel.force-include]
+"hooks/claude_stop_hook.py" = "vocalize/hooks/claude_stop_hook.py"
+"hooks/install_hook.py" = "vocalize/hooks/install_hook.py"
+
+# Older plans and research describe features this release does not have.
+[tool.hatch.build.targets.sdist]
+exclude = ["/docs/plans", "/docs/research"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

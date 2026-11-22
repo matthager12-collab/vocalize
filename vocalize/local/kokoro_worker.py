@@ -21,13 +21,23 @@ and each line of stdout is one reply
 
 The text arrives on stdin and never through argv, where every other
 process on the machine could read it. It is never printed back, either:
-error replies carry the exception's own words, clipped to one short line.
+kokoro-onnx puts the input text in its own exception messages, so every
+error reply and stderr line is a fixed message, never the exception's.
+
+Before kokoro_onnx is imported the model and voices files must be
+absolute existing paths, and the espeak-ng library and data come only
+from the installed espeakng_loader package, passed explicitly; if it
+cannot provide them the worker refuses rather than letting kokoro-onnx
+search the system. Debug logging, which writes phonemes, is never on.
+A refusal exits 2 with one fixed line on stderr that names no path.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import signal
 import sys
 import wave
@@ -41,10 +51,71 @@ SAMPLE_RATE = 24000
 _MAX_ERROR_CHARS = 200
 
 
+# Engine switches read from the environment. The runtime's allow-list
+# never passes them; they are dropped here too before kokoro_onnx loads.
+_ENGINE_VARIABLES = ("LOG_LEVEL", "ONNX_PROVIDER", "PHONEMIZER_ESPEAK_LIBRARY",
+                     "PHONEMIZER_ESPEAK_PATH", "ESPEAK_DATA_PATH")
+
+
+class Refused(ValueError):
+    """A fixed, path-free reason to stop before any engine code runs."""
+
+
 def _one_line(exc: BaseException) -> str:
     """An exception as a single short line, safe to put on a pipe."""
     message = " ".join(str(exc).split()) or exc.__class__.__name__
     return message[:_MAX_ERROR_CHARS]
+
+
+def _require_file(value: str, what: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or not os.path.isabs(value):
+        raise Refused(f"the {what} must be an absolute path")
+    if not os.path.isfile(value):
+        raise Refused(f"the {what} does not exist")
+    return value
+
+
+def _quiet_engine() -> None:
+    """Never let kokoro-onnx log at debug level: it logs the phonemes."""
+    for name in _ENGINE_VARIABLES:
+        os.environ.pop(name, None)
+    for name in ("kokoro_onnx", "phonemizer"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _espeak_paths() -> tuple[str, str]:
+    """The espeak-ng library and data from espeakng_loader, or Refused.
+
+    Passed to kokoro-onnx explicitly so it never falls back to an
+    environment variable or a system-wide library. The library is loaded
+    here once, so a broken one is an error rather than a fallback.
+    """
+    import ctypes
+
+    try:
+        import espeakng_loader
+
+        library = espeakng_loader.get_library_path()
+        data = espeakng_loader.get_data_path()
+    except Exception:  # noqa: BLE001 -- any failure means no bundled espeak-ng
+        raise Refused("espeak-ng from espeakng_loader is not available") from None
+    if not all(isinstance(path, str) and os.path.isabs(path) for path in (library, data)):
+        raise Refused("espeak-ng from espeakng_loader is not available")
+    if not os.path.isfile(library) or not os.path.isdir(data):
+        raise Refused("espeak-ng from espeakng_loader is not available")
+    try:
+        ctypes.CDLL(library)
+    except OSError:
+        raise Refused("espeak-ng from espeakng_loader could not be loaded") from None
+    return library, data
+
+
+def _espeak_config():
+    """kokoro-onnx's EspeakConfig naming the bundled library and data."""
+    library, data = _espeak_paths()
+    from kokoro_onnx import EspeakConfig
+
+    return EspeakConfig(lib_path=library, data_path=data)
 
 
 def _kokoro_class():
@@ -98,10 +169,16 @@ def serve(model, args, stdin=None, stdout=None) -> int:
         if not line:
             continue
 
-        request_id = None
         try:
             request = json.loads(line)
-            request_id = request.get("id")
+        except ValueError:
+            request = None
+        if not isinstance(request, dict):
+            stdout.write(json.dumps({"id": None, "ok": False, "error": "bad request"}) + "\n")
+            stdout.flush()
+            continue
+        request_id = request.get("id")
+        try:
             samples, rate = model.create(
                 request["text"],
                 voice=args.voice,
@@ -110,8 +187,9 @@ def serve(model, args, stdin=None, stdout=None) -> int:
             )
             write_wav(samples, request["out"], rate)
             reply = {"id": request_id, "ok": True}
-        except Exception as exc:  # noqa: BLE001 — one bad request must not end the session
-            reply = {"id": request_id, "ok": False, "error": _one_line(exc)}
+        except Exception:  # noqa: BLE001 — one bad request must not end the session
+            # Fixed words: kokoro-onnx's messages can quote the text.
+            reply = {"id": request_id, "ok": False, "error": "synthesis failed"}
 
         stdout.write(json.dumps(reply) + "\n")
         stdout.flush()
@@ -126,9 +204,19 @@ def main(argv=None) -> int:
 
     args = parse_args(argv)
     try:
-        model = _kokoro_class()(args.model, args.voices)
-    except Exception as exc:  # noqa: BLE001 — onnxruntime raises anything; exit 1 either way
-        print(f"kokoro: could not load the model: {_one_line(exc)}", file=sys.stderr)
+        model_path = _require_file(args.model, "model file")
+        voices_path = _require_file(args.voices, "voices file")
+        _quiet_engine()
+        espeak = _espeak_config()
+    except Refused as exc:
+        print(f"kokoro: refused: {exc}", file=sys.stderr)
+        return 2
+    try:
+        kokoro = _kokoro_class()
+        _quiet_engine()  # again: importing the engine may set its own level
+        model = kokoro(model_path, voices_path, espeak_config=espeak)
+    except Exception:  # noqa: BLE001 — onnxruntime raises anything; exit 1 either way
+        print("kokoro: could not load the model", file=sys.stderr)
         return 1
 
     if args.list_voices:
@@ -146,8 +234,8 @@ def main(argv=None) -> int:
             )
             with tempfile.TemporaryDirectory() as tmp:
                 write_wav(samples, str(Path(tmp) / "selftest.wav"), rate)
-        except Exception as exc:  # noqa: BLE001 — the point is to report, not to crash
-            print(f"kokoro: selftest failed: {_one_line(exc)}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 — the point is to report, not to crash
+            print("kokoro: selftest failed", file=sys.stderr)
             return 1
         print("ok")
         return 0

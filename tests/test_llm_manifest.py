@@ -109,9 +109,11 @@ def test_check_config_refuses_missing_tokenizer(tmp_path):
 # --- argv contracts ----------------------------------------------------
 
 
-def test_selftest_argv_is_online():
+def test_selftest_argv_is_offline_because_the_locked_environment_exists_first():
     argv = manifest.selftest_argv(Path("/fake"))
-    assert "--offline" not in argv
+    assert "--offline" in argv
+    assert "--with" not in argv
+    assert argv[argv.index("--python") + 1] == str(manifest.runtime_python())
     assert "--selftest" in argv
     assert "--once" not in argv
 
@@ -123,14 +125,14 @@ def test_runtime_argv_is_offline():
     assert "--selftest" not in argv
 
 
-def test_selftest_and_runtime_differ_only_by_offline_and_mode():
-    """The two argvs must differ in exactly --offline and --selftest/--once."""
+def test_selftest_and_runtime_differ_only_by_mode():
+    """The two argvs must differ in exactly --selftest/--once."""
     selftest = set(manifest.selftest_argv(Path("/fake")))
     runtime = set(manifest.runtime_argv(Path("/fake")))
     only_selftest = selftest - runtime
     only_runtime = runtime - selftest
     assert only_selftest == {"--selftest"}, f"selftest-only: {only_selftest}"
-    assert only_runtime == {"--offline", "--once"}, f"runtime-only: {only_runtime}"
+    assert only_runtime == {"--once"}, f"runtime-only: {only_runtime}"
 
 
 def test_runtime_package_is_recorded():

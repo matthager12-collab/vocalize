@@ -1,70 +1,15 @@
-import os
-import types
-
 import pytest
 
 from vocalize.config import (
     DEFAULT_CHAIN,
-    DEFAULT_MODEL,
     DEFAULT_VOICE,
-    _load_dotenv_if_present,
-    budget_for,
-    chain_source,
-    config_path,
-    provider_table,
-    resolve_api_key,
+    load_config_file,
     resolve_chain,
     resolve_overflow,
     resolve_provider_settings,
     resolve_settings,
 )
-from vocalize.exceptions import ConfigError, MissingAPIKeyError
-
-# Bound at import time on purpose: conftest's autouse fixture replaces the
-# module attribute, so this reference is the only way to reach the real one.
-real_load_dotenv = _load_dotenv_if_present
-
-
-def test_explicit_key_wins_over_everything(monkeypatch):
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    assert resolve_api_key("explicit-key") == "explicit-key"
-
-
-def test_falls_back_to_env_var(monkeypatch):
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    assert resolve_api_key(None) == "env-key"
-
-
-def test_raises_clear_error_when_nothing_found(monkeypatch):
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    with pytest.raises(MissingAPIKeyError):
-        resolve_api_key(None)
-
-
-def test_falls_back_to_the_keychain(monkeypatch, fake_keychain):
-    from vocalize import auth
-
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    fake_keychain[(auth.SERVICE, auth.USERNAME)] = "keychain-key"
-
-    assert resolve_api_key(None) == "keychain-key"
-
-    # The keychain is the last tier: anything more local still wins.
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "env-key")
-    assert resolve_api_key(None) == "env-key"
-
-
-def test_dotenv_loader_reads_the_env_file_in_the_cwd(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("ELEVENLABS_API_KEY=from-cwd-file\n", encoding="utf-8")
-    # setenv before delenv so monkeypatch restores the var whether or not it
-    # was set beforehand — the real loader writes straight to os.environ.
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "placeholder")
-    monkeypatch.delenv("ELEVENLABS_API_KEY")
-
-    real_load_dotenv()
-
-    assert os.environ["ELEVENLABS_API_KEY"] == "from-cwd-file"
+from vocalize.exceptions import ConfigError
 
 
 def _isolate(monkeypatch, tmp_path, body=None):
@@ -77,118 +22,6 @@ def _isolate(monkeypatch, tmp_path, body=None):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
     return path
-
-
-def test_config_path_honours_xdg_config_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    assert config_path() == tmp_path / "vocalize" / "config.toml"
-
-
-def test_config_path_falls_back_to_dot_config(monkeypatch, tmp_path):
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
-    assert config_path() == tmp_path / ".config" / "vocalize" / "config.toml"
-
-
-def test_missing_config_file_gives_the_built_in_defaults(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path)
-
-    settings = resolve_settings()
-
-    assert settings.voice_id == DEFAULT_VOICE
-    assert settings.model_id == DEFAULT_MODEL
-    assert settings.speed is None
-
-
-def test_config_file_beats_the_default(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\nspeed = 0.9\n')
-
-    settings = resolve_settings()
-
-    assert settings.voice_id == "file-voice"
-    assert settings.model_id == "file-model"
-    assert settings.speed == 0.9
-
-
-def test_env_var_beats_the_config_file(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\nspeed = 0.9\n')
-    monkeypatch.setenv("VOCALIZE_VOICE", "env-voice")
-    monkeypatch.setenv("VOCALIZE_MODEL", "env-model")
-    monkeypatch.setenv("VOCALIZE_SPEED", "1.1")
-
-    settings = resolve_settings()
-
-    assert settings.voice_id == "env-voice"
-    assert settings.model_id == "env-model"
-    assert settings.speed == 1.1
-
-
-def test_flag_beats_env_var_and_config_file(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\nspeed = 0.9\n')
-    monkeypatch.setenv("VOCALIZE_VOICE", "env-voice")
-    monkeypatch.setenv("VOCALIZE_MODEL", "env-model")
-    monkeypatch.setenv("VOCALIZE_SPEED", "1.1")
-
-    settings = resolve_settings(voice_id="flag-voice", model_id="flag-model", speed=0.8)
-
-    assert settings.voice_id == "flag-voice"
-    assert settings.model_id == "flag-model"
-    assert settings.speed == 0.8
-
-
-def test_unknown_config_key_warns_but_still_loads_the_known_ones(monkeypatch, tmp_path, capsys):
-    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nvoise = "typo"\n')
-
-    settings = resolve_settings()
-
-    assert settings.voice_id == "file-voice"
-    captured = capsys.readouterr()
-    assert "vocalize: unknown config key 'voise'" in captured.err
-    assert captured.err.count("unknown config key") == 1
-
-
-def test_malformed_config_file_gives_a_clean_error(monkeypatch, tmp_path):
-    path = _isolate(monkeypatch, tmp_path, "voice = \n")
-
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_settings()
-
-    assert str(path) in str(excinfo.value)
-
-
-@pytest.mark.parametrize("value", ["fast", "0.2", "5"])
-def test_invalid_speed_from_the_env_var_is_rejected(monkeypatch, tmp_path, value):
-    _isolate(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_SPEED", value)
-
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_settings()
-
-    assert "VOCALIZE_SPEED" in str(excinfo.value)
-
-
-@pytest.mark.parametrize("literal", ['"fast"', "0.2", "5"])
-def test_invalid_speed_from_the_config_file_is_rejected(monkeypatch, tmp_path, literal):
-    path = _isolate(monkeypatch, tmp_path, f"speed = {literal}\n")
-
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_settings()
-
-    assert "'speed'" in str(excinfo.value)
-    assert str(path) in str(excinfo.value)
-
-
-@pytest.mark.parametrize("value", ["fast", 0.2, 5])
-def test_invalid_speed_from_the_flag_is_rejected(monkeypatch, tmp_path, value):
-    _isolate(monkeypatch, tmp_path)
-
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_settings(speed=value)
-
-    assert "--speed" in str(excinfo.value)
-
-
-# --- overflow mode and cap resolution ---------------------------------------
 
 
 def _isolate_overflow(monkeypatch, tmp_path, body=None):
@@ -256,318 +89,6 @@ def test_overflow_mode_is_case_insensitive(monkeypatch, tmp_path):
     assert resolve_overflow() == ("never", None)
 
 
-# --- chain resolution --------------------------------------------------------
-
-
-def _isolate_chain(monkeypatch, tmp_path, body=None):
-    """Same as _isolate, for VOCALIZE_CHAIN."""
-    path = _isolate(monkeypatch, tmp_path, body)
-    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
-    return path
-
-
-def _stub_providers(monkeypatch, **stubs):
-    """Make providers.get(name) return a stub with the given DEFAULTS.
-
-    Any name not in `stubs` falls through to the real registry, so
-    'elevenlabs' and 'say' keep working unchanged. google.py/openai.py/
-    polly.py are being written by other agents in parallel and may not
-    exist yet — tests that need them supply DEFAULTS here instead.
-    """
-    import vocalize.providers as providers_pkg
-
-    real_get = providers_pkg.get
-
-    def fake_get(name):
-        if name in stubs:
-            return types.SimpleNamespace(DEFAULTS=stubs[name])
-        return real_get(name)
-
-    monkeypatch.setattr("vocalize.providers.get", fake_get)
-
-
-def test_default_chain_is_kokoro_then_say(monkeypatch, tmp_path):
-    # Local first, degrading to the always-present `say` (DEC-022).
-    _isolate_chain(monkeypatch, tmp_path)
-    assert resolve_chain() == list(DEFAULT_CHAIN) == ["kokoro", "say"]
-
-
-def test_chain_file_beats_default(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path, 'chain = ["google", "polly", "say"]\n')
-    assert resolve_chain() == ["google", "polly", "say"]
-
-
-def test_chain_env_beats_file(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path, 'chain = ["google", "say"]\n')
-    monkeypatch.setenv("VOCALIZE_CHAIN", "openai,say")
-    assert resolve_chain() == ["openai", "say"]
-
-
-def test_chain_flag_beats_env_and_file(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path, 'chain = ["google", "say"]\n')
-    monkeypatch.setenv("VOCALIZE_CHAIN", "openai,say")
-    assert resolve_chain(provider="say") == ["say"]
-
-
-def test_chain_env_var_parses_with_spaces_and_drops_duplicates(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_CHAIN", " google ,  say , google ")
-    assert resolve_chain() == ["google", "say"]
-
-
-def test_chain_flag_with_unknown_provider_raises_naming_source(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path)
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain(provider="bogus")
-    assert "--provider" in str(excinfo.value)
-    assert "bogus" in str(excinfo.value)
-
-
-def test_chain_env_with_unknown_provider_raises_naming_source(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_CHAIN", "bogus,say")
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "VOCALIZE_CHAIN" in str(excinfo.value)
-    assert "bogus" in str(excinfo.value)
-
-
-def test_chain_file_with_unknown_provider_raises_naming_source(monkeypatch, tmp_path):
-    path = _isolate_chain(monkeypatch, tmp_path, 'chain = ["bogus", "say"]\n')
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "chain" in str(excinfo.value)
-    assert str(path) in str(excinfo.value)
-    assert "bogus" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        'chain = "elevenlabs"\n',  # not a list
-        "chain = [1, 2]\n",  # not strings
-        'chain = ["elevenlabs", ""]\n',  # empty string entry
-    ],
-)
-def test_chain_bad_shape_in_file_raises(monkeypatch, tmp_path, body):
-    _isolate_chain(monkeypatch, tmp_path, body)
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "chain" in str(excinfo.value)
-
-
-def test_chain_duplicates_in_file_raises(monkeypatch, tmp_path):
-    path = _isolate_chain(monkeypatch, tmp_path, 'chain = ["say", "elevenlabs", "say"]\n')
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "Duplicate" in str(excinfo.value)
-    assert str(path) in str(excinfo.value)
-
-
-def test_chain_env_empty_after_parsing_raises(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_CHAIN", " , , ")
-    with pytest.raises(ConfigError):
-        resolve_chain()
-
-
-def test_chain_empty_list_in_file_raises(monkeypatch, tmp_path):
-    path = _isolate_chain(monkeypatch, tmp_path, "chain = []\n")
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "chain" in str(excinfo.value)
-    assert "at least one provider" in str(excinfo.value)
-    assert str(path) not in str(excinfo.value)  # message names the key, not a path
-
-
-@pytest.mark.parametrize("value", ["", "   "])
-def test_chain_env_empty_or_blank_is_treated_as_unset(monkeypatch, tmp_path, value):
-    # Falls through to the file when the file has a chain...
-    _isolate_chain(monkeypatch, tmp_path / "with-file", 'chain = ["google", "say"]\n')
-    monkeypatch.setenv("VOCALIZE_CHAIN", value)
-    assert resolve_chain() == ["google", "say"]
-    assert chain_source() == "config file"
-
-    # ...and to the built-in default when it doesn't.
-    _isolate_chain(monkeypatch, tmp_path / "without-file")
-    monkeypatch.setenv("VOCALIZE_CHAIN", value)
-    assert resolve_chain() == list(DEFAULT_CHAIN)
-    assert chain_source() == "default"
-
-
-def test_chain_source_reports_each_tier(monkeypatch, tmp_path):
-    _isolate_chain(monkeypatch, tmp_path)
-    assert chain_source() == "default"
-
-    _isolate_chain(monkeypatch, tmp_path, 'chain = ["google", "say"]\n')
-    assert chain_source() == "config file"
-
-    monkeypatch.setenv("VOCALIZE_CHAIN", "openai,say")
-    assert chain_source() == "environment"
-
-    assert chain_source(provider="say") == "flag"
-
-
-# --- [providers.*] tables ----------------------------------------------------
-
-
-def test_providers_key_must_be_a_table(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, 'providers = "nope"\n')
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "providers" in str(excinfo.value)
-
-
-def test_providers_value_must_be_a_table_of_tables(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, 'providers = { google = "nope" }\n')
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "providers" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    "literal", ["-5", "1.5", "true", '"1000"']
-)
-def test_invalid_monthly_chars_raises_naming_the_provider(monkeypatch, tmp_path, literal):
-    path = _isolate(monkeypatch, tmp_path, f"[providers.google]\nmonthly_chars = {literal}\n")
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_chain()
-    assert "monthly_chars" in str(excinfo.value)
-    assert "google" in str(excinfo.value)
-    assert str(path) in str(excinfo.value)
-
-
-def test_monthly_chars_zero_means_unlimited_budget(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, "[providers.google]\nmonthly_chars = 0\n")
-    assert budget_for("google") is None
-
-
-def test_monthly_chars_positive_is_the_budget(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, "[providers.google]\nmonthly_chars = 1000000\n")
-    assert budget_for("google") == 1000000
-
-
-def test_unknown_provider_name_under_providers_warns_but_still_loads(monkeypatch, tmp_path, capsys):
-    _isolate(monkeypatch, tmp_path, '[providers.notaprovider]\nvoice = "x"\n')
-
-    chain = resolve_chain()
-
-    assert chain == list(DEFAULT_CHAIN)
-    captured = capsys.readouterr()
-    assert "unknown provider 'notaprovider'" in captured.err
-    assert "elevenlabs" in captured.err  # names the valid set
-
-
-def test_unknown_key_inside_provider_table_warns_but_still_loads(monkeypatch, tmp_path, capsys):
-    _isolate(monkeypatch, tmp_path, '[providers.google]\nbogus = "x"\n')
-
-    table = provider_table("google")
-
-    assert table == {"bogus": "x"}
-    captured = capsys.readouterr()
-    assert "unknown config key 'bogus'" in captured.err
-    assert "[providers.google]" in captured.err
-
-
-def test_provider_table_speed_is_known_and_applied(monkeypatch, tmp_path, capsys):
-    _isolate(monkeypatch, tmp_path, "[providers.elevenlabs]\nspeed = 0.9\n")
-
-    settings = resolve_provider_settings("elevenlabs")
-
-    assert settings.speed == 0.9
-    captured = capsys.readouterr()
-    assert "unknown config key" not in captured.err
-
-
-# --- resolve_provider_settings -----------------------------------------------
-
-
-def test_resolve_provider_settings_elevenlabs_legacy_flat_keys_beat_defaults(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path, 'voice = "file-voice"\nmodel = "file-model"\n')
-
-    settings = resolve_provider_settings("elevenlabs")
-
-    assert settings.voice_id == "file-voice"
-    assert settings.model_id == "file-model"
-    assert settings.provider == "elevenlabs"
-
-
-def test_resolve_provider_settings_google_table_voice_and_language(monkeypatch, tmp_path):
-    _stub_providers(monkeypatch, google={"voice": "default-voice", "language": "default-lang"})
-    _isolate(
-        monkeypatch,
-        tmp_path,
-        '[providers.google]\nvoice = "en-US-Neural2-F"\nlanguage = "en-US"\n',
-    )
-
-    settings = resolve_provider_settings("google")
-
-    assert settings.voice_id == "en-US-Neural2-F"
-    assert settings.language == "en-US"
-    assert settings.provider == "google"
-
-
-def test_resolve_provider_settings_polly_engine_maps_to_model_id(monkeypatch, tmp_path):
-    _stub_providers(monkeypatch, polly={"voice": "Joanna"})
-    _isolate(
-        monkeypatch,
-        tmp_path,
-        '[providers.polly]\nvoice = "Matthew"\nengine = "neural"\n'
-        'region = "us-east-1"\nprofile = "default"\n',
-    )
-
-    settings = resolve_provider_settings("polly")
-
-    assert settings.voice_id == "Matthew"
-    assert settings.model_id == "neural"
-    assert settings.region == "us-east-1"
-    assert settings.profile == "default"
-
-
-def test_resolve_provider_settings_flags_and_env_apply_only_when_primary(monkeypatch, tmp_path):
-    _stub_providers(monkeypatch, google={"voice": "default-voice"})
-    _isolate(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_VOICE", "env-voice")
-
-    settings = resolve_provider_settings(
-        "google", voice_id="flag-voice", primary=False
-    )
-
-    assert settings.voice_id == "default-voice"
-
-    # Sanity check the flip side: as the primary, the same flag does win.
-    primary_settings = resolve_provider_settings(
-        "google", voice_id="flag-voice", primary=True
-    )
-    assert primary_settings.voice_id == "flag-voice"
-
-
-def test_resolve_provider_settings_invalid_vocalize_speed_still_rejected_with_source(
-    monkeypatch, tmp_path
-):
-    _isolate(monkeypatch, tmp_path)
-    monkeypatch.setenv("VOCALIZE_SPEED", "way too fast")
-
-    with pytest.raises(ConfigError) as excinfo:
-        resolve_provider_settings("elevenlabs", primary=True)
-
-    assert "VOCALIZE_SPEED" in str(excinfo.value)
-
-
-def test_resolve_provider_settings_sets_the_provider_field(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path)
-    settings = resolve_provider_settings("say")
-    assert settings.provider == "say"
-
-
-# --- the [stt] table (T-42, DEC-006) ----------------------------------
-#
-# Every value here ends up as one argv entry in a subprocess — the
-# recorder's --device, the whisper worker's --model and --language — so
-# each is checked before it can get that far, and each check has a test
-# that proves it can refuse.
-
-
 def _load_stt(monkeypatch, tmp_path, body):
     from vocalize.config import load_config_file
 
@@ -580,13 +101,13 @@ def test_stt_table_loads_with_valid_values(monkeypatch, tmp_path):
 
     data = _load_stt(
         monkeypatch, tmp_path,
-        '[stt]\nmodel = "base.en"\nlanguage = "en"\ncleanup = true\n'
+        '[stt]\nmodel = "base.en"\nlanguage = "en"\ncleanup = "local"\n'
         'max_seconds = 30\ninput_device = "Built-in Microphone"\n',
     )
 
     resolved = resolve_stt(data)
     assert resolved["model"] == "base.en"
-    assert resolved["cleanup"] == "claude-cli"  # 0.10.x `true`, coerced to the backend it meant
+    assert resolved["cleanup"] == "local"
     assert resolved["max_seconds"] == 30
     assert resolved["input_device"] == "Built-in Microphone"
     # Untouched keys still come from the defaults.
@@ -701,9 +222,7 @@ def test_stt_beam_size_at_the_edges_is_accepted(monkeypatch, tmp_path, value):
     assert resolve_stt(data)["beam_size"] == int(value)
 
 
-@pytest.mark.parametrize("literal, expected", [("true", "claude-cli"), ("false", "off"),
-                                               ('"off"', "off"), ('"claude-cli"', "claude-cli"),
-                                               ('"anthropic"', "anthropic"), ('"local"', "local")])
+@pytest.mark.parametrize("literal, expected", [("false", "off"), ('"off"', "off"), ('"local"', "local")])
 def test_stt_cleanup_accepts_the_enum_and_coerces_legacy_bools(monkeypatch, tmp_path, literal, expected):
     from vocalize.config import resolve_stt
 
@@ -711,7 +230,7 @@ def test_stt_cleanup_accepts_the_enum_and_coerces_legacy_bools(monkeypatch, tmp_
     assert resolve_stt(data)["cleanup"] == expected
 
 
-@pytest.mark.parametrize("literal", ['"claude"', '"yes"', "1", '"ON"'])
+@pytest.mark.parametrize("literal", ['"claude"', '"yes"', "1", '"ON"', '"Claude-CLI"'])
 def test_an_stt_cleanup_off_the_enum_is_refused(monkeypatch, tmp_path, literal):
     with pytest.raises(ConfigError) as excinfo:
         _load_stt(monkeypatch, tmp_path, f"[stt]\ncleanup = {literal}\n")
@@ -731,97 +250,90 @@ def test_an_stt_verbatim_that_is_not_a_bool_is_refused(monkeypatch, tmp_path):
         _load_stt(monkeypatch, tmp_path, '[stt]\nverbatim = "yes"\n')
 
 
-# --- [notes] (parsed and rendered from 0.12.0, honoured from 0.14.0) -----------
+# --- [transcribe], read under its old name [notes] too (DEC-007) ------------
 
 
-def test_notes_defaults_apply_with_no_table_at_all(monkeypatch, tmp_path):
-    from vocalize.config import NOTES_DEFAULTS, resolve_notes
+def test_transcribe_defaults_apply_with_no_table_at_all(monkeypatch, tmp_path):
+    from vocalize.config import TRANSCRIBE_DEFAULTS, resolve_notes, resolve_transcribe
 
-    assert resolve_notes(_load_stt(monkeypatch, tmp_path, "")) == NOTES_DEFAULTS
+    data = _load_stt(monkeypatch, tmp_path, "")
+    assert resolve_transcribe(data) == TRANSCRIBE_DEFAULTS
+    assert set(TRANSCRIBE_DEFAULTS) == {"folder", "keep_audio", "model"}
+    assert resolve_notes(data) == TRANSCRIBE_DEFAULTS
 
 
-def test_notes_table_loads_with_valid_values(monkeypatch, tmp_path):
-    from vocalize.config import resolve_notes
+@pytest.mark.parametrize("section", ["transcribe", "notes"])
+def test_transcribe_table_loads_under_either_name(monkeypatch, tmp_path, section):
+    from vocalize.config import resolve_notes, resolve_transcribe
 
     data = _load_stt(
         monkeypatch, tmp_path,
-        '[notes]\nfolder = "~/Notes"\ntemplate = "meeting"\nsummarizer = "claude-cli"\n'
-        'keep_audio = true\nmodel = "small.en"\n',
+        f'[{section}]\nfolder = "~/Notes"\nkeep_audio = true\nmodel = "small.en"\n',
     )
-    resolved = resolve_notes(data)
-    assert resolved == {"folder": "~/Notes", "template": "meeting", "summarizer": "claude-cli",
-                        "keep_audio": True, "model": "small.en"}
+    expected = {"folder": "~/Notes", "keep_audio": True, "model": "small.en"}
+    assert resolve_transcribe(data) == expected
+    assert resolve_notes(data) == expected
 
 
-def test_a_custom_notes_template_path_is_accepted(monkeypatch, tmp_path):
-    from vocalize.config import resolve_notes
+def test_transcribe_wins_a_key_both_tables_set(monkeypatch, tmp_path):
+    from vocalize.config import resolve_transcribe
 
-    data = _load_stt(monkeypatch, tmp_path, '[notes]\ntemplate = "/Users/me/prompts/standup.md"\n')
-    assert resolve_notes(data)["template"] == "/Users/me/prompts/standup.md"
+    data = _load_stt(
+        monkeypatch, tmp_path,
+        '[notes]\nfolder = "~/Old"\nkeep_audio = true\n\n[transcribe]\nfolder = "~/New"\n',
+    )
+    assert resolve_transcribe(data) == {"folder": "~/New", "keep_audio": True, "model": ""}
 
 
-@pytest.mark.parametrize("body", [
-    '[notes]\nsummarizer = "openai"\n',
-    '[notes]\ntemplate = "haiku"\n',
-    '[notes]\ntemplate = 3\n',
-    '[notes]\nkeep_audio = "no"\n',
-    '[notes]\nfolder = ""\n',
-    '[notes]\nmodel = "nope"\n',
-    'notes = "keep me"\n',
+@pytest.mark.parametrize("section", ["transcribe", "notes"])
+@pytest.mark.parametrize("line", [
+    'keep_audio = "no"',
+    'folder = ""',
+    'model = "nope"',
 ])
-def test_a_bad_notes_value_is_refused(monkeypatch, tmp_path, body):
+def test_a_bad_transcribe_value_is_refused(monkeypatch, tmp_path, section, line):
+    with pytest.raises(ConfigError, match=rf"{section}\."):
+        _load_stt(monkeypatch, tmp_path, f"[{section}]\n{line}\n")
+
+
+@pytest.mark.parametrize("body", ['notes = "keep me"\n', 'transcribe = "keep me"\n'])
+def test_a_transcribe_value_that_is_not_a_table_is_refused(monkeypatch, tmp_path, body):
     with pytest.raises(ConfigError):
         _load_stt(monkeypatch, tmp_path, body)
 
 
-def test_an_unknown_notes_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
-    data = _load_stt(monkeypatch, tmp_path, '[notes]\ncolour = "blue"\n')
+def test_an_unknown_transcribe_key_warns_but_still_loads(monkeypatch, tmp_path, capsys):
+    data = _load_stt(monkeypatch, tmp_path, '[transcribe]\ncolour = "blue"\n')
 
-    assert data["notes"] == {"colour": "blue"}
-    assert "unknown config key 'colour' in [notes]" in capsys.readouterr().err
+    assert data["transcribe"] == {"colour": "blue"}
+    assert "unknown config key 'colour' in [transcribe]" in capsys.readouterr().err
 
 
 # --- provider values are short strings (issue #5) -----------------------------
 
 
-@pytest.mark.parametrize("key", ["voice", "model", "engine", "language", "region", "profile"])
+@pytest.mark.parametrize("key", ["voice", "language"])
 def test_a_provider_voice_type_that_is_not_a_string_is_refused(monkeypatch, tmp_path, key):
     with pytest.raises(ConfigError) as excinfo:
-        _load_stt(monkeypatch, tmp_path, f"[providers.elevenlabs]\n{key} = 12345\n")
+        _load_stt(monkeypatch, tmp_path, f"[providers.kokoro]\n{key} = 12345\n")
 
     message = str(excinfo.value)
-    assert key in message and "[providers.elevenlabs]" in message
+    assert key in message and "[providers.kokoro]" in message
 
 
 @pytest.mark.parametrize("literal", ['"-flag"', '""', '"' + "x" * 129 + '"', '"a\u0007b"'])
 def test_a_provider_voice_type_that_is_flag_shaped_empty_or_long_is_refused(monkeypatch, tmp_path, literal):
     with pytest.raises(ConfigError):
-        _load_stt(monkeypatch, tmp_path, f"[providers.google]\nvoice = {literal}\n")
+        _load_stt(monkeypatch, tmp_path, f"[providers.kokoro]\nvoice = {literal}\n")
 
 
 def test_a_plain_provider_voice_string_still_loads(monkeypatch, tmp_path):
-    data = _load_stt(monkeypatch, tmp_path, '[providers.google]\nvoice = "en-GB-Neural2-A"\n')
-    assert data["providers"]["google"]["voice"] == "en-GB-Neural2-A"
+    data = _load_stt(monkeypatch, tmp_path, '[providers.kokoro]\nvoice = "en-GB-Neural2-A"\n')
+    assert data["providers"]["kokoro"]["voice"] == "en-GB-Neural2-A"
 
 
-def test_an_anthropic_providers_table_is_known_and_budgeted(monkeypatch, tmp_path, capsys):
-    from vocalize.config import ANTHROPIC_DEFAULT_BUDGET, budget_for
-
-    data = _load_stt(monkeypatch, tmp_path, "[providers.anthropic]\nmonthly_chars = 500000\n")
-    assert "unknown provider" not in capsys.readouterr().err
-    assert budget_for("anthropic", data) == 500000
-    assert budget_for("anthropic", {}) == ANTHROPIC_DEFAULT_BUDGET
-    assert budget_for("elevenlabs", {}) is None
 
 
-def test_an_anthropic_budget_of_zero_means_zero_not_the_default(monkeypatch, tmp_path):
-    """`monthly_chars = 0` is the only way to say "spend nothing" on the one
-    provider that is never unlimited. Read as falsy it became the largest
-    budget in the file."""
-    from vocalize.config import budget_for
-
-    data = _load_stt(monkeypatch, tmp_path, "[providers.anthropic]\nmonthly_chars = 0\n")
-    assert budget_for("anthropic", data) == 0
 
 
 def test_stt_beam_size_defaults_to_five(monkeypatch, tmp_path):
@@ -923,11 +435,20 @@ def test_an_unknown_key_warns_once_however_often_the_file_is_read(
     assert capsys.readouterr().err == ""
 
 
-def test_a_notes_template_may_not_look_like_a_flag(monkeypatch, tmp_path):
-    """A `.md` name that starts with a dash would read as an option to
-    whatever later opens it; refused like every other provider text."""
-    with pytest.raises(ConfigError, match="notes.template"):
-        _load_stt(monkeypatch, tmp_path, '[notes]\ntemplate = "-rf.md"\n')
+@pytest.mark.parametrize("section", ["notes", "transcribe"])
+def test_a_summary_template_or_summarizer_is_retired_whatever_its_value(
+    monkeypatch, tmp_path, section
+):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    data = _load_stt(
+        monkeypatch, tmp_path, f'[{section}]\ntemplate = "-rf.md"\nsummarizer = 3\n'
+    )
+    assert data[section] == {}
+    notices = config.retired_notices({section: {"template": "x", "summarizer": "y"}})
+    assert [n for n in notices if f"{section}.template" in n] != []
+    assert [n for n in notices if f"{section}.summarizer" in n] != []
 
 
 # --- the [app] table (run 7, T-62) -------------------------------------------
@@ -1108,3 +629,327 @@ def test_unknown_speech_key_warns(monkeypatch, tmp_path, capsys):
     data = _load_stt(monkeypatch, tmp_path, '[speech]\nunknown_speech_option = "yes"\n')
     resolve_speech(data)
     assert "unknown config key 'unknown_speech_option' in [speech]" in capsys.readouterr().err
+
+
+def test_local_default_settings(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    settings = resolve_settings()
+    assert (settings.provider, settings.voice_id) == ("kokoro", DEFAULT_VOICE)
+    assert not hasattr(settings, "model_id")
+    assert resolve_chain() == list(DEFAULT_CHAIN)
+
+
+def test_local_provider_precedence_and_fallback_isolation(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, '[providers.kokoro]\nvoice="af_bella"\nspeed=0.9\n')
+    assert resolve_provider_settings("kokoro").voice_id == "af_bella"
+    monkeypatch.setenv("VOCALIZE_VOICE", "af_heart")
+    assert resolve_provider_settings("kokoro").voice_id == "af_heart"
+    assert resolve_provider_settings("kokoro", voice_id="af_nicole").voice_id == "af_nicole"
+    assert resolve_provider_settings("kokoro", primary=False).voice_id == "af_bella"
+
+
+# --- a 0.15 config loads with notices, not an error (DEC-005, T-13) ----------
+
+CANARY = "SECRET_CANARY_0123456789"
+
+V015_CONFIG = f"""\
+voice = "21m00Tcm4TlvDq8ikWAM"
+model = "eleven_multilingual_v2"
+speed = 1.1
+chain = ["elevenlabs", "openai", "kokoro", "google", "polly", "say"]
+
+[providers.openai]
+api_key = "{CANARY}"
+voice = "alloy"
+
+[providers.kokoro]
+voice = "af_bella"
+
+[providers.anthropic]
+monthly_chars = 1000
+api_key = "{CANARY}"
+
+[stt]
+cleanup = "claude-cli"
+
+[notes]
+folder = "~/Notes"
+template = "meeting"
+summarizer = "anthropic"
+"""
+
+V015_RETIRED_PATHS = (
+    "voice", "model", "speed",
+    "chain entry 'elevenlabs'", "chain entry 'openai'", "chain entry 'google'",
+    "chain entry 'polly'",
+    "[providers.openai]", "[providers.anthropic]", "stt.cleanup", "notes.template",
+    "notes.summarizer",
+)
+
+
+def _paths_in(notices):
+    return [
+        path for path in V015_RETIRED_PATHS
+        for notice in notices if f"retired setting {path} in " in notice
+    ]
+
+
+def test_a_015_config_loads_with_one_notice_per_retired_key(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+    from vocalize.config import resolve_stt, resolve_transcribe
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, V015_CONFIG)
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+
+    data = load_config_file()
+    assert resolve_chain(None, data) == ["kokoro", "say"]
+    assert resolve_stt(data)["cleanup"] == "off"
+    assert resolve_settings(file_config=data).voice_id == "af_bella"
+    assert resolve_settings(file_config=data).speed is None  # flat speed ignored
+    assert resolve_transcribe(data) == {"folder": "~/Notes", "keep_audio": False, "model": ""}
+    # Read again, as the portal does on every poll: nothing new is printed.
+    load_config_file()
+
+    captured = capsys.readouterr()
+    printed = captured.err.splitlines()
+    assert sorted(_paths_in(printed)) == sorted(V015_RETIRED_PATHS)
+    assert len(printed) == len(V015_RETIRED_PATHS)
+    assert captured.out == ""  # stdout is the menu-bar app's
+    assert CANARY not in captured.err + captured.out
+
+    raw = _parse_toml(V015_CONFIG)
+    notices = config.retired_notices(raw)
+    assert sorted(_paths_in(notices)) == sorted(V015_RETIRED_PATHS)
+    assert len(notices) == len(V015_RETIRED_PATHS)
+    assert all(CANARY not in notice for notice in notices)
+    assert raw["providers"]["openai"]["api_key"] == CANARY  # nothing was mutated
+
+
+def _parse_toml(text):
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        import tomli as tomllib
+    return tomllib.loads(text)
+
+
+@pytest.mark.parametrize("body, path", [
+    ('api_key = "SECRET_CANARY"', "api_key"),
+    ('endpoint = "https://SECRET_CANARY.example"', "endpoint"),
+    ('[providers.kokoro]\napi_key = "SECRET_CANARY"', "providers.kokoro.api_key"),
+    ('[providers.polly]\nregion = "SECRET_CANARY"', "[providers.polly]"),
+    ("[stt]\ncleanup = true", "stt.cleanup"),
+    ('[stt]\ncleanup = "anthropic"', "stt.cleanup"),
+])
+def test_a_retired_key_is_ignored_with_a_notice_that_never_echoes_its_value(
+    monkeypatch, tmp_path, capsys, body, path
+):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, body + "\n")
+
+    data = load_config_file()
+
+    err = capsys.readouterr().err
+    assert f"retired setting {path} in " in err
+    assert "SECRET_CANARY" not in err + repr(data)
+    assert config.resolve_stt(data)["cleanup"] == "off"
+
+
+def test_hosted_cleanup_never_becomes_local():
+    from vocalize.config import resolve_stt
+
+    for value in ("claude-cli", "anthropic", True):
+        assert resolve_stt({"stt": {"cleanup": value}})["cleanup"] == "off"
+
+
+def test_a_chain_of_only_cloud_engines_falls_back_to_the_default(monkeypatch):
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    assert resolve_chain(file_config={"chain": ["openai", "polly"]}) == list(DEFAULT_CHAIN)
+    assert resolve_chain(file_config={"chain": ["piper", "openai"]}) == ["piper"]
+
+
+@pytest.mark.parametrize("body", [
+    'chain = ["kokoro", "nonesuch"]',
+    'chain = "kokoro"',
+    '[stt]\ncleanup = "claude"',
+    '[providers.kokoro]\nvoice = 5',
+    'providers = {kokoro = "x"}',
+    'max_chars = 0\n[providers.kokoro]\napi_key = "k"',
+])
+def test_a_malformed_live_value_beside_retired_keys_is_still_an_error(
+    monkeypatch, tmp_path, body
+):
+    _isolate(monkeypatch, tmp_path, 'voice = "old"\n' + body + "\n")
+    with pytest.raises(ConfigError):
+        data = load_config_file()
+        resolve_overflow(file_config=data)
+
+
+@pytest.mark.parametrize("name", ["elevenlabs", "openai", "google", "polly", "anthropic", "claude-cli"])
+def test_cloud_names_in_a_flag_or_env_chain_are_still_rejected(monkeypatch, name):
+    with pytest.raises(ConfigError):
+        resolve_chain(provider=name, file_config={})
+    monkeypatch.setenv("VOCALIZE_CHAIN", "kokoro," + name)
+    with pytest.raises(ConfigError):
+        resolve_chain(file_config={})
+
+
+@pytest.mark.parametrize("name", ["anthropic", "claude-cli"])
+def test_a_name_that_was_never_a_chain_engine_is_still_rejected(name):
+    with pytest.raises(ConfigError):
+        resolve_chain(file_config={"chain": ["kokoro", name]})
+
+
+@pytest.mark.parametrize("value", ["--flag", "x\nforged", "x" * 129])
+def test_local_voice_env_rejects_option_control_and_oversize(monkeypatch, value):
+    monkeypatch.setenv("VOCALIZE_VOICE", value)
+    with pytest.raises(ConfigError):
+        resolve_provider_settings("kokoro", {})
+
+
+def test_ambient_cloud_credentials_are_not_loaded_or_selected(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "SECRET_CANARY")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "SECRET_CANARY")
+    assert resolve_chain(file_config={}) == ["kokoro", "say"]
+
+
+# --- [providers.anthropic] and unknown provider tables (H1, M1) -------------
+
+
+@pytest.mark.parametrize("body, path", [
+    ("[providers.anthropic]\nmonthly_chars = 1000", "[providers.anthropic]"),
+    ('[providers.anthropic]\napi_key = "SECRET_CANARY"', "[providers.anthropic]"),
+])
+def test_the_015_anthropic_table_is_retired_not_an_error(monkeypatch, tmp_path, capsys, body, path):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, body + "\n")
+
+    data = load_config_file()
+
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert f"retired setting {path} in " in err[0]
+    assert "SECRET_CANARY" not in repr(err) + repr(data)
+    assert "1000" not in err[0]
+    assert "anthropic" not in data.get("providers", {})
+    assert config.without_retired_settings(_parse_toml(body)) == {"providers": {}}
+
+
+def test_an_unknown_provider_table_is_ignored_with_one_notice(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(
+        monkeypatch, tmp_path,
+        '[providers.nonesuch]\nvoice = "SECRET_CANARY"\nspeed = 99\n'
+        '[providers.kokoro]\nvoice = "af_bella"\n',
+    )
+
+    data = load_config_file()
+    load_config_file()  # the portal re-reads: still one notice
+
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert "[providers.nonesuch]" in err[0]
+    assert "SECRET_CANARY" not in err[0] and "99" not in err[0]
+    assert data["providers"] == {"kokoro": {"voice": "af_bella"}}
+    assert resolve_settings(file_config=data).voice_id == "af_bella"
+
+
+def test_a_non_table_under_an_unknown_provider_name_is_dropped_without_echo(
+    monkeypatch, tmp_path, capsys,
+):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, '[providers]\nanthropic = "SECRET_CANARY"\nnonesuch = 3\n')
+
+    data = load_config_file()
+
+    err = capsys.readouterr().err
+    assert "SECRET_CANARY" not in err + repr(data)
+    assert data["providers"] == {}
+
+
+def test_an_unknown_provider_table_is_dropped_by_the_writer_too():
+    from vocalize import config
+
+    raw = {"providers": {"nonesuch": {"voice": "x"}, "say": {"voice": "Alex"}}}
+    assert config.without_retired_settings(raw) == {"providers": {"say": {"voice": "Alex"}}}
+    (notice,) = config.retired_notices(raw)
+    assert "[providers.nonesuch]" in notice
+
+
+# --- settings no engine read are retired (review M2) -------------------------
+
+
+@pytest.mark.parametrize("body, path", [
+    ('[providers.kokoro]\nmodel = "SECRET_CANARY"', "providers.kokoro.model"),
+    ("[providers.kokoro]\nmodel = 12345", "providers.kokoro.model"),
+    ('[providers.piper]\nmodel = "SECRET_CANARY"', "providers.piper.model"),
+    ('[providers.say]\nmodel = "SECRET_CANARY"', "providers.say.model"),
+    ('[providers.piper]\nlanguage = "SECRET_CANARY"', "providers.piper.language"),
+    ('[providers.say]\nlanguage = "SECRET_CANARY"', "providers.say.language"),
+])
+def test_an_engine_key_no_engine_reads_is_retired_with_one_notice(
+    monkeypatch, tmp_path, capsys, body, path
+):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, body + '\nvoice = "x_voice"\n')
+
+    data = load_config_file()
+    load_config_file()
+
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert f"retired setting {path} in " in err[0]
+    assert "SECRET_CANARY" not in repr(err) + repr(data) and "12345" not in err[0]
+    name = path.split(".")[1]
+    assert data["providers"][name] == {"voice": "x_voice"}
+    assert config.without_retired_settings(_parse_toml(body)) == {"providers": {name: {}}}
+
+
+def test_the_kokoro_language_is_still_a_setting(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, '[providers.kokoro]\nlanguage = "b"\n')
+
+    data = load_config_file()
+
+    assert capsys.readouterr().err == ""
+    assert resolve_provider_settings("kokoro", data).language == "b"
+
+
+def test_vocalize_model_no_longer_changes_anything(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    before = resolve_provider_settings("kokoro", {})
+    monkeypatch.setenv("VOCALIZE_MODEL", "anything")
+    assert resolve_provider_settings("kokoro", {}) == before
+    with pytest.raises(TypeError):
+        resolve_provider_settings("kokoro", {}, model_id="x")
+
+
+def test_a_flat_model_key_stays_retired():
+    from vocalize import config
+
+    (notice,) = config.retired_notices({"model": "SECRET_CANARY"})
+    assert "retired setting model in " in notice and "SECRET_CANARY" not in notice
+    assert config.without_retired_settings({"model": "x"}) == {}
+
+
+def test_each_engine_table_knows_only_what_its_engine_reads():
+    from vocalize import config
+
+    assert config.KNOWN_PROVIDER_KEYS == {
+        "kokoro": ("voice", "language", "speed"),
+        "piper": ("voice", "speed"),
+        "say": ("voice", "speed"),
+    }

@@ -41,11 +41,11 @@ def test_portal_round_trips_warm_minutes(tmp_path, monkeypatch):
     assert status == 200
     authed = {**headers, TOKEN_HEADER: json.loads(body)["token"]}
     status, _, _ = portal.route(
-        "POST", "/api/stt", authed,
-        json.dumps({"settings": {"warm_minutes": 15},
+        "POST", "/api/settings", authed,
+        json.dumps({"changes": {"stt.warm_minutes": 15},
                     "fingerprint": wizard.ABSENT_CONFIG}).encode(),
     )
     assert status == 200
     status, _, body = portal.route("GET", "/api/state", authed)
     assert status == 200
-    assert json.loads(body)["stt"]["warm_minutes"] == 15
+    assert json.loads(body)["values"]["stt.warm_minutes"] == 15

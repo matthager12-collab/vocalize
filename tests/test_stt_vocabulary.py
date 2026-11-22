@@ -58,12 +58,12 @@ def test_portal_round_trips_vocabulary(tmp_path, monkeypatch):
 
     status, _, _ = portal.route(
         "POST",
-        "/api/stt",
+        "/api/settings",
         authed,
-        json.dumps({"settings": {"vocabulary": items}, "fingerprint": wizard.ABSENT_CONFIG}).encode(),
+        json.dumps({"changes": {"stt.vocabulary": items}, "fingerprint": wizard.ABSENT_CONFIG}).encode(),
     )
 
     assert status == 200
     status, _, body = portal.route("GET", "/api/state", authed)
     assert status == 200
-    assert json.loads(body)["stt"]["vocabulary"] == items
+    assert json.loads(body)["values"]["stt.vocabulary"] == items

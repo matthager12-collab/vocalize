@@ -1,11 +1,9 @@
 """DEC-047 release gate: real cold starts, reuse, footprint, and cross-take canaries.
 
-Run with VOCALIZE_EVAL=1 and pytest -s to see every measurement. No downloads.
+Run through tests/eval_runner.py in an approved exclusive window. No downloads.
 """
 
 import os
-import re
-import shlex
 import socket
 import subprocess
 import tempfile
@@ -14,6 +12,8 @@ import time
 from pathlib import Path
 
 import pytest
+from eval_memory import MemoryMeasurementError, physical_footprint, worker_kind
+from eval_runner import TEMP_ROOT, group_processes, owned_group
 from test_whisper_leak import VOCABULARY, write_noise
 
 from vocalize import config, dictate, llm
@@ -28,31 +28,15 @@ REAL_LLM = llm_manifest.MODEL_DIR
 
 
 def serving_processes(*, python_only=True):
-    """Inspect Python workers, excluding uv wrappers with the same argv tail."""
-    result = subprocess.run(
-        ["/usr/bin/pgrep", "-f", "_worker.py.*--serve"],
-        capture_output=True, text=True, check=False, timeout=2,
-    )
-    assert result.returncode in (0, 1), "pgrep failed"
+    """Inspect only this eval's group; never count or sample production workers."""
     workers = {}
-    for pid in result.stdout.split():
-        result = subprocess.run(
-            ["/bin/ps", "-p", pid, "-o", "command="],
-            capture_output=True, text=True, check=False, timeout=2,
-        )
-        argv = shlex.split(result.stdout.strip())
-        if not argv or (python_only and not Path(argv[0]).name.lower().startswith("python")):
+    for pid, (state, command) in group_processes(owned_group()).items():
+        if state.startswith("Z"):
             continue
-        for kind in ("whisper", "llm"):
-            if any(Path(arg).name == f"{kind}_worker.py" for arg in argv) and "--serve" in argv:
-                workers[int(pid)] = kind
+        kind = worker_kind(command, python_only=python_only)
+        if kind is not None:
+            workers[pid] = kind
     return workers
-
-
-def footprint_gb(output):
-    match = re.search(r"Physical footprint \(peak\):\s*([\d.]+)\s*([KMGT]?)", output)
-    assert match, "vmmap did not report Physical footprint (peak)"
-    return float(match[1]) * 1024 ** (" KMGT".index(match[2]) if match[2] else 0) / 1e9
 
 
 class MemorySamples:
@@ -62,25 +46,39 @@ class MemorySamples:
         self.stop = threading.Event()
         self.samples = []
         self.errors = []
+        self.identities = {}
         self.thread = threading.Thread(target=self.sample, daemon=True)
+
+    def sample_once(self):
+        workers = serving_processes()
+        observed = {}
+        peaks = {"whisper": 0.0, "llm": 0.0}
+        for pid, kind in workers.items():
+            try:
+                measurement = physical_footprint(pid)
+            except ProcessLookupError:
+                if pid not in serving_processes():
+                    continue
+                raise MemoryMeasurementError("owned worker vanished during footprint measurement") from None
+            # Never retain a counter after its PID leaves the owned group or
+            # changes its command identity. All process queries stay scoped.
+            if serving_processes().get(pid) != kind:
+                raise MemoryMeasurementError("owned worker identity changed during measurement")
+            identity = measurement["identity"]
+            if pid in self.identities and self.identities[pid] != identity:
+                raise MemoryMeasurementError("owned worker PID was reused or exec changed identity")
+            self.identities[pid] = identity
+            observed[pid] = kind
+            # Account for every owned worker even if lifecycle regression
+            # temporarily creates duplicates. Count gates below also fail.
+            peaks[kind] += measurement["peak_bytes"] / 1e9
+        counts = {kind: list(observed.values()).count(kind) for kind in peaks}
+        self.samples.append((counts, peaks))
 
     def sample(self):
         try:
             while not self.stop.is_set():
-                workers = serving_processes()
-                counts = {kind: list(workers.values()).count(kind) for kind in ("whisper", "llm")}
-                peaks = {"whisper": 0.0, "llm": 0.0}
-                for pid, kind in workers.items():
-                    result = subprocess.run(
-                        ["/usr/bin/vmmap", "--summary", str(pid)],
-                        capture_output=True, text=True, check=False, timeout=3,
-                    )
-                    # A just-shut-down process can vanish between pgrep and vmmap.
-                    if result.returncode and pid not in serving_processes():
-                        continue
-                    assert result.returncode == 0, "vmmap failed"
-                    peaks[kind] = max(peaks[kind], footprint_gb(result.stdout))
-                self.samples.append((counts, peaks))
+                self.sample_once()
                 self.stop.wait(0.05)
         except Exception as exc:  # noqa: BLE001 -- propagate sampler failures to the test
             self.errors.append(exc)
@@ -93,7 +91,7 @@ class MemorySamples:
 
 
 def shutdown(bases):
-    """Send lifecycle control to our private sockets; never signal wrapper PIDs."""
+    """Try private socket shutdown; the outer supervisor always kills leftovers."""
     deadline = time.monotonic() + 5
     while True:
         for base in bases:
@@ -115,7 +113,7 @@ def shutdown(bases):
         if not workers and not sockets:
             return
         if time.monotonic() >= deadline:
-            assert not workers and not sockets, "--serve processes or sockets remain after 5 s"
+            assert not workers and not sockets, "owned workers or sockets remain after 5 s; supervisor will reap"
         time.sleep(0.05)
 
 
@@ -139,7 +137,7 @@ def test_warm_timing_memory_and_canaries(tmp_path, monkeypatch):
     except OSError:
         available = False
     if not available:
-        pytest.skip("both real models must be installed and readable")
+        pytest.fail("both real models must be installed and readable; evaluation is not qualified")
     monkeypatch.setattr(whisper_manifest, "MODEL_DIR", REAL_WHISPER)
     monkeypatch.setattr(llm_manifest, "MODEL_DIR", REAL_LLM)
     # The eval is about the models, not the install stamp (as in
@@ -147,14 +145,14 @@ def test_warm_timing_memory_and_canaries(tmp_path, monkeypatch):
     from vocalize.local import install
 
     monkeypatch.setattr(install, "installed", lambda *args, **kwargs: (True, ""))
-    assert not serving_processes(python_only=False), "stop existing warm servers before this isolated eval"
+    assert not serving_processes(python_only=False), "unexpected worker in this fresh evaluation group"
     stt = config.resolve_stt({"stt": {"cleanup": "local", "vocabulary": VOCABULARY}})
     clip = jargon_clip(tmp_path)
     system = llm.CLEANUP_PROMPT.rstrip() + "\n\n" + llm.DATA_BOUNDARY
     waits, samples, bases = {}, {}, []
     vocabulary = config.vocabulary_prompt(VOCABULARY)
     # Short paths are required for sockaddr_un on macOS. TemporaryDirectory is 0700.
-    with tempfile.TemporaryDirectory(prefix="vw-", dir="/tmp") as root:
+    with tempfile.TemporaryDirectory(prefix="vw-", dir=os.environ[TEMP_ROOT]) as root:
         try:
             # 1. Today's path, with no warm endpoint anywhere: the baseline.
             missing = Path(root) / "missing"
@@ -239,6 +237,11 @@ def test_warm_timing_memory_and_canaries(tmp_path, monkeypatch):
             count = max(c["llm"] for c, _ in all_samples)
             print(f"maximum LLM processes = {count}", flush=True)
             assert count == 1, "missing or duplicate LLM server"
+            whisper_count = max(c["whisper"] for c, _ in all_samples)
+            print(f"maximum Whisper processes = {whisper_count}", flush=True)
+            assert whisper_count == 1, "missing or duplicate Whisper server"
+            assert any(c["llm"] == c["whisper"] == 1 for c, _ in all_samples), \
+                "no simultaneous model footprint sample"
             for kind, peak in peaks.items():
                 print(f"{kind} physical footprint peak = {peak:.3f} GB", flush=True)
                 assert peak > 0, f"no {kind} memory measurement"
@@ -255,4 +258,4 @@ def test_warm_timing_memory_and_canaries(tmp_path, monkeypatch):
             assert together <= 4.6
         finally:
             shutdown(bases)
-            print("remaining --serve processes = 0", flush=True)
+            print("remaining owned --serve processes = 0", flush=True)

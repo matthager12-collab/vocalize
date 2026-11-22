@@ -9,7 +9,7 @@ baked into the Quick Actions as `__HELPER__`.
 Baked paths are the STABLE ones, never resolved: `shutil.which` finds a
 symlink (a Homebrew formula's, a `uv tool`'s shim), and a resolved target
 (the Cellar or Caskroom path underneath it) breaks the moment that formula
-upgrades. `_resolve_vocalize_bin` and `_resolve_claude` return exactly what
+upgrades. `_resolve_vocalize_bin` returns exactly what
 `which` found — or, for vocalize, `sys.argv[0]` when it is not on PATH at
 all (e.g. a repo `.venv` console script run directly).
 """
@@ -36,8 +36,6 @@ BUNDLE_NAMES = (
     "Dictate with Vocalize.workflow",
 )
 PLACEHOLDER = "__VOCALIZE_BIN__"
-CLAUDE_PLACEHOLDER = "__CLAUDE_BIN__"
-CLAUDE_EXTRA_PATH_PLACEHOLDER = "__CLAUDE_EXTRA_PATH__"
 HELPER_PLACEHOLDER = "__HELPER__"
 PBS = "/System/Library/CoreServices/pbs"
 
@@ -46,8 +44,8 @@ PBS = "/System/Library/CoreServices/pbs"
 _UNSAFE_PATH_CHARS = set('"\\`$')
 
 # The tools `vocalize integrate claude`'s pre-check and the Quick Actions
-# depend on: the CLI itself, the summarizer, and what the summarizer needs.
-_PATH_TOOLS = ("vocalize", "claude", "node", "python3")
+# depend on: the local CLI and the stdlib-only selection helper.
+_PATH_TOOLS = ("vocalize", "python3")
 
 
 def _resolve_vocalize_bin() -> str:
@@ -64,23 +62,6 @@ def _resolve_helper() -> Path:
     return helper
 
 
-def _resolve_claude() -> tuple[str, str]:
-    """Return (claude_path, extra_PATH). Empty strings when claude is absent.
-
-    claude.exe may need `node` resolved via PATH even when invoked by its
-    absolute path, and a bare Services environment has neither on PATH, so
-    bake claude's and node's directories for the helper to prepend.
-    """
-    found = shutil.which("claude")
-    if not found:
-        return "", ""
-    dirs = [str(Path(found).parent)]
-    node = shutil.which("node")
-    if node:
-        node_dir = str(Path(node).parent)
-        if node_dir not in dirs:
-            dirs.append(node_dir)
-    return found, os.pathsep.join(dirs)
 
 
 class RefusedDestination(RuntimeError):
@@ -110,17 +91,14 @@ def _install_one(name: str, substitutions: dict) -> None:
 
 def main() -> int:
     """Copy the five Quick Action bundles into ~/Library/Services with this
-    machine's vocalize/claude/helper paths baked in. 0 on success, 1 on a
+    machine's vocalize/helper paths baked in. 0 on success, 1 on a
     refusal (an unsafe path)."""
     bin_path = str(_resolve_vocalize_bin())
     helper_path = str(_resolve_helper())
-    claude_path, claude_extra_path = _resolve_claude()
 
     substitutions = {
         PLACEHOLDER: bin_path,
         HELPER_PLACEHOLDER: helper_path,
-        CLAUDE_PLACEHOLDER: claude_path,
-        CLAUDE_EXTRA_PATH_PLACEHOLDER: claude_extra_path,
     }
     # `sys.argv[0]` is a fallback, not a promise: under `python -m vocalize`
     # it is a non-executable `__main__.py`, and through the legacy
@@ -161,10 +139,6 @@ def main() -> int:
         pass  # the registry catches up at the next login; the bundles are in place
 
     print(f"\nUsing vocalize at: {bin_path}")
-    if claude_path:
-        print(f"Summaries via claude at: {claude_path}")
-    else:
-        print("claude not found; Quick Actions will offer speak-all / truncate only.")
     print('Highlight text in any app, then right-click -> Services -> "Speak with Vocalize".')
     print("Keyboard shortcuts: System Settings -> Keyboard -> Keyboard Shortcuts -> Services.")
     print("If the actions don't appear, re-open the Services submenu once, or log out and in.")
@@ -259,13 +233,75 @@ def integrate_claude(*, yes: bool) -> int:
         needs_you.append("grant Accessibility to Vocalize.app")
 
     print()
-    print("Summary:")
+    print("Result:")
     print(f"  installed: /speak skill ({skill_result}), 5 Quick Actions")
     if skill_result == "kept":
         print("  skipped: /speak skill (rerun with --yes to overwrite the existing file)")
     print(f"  needs you: {'; '.join(needs_you)}")
 
     return 0
+
+
+def installed_paths() -> list[Path]:
+    """What `integrate_claude` put on this machine and is still there: each
+    Quick Action bundle directory, and the /speak skill when it is the
+    shipped file. Read-only and cheap: a few stats and one small read."""
+    found = [
+        SERVICES_DIR / name for name in BUNDLE_NAMES
+        if (SERVICES_DIR / name).is_dir() and not (SERVICES_DIR / name).is_symlink()
+    ]
+    if _skill_is_ours():
+        found.append(SKILL_DEST)
+    return found
+
+
+def _skill_is_ours() -> bool:
+    if SKILL_DEST.is_symlink() or not SKILL_DEST.is_file():
+        return False
+    try:
+        return SKILL_DEST.read_bytes() == SKILL_SRC.read_bytes()
+    except OSError:
+        return False
+
+
+def remove_claude() -> tuple[list[Path], list[Path]]:
+    """Undo `integrate_claude`: remove the five Quick Action bundles and the
+    /speak skill. Returns (removed, kept).
+
+    Exactly what the installer wrote, by name, and nothing else: a symlink
+    or a plain file at a bundle's name is kept (the installer refuses to
+    replace those too), and so is a SKILL.md that differs from the shipped
+    one — the installer keeps a user's own file without --yes, so a
+    different file there is not ours to delete. The skill's directory goes
+    only when that leaves it empty. `~/.claude/commands/` is never touched.
+    Raises OSError when a removal fails.
+    """
+    removed: list[Path] = []
+    kept: list[Path] = []
+    for name in BUNDLE_NAMES:
+        dest = SERVICES_DIR / name
+        if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+            kept.append(dest)
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+            removed.append(dest)
+
+    if _skill_is_ours():
+        SKILL_DEST.unlink()
+        removed.append(SKILL_DEST)
+        try:
+            SKILL_DEST.parent.rmdir()  # only succeeds when empty
+        except OSError:
+            pass
+    elif SKILL_DEST.exists() or SKILL_DEST.is_symlink():
+        kept.append(SKILL_DEST)
+
+    if removed:
+        try:
+            subprocess.run([PBS, "-update"], check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass  # the Services menu catches up at the next login
+    return removed, kept
 
 
 if __name__ == "__main__":

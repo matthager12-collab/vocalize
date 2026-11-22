@@ -2,14 +2,14 @@
 
 `vocalize status` (and, in 0.11.0, the config portal polling it) needs to
 know at a glance whether each configured provider can actually be used
-right now. Some checks — a keychain read chief among them — can block on a
+right now. Some checks — a native runtime probe, for example — can block on a
 macOS permission dialog, so every probe runs on its own daemon thread,
 joined with a timeout. A probe still stuck when the timeout elapses gets a
 "still checking" row instead of hanging the caller.
 
 Daemon threads, not a ThreadPoolExecutor: a pool's workers are joined at
 interpreter exit, which would hang `vocalize status` forever on a wedged
-keychain call. A plain daemon thread lets the process exit with the probe
+native call. A plain daemon thread lets the process exit with the probe
 still running.
 
 A module-level registry keeps at most one in-flight thread per row name:
@@ -20,7 +20,7 @@ thread total, never one per poll.
 
 from __future__ import annotations
 
-import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,18 +30,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
-from . import app, auth, config, ledger
+from . import app, auth, config
 from .exceptions import VocalizeError
 
-# Providers authenticated by a single stored/env API key — see
-# auth.PROVIDER_ENV_VARS / PROVIDER_USERNAMES. Polly, say and kokoro each
-# get their own probe below.
-_CREDENTIAL_PROVIDERS = ("elevenlabs", "openai", "google")
-
 #: The detail on the row a probe that is still running gets. Named because
-#: callers have to tell "no answer yet" from "the probe raised" — see
-#: portal._key_info.
-STILL_CHECKING = "still checking — a slow probe, or a keychain dialog, may be waiting"
+#: callers have to tell "no answer yet" from "the probe raised".
+STILL_CHECKING = "still checking — a local runtime probe may be waiting"
 
 
 class Row(NamedTuple):
@@ -74,49 +68,32 @@ _inflight: dict[str, _Slot] = {}
 _lock = threading.Lock()
 
 
-def _credential_row(name: str, file_config: dict, *, in_chain: bool = True) -> Row:
-    source = auth.key_source(None, name)
-    if source == "not found":
-        if not in_chain:
-            return Row(name, "ok", "not in your chain; no key stored", "")
-        return Row(
-            name, "fail", "no API key configured",
-            f"run: vocalize auth login --provider {name}",
-        )
+def _install_row(name: str, reason: str, action: str) -> Row:
+    """A not-ready row that names its fix once.
 
-    detail = f"key from {source}"
-    if not in_chain:
-        return Row(name, "warn", f"{detail} (not in your chain)", "")
-
-    budget = config.budget_for(name, file_config)
-    if budget is not None:
-        used, exhausted = ledger.status(name)
-        detail += f"; {used:,}/{budget:,} characters this month"
-        if exhausted or used >= budget:
-            return Row(
-                name, "warn", f"{detail} (budget exhausted)",
-                "raise monthly_chars in config, or wait for next month",
-            )
-    return Row(name, "ok", detail, "")
-
-
-def _polly_row(file_config: dict, *, in_chain: bool = True) -> Row:
-    profile = (
-        config.provider_table("polly", file_config).get("profile")
-        or os.environ.get("AWS_PROFILE")
-        or "default"
+    The install checker's reasons already end in the command ("not
+    installed — run: vocalize local install"), and the row's action is
+    the same command, so the screen used to print it twice. The action
+    stays — the portal shows it as the command to run — and the detail
+    loses its copy. A reason that names the command some other way keeps
+    it, and the row then has no separate action.
+    """
+    suffix = re.compile(
+        r"\s+—\s+(?:run|reinstall with):?\s+`?" + re.escape(action) + r"`?(?:\s+again)?\s*$"
     )
-    status = auth.polly_credential_status(profile)
-    if status == "not configured":
-        if not in_chain:
-            return Row("polly", "ok", "not in your chain; no key stored", "")
-        return Row(
-            "polly", "fail", "no AWS credentials found",
-            "set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or configure ~/.aws/credentials",
-        )
-    if not in_chain:
-        return Row("polly", "warn", f"credentials from {status} (not in your chain)", "")
-    return Row("polly", "ok", f"credentials from {status}", "")
+    detail = suffix.sub("", reason)
+    if action in detail:
+        return Row(name, "warn", detail, "")
+    return Row(name, "warn", detail, action)
+
+
+def _piper_row() -> Row:
+    from .providers import piper as piper_provider  # lazy import, no cycle risk
+
+    ready, reason = piper_provider.installed()
+    if ready:
+        return Row("piper", "ok", "installed and ready", "")
+    return _install_row("piper", reason, "vocalize local install --piper")
 
 
 def _kokoro_row() -> Row:
@@ -125,7 +102,7 @@ def _kokoro_row() -> Row:
     ready, reason = kokoro_provider.installed()
     if ready:
         return Row("kokoro", "ok", "installed and ready", "")
-    return Row("kokoro", "warn", reason, "vocalize local install")
+    return _install_row("kokoro", reason, "vocalize local install")
 
 
 # --- dictation rows ---------------------------------------------------
@@ -151,9 +128,9 @@ _STT_INSTALL_ACTION = "vocalize local install --stt"
 
 
 def _installed_stt_models() -> list[str]:
-    from .local import install, whisper_manifest
+    from .local import install, parakeet_manifest, whisper_manifest
 
-    return [
+    models = [
         model
         for model in whisper_manifest.MODELS
         if install.installed(
@@ -162,6 +139,11 @@ def _installed_stt_models() -> list[str]:
             install_hint=_STT_INSTALL_ACTION,
         )[0]
     ]
+    if parakeet_manifest.supported() and install.installed(
+        parakeet_manifest, install_hint=_STT_INSTALL_ACTION
+    )[0]:
+        models.insert(0, "parakeet")
+    return models
 
 
 def _recorder_is_built() -> bool:
@@ -180,10 +162,147 @@ def stt_configured(file_config: dict) -> bool:
         return False
 
 
-def _stt_model_row() -> Row:
-    models = _installed_stt_models()
-    if models:
-        return Row("stt model", "ok", f"{', '.join(models)} on disk", "")
+def cleanup_is_local(file_config: dict) -> bool:
+    """Whether `[stt] cleanup` resolves to `local`. Never raises: a bad
+    value is a config error other commands report, not a status row."""
+    try:
+        return config.resolve_stt(file_config)["cleanup"] == "local"
+    except VocalizeError:
+        return False
+
+
+_WHISPER_INSTALL_ACTION = "vocalize local install --stt --engine whisper"
+_PARAKEET_INSTALL_ACTION = "vocalize local install --stt --engine parakeet"
+
+
+def engine_state(manifest, files=None, install_hint: str = _STT_INSTALL_ACTION) -> str:
+    """"ready", "runtime" or "missing" for one engine's model files.
+
+    "runtime" is the state an upgrade from 0.15 leaves: every model file is
+    on disk and verified, but the hash-locked environment this version runs
+    the engine in was never built. Installing again builds it, and checks
+    the files on disk rather than downloading them again.
+    """
+    from .local import install
+
+    ready, reason = install.installed(manifest, files=files, install_hint=install_hint)
+    if ready:
+        return "ready"
+    # `installed` checks the runtime last, so its runtime reason means every
+    # file before it passed.
+    if (install.locked(manifest) and not install.runtime_installed(manifest)
+            and "locked runtime" in reason):
+        return "runtime"
+    return "missing"
+
+
+def _whisper_states() -> dict[str, str]:
+    """Each Whisper model that is ready or waits only for its runtime."""
+    from .local import whisper_manifest
+
+    out = {}
+    for model in whisper_manifest.MODELS:
+        state = engine_state(whisper_manifest, [whisper_manifest.file_for(model)])
+        if state != "missing":
+            out[model] = state
+    return out
+
+
+def _whisper_install(models) -> str:
+    """The install command that builds Whisper's runtime around `models`."""
+    from .local import whisper_manifest
+
+    if not models or whisper_manifest.DEFAULT_MODEL in models:
+        return _WHISPER_INSTALL_ACTION
+    return f"{_WHISPER_INSTALL_ACTION} --model {models[0]}"
+
+
+def upgrade_commands() -> list[str]:
+    """The install commands to run once after an upgrade: one per engine
+    whose model files are on disk and verified but whose locked runtime is
+    missing. Empty when there is nothing to do. Never raises."""
+    from .local import kokoro_manifest, llm_manifest, parakeet_manifest
+
+    out = []
+    try:
+        if engine_state(kokoro_manifest, install_hint="vocalize local install") == "runtime":
+            out.append("vocalize local install")
+        if (parakeet_manifest.supported()
+                and engine_state(parakeet_manifest) == "runtime"):
+            out.append(_PARAKEET_INSTALL_ACTION)
+        whisper = _whisper_states()
+        waiting = [model for model, state in whisper.items() if state == "runtime"]
+        if waiting and "ready" not in whisper.values():
+            out.append(_whisper_install(waiting))
+        if engine_state(llm_manifest, install_hint=_LLM_INSTALL_ACTION) == "runtime":
+            out.append(_LLM_INSTALL_ACTION)
+    except (OSError, VocalizeError):
+        return out
+    return out
+
+
+def upgrade_line(commands: list[str]) -> str:
+    """The one plain line `status` and `local status` end with after an upgrade."""
+    return (
+        "After upgrading from an older version, run once: " + "; ".join(commands)
+        + ". Model files already on disk are checked and not downloaded again."
+    )
+
+
+def _runtime_row(what: str, command: str) -> Row:
+    return Row("stt model", "fail",
+               f"{what} installed; its runtime must be installed once", command)
+
+
+def _stt_model_row(file_config: dict | None = None) -> Row:
+    """The configured dictation engine: Parakeet, Whisper, or either (auto).
+
+    An engine whose model files are verified but whose locked runtime is
+    missing (an upgrade from 0.15) is named as installed, with the one
+    command that builds its runtime. File transcription follows the same
+    engine, and with auto falls back to whichever one is installed.
+    """
+    from .local import parakeet_manifest
+
+    try:
+        engine = config.resolve_stt(file_config or {})["engine"]
+    except VocalizeError:
+        engine = "auto"
+    supported = parakeet_manifest.supported()
+    parakeet = engine_state(parakeet_manifest) if supported else "missing"
+    whisper = _whisper_states()
+    whisper_ready = [model for model, state in whisper.items() if state == "ready"]
+    whisper_waiting = [model for model, state in whisper.items() if state == "runtime"]
+
+    if engine == "parakeet":
+        if parakeet == "ready":
+            return Row("stt model", "ok", "Parakeet ready", "")
+        if parakeet == "runtime":
+            return _runtime_row("Parakeet model", _PARAKEET_INSTALL_ACTION)
+        detail = "Parakeet not installed" if supported else "Parakeet needs an Apple Silicon Mac"
+        return Row("stt model", "fail", detail, _PARAKEET_INSTALL_ACTION if supported else "")
+    if engine == "whisper":
+        if whisper_ready:
+            return Row("stt model", "ok", f"Whisper {', '.join(whisper_ready)} on disk", "")
+        if whisper_waiting:
+            return _runtime_row(f"Whisper model {', '.join(whisper_waiting)}",
+                                _whisper_install(whisper_waiting))
+        return Row("stt model", "fail", "no Whisper model installed", _WHISPER_INSTALL_ACTION)
+
+    if parakeet == "ready" or whisper_ready:
+        parts = []
+        if parakeet == "ready":
+            parts.append("Parakeet on disk")
+        elif supported:
+            parts.append("Parakeet not installed")
+        if whisper_ready:
+            parts.append(f"Whisper {', '.join(whisper_ready)} on disk")
+        return Row("stt model", "ok", "; ".join(parts), "")
+    if parakeet == "runtime":
+        return _runtime_row("Parakeet model", _PARAKEET_INSTALL_ACTION)
+    if whisper_waiting:
+        return _runtime_row(f"Whisper model {', '.join(whisper_waiting)}",
+                            _whisper_install(whisper_waiting))
     return Row("stt model", "fail", "no speech-to-text model installed", _STT_INSTALL_ACTION)
 
 
@@ -201,7 +320,7 @@ def _llm_model_row() -> Row:
         return Row("llm model", "ok", "installed and ready", "")
 
     # When the model is not installed, check whether the machine has
-    # enough RAM — if not, the reason names the figures and the cloud
+    # enough RAM — if not, the reason names the figures and the local
     # alternatives.
     ram = local_module.physical_ram_bytes()
     if ram is not None and ram < llm_manifest.MIN_RAM_BYTES:
@@ -211,10 +330,10 @@ def _llm_model_row() -> Row:
         required = _human_readable_size(llm_manifest.MIN_RAM_BYTES)
         return Row(
             "llm model", "warn",
-            f"{measured} RAM, needs {required}; use claude-cli or anthropic instead",
+            f"{measured} RAM, needs {required}; disable cleanup until a compatible local model is installed",
             "",
         )
-    return Row("llm model", "warn", reason, _LLM_INSTALL_ACTION)
+    return _install_row("llm model", reason, _LLM_INSTALL_ACTION)
 
 
 def _recorder_row() -> Row:
@@ -403,14 +522,6 @@ def _swiftc_row() -> Row:
     return Row("swiftc", "fail", "swiftc not found", "xcode-select --install")
 
 
-def _claude_row() -> Row:
-    if shutil.which("claude"):
-        return Row("claude", "ok", "claude on PATH", "")
-    return Row(
-        "claude", "warn",
-        "not on PATH; /speak summaries and claude-cli cleanup unavailable", "",
-    )
-
 
 def _shebang_row() -> Row:
     """Does the running console script's interpreter still exist.
@@ -486,11 +597,14 @@ def _app_bundle_row() -> Row:
     return Row("app bundle", row.state, row.detail, row.action)
 
 
-_ICLOUD_CAVEAT = "notes would sync off this machine via iCloud Drive; keep the notes folder outside it"
+_ICLOUD_CAVEAT = (
+    "transcripts would sync off this machine via iCloud Drive; "
+    "keep the transcripts folder outside it"
+)
 
 
-def _notes_folder_row(file_config: dict) -> Row:
-    folder = Path(config.resolve_notes(file_config)["folder"]).expanduser()
+def _transcripts_folder_row(file_config: dict) -> Row:
+    folder = Path(config.resolve_transcribe(file_config)["folder"]).expanduser()
     if folder.exists():
         try:
             total_bytes = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
@@ -503,19 +617,17 @@ def _notes_folder_row(file_config: dict) -> Row:
     mobile_documents = Path.home() / "Library" / "Mobile Documents"
     under_icloud = folder == mobile_documents or mobile_documents in folder.parents
     if under_icloud:
-        return Row("notes folder", "warn", f"{detail} — {_ICLOUD_CAVEAT}", "")
-    return Row("notes folder", "ok", detail, "")
+        return Row("transcripts folder", "warn", f"{detail} — {_ICLOUD_CAVEAT}", "")
+    return Row("transcripts folder", "ok", detail, "")
 
 
 def _make_probe(name: str, file_config: dict, *, in_chain: bool = True) -> Callable[[], Row]:
-    if name in _CREDENTIAL_PROVIDERS:
-        return lambda: _credential_row(name, file_config, in_chain=in_chain)
-    if name == "polly":
-        return lambda: _polly_row(file_config, in_chain=in_chain)
     if name == "kokoro":
         return _kokoro_row
+    if name == "piper":
+        return _piper_row
     if name == "say":
-        return lambda: Row("say", "ok", "local, no credentials needed", "")
+        return lambda: Row("say", "ok", "built into macOS, nothing to install", "")
     # Not one of the known provider shapes (a hand-edited or future config).
     # Never raise here — an unknown chain entry is a warning, not a crash.
     return lambda: Row(name, "warn", "no readiness check registered for this provider", "")
@@ -548,11 +660,10 @@ def _start_probe(name: str, probe: Callable[[], Row]) -> tuple[threading.Thread,
                     slot.row = probe()
                 except Exception as exc:  # noqa: BLE001 — a probe must never crash status
                     # Never interpolate str(exc): _PROBES is an open registry
-                    # (future portal/dictation probes touch subprocesses and
-                    # the network), so an exception message here is untrusted
-                    # and may embed credential-shaped text — the same class
-                    # of leak auth.scrub() exists to guard against. Report
-                    # only the exception's type, never its message.
+                    # (probes touch subprocesses and user files), so an
+                    # exception message here is untrusted and may quote
+                    # private paths or input. Report only the exception's
+                    # type, never its message.
                     slot.row = Row(name, "warn", f"probe failed: {type(exc).__name__}", "")
 
             slot.thread = threading.Thread(target=target, daemon=True)
@@ -572,7 +683,7 @@ def run_probes(probes: list[tuple[str, Callable[[], Row]]], timeout: float) -> l
 
     All of them are started before any of them is joined, and they share
     one deadline. Joining each in turn instead costs `len(probes) x
-    timeout` whenever a keychain dialog is up — and the portal pays that on
+    timeout` whenever a native probe is blocked — and the portal pays that on
     every poll, not once.
     """
     started = [(name, *_start_probe(name, probe)) for name, probe in probes]
@@ -623,7 +734,7 @@ def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
             _PROBES[name] = _make_probe(name, file_config)
 
         if stt_configured(file_config):
-            _PROBES["stt model"] = _stt_model_row
+            _PROBES["stt model"] = lambda: _stt_model_row(file_config)
             _PROBES["recorder"] = _recorder_row
             _PROBES["microphone"] = _microphone_row
             _PROBES["input device"] = lambda: _input_device_row(file_config)
@@ -635,9 +746,14 @@ def readiness(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
                 _PROBES.pop(name, None)
                 _drop_inflight(name)
 
-        # LLM row: always shown, since the local model is relevant to
-        # cleanup regardless of whether dictation is configured.
-        _PROBES["llm model"] = _llm_model_row
+        # The language model only matters to a machine that asked for
+        # local cleanup; everywhere else its row would be a warning that
+        # fails `status` for a feature nobody opted into.
+        if cleanup_is_local(file_config):
+            _PROBES["llm model"] = _llm_model_row
+        else:
+            _PROBES.pop("llm model", None)
+            _drop_inflight("llm model")
 
         if app.bundle_state() != "not built":
             _PROBES["app"] = _app_row
@@ -675,7 +791,7 @@ def doctor_rows(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
         for name in auth.PROVIDER_NAMES
     ]
     probes += [
-        ("stt model", _stt_model_row),
+        ("stt model", lambda: _stt_model_row(file_config)),
         ("recorder", _recorder_row),
         ("microphone", _microphone_row),
         ("input device", lambda: _input_device_row(file_config)),
@@ -685,12 +801,11 @@ def doctor_rows(file_config: dict, *, timeout: float = 2.0) -> list[Row]:
         ("cli path", _cli_path_row),
         ("uv", _uv_row),
         ("swiftc", _swiftc_row),
-        ("claude", _claude_row),
         ("shebang", _shebang_row),
         ("hammerspoon", _hammerspoon_row),
         ("services shortcut", lambda: _services_shortcut_row(file_config)),
         ("cli start-up", _cli_startup_row),
         ("app bundle", _app_bundle_row),
-        ("notes folder", lambda: _notes_folder_row(file_config)),
+        ("transcripts folder", lambda: _transcripts_folder_row(file_config)),
     ]
     return run_probes(probes, timeout)

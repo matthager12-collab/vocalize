@@ -11,8 +11,6 @@ def _seed_templates(tmp_path):
     templates = tmp_path / "quick_actions"
     body = (
         f'BIN="{install_quick_action.PLACEHOLDER}" '
-        f'CLAUDE="{install_quick_action.CLAUDE_PLACEHOLDER}" '
-        f'EXTRA="{install_quick_action.CLAUDE_EXTRA_PATH_PLACEHOLDER}" '
         f'HELPER="{install_quick_action.HELPER_PLACEHOLDER}"'
     )
     for name in install_quick_action.BUNDLE_NAMES:
@@ -44,22 +42,16 @@ def install_env(monkeypatch, tmp_path):
     fake_helper.write_text("# helper\n", encoding="utf-8")
     monkeypatch.setattr(install_quick_action, "_resolve_helper", lambda: fake_helper)
 
-    fake_claude = tmp_path / "npm" / "bin" / "claude"
-    fake_extra = str(tmp_path / "npm" / "bin")
-    monkeypatch.setattr(
-        install_quick_action, "_resolve_claude", lambda: (str(fake_claude), fake_extra)
-    )
-
     pbs_calls = []
     monkeypatch.setattr(
         install_quick_action.subprocess, "run",
         lambda argv, **kwargs: pbs_calls.append(argv),
     )
-    return services, fake_bin, fake_helper, fake_claude, pbs_calls
+    return services, fake_bin, fake_helper, pbs_calls
 
 
 def test_copies_both_bundles_into_services_dir(install_env):
-    services, _bin, _helper, _claude, _pbs = install_env
+    services, _bin, _helper, _pbs = install_env
 
     assert install_quick_action.main() == 0
 
@@ -68,7 +60,7 @@ def test_copies_both_bundles_into_services_dir(install_env):
 
 
 def test_substitutes_the_vocalize_bin_placeholder(install_env):
-    services, fake_bin, _helper, _claude, _pbs = install_env
+    services, fake_bin, _helper, _pbs = install_env
 
     assert install_quick_action.main() == 0
 
@@ -80,36 +72,22 @@ def test_substitutes_the_vocalize_bin_placeholder(install_env):
         assert str(fake_bin) in text
 
 
-def test_substitutes_claude_helper_and_extra_path_placeholders(install_env):
-    services, _bin, fake_helper, fake_claude, _pbs = install_env
+def test_substitutes_only_local_helper_placeholder(install_env):
+    services, _bin, fake_helper, _pbs = install_env
 
     assert install_quick_action.main() == 0
 
     text = (services / "Speak with Vocalize.workflow" / "Contents" / "Resources"
             / "document.wflow").read_text(encoding="utf-8")
-    for placeholder in (install_quick_action.CLAUDE_PLACEHOLDER,
-                        install_quick_action.CLAUDE_EXTRA_PATH_PLACEHOLDER,
-                        install_quick_action.HELPER_PLACEHOLDER):
-        assert placeholder not in text
+    assert install_quick_action.HELPER_PLACEHOLDER not in text
     assert str(fake_helper) in text
-    assert str(fake_claude) in text
+    assert "CLAUDE" not in text
 
 
-def test_bakes_empty_claude_values_when_claude_absent(install_env, monkeypatch):
-    services, _bin, _helper, _claude, _pbs = install_env
-    monkeypatch.setattr(install_quick_action, "_resolve_claude", lambda: ("", ""))
-
-    assert install_quick_action.main() == 0
-
-    text = (services / "Speak with Vocalize.workflow" / "Contents" / "Resources"
-            / "document.wflow").read_text(encoding="utf-8")
-    # Placeholders gone, replaced by empty strings — no traceback, still installs.
-    assert install_quick_action.CLAUDE_PLACEHOLDER not in text
-    assert 'CLAUDE=""' in text
 
 
 def test_runs_pbs_update_after_installing(install_env):
-    _services, _bin, _helper, _claude, pbs_calls = install_env
+    _services, _bin, _helper, pbs_calls = install_env
 
     assert install_quick_action.main() == 0
 
@@ -117,7 +95,7 @@ def test_runs_pbs_update_after_installing(install_env):
 
 
 def test_is_idempotent_on_rerun(install_env):
-    services, fake_bin, _helper, _claude, _pbs = install_env
+    services, fake_bin, _helper, _pbs = install_env
 
     assert install_quick_action.main() == 0
     assert install_quick_action.main() == 0
@@ -131,7 +109,7 @@ def test_is_idempotent_on_rerun(install_env):
 
 
 def test_refuses_an_unsafe_vocalize_path(install_env, monkeypatch, tmp_path, capsys):
-    services, _bin, _helper, _claude, pbs_calls = install_env
+    services, _bin, _helper, pbs_calls = install_env
     evil = tmp_path / 'has"quote' / "vocalize"
     monkeypatch.setattr(install_quick_action, "_resolve_vocalize_bin", lambda: evil)
 
@@ -149,7 +127,7 @@ def test_refuses_a_vocalize_path_that_is_not_executable(
     non-executable `__main__.py`; baking it gives four Quick Actions that
     fail their own `[[ -x "$BIN" ]]` guard while the command reports
     success."""
-    services, _bin, _helper, _claude, pbs_calls = install_env
+    services, _bin, _helper, pbs_calls = install_env
     not_executable = tmp_path / "checkout" / "__main__.py"
     not_executable.parent.mkdir()
     not_executable.write_text("# entry point\n", encoding="utf-8")
@@ -168,7 +146,7 @@ def test_refuses_a_relative_vocalize_path(install_env, monkeypatch, capsys):
     """The legacy `python3 hooks/install_quick_action.py` route bakes argv[0]
     verbatim; a relative path is resolved against the Service's cwd, not the
     repo root."""
-    services, bin_path, _helper, _claude, pbs_calls = install_env
+    services, bin_path, _helper, pbs_calls = install_env
     monkeypatch.chdir(bin_path.parent)
     monkeypatch.setattr(
         install_quick_action, "_resolve_vocalize_bin", lambda: Path("./vocalize")
@@ -181,18 +159,6 @@ def test_refuses_a_relative_vocalize_path(install_env, monkeypatch, capsys):
     assert pbs_calls == []
 
 
-def test_refuses_an_unsafe_claude_path(install_env, monkeypatch, tmp_path, capsys):
-    services, _bin, _helper, _claude, pbs_calls = install_env
-    monkeypatch.setattr(
-        install_quick_action, "_resolve_claude",
-        lambda: (str(tmp_path / "ev`il" / "claude"), ""),
-    )
-
-    assert install_quick_action.main() == 1
-
-    assert "Refusing to install" in capsys.readouterr().err
-    assert not services.exists()
-    assert pbs_calls == []
 
 
 def test_resolve_vocalize_bin_uses_which_unresolved(monkeypatch, tmp_path):
@@ -226,26 +192,8 @@ def test_errors_when_helper_missing(monkeypatch, tmp_path, capsys):
     assert "picker helper" in capsys.readouterr().err
 
 
-def test_resolve_claude_empty_when_absent(monkeypatch):
-    monkeypatch.setattr(install_quick_action.shutil, "which", lambda name: None)
-    assert install_quick_action._resolve_claude() == ("", "")
 
 
-def test_resolve_claude_includes_node_dir(monkeypatch, tmp_path):
-    claude = tmp_path / "npm" / "bin" / "claude"
-    node = tmp_path / "node" / "bin" / "node"
-
-    def which(name):
-        return {"claude": str(claude), "node": str(node)}.get(name)
-
-    monkeypatch.setattr(install_quick_action.shutil, "which", which)
-    path, extra = install_quick_action._resolve_claude()
-    # Unresolved — never .resolve(): the gate greps for the symlink itself,
-    # not its Cellar/Caskroom target (T-81).
-    assert path == str(claude)
-    parts = extra.split(install_quick_action.os.pathsep)
-    assert str(claude.parent) in parts
-    assert str(node.parent) in parts
 
 
 def _real_wflow(name):
@@ -263,7 +211,7 @@ def test_checked_in_speak_bundle_execs_the_helper():
     # inputMethod 0 = stdin: selected text reaches the helper via stdin only.
     assert params["inputMethod"] == 0
     assert 'exec /usr/bin/python3 "__HELPER__"' in script
-    assert 'export CLAUDE_BIN="__CLAUDE_BIN__"' in script
+    assert "CLAUDE_BIN" not in script
     assert 'export VOCALIZE_BIN="$BIN"' in script
 
 
@@ -300,7 +248,7 @@ def _real_info(name):
 
 
 def test_the_dictate_bundle_is_installed_with_the_others(install_env):
-    services, fake_bin, _helper, _claude, _pbs = install_env
+    services, fake_bin, _helper, _pbs = install_env
 
     assert install_quick_action.main() == 0
 
@@ -346,14 +294,14 @@ def test_the_dictate_bundle_does_not_reuse_the_stop_bundles_uuids():
     assert dictate_action["InputUUID"] != stop_action["InputUUID"]
 
 
-def test_the_dictate_bundle_execs_dictate_and_exports_the_claude_environment():
+def test_the_dictate_bundle_execs_dictate_without_cloud_environment():
     script = _real_wflow(DICTATE_BUNDLE)["actions"][0]["action"]["ActionParameters"][
         "COMMAND_STRING"
     ]
 
     assert 'exec "$BIN" dictate' in script
-    assert 'export CLAUDE_BIN="__CLAUDE_BIN__"' in script
-    assert 'export CLAUDE_EXTRA_PATH="__CLAUDE_EXTRA_PATH__"' in script
+    assert "CLAUDE_BIN" not in script
+    assert "CLAUDE_EXTRA_PATH" not in script
     assert install_quick_action.PLACEHOLDER in script
 
 

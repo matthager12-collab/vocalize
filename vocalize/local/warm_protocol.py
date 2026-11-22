@@ -118,20 +118,23 @@ def peer_uid(sock) -> int | None:
         return None
 
 
-def fingerprint(worker_file, runtime: str, model_path) -> dict:
+def fingerprint(worker_file, runtime: str, model_path, *, runtime_identity=None) -> dict:
     """Detect worker, runtime and model changes before reusing a process."""
     model = Path(model_path)
     try:
         size = model.stat().st_size
     except FileNotFoundError:
         size = 0
-    return {
+    result = {
         "protocol": PROTOCOL,
         "worker_sha256": hashlib.sha256(Path(worker_file).read_bytes()).hexdigest(),
         "runtime": runtime,
         "model": model.name,
         "model_size": size,
     }
+    if runtime_identity is not None:
+        result["runtime_identity"] = runtime_identity
+    return result
 
 
 def _seconds(value):

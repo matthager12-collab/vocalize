@@ -64,7 +64,7 @@ def test_speak_writes_audio_file(monkeypatch, tmp_path):
 
     result = runner.invoke(
         main,
-        ["speak", "hello world", "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+        ["speak", "hello world", "--output", str(out_file), "--no-play"],
     )
 
     assert result.exit_code == 0, result.output
@@ -77,7 +77,7 @@ def test_speak_plays_by_default(monkeypatch, tmp_path):
     runner = CliRunner()
 
     result = runner.invoke(
-        main, ["speak", "hi", "--api-key", "fake-key", "--output", str(out_file)]
+        main, ["speak", "hi", "--output", str(out_file)]
     )
 
     assert result.exit_code == 0, result.output
@@ -91,7 +91,7 @@ def test_speak_file_reads_from_stdin(monkeypatch, tmp_path):
 
     result = runner.invoke(
         main,
-        ["speak-file", "-", "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+        ["speak-file", "-", "--output", str(out_file), "--no-play"],
         input="# Title\n\nSome body text.",
     )
 
@@ -108,7 +108,7 @@ def test_speak_file_reads_from_path(monkeypatch, tmp_path):
 
     result = runner.invoke(
         main,
-        ["speak-file", str(src), "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+        ["speak-file", str(src), "--output", str(out_file), "--no-play"],
     )
 
     assert result.exit_code == 0, result.output
@@ -127,7 +127,7 @@ def test_raw_flag_skips_flattening(monkeypatch, tmp_path):
     result = runner.invoke(
         main,
         [
-            "speak-file", str(src), "--api-key", "fake-key",
+            "speak-file", str(src),
             "--output", str(out_file), "--no-play", "--raw",
         ],
     )
@@ -146,7 +146,7 @@ def test_max_chars_truncates_and_notes(monkeypatch, tmp_path):
         main,
         [
             "speak", "hello world, this is a long sentence to truncate",
-            "--api-key", "fake-key", "--output", str(out_file), "--no-play",
+            "--output", str(out_file), "--no-play",
             "--max-chars", "10",
         ],
     )
@@ -161,19 +161,19 @@ def test_short_input_makes_one_chain_call_and_relays_its_progress(monkeypatch, t
     # test_chain.py); what the CLI owes is one call with the whole text and
     # every chain message relayed to stderr.
     _played, captured_text, _captured_settings = _patch_tts(
-        monkeypatch, echo_lines=["Requesting 11 characters from elevenlabs..."]
+        monkeypatch, echo_lines=["Requesting 11 characters from kokoro..."]
     )
     out_file = tmp_path / "out.mp3"
     runner = CliRunner()
 
     result = runner.invoke(
         main,
-        ["speak", "hello world", "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+        ["speak", "hello world", "--output", str(out_file), "--no-play"],
     )
 
     assert result.exit_code == 0, result.output
     assert captured_text == ["hello world"]
-    assert "Requesting 11 characters from elevenlabs..." in result.output
+    assert "Requesting 11 characters from kokoro..." in result.output
     assert "Long input" not in result.output
 
 
@@ -188,47 +188,13 @@ def test_chunk_chars_flag_reaches_the_chain(monkeypatch, tmp_path):
     result = runner.invoke(
         main,
         [
-            "speak", "some words", "--api-key", "fake-key",
+            "speak", "some words",
             "--output", str(out_file), "--no-play", "--chunk-chars", "50",
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert calls[0]["chunk_chars"] == 50
-
-
-def test_missing_api_key_gives_clean_error(monkeypatch, tmp_path):
-    # Forced to ElevenLabs, a missing key has nowhere to fall back to: the
-    # chain's all-failed error still has to name the fix.
-    _isolate_config(monkeypatch, tmp_path)
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    runner = CliRunner()
-
-    result = runner.invoke(
-        main, ["speak", "hello", "--no-play", "--provider", "elevenlabs"]
-    )
-
-    assert result.exit_code != 0
-    from vocalize.exceptions import TTSRequestError
-
-    assert isinstance(result.exception, TTSRequestError)
-    assert "No ElevenLabs API key found" in str(result.exception)
-
-
-def test_voices_command_lists_ids_and_names(monkeypatch):
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
-    monkeypatch.setattr(
-        cli_module,
-        "list_voices",
-        lambda client: [{"id": "abc", "name": "Rachel"}, {"id": "def", "name": "Josh"}],
-    )
-    runner = CliRunner()
-
-    result = runner.invoke(main, ["voices", "--api-key", "fake-key"])
-
-    assert result.exit_code == 0, result.output
-    assert "abc\tRachel" in result.output
-    assert "def\tJosh" in result.output
 
 
 def test_speak_file_missing_path_gives_clean_error(tmp_path):
@@ -291,7 +257,7 @@ def test_default_output_lands_in_cache_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
     runner = CliRunner()
 
-    result = runner.invoke(main, ["speak", "hello", "--api-key", "fake-key", "--no-play"])
+    result = runner.invoke(main, ["speak", "hello", "--no-play"])
 
     assert result.exit_code == 0, result.output
     assert (tmp_path / "last.mp3").exists()
@@ -312,7 +278,7 @@ def test_speed_flag_reaches_the_settings(monkeypatch, tmp_path):
     result = runner.invoke(
         main,
         [
-            "speak", "hello", "--api-key", "fake-key",
+            "speak", "hello",
             "--output", str(out_file), "--no-play", "--speed", "1.1",
         ],
     )
@@ -329,58 +295,11 @@ def test_no_speed_flag_leaves_speed_unset(monkeypatch, tmp_path):
 
     result = runner.invoke(
         main,
-        ["speak", "hello", "--api-key", "fake-key", "--output", str(out_file), "--no-play"],
+        ["speak", "hello", "--output", str(out_file), "--no-play"],
     )
 
     assert result.exit_code == 0, result.output
     assert captured_settings[0].speed is None
-
-
-def test_usage_command_prints_tier_used_limit_and_percent(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
-    monkeypatch.setattr(
-        cli_module,
-        "get_usage",
-        lambda client: {"tier": "creator", "used": 12345, "limit": 100000, "resets_at": None},
-    )
-    # Empty tmp_path also covers the "cache empty" branch.
-    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
-    runner = CliRunner()
-
-    result = runner.invoke(main, ["usage", "--api-key", "fake-key"])
-
-    assert result.exit_code == 0, result.output
-    assert "creator" in result.output
-    assert "12,345" in result.output
-    assert "100,000" in result.output
-    assert "12.3%" in result.output
-    assert "cache empty" in result.output
-    # The cleanup backend has a ledger row too, against its default budget.
-    assert "anthropic: 0 / 2,000,000 characters (0.0%)" in result.output
-
-
-def test_usage_command_reports_local_cache_file_count(monkeypatch, tmp_path):
-    from datetime import datetime, timezone
-
-    reset_unix = 1735689600
-    expected_date = datetime.fromtimestamp(reset_unix, tz=timezone.utc).astimezone().strftime("%Y-%m-%d")
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
-    monkeypatch.setattr(
-        cli_module,
-        "get_usage",
-        lambda client: {"tier": "free", "used": 0, "limit": 10000, "resets_at": reset_unix},
-    )
-    (tmp_path / "a.mp3").write_bytes(b"x" * 1000)
-    (tmp_path / "b.mp3").write_bytes(b"y" * 2000)
-    (tmp_path / "not-audio.txt").write_bytes(b"ignore me")
-    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
-    runner = CliRunner()
-
-    result = runner.invoke(main, ["usage", "--api-key", "fake-key"])
-
-    assert result.exit_code == 0, result.output
-    assert "2 files" in result.output
-    assert expected_date in result.output
 
 
 def test_invalid_speed_gives_a_clean_error_not_a_traceback(monkeypatch, tmp_path, capsys):
@@ -389,8 +308,8 @@ def test_invalid_speed_gives_a_clean_error_not_a_traceback(monkeypatch, tmp_path
         "sys.argv",
         # --api-key belongs to ElevenLabs alone, so name it: the default chain
         # starts local and would refuse the flag before ever seeing --speed.
-        ["vocalize", "speak", "hello", "--provider", "elevenlabs",
-         "--api-key", "fake-key", "--no-play", "--speed", "5"],
+        ["vocalize", "speak", "hello", "--provider", "kokoro",
+         "--no-play", "--speed", "5"],
     )
 
     with pytest.raises(SystemExit) as excinfo:
@@ -418,7 +337,7 @@ def _speak_long(monkeypatch, tmp_path, extra_args, text="word " * 100):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["speak", text, "--api-key", "fake-key", "--output", str(out_file), "--no-play",
+        ["speak", text, "--output", str(out_file), "--no-play",
          *extra_args],
     )
     return result, captured_text
@@ -633,7 +552,7 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     cfg = tmp_path / "vocalize" / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(
-        '[stt]\nmodel = "base.en"\ncleanup = true\nmax_seconds = 30\ncues = "sounds"\n',
+        '[stt]\nmodel = "base.en"\ncleanup = "local"\nmax_seconds = 30\ncues = "sounds"\n',
         encoding="utf-8",
     )
 
@@ -642,19 +561,19 @@ def test_settings_prints_the_stt_lines(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert "stt.model=base.en" in result.output
     assert "stt.language=en" in result.output
-    assert "stt.cleanup=claude-cli" in result.output  # legacy `true`, coerced
+    assert "stt.cleanup=local" in result.output  # legacy `true`, coerced
     assert "stt.verbatim=false" in result.output
     assert "stt.max_seconds=30" in result.output
     assert "stt.cues=sounds" in result.output
     assert "stt.paste=false" in result.output
     assert result.output.index("stt.paste=") > result.output.index("stt.cues=")
-    assert "notes.summarizer=local" in result.output
+    assert "notes.summarizer=off" in result.output
     # The menu-bar app parses exactly these four lines (design.md § The [app] table).
     assert "app.dictate=ctrl+alt+cmd+d" in result.output
     assert "app.dictate_mode=toggle" in result.output
     assert "app.speak=ctrl+alt+cmd+s" in result.output
     assert "app.stop=ctrl+alt+cmd+x" in result.output
-    assert "notes.template=memo" in result.output
+    assert "notes.template=" not in result.output
 
 
 def test_settings_prints_stt_paste_true_when_configured(monkeypatch, tmp_path):
@@ -721,7 +640,7 @@ def test_the_verbatim_flag_and_a_bare_cleanup_reach_the_stt_options(monkeypatch,
     assert plain["cleanup"] == "off" and plain["verbatim"] is False
 
     flagged = _stt_options(True, True, None)
-    assert flagged["cleanup"] == "claude-cli"  # bare --cleanup keeps its 0.10 meaning
+    assert flagged["cleanup"] == "local"
     assert flagged["verbatim"] is True
 
 
@@ -814,7 +733,7 @@ def test_clip_speaks_the_clipboard(monkeypatch, tmp_path):
     out_file = tmp_path / "out.mp3"
 
     result = CliRunner().invoke(
-        main, ["clip", "--api-key", "fake-key", "--output", str(out_file), "--no-play"]
+        main, ["clip", "--output", str(out_file), "--no-play"]
     )
 
     assert result.exit_code == 0, result.output
@@ -829,7 +748,7 @@ def test_clip_stops_current_playback_first(monkeypatch, tmp_path):
     out_file = tmp_path / "out.mp3"
 
     result = CliRunner().invoke(
-        main, ["clip", "--api-key", "fake-key", "--output", str(out_file)]
+        main, ["clip", "--output", str(out_file)]
     )
 
     assert result.exit_code == 0, result.output
@@ -847,7 +766,7 @@ def test_clip_does_not_stop_playback_with_no_play(monkeypatch, tmp_path):
     out_file = tmp_path / "out.mp3"
 
     result = CliRunner().invoke(
-        main, ["clip", "--api-key", "fake-key", "--output", str(out_file), "--no-play"]
+        main, ["clip", "--output", str(out_file), "--no-play"]
     )
 
     assert result.exit_code == 0, result.output
@@ -857,7 +776,7 @@ def test_clip_refuses_an_empty_clipboard(monkeypatch):
     _played, captured_text, _settings = _patch_tts(monkeypatch)
     monkeypatch.setattr(cli_module, "read_clipboard", lambda: "   \n ")
 
-    result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
+    result = CliRunner().invoke(main, ["clip", "--no-play"])
 
     assert result.exit_code != 0
     assert isinstance(result.exception, cli_module.TTSRequestError)
@@ -869,7 +788,7 @@ def test_clip_refuses_a_credential_without_echoing_it(monkeypatch):
     secret = "sk-supersecretvalue123456"
     monkeypatch.setattr(cli_module, "read_clipboard", lambda: secret)
 
-    result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
+    result = CliRunner().invoke(main, ["clip", "--no-play"])
 
     assert result.exit_code == 3  # its own code: "I refused to read this"
     assert "Refusing to speak" in result.output
@@ -884,7 +803,7 @@ def test_clip_reserves_exit_3_for_the_refusal_not_for_ordinary_failures(monkeypa
     _played, _captured_text, _settings = _patch_tts(monkeypatch)
     monkeypatch.setattr(cli_module, "read_clipboard", lambda: "   \n ")
 
-    result = CliRunner().invoke(main, ["clip", "--api-key", "fake-key", "--no-play"])
+    result = CliRunner().invoke(main, ["clip", "--no-play"])
 
     assert result.exit_code not in (0, 3)
 
@@ -896,7 +815,7 @@ def test_clip_allow_secret_bypasses_the_guard(monkeypatch, tmp_path):
 
     result = CliRunner().invoke(
         main,
-        ["clip", "--allow-secret", "--api-key", "fake-key",
+        ["clip", "--allow-secret",
          "--output", str(out_file), "--no-play"],
     )
 
@@ -1022,12 +941,12 @@ def test_provider_flag_forces_a_single_provider_chain(monkeypatch, tmp_path):
 
     result = CliRunner().invoke(
         main,
-        ["speak", "hello", "--provider", "google", "--output", str(tmp_path / "out.mp3"),
+        ["speak", "hello", "--provider", "piper", "--output", str(tmp_path / "out.mp3"),
          "--no-play"],
     )
 
     assert result.exit_code == 0, result.output
-    assert calls[0]["chain"] == ["google"]
+    assert calls[0]["chain"] == ["piper"]
 
 
 def test_no_provider_flag_leaves_the_configured_chain_alone(monkeypatch, tmp_path):
@@ -1042,23 +961,6 @@ def test_no_provider_flag_leaves_the_configured_chain_alone(monkeypatch, tmp_pat
 
     assert result.exit_code == 0, result.output
     assert calls[0]["chain"] == ["kokoro", "say"]
-
-
-def test_api_key_with_another_provider_is_a_usage_error(monkeypatch, tmp_path):
-    _isolate_config(monkeypatch, tmp_path)
-    calls = []
-    _patch_tts(monkeypatch, calls=calls)
-
-    result = CliRunner().invoke(
-        main, ["speak", "hello", "--api-key", "sk-secret", "--provider", "openai", "--no-play"]
-    )
-
-    assert result.exit_code == 2
-    assert "--api-key only applies to ElevenLabs" in result.output
-    assert "vocalize auth login --provider openai" in result.output
-    # Refused before anything was synthesized, and the key is not echoed.
-    assert calls == []
-    assert "sk-secret" not in result.output
 
 
 def test_an_unknown_provider_is_rejected_at_the_flag_layer(monkeypatch, tmp_path):
@@ -1230,7 +1132,7 @@ def test_without_the_flag_the_chain_is_not_told_it_was_forced(monkeypatch, tmp_p
     _patch_tts(monkeypatch, calls=calls)
 
     result = CliRunner().invoke(
-        main, ["speak", "hello", "--api-key", "k", "--no-play",
+        main, ["speak", "hello", "--no-play",
                "--output", str(tmp_path / "out.mp3")]
     )
 
@@ -1253,185 +1155,23 @@ def test_no_play_never_streams(monkeypatch, tmp_path):
 # --- per-provider `auth login` -----------------------------------------------
 
 
-def test_auth_login_stores_a_key_for_openai(fake_keychain, monkeypatch):
-    import vocalize.auth as auth_module
-
-    class _Stub:
-        def validate(self, key):
-            pass
-
-    monkeypatch.setattr("vocalize.providers.get", lambda name: _Stub())
-
-    result = CliRunner().invoke(
-        main,
-        ["auth", "login", "--provider", "openai", "--stdin"],
-        input="sk-openaikeyabc1234567\n",
-    )
-
-    assert result.exit_code == 0, result.output
-    assert fake_keychain[(auth_module.SERVICE, "openai-api-key")] == "sk-openaikeyabc1234567"
-    assert "openai-api-key" in result.output
-    assert "sk-openaikeyabc1234567" not in result.output
-
-
-def test_auth_login_stores_a_key_for_anthropic(fake_keychain, monkeypatch):
-    """The slot that is not a voice: stored under its own username, checked
-    with Anthropic (stubbed here), and the key is in no line of output."""
-    import vocalize.auth as auth_module
-
-    seen = []
-    monkeypatch.setattr("vocalize.llm.validate_anthropic_key", lambda key: seen.append(key))
-
-    result = CliRunner().invoke(
-        main,
-        ["auth", "login", "--provider", "anthropic", "--stdin"],
-        input="sk-ant-anthropickey1234567\n",
-    )
-
-    assert result.exit_code == 0, result.output
-    assert seen == ["sk-ant-anthropickey1234567"]
-    assert fake_keychain[(auth_module.SERVICE, "anthropic-api-key")] == "sk-ant-anthropickey1234567"
-    assert "anthropic-api-key" in result.output
-    assert "sk-ant-anthropickey1234567" not in result.output
-    assert "anthropic" not in auth_module.PROVIDER_NAMES  # still not a voice
-
-
-def test_auth_status_and_logout_reach_the_anthropic_slot(fake_keychain, monkeypatch):
-    import vocalize.auth as auth_module
-
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    fake_keychain[(auth_module.SERVICE, "anthropic-api-key")] = "sk-ant-stored-0000000000"
-
-    status = CliRunner().invoke(main, ["auth", "status", "--provider", "anthropic"])
-    assert status.exit_code == 0, status.output
-    assert status.output.startswith("anthropic: keychain")
-    assert "sk-ant-stored" not in status.output
-
-    listing = CliRunner().invoke(main, ["auth", "status"])
-    assert listing.exit_code == 0, listing.output
-    assert "anthropic" in listing.output
-
-    logout = CliRunner().invoke(main, ["auth", "logout", "--provider", "anthropic"])
-    assert logout.exit_code == 0, logout.output
-    assert (auth_module.SERVICE, "anthropic-api-key") not in fake_keychain
-
-
-def test_auth_login_refuses_polly(fake_keychain):
-    result = CliRunner().invoke(main, ["auth", "login", "--provider", "polly"])
-
-    assert result.exit_code == 1
-    assert "Polly uses your AWS credentials" in result.output
-    assert "vocalize auth status --provider polly" in result.output
-
-
-@pytest.mark.parametrize("provider", ["say", "kokoro"])
-def test_auth_login_refuses_local_providers(fake_keychain, provider):
-    result = CliRunner().invoke(main, ["auth", "login", "--provider", provider])
-
-    assert result.exit_code == 1
-    assert "is local and needs no credentials" in result.output
-
-
 # --- per-provider `auth status` ----------------------------------------------
-
-
-def test_auth_status_no_flag_lists_other_chain_providers(monkeypatch, tmp_path):
-    _isolate_config(monkeypatch, tmp_path)
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-
-    result = CliRunner().invoke(main, ["auth", "status"])
-
-    assert result.exit_code == 0, result.output
-    assert "say: local, no credentials" in result.output
-
-
-def test_auth_status_provider_google_environment(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "g-key")
-
-    result = CliRunner().invoke(main, ["auth", "status", "--provider", "google"])
-
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "google: environment"
-
-
-def test_auth_status_provider_openai_not_configured(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    result = CliRunner().invoke(main, ["auth", "status", "--provider", "openai"])
-
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "openai: not configured"
-
-
-def test_auth_status_provider_admits_an_unreadable_keychain(monkeypatch):
-    # key_source flattens "could not look" into "not found"; the status
-    # line used to repeat that as "not configured" and send the user off
-    # to store a key they may already have.
-    class _Broken:
-        def get_password(self, service, username):
-            raise RuntimeError("no recommended backend")
-
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr("vocalize.auth._backend", lambda: _Broken())
-
-    result = CliRunner().invoke(main, ["auth", "status", "--provider", "openai"])
-
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "openai: keychain unavailable (no recommended backend)"
-
-
-def test_auth_status_provider_openai_keychain_is_masked(fake_keychain, monkeypatch):
-    import vocalize.auth as auth_module
-
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    fake_keychain[(auth_module.SERVICE, "openai-api-key")] = "sk-abcxyz1234567890"
-
-    result = CliRunner().invoke(main, ["auth", "status", "--provider", "openai"])
-
-    assert result.exit_code == 0, result.output
-    assert "openai: keychain (sk-a…)" in result.output
-    assert "sk-abcxyz1234567890" not in result.output
-
-
-def test_auth_status_provider_polly(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shh")
-
-    result = CliRunner().invoke(main, ["auth", "status", "--provider", "polly"])
-
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "polly: environment"
-
-
-def test_auth_status_provider_say_and_kokoro(monkeypatch):
-    result_say = CliRunner().invoke(main, ["auth", "status", "--provider", "say"])
-    result_kokoro = CliRunner().invoke(main, ["auth", "status", "--provider", "kokoro"])
-
-    assert result_say.output.strip() == "say: local, no credentials"
-    assert result_kokoro.output.strip() == "kokoro: local provider (see: vocalize local status)"
 
 
 # --- `voices --provider` -----------------------------------------------------
 
 
-def test_voices_provider_google_dispatches_to_the_provider_module(monkeypatch):
+def test_voices_provider_piper_dispatches_to_the_provider_module(monkeypatch):
     class _Stub:
         def list_voices(self):
             return [{"id": "en-US-Neural2-F", "name": "Neural2 F (en-US)"}]
 
     monkeypatch.setattr(cli_module.providers, "get", lambda name: _Stub())
 
-    result = CliRunner().invoke(main, ["voices", "--provider", "google"])
+    result = CliRunner().invoke(main, ["voices", "--provider", "piper"])
 
     assert result.exit_code == 0, result.output
     assert "en-US-Neural2-F\tNeural2 F (en-US)" in result.output
-
-
-def test_voices_api_key_with_another_provider_is_a_usage_error(monkeypatch):
-    result = CliRunner().invoke(main, ["voices", "--api-key", "x", "--provider", "openai"])
-
-    assert result.exit_code == 2
-    assert "--api-key only applies to ElevenLabs" in result.output
 
 
 def test_voices_kokoro_lists_the_manifest_ids_without_the_runtime(monkeypatch):
@@ -1449,76 +1189,6 @@ def test_voices_kokoro_lists_the_manifest_ids_without_the_runtime(monkeypatch):
 
 
 # --- `usage` ------------------------------------------------------------------
-
-
-def test_usage_table_shows_budget_and_marks_exhausted(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli_module, "build_client", lambda key: object())
-    monkeypatch.setattr(
-        cli_module,
-        "get_usage",
-        lambda client: {"tier": "free", "used": 0, "limit": 10000, "resets_at": None},
-    )
-    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    cfg = tmp_path / "cfg" / "vocalize" / "config.toml"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text("[providers.google]\nmonthly_chars = 1000\n", encoding="utf-8")
-
-    from vocalize import ledger
-
-    ledger.record("google", 1200)
-
-    result = CliRunner().invoke(main, ["usage", "--api-key", "fake-key"])
-
-    assert result.exit_code == 0, result.output
-    assert "google: 1,200 / 1,000 bytes (120.0%) EXHAUSTED" in result.output
-    assert "elevenlabs: 0 characters (no monthly_chars set — unlimited)" in result.output
-
-
-def test_usage_shows_a_zero_anthropic_budget_as_a_budget(monkeypatch, tmp_path):
-    """`monthly_chars = 0` on anthropic means "send nothing" — the line must
-    say so rather than call it unlimited (and must not divide by it)."""
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    cfg = tmp_path / "cfg" / "vocalize" / "config.toml"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text("[providers.anthropic]\nmonthly_chars = 0\n", encoding="utf-8")
-
-    result = CliRunner().invoke(main, ["usage"])
-
-    assert result.exit_code == 0, result.output
-    assert "anthropic: 0 / 0 characters" in result.output
-    assert "anthropic: 0 characters (no monthly_chars set" not in result.output
-
-
-def test_usage_marks_an_exhausted_provider_without_a_budget(monkeypatch, tmp_path):
-    # The common case: no monthly_chars set. A provider a real quota error
-    # marked exhausted was invisible on this line.
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty"))
-
-    from vocalize import ledger
-
-    ledger.mark_exhausted("elevenlabs")
-
-    result = CliRunner().invoke(main, ["usage"])
-
-    assert result.exit_code == 0, result.output
-    assert "elevenlabs: 0 characters (no monthly_chars set — unlimited) EXHAUSTED" in result.output
-    assert "google: 0 bytes (no monthly_chars set — unlimited)\n" in result.output
-
-
-def test_usage_without_a_key_skips_the_elevenlabs_block(monkeypatch, tmp_path):
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    monkeypatch.setattr(cli_module, "DEFAULT_CACHE_DIR", tmp_path)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty"))
-
-    result = CliRunner().invoke(main, ["usage"])
-
-    assert result.exit_code == 0, result.output
-    assert "ElevenLabs remote quota: no key configured, skipped." in result.output
 
 
 # --- `local install` resume ---------------------------------------------------
@@ -1637,21 +1307,20 @@ def test_chain_write_preserves_other_keys_and_tables(monkeypatch, tmp_path):
     cfg_path = tmp_path / "vocalize" / "config.toml"
     cfg_path.parent.mkdir(parents=True)
     cfg_path.write_text(
-        'voice = "abc"\n\n[providers.google]\nvoice = "en-US-Neural2-F"\nmonthly_chars = 500\n',
+        'max_chars = 4000\n\n[providers.piper]\nvoice = "en-US-Neural2-F"\n',
         encoding="utf-8",
     )
 
-    result = CliRunner().invoke(main, ["chain", "google", "say"])
+    result = CliRunner().invoke(main, ["chain", "piper", "say"])
 
     assert result.exit_code == 0, result.output
-    assert "chain=google,say" in result.output
+    assert "chain=piper,say" in result.output
     assert f"wrote {cfg_path}" in result.output
 
     text = cfg_path.read_text()
-    assert 'chain = ["google", "say"]' in text
-    assert 'voice = "abc"' in text
-    assert "[providers.google]" in text
-    assert "monthly_chars = 500" in text
+    assert 'chain = ["piper", "say"]' in text
+    assert 'max_chars = 4000' in text
+    assert "[providers.piper]" in text
 
 
 def test_chain_creates_the_file_when_missing(monkeypatch, tmp_path):
@@ -1659,11 +1328,11 @@ def test_chain_creates_the_file_when_missing(monkeypatch, tmp_path):
     cfg_path = tmp_path / "vocalize" / "config.toml"
     assert not cfg_path.exists()
 
-    result = CliRunner().invoke(main, ["chain", "polly", "say"])
+    result = CliRunner().invoke(main, ["chain", "piper", "say"])
 
     assert result.exit_code == 0, result.output
     assert cfg_path.exists()
-    assert 'chain = ["polly", "say"]' in cfg_path.read_text()
+    assert 'chain = ["piper", "say"]' in cfg_path.read_text()
 
 
 def test_chain_rejects_an_unknown_provider(monkeypatch, tmp_path):
@@ -1673,7 +1342,7 @@ def test_chain_rejects_an_unknown_provider(monkeypatch, tmp_path):
 
     assert result.exit_code == 2
     assert "Unknown provider" in result.output
-    assert "elevenlabs" in result.output
+    assert "kokoro" in result.output
 
 
 def test_chain_rejects_a_duplicate_provider(monkeypatch, tmp_path):
@@ -1718,7 +1387,7 @@ def test_chain_refuses_a_file_that_changed_between_its_read_and_its_write(
 
     monkeypatch.setattr(cli_module, "load_config_file", load_then_race)
 
-    result = CliRunner().invoke(main, ["chain", "polly"])
+    result = CliRunner().invoke(main, ["chain", "say"])
 
     assert result.exit_code != 0
     assert isinstance(result.exception, ConfigChangedError)
@@ -2660,7 +2329,7 @@ def test_integrate_claude_bakes_the_unresolved_which_path(integrate_env):
     assert result.exit_code == 0, result.output
     text = _wflow_text(services)
     # Unresolved: exactly what which() returned, never a symlink target.
-    assert str(fake_claude) in text
+    assert str(fake_claude) not in text
     assert "__CLAUDE_BIN__" not in text
 
 
@@ -2710,8 +2379,8 @@ def test_integrate_claude_path_precheck_reports_each_tool(integrate_env):
 
     assert result.exit_code == 0, result.output
     assert "vocalize:" in result.output
-    assert "claude:" in result.output
-    assert "node:" in result.output
+    assert "claude:" not in result.output
+    assert "node:" not in result.output
     assert "python3:" in result.output
 
 
@@ -2789,3 +2458,296 @@ def test_integrate_claude_warns_and_adds_needs_you_on_shortcut_conflict(
     assert "System Settings › Keyboard › Keyboard Shortcuts › Services" in result.output
     assert "clear 'Dictate with Vocalize' shortcut in Services" in result.output
 
+
+
+@pytest.mark.parametrize("command", ["auth", "usage", "summarize-text"])
+def test_removed_hosted_commands_are_unavailable(command):
+    result = CliRunner().invoke(main, [command])
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+
+
+@pytest.mark.parametrize("provider", ["elevenlabs", "openai", "google", "polly", "anthropic"])
+def test_cloud_engine_is_rejected_before_speech(monkeypatch, provider):
+    monkeypatch.setattr(cli_module, "chain_run", lambda *a, **kw: pytest.fail("speech called"))
+    result = CliRunner().invoke(main, ["speak", "private text", "--provider", provider])
+    assert result.exit_code == 2
+
+
+def test_cleanup_flag_always_selects_local(monkeypatch):
+    monkeypatch.setattr(cli_module, "load_config_file", lambda: {"stt": {"cleanup": "off"}})
+    assert cli_module._stt_options(True, False, None)["cleanup"] == "local"
+
+
+# --- phase 1 review fixes (H1, M1, L4, transcribe help) ---------------------
+
+
+def test_settings_loads_a_015_anthropic_table_and_an_unknown_table(monkeypatch, tmp_path):
+    """The menu-bar app runs `vocalize settings`: it must not fail on either."""
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text(
+        '[providers.anthropic]\nmonthly_chars = 1000\n\n[providers.nonesuch]\nvoice = "x"\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "chain=kokoro,say" in result.stdout
+    notices = result.stderr.splitlines()
+    assert len(notices) == 2
+    assert "[providers.anthropic]" in notices[0] and "1000" not in notices[0]
+    assert "[providers.nonesuch]" in notices[1]
+    assert "vocalize:" not in result.stdout
+
+
+def test_chain_says_when_it_kept_a_backup_of_a_commented_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('# mine\nchain = ["say"]\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "piper", "say"])
+
+    assert result.exit_code == 0, result.output
+    backup = cfg_path.with_name("config.toml.bak")
+    assert backup.read_text() == '# mine\nchain = ["say"]\n'
+    assert str(backup) in result.output
+    assert f"wrote {cfg_path}" in result.output
+
+    again = CliRunner().invoke(main, ["chain", "say"])
+    assert again.exit_code == 0, again.output
+    assert str(backup) not in again.output
+
+
+def test_transcribe_help_names_the_transcripts_folder():
+    result = CliRunner().invoke(main, ["transcribe", "--help"])
+
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())  # help text wraps
+    assert "notes folder" not in text
+    assert text.count("transcripts folder") == 2
+
+
+# --- `local status` judges speech-to-text by the engine dictation uses ---
+
+
+def _stt_installs(monkeypatch, *, parakeet: bool, whisper: bool, engine: str | None):
+    """Parakeet supported; each engine installed or not; uv present."""
+    from vocalize import local as local_module
+    from vocalize.local import install as install_module
+    from vocalize.local import parakeet_manifest, whisper_manifest
+
+    def installed(manifest, model_dir=None, files=None, install_hint="vocalize local install"):
+        if manifest is parakeet_manifest:
+            ok = parakeet
+        elif manifest is whisper_manifest:
+            ok = whisper and files == [whisper_manifest.file_for(whisper_manifest.DEFAULT_MODEL)]
+        else:
+            ok = False
+        return (True, "") if ok else (False, f"not installed — run: {install_hint}")
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    monkeypatch.setattr(install_module, "installed", installed)
+    monkeypatch.setattr(local_module, "uv_path", lambda: "/fake/uv")
+    if engine is not None:
+        cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "vocalize" / "config.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(f'[stt]\nengine = "{engine}"\n', encoding="utf-8")
+
+
+def _stt_verdict(output: str) -> str:
+    return next(line for line in output.splitlines() if line.startswith("STT:"))
+
+
+@pytest.mark.parametrize("engine", ["parakeet", None])
+def test_local_status_is_ready_when_parakeet_dictates(monkeypatch, engine):
+    """F3 (m2): Parakeet configured and ready read as 'STT: not ready'."""
+    _stt_installs(monkeypatch, parakeet=True, whisper=False, engine=engine)
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert _stt_verdict(result.output) == "STT: ready (parakeet)"
+
+
+def test_local_status_names_the_parakeet_install_when_parakeet_is_chosen_and_missing(monkeypatch):
+    _stt_installs(monkeypatch, parakeet=False, whisper=True, engine="parakeet")
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    verdict = _stt_verdict(result.output)
+    assert verdict.startswith("STT: not ready")
+    assert verdict.endswith("vocalize local install --stt --engine parakeet")
+
+
+def test_local_status_never_offers_parakeet_as_the_repair_for_a_ready_whisper(monkeypatch):
+    """m1: with Whisper ready, `local install --stt` would install Parakeet,
+    which repairs nothing."""
+    _stt_installs(monkeypatch, parakeet=False, whisper=True, engine=None)
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert _stt_verdict(result.output).startswith("STT: ready")
+    parakeet_block = result.output.split("Parakeet (speech-to-text")[1].split("\n\n")[0]
+    assert not parakeet_block.rstrip().endswith("run: vocalize local install --stt")
+    assert "vocalize local install --stt --engine parakeet" in parakeet_block
+    assert "Whisper" in parakeet_block  # says which engine dictation uses
+
+
+def test_local_status_names_the_whisper_install_when_whisper_is_chosen_and_missing(monkeypatch):
+    _stt_installs(monkeypatch, parakeet=True, whisper=False, engine="whisper")
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    verdict = _stt_verdict(result.output)
+    assert verdict.startswith("STT: not ready")
+    assert verdict.endswith("vocalize local install --stt --engine whisper")
+
+
+def test_local_install_stt_help_names_parakeet_as_the_apple_silicon_default():
+    result = CliRunner().invoke(main, ["local", "install", "--help"])
+
+    text = " ".join(result.output.split())
+    assert "Parakeet on Apple Silicon" in text
+    assert "runtime (whisper.cpp) instead" not in text
+
+
+# --- `vocalize local stop` (W5-B) ------------------------------------------
+
+
+@pytest.mark.parametrize("stopped, lines", [
+    ({"whisper": True, "llm": False},
+     ["Whisper warm server: stopped.", "Cleanup model warm server: none was running."]),
+    ({"whisper": False, "llm": False},
+     ["Whisper warm server: none was running.", "Cleanup model warm server: none was running."]),
+    ({"whisper": True, "llm": True},
+     ["Whisper warm server: stopped.", "Cleanup model warm server: stopped."]),
+])
+def test_local_stop_reports_each_kind_and_exits_zero(monkeypatch, stopped, lines):
+    from vocalize.local import warm
+
+    calls = []
+    monkeypatch.setattr(warm, "stop_all", lambda: calls.append("all") or dict(stopped))
+
+    result = CliRunner().invoke(main, ["local", "stop"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == lines
+    assert calls == ["all"]
+
+
+def test_local_stop_with_nothing_running_touches_nothing():
+    result = CliRunner().invoke(main, ["local", "stop"])
+    assert result.exit_code == 0, result.output
+    assert "none was running" in result.output
+
+
+def test_local_help_lists_stop():
+    result = CliRunner().invoke(main, ["local", "--help"])
+    assert result.exit_code == 0
+    assert any(line.split()[:1] == ["stop"] for line in result.output.splitlines())
+
+
+def test_no_help_text_is_left_over_from_the_cloud_version():
+    """`settings` once said 'no API call, no key needed' (W5-B)."""
+    import click
+
+    def walk(command, path):
+        yield path, command
+        for name, sub in getattr(command, "commands", {}).items():
+            yield from walk(sub, [*path, name])
+
+    for path, command in walk(main, ["vocalize"]):
+        texts = [command.help or "", command.short_help or ""]
+        texts += [p.help or "" for p in command.params if isinstance(p, click.Option)]
+        for text in texts:
+            lowered = text.lower()
+            for word in ("api call", "api key", "no key", "cloud", "credentials", "budget",
+                         "usage summary"):
+                assert word not in lowered, (path, word, text)
+
+
+def test_settings_help_says_what_it_prints():
+    text = " ".join((main.commands["settings"].help or "").split())
+    assert "one per line" in text and "menu-bar app" in text
+
+
+def test_the_output_option_names_only_the_formats_local_engines_write():
+    """mp3 came only from the retired hosted engines."""
+    import click
+
+    for name in ("speak", "speak-file", "clip"):
+        option = next(p for p in main.commands[name].params
+                      if isinstance(p, click.Option) and p.name == "output_path")
+        assert "mp3" not in (option.help or "")
+        assert "wav" in (option.help or "")
+
+
+# --- settings no engine read are gone from the command line (review M2) -----
+
+
+@pytest.mark.parametrize("command", [["speak", "hi"], ["speak-file", "-"], ["clip"]])
+def test_the_speaking_commands_have_no_model_option(command):
+    assert "--model" not in CliRunner().invoke(main, [command[0], "--help"]).output
+    result = CliRunner().invoke(main, [*command, "--model", "x"], input="hi")
+    assert result.exit_code == 2
+    assert "No such option '--model'" in result.output
+
+
+def test_vocalize_model_is_ignored_when_speaking(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_MODEL", "something")
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--no-play", "--output", str(tmp_path / "out.mp3")])
+
+    assert result.exit_code == 0, result.output
+    assert "model_id" not in calls[0]["overrides"]
+
+
+def test_settings_prints_no_model_line(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    lines = CliRunner().invoke(main, ["settings"]).output.splitlines()
+    assert not any(line.startswith("model=") for line in lines)
+    assert not any(".model=" in line and line.startswith("providers.") for line in lines)
+
+
+# --- the writer's notices reach the terminal (review L5) ----------------------
+
+
+def test_chain_keeps_an_unknown_table_and_names_it(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('[meetings]\nroom = "B"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert "[meetings]" in result.output and "does not use it" in result.output
+    assert '[meetings]\nroom = "B"' in cfg_path.read_text()
+
+
+def test_chain_says_the_backup_still_holds_a_retired_setting(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('api_key = "SECRET_CANARY"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert "SECRET_CANARY" not in cfg_path.read_text() + result.output
+    assert "config.toml.bak" in result.output
+    assert "still holds the retired settings" in result.output

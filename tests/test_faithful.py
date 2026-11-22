@@ -1,7 +1,39 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from vocalize import llm
+
+
+@pytest.mark.parametrize("raw,output", [
+    ("He works in marketing, or rather, in sales now.", "He works in sales."),
+    ("We should probably send three copies, actually four copies.", "We should send four copies."),
+    ("She is still waiting, sorry, still reviewing it.", "She is reviewing it."),
+    ("It is already finished.", "It is finished."),
+    ("Maybe move it to Tuesday, no, Wednesday.", "Move it to Wednesday."),
+    ("The report is not ready yet.", "The report is not ready."),
+])
+def test_guard_rejects_dropped_meaning_qualifiers(raw, output):
+    assert not llm.faithful(raw, output)
+
+
+def test_omission_preserves_raw_without_claiming_model_quality(monkeypatch):
+    raw = "He works in marketing, or rather, in sales now."
+    monkeypatch.setattr(llm, "_complete", lambda *args, **kwargs: "He works in sales.")
+    assert llm.cleanup_transcript(raw, "local") == (raw, False)
+
+
+def test_qualifier_check_allows_case_punctuation_and_deduplication():
+    assert llm.faithful("Now now the report is ready.", "Now the report is ready.")
+    assert llm.faithful("He works in marketing, or rather, in sales now.", "He works in sales now.")
+
+
+def test_qualifier_correction_conservatively_keeps_raw(monkeypatch):
+    # The finite lexical guard cannot prove this intentional correction safe.
+    raw = "Send it now, no, send it later."
+    monkeypatch.setattr(llm, "_complete", lambda *args, **kwargs: "Send it later.")
+    assert llm.cleanup_transcript(raw, "local") == (raw, False)
 
 
 def test_recorded_good_outputs_are_faithful():
@@ -26,15 +58,6 @@ def test_guard_allows_spoken_formatting_but_not_new_email():
     assert llm.faithful("meet march third at nine thirty", "Meet March 3 at 9:30")
     assert llm.faithful("reach sam at sam at example dot com", "Reach Sam at sam@example.com")
     assert not llm.faithful("email bob", "Email bob@evil.com")
-
-
-def test_unexpected_stop_reason_is_not_echoed(monkeypatch, capsys):
-    monkeypatch.setattr(
-        llm._http, "request",
-        lambda *args, **kwargs: (200, b'{"content": [], "stop_reason": "CANARY-SECRET-123"}'),
-    )
-    assert llm._anthropic("key", "system", "text", 1, 1, "cleanup") is None
-    assert "CANARY-SECRET-123" not in capsys.readouterr().err
 
 
 def test_guard_rejects_an_obeyed_instruction_that_drops_what_was_said():

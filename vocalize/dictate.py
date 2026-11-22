@@ -15,11 +15,8 @@ What crosses which boundary, and why (DEC-007):
   printed to stdout by `vocalize listen`. It never becomes an argument, a
   notification, a log line or a file. Notifications carry fixed strings
   from this module — `_notify` refuses anything else by construction.
-* Only `--cleanup` sends text off the machine, to `claude -p` with every
-  tool denied, and only when the user turned it on. That step is the one
-  exception to "never written to a file": Claude Code logs the prompt and
-  stdin of every print-mode run under its own configuration directory
-  (docs/dictation.md § Privacy, DEC-014).
+* Optional cleanup uses the on-device model only. Missing local inference
+  preserves the raw transcript; hosted processing is unavailable.
 
 The recorder is launched through LaunchServices (`open -n -a`), not
 exec'd, because macOS attributes the microphone to the *responsible*
@@ -49,10 +46,10 @@ from array import array
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import audio, config, interrupted, llm
+from . import audio, config, interrupted, llm, vocabulary
 from .exceptions import DictationError, VocalizeError
 
-# Same directory as the playback lock and the ledger. Spelled out here so
+# Same directory as the playback lock. Spelled out here so
 # tests can point the whole module at a temporary directory in one line.
 CACHE_DIR = Path.home() / ".cache" / "vocalize"
 
@@ -179,9 +176,8 @@ _CUE_WORDS = {
 # `_notify` enforces that by refusing anything not in this set.
 _NOTIFY_COPIED = "Dictation copied to the clipboard."
 _NOTIFY_COPIED_RAW = "Dictation copied to the clipboard (cleanup skipped)."
-# Visible egress: the one notification that says text left this Mac, fixed
-# text like every other (review R13 of the 2026-09 app-roadmap plan).
-_NOTIFY_COPIED_CLEANED = "Dictation copied to the clipboard (cleaned up by Claude — sent off this Mac)."
+# Cleanup stays on device; notifications never include the transcript.
+_NOTIFY_COPIED_CLEANED = "Dictation copied to the clipboard (cleaned up locally)."
 _NOTIFY_NOTHING_HEARD = "Nothing heard — nothing was transcribed."
 _NOTIFY_CANCELLED = "Dictation cancelled."
 _NOTIFY_BUSY = "Still transcribing the last dictation."
@@ -225,9 +221,6 @@ _RESUME_DIALOG = (
     f"giving up after {_RESUME_GIVE_UP}"
 )
 
-# The cleanup pass. The transcript is DATA, stated in the prompt and
-# enforced by denying every tool: a dictated sentence that asks Claude to
-# do something has nothing to do it with (design § Cleanup pass).
 # What `listen --check` last learned about the microphone, so `vocalize
 # status` can report it without launching an app of its own.
 MIC_STATUS_WORDS = ("authorized", "denied", "unknown", "notDetermined", "incomplete")
@@ -1095,20 +1088,18 @@ def _uv_or_raise() -> str:
 def worker_argv(uv: str, wav_path: Path, stt: dict) -> list[str]:
     """The exact argv that transcribes one WAV.
 
-    `--no-project` and a pinned `--with`, run from the system temporary
-    directory: uv must never adopt whatever project the user happens to be
-    standing in. The audio's *path* is an argument; its contents, and the
-    text that comes back, are not.
+    `--no-project` and the hash-locked environment's own interpreter (no
+    `--with`, so nothing is resolved or fetched), run from the system
+    temporary directory: uv must never adopt whatever project the user
+    happens to be standing in. The audio's *path* is an argument; its
+    contents, and the text that comes back, are not.
     """
     from .local import whisper_manifest as manifest
 
     stt = _checked(stt)
     model = stt["model"]
     return [
-        uv, "run", "--no-project",
-        "--python", manifest.PYTHON_VERSION,
-        "--with", manifest.RUNTIME_PACKAGE,
-        str(manifest.worker_path()),
+        uv, *manifest.runtime_prefix(),
         "--transcribe", str(wav_path),
         "--model", str(manifest.model_path(model)),
         "--language", str(stt["language"]),
@@ -1117,9 +1108,88 @@ def worker_argv(uv: str, wav_path: Path, stt: dict) -> list[str]:
     ]
 
 
+PARAKEET_INSTALL_HINT = "vocalize local install --stt --engine parakeet"
+
+
+def _whisper_identity(manifest, selected) -> str:
+    """What the warm Whisper server's fingerprint carries: the explicit
+    runtime's identity, or the lock's sha256, so a changed lock never
+    reuses a server started from the old environment."""
+    from .local import locks
+
+    return selected.identity if selected else locks.identity(manifest.lock_file())
+
+
+def _raise_if_offline(result, install_command: str) -> None:
+    """uv refused to fetch an uncached runtime: say how to install it.
+
+    The worker's diagnostics are only matched, never shown, and nothing
+    retries with the network.
+    """
+    from .local import runtime
+
+    if runtime.offline_failure(result.stderr):
+        raise DictationError(
+            f"The transcriber could not start offline: {runtime.reinstall_hint(install_command)}."
+        )
+
+
+def engine_for(stt: dict) -> str:
+    """Which engine transcribes: "parakeet" or "whisper".
+
+    "auto" (the default) picks Parakeet only where it can run and is
+    installed, so a machine that never installed it keeps using whisper.
+    """
+    from .local import install, parakeet_manifest
+
+    engine = (stt or {}).get("engine", "auto")
+    if engine != "auto":
+        return engine
+    if parakeet_manifest.supported() and install.installed(parakeet_manifest)[0]:
+        return "parakeet"
+    return "whisper"
+
+
+def _transcribe_parakeet(wav_path: Path) -> str:
+    """One-shot: the worker prints a single JSON line. No warm server."""
+    from .local import install, runtime
+    from .local import parakeet_manifest as manifest
+
+    if not manifest.supported():
+        raise DictationError("Parakeet needs an Apple Silicon Mac. Use [stt] engine = \"whisper\".")
+    ready, reason = install.installed(manifest, install_hint=PARAKEET_INSTALL_HINT)
+    if not ready:
+        raise DictationError(f"Speech-to-text model parakeet: {reason}")
+
+    timeout = _transcribe_timeout(_wav_duration(wav_path))
+    try:
+        result = subprocess.run(
+            [_uv_or_raise(), *manifest.runtime_argv(), "--transcribe", str(wav_path)],
+            capture_output=True, text=True, check=False, timeout=timeout,
+            env=runtime.environment(),  # allowlisted, offline, no credentials
+            cwd=tempfile.gettempdir(),  # never the caller's project directory
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DictationError("Transcription timed out.") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DictationError(f"Could not run the transcriber: {exc}") from exc
+    if result.returncode != 0:
+        _raise_if_offline(result, PARAKEET_INSTALL_HINT)
+        raise DictationError("The transcriber failed to run.")
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    try:
+        reply = json.loads(lines[-1])
+    except (IndexError, ValueError) as exc:
+        raise DictationError("The transcriber did not answer.") from exc
+    if not isinstance(reply, dict) or not reply.get("ok"):
+        raise DictationError("The transcriber could not read the recording.")
+    text = reply.get("text")
+    return sanitize(text) if isinstance(text, str) else ""
+
+
 def transcribe(wav_path: Path, stt: dict) -> str:
     """The transcript of one WAV. Raises DictationError on any failure."""
-    from .local import install
+    from .local import install, runtime
     from .local import whisper_manifest as manifest
 
     # First, exactly as `recorder_argv` and `worker_argv` do it: this is
@@ -1127,6 +1197,12 @@ def transcribe(wav_path: Path, stt: dict) -> str:
     # must be a DictationError with a message, never a KeyError out of the
     # allowlist lookup below and up through the CLI as a traceback.
     stt = _checked(stt)
+    if engine_for(stt) == "parakeet":
+        return _transcribe_parakeet(wav_path)
+    try:
+        selected = runtime.selection(manifest.RUNTIME_PACKAGE)
+    except runtime.RuntimeSelectionError as exc:
+        raise DictationError(str(exc)) from exc
     model = stt["model"]
     ready, reason = install.installed(
         manifest,
@@ -1143,6 +1219,7 @@ def transcribe(wav_path: Path, stt: dict) -> str:
 
         fingerprint = warm_protocol.fingerprint(
             manifest.worker_path(), manifest.RUNTIME_PACKAGE, manifest.model_path(model),
+            runtime_identity=_whisper_identity(manifest, selected),
         )
         reply = warm.request("whisper", {
             "op": "transcribe", "wav": str(wav_path), "language": stt["language"],
@@ -1157,9 +1234,9 @@ def transcribe(wav_path: Path, stt: dict) -> str:
     _refresh_claim(wav_path.parent)
     try:
         result = subprocess.run(
-            worker_argv(_uv_or_raise(), wav_path, stt),
+            runtime.command(manifest, worker_argv("" if selected else _uv_or_raise(), wav_path, stt), selected),
             capture_output=True, text=True, check=False,
-            timeout=timeout,
+            timeout=timeout, env=runtime.environment(selected),
             cwd=tempfile.gettempdir(),  # never the caller's project directory
         )
     except subprocess.TimeoutExpired as exc:
@@ -1168,6 +1245,8 @@ def transcribe(wav_path: Path, stt: dict) -> str:
         raise DictationError(f"Could not run the transcriber: {exc}") from exc
 
     if result.returncode != 0:
+        if not selected:
+            _raise_if_offline(result, "vocalize local install --stt")
         raise DictationError("The transcriber failed to run.")
 
     lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
@@ -1268,29 +1347,55 @@ def _finish_take(workdir: Path, stt: dict) -> tuple[str | None, bool, str | None
     take = workdir / _TAKE_NAME
     if _is_silent(take):
         return None, False, None
+    return _transcribe_take(take, stt, before_cleanup=lambda: _refresh_claim(workdir))
+
+
+def _transcribe_take(take: Path, stt: dict, *, before_cleanup=None) -> tuple[str | None, bool, str | None]:
+    """Engine, vocabulary corrections, then cleanup when it is on.
+
+    The one sequence both a live take and `listen --wav` run, so the two
+    can never drift apart again. The silence guard is the caller's: it
+    reads every sample, and `transcribe_wav` must tell silence apart from
+    an empty transcript.
+    """
     text = transcribe(take, stt)
-    if not text:
+    if not _has_words(text):
         return None, False, None
+    # After any engine, before cleanup: Parakeet never saw the vocabulary.
+    text = vocabulary.correct(text, stt.get("vocabulary") or [])
     backend = cleanup_backend(stt)
     if backend == "off":
         return text, False, text
-    _refresh_claim(workdir)  # transcription is done; the cleanup pass is its own stage
+    if before_cleanup is not None:
+        before_cleanup()  # transcription is done; the cleanup pass is its own stage
     raw = text
     text, cleaned = llm.cleanup_transcript(text, backend, bool(stt.get("verbatim")))
     return text, not cleaned, raw
 
 
+def _has_words(text: str | None) -> bool:
+    """Whether a transcript has a letter or a digit in it.
+
+    Low-level noise gets past the silence guard, and Whisper then answers
+    with punctuation alone (".") where Parakeet answers with nothing. Both
+    are nothing heard, so both engines end the same way.
+    """
+    return bool(text) and any(ch.isalnum() for ch in text)
+
+
 def cleanup_backend(stt: dict) -> str:
-    """The `[stt] cleanup` backend for a settings dict, legacy bools included.
+    """The local cleanup backend, refusing retired hosted and ambiguous choices.
 
     The dicts that reach this module are not always the resolved ones
     (`toggle` is handed whatever the CLI or the portal built), so the
-    0.10.x true/false spelling is read here as well as in `resolve_stt`.
+    legacy true is refused here as well as in `resolve_stt`.
     """
     backend = stt.get("cleanup", "off")
-    if isinstance(backend, bool):
-        return "claude-cli" if backend else "off"
-    return backend or "off"
+    if backend is False or backend is None or backend == "":
+        return "off"
+    if backend not in ("local", "off"):
+        raise DictationError("Cleanup requires local or off; hosted processing was removed")
+    return backend
 
 
 # --- warm servers -----------------------------------------------------
@@ -1301,22 +1406,33 @@ def _warm_specs(stt: dict, *, base: Path | None = None) -> list[tuple]:
     specs = []
     for kind in ("whisper", "llm"):
         try:
-            from .local import install, llm_manifest, warm_protocol, whisper_manifest
+            from .local import (
+                install,
+                llm_manifest,
+                runtime,
+                warm,
+                warm_protocol,
+                whisper_manifest,
+            )
 
             settings = _checked(stt)
             window = ["--warm-seconds", str(60 * settings["warm_minutes"]),
                       "--abandon-seconds", str(settings["max_take_seconds"] + 60)]
-            serve = ["--serve", "--socket", str(warm_protocol.socket_path(kind, base))]
-            env = None
+            # warm.socket_path, not the protocol's: the server must bind
+            # where the client will look, short fallback folder included.
+            serve = ["--serve", "--socket", str(warm.socket_path(kind, base))]
             if kind == "whisper":
+                if engine_for(settings) == "parakeet":
+                    continue  # nothing to keep warm: Parakeet runs one-shot
                 manifest = whisper_manifest
                 model = manifest.model_path(settings["model"])
                 if not model.is_file():
                     continue
-                argv = [_uv_or_raise(), "run", "--no-project", "--python", manifest.PYTHON_VERSION,
-                        "--with", manifest.RUNTIME_PACKAGE, str(manifest.worker_path()), *serve,
+                selected = runtime.selection(manifest.RUNTIME_PACKAGE)
+                argv = ["" if selected else _uv_or_raise(), *manifest.runtime_prefix(), *serve,
                         "--model", str(model), "--language", settings["language"],
                         "--beam-size", str(settings["beam_size"]), *window]
+                identity = _whisper_identity(manifest, selected)
             else:
                 manifest = llm_manifest
                 if cleanup_backend(settings) != "local" or not install.installed(
@@ -1324,12 +1440,19 @@ def _warm_specs(stt: dict, *, base: Path | None = None) -> list[tuple]:
                 )[0]:
                     continue
                 model = manifest.MODEL_DIR / "model.safetensors"
-                argv = [_uv_or_raise(), *manifest.runtime_argv()]
+                selected = runtime.selection(manifest.RUNTIME_PACKAGE)
+                argv = ["" if selected else _uv_or_raise(), *manifest.runtime_argv()]
                 once = argv.index("--once")
                 argv[once:once + 1] = [*serve, *window]
-                env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+                # The same identity the client in llm.py expects.
+                identity = llm.warm_identity(selected)
+            argv = runtime.command(manifest, argv, selected)
+            env = runtime.environment(selected)
+            if identity is not None:
+                env[runtime.IDENTITY_ENV] = identity
             fingerprint = warm_protocol.fingerprint(
                 manifest.worker_path(), manifest.RUNTIME_PACKAGE, model,
+                runtime_identity=identity,
             )
             specs.append((kind, argv, env, fingerprint))
         except Exception:  # noqa: BLE001, S110 -- one broken spec must not suppress the other
@@ -1402,6 +1525,27 @@ def _warm_after(stt: dict) -> None:
                 pass
     except Exception:  # noqa: BLE001, S110 -- warming must never break dictation
         pass
+
+
+def _warm_hold(stt: dict) -> str | None:
+    """A file take's `_warm_up`: hold whatever is already warm, so it cannot
+    expire mid-take, and return the lease id for `_warm_down`. No
+    microphone waits on it, so it runs here, each lease bounded to 0.2 s.
+    None, and nothing asked, when warm_minutes is 0. Never spawns."""
+    try:
+        if int(stt.get("warm_minutes") or 0) <= 0:
+            return None
+        from .local import warm
+
+        nonce = secrets.token_hex(16)
+        for kind, _argv, _env, fingerprint in _warm_specs(stt):
+            try:
+                warm.lease(kind, fingerprint, nonce)
+            except Exception:  # noqa: BLE001, S110 -- best effort per model
+                pass
+        return nonce
+    except Exception:  # noqa: BLE001 -- warming must never break a transcription
+        return None
 
 
 def _warm_down(nonce: str | None) -> None:
@@ -1765,7 +1909,7 @@ def _stop(workdir: Path, pid: int | None, started: float, stt: dict) -> int:
             _play(_SOUND_DONE, stt)
             if cleanup_skipped:
                 _notify(_NOTIFY_COPIED_RAW)
-            elif cleanup_backend(stt) in llm.CLOUD_BACKENDS:
+            elif cleanup_backend(stt) == "local":
                 _notify(_NOTIFY_COPIED_CLEANED)
             else:
                 _notify(_NOTIFY_COPIED)
@@ -2086,7 +2230,35 @@ def listen(stt: dict, *, wait) -> str | None:
         _warm_after(stt)
 
 
-def transcribe_wav(path: Path, stt: dict) -> str | None:
+@contextmanager
+def _lower_case_name(path: Path):
+    """`path`, or a hard link to it named `take.wav` when its ending is not
+    exactly `.wav`. A hard link is the same file under a second name, so
+    the workers' no-symlink open accepts it; one that cannot be made (the
+    file is on another volume) is refused with what to do instead."""
+    if path.name.endswith(".wav"):
+        yield path
+        return
+    folder = Path(tempfile.mkdtemp(prefix="vocalize-wav-"))  # 0700
+    try:
+        link = folder / "take.wav"
+        try:
+            os.link(path, link)
+        except OSError:
+            raise DictationError(
+                "Speech-to-text could not read this file under its current name. "
+                "Rename it to end in .wav (lower case) and try again."
+            ) from None
+        yield link
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+WAV_SILENT_NOTICE = "The recording is silent: there are no words to transcribe."
+WAV_CLEANUP_SKIPPED_NOTICE = "Cleanup skipped: this is the transcript as heard."
+
+
+def transcribe_wav(path: Path, stt: dict, *, notice=None) -> str | None:
     """`vocalize listen --wav FILE`: transcribe a file the user names.
 
     Trusted input by contract — the user chose the path — but the format is
@@ -2094,7 +2266,33 @@ def transcribe_wav(path: Path, stt: dict) -> str | None:
     fails with a message rather than reaching whisper.cpp's C code. The
     message never quotes the file or the underlying error: both are
     attacker-shaped text on a terminal.
+
+    The same steps as a live take, in the same order (`_transcribe_take`),
+    behind the same silence guard. "" is a silent recording, None is one
+    in which the engine heard nothing (no letter or digit in what it
+    returned). `notice` gets fixed text only — never the transcript — when
+    cleanup was asked for and did not run.
+
+    Any letter case of the `.wav` ending is accepted. The Whisper worker
+    takes only a lower-case `.wav` name and both workers open the file
+    without following a link, so another case is handed over as a hard
+    link — the same file, nothing copied — named `take.wav` in a private
+    temporary folder, removed after the take.
+
+    Warm servers as in `listen()`: with `[stt] warm_minutes` above 0, what
+    is already warm is held for the take and released after it, then
+    whatever is not warm starts. With 0 a running server is still used
+    (`transcribe` and cleanup always try one) and nothing starts.
     """
+    # Absolute before anything else: both workers run from the system
+    # temporary directory, where a relative path names nothing.
+    path = Path(path).absolute()
+    if not path.exists():
+        raise DictationError("That file does not exist.")
+    if not path.is_file():
+        raise DictationError("That is not a regular file. Name a 16 kHz mono 16-bit WAV recording.")
+    if path.suffix.lower() != ".wav":
+        raise DictationError("Speech-to-text reads only files whose name ends in .wav.")
     try:
         with wave.open(str(path), "rb") as reader:
             params = (reader.getnchannels(), reader.getsampwidth(), reader.getframerate())
@@ -2108,4 +2306,16 @@ def transcribe_wav(path: Path, stt: dict) -> str | None:
             "Speech-to-text needs a 16 kHz mono 16-bit WAV recording. Convert it "
             "with: afconvert -f WAVE -d LEI16@16000 -c 1 <in> <out>"
         )
-    return transcribe(path, stt) or None
+    if _is_silent(path):
+        return ""
+    stt = stt or {}
+    with _lower_case_name(path) as handed:
+        nonce = _warm_hold(stt)
+        try:
+            text, cleanup_skipped, _raw = _transcribe_take(handed, stt)
+        finally:
+            _warm_down(nonce)
+            _warm_after(stt)
+    if cleanup_skipped and notice is not None:
+        notice(WAV_CLEANUP_SKIPPED_NOTICE)
+    return text

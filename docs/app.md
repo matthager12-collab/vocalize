@@ -99,7 +99,8 @@ composes with `&&` in a script.
 
 ## Chords
 
-Three chords, set under `[app]` in `~/.config/vocalize/config.toml`:
+Three chords and two choices, set under `[app]` in
+`~/.config/vocalize/config.toml` or in the settings page's Hotkeys section:
 
 | Key | What it does | Default |
 |---|---|---|
@@ -107,6 +108,7 @@ Three chords, set under `[app]` in `~/.config/vocalize/config.toml`:
 | `dictate_mode` | `toggle` or `hold` | `toggle` |
 | `speak` | speak the selection | `ctrl+alt+cmd+s` |
 | `stop` | stop whatever is playing | `ctrl+alt+cmd+x` |
+| `stop_hotkey` | `stop`, or `pause` to make the stop chord pause and resume | `stop` |
 
 ```toml
 [app]
@@ -195,17 +197,16 @@ defaults write cards.arda.vocalize.app VocalizeBinary /path/to/vocalize
 
 Uninstalling removes this override automatically.
 
-## The Setup tab
+## From the settings page
 
-`vocalize portal` has a **Setup** tab, after Local. It walks the nine
-setup steps — toolchain, building both bundles, the login item, chords,
-the model download, the microphone, `/speak` and Quick Actions,
-Accessibility, and a self-test — as a checklist built from the readiness
-rows the sidebar shows (step 1 points at `vocalize doctor`), so it's always
-current with what's actually on the machine. Its "Install the app" button drives this same `app install`
-sequence (build, plist, bootout, bootstrap, and the Accessibility reset on
-a rebuild) through the portal instead of the CLI; the GUI-only steps still
-print from `vocalize integrate claude`, not the page.
+`vocalize portal` opens the settings page. Its **Hotkeys** section holds the
+five `[app]` settings and four buttons: install the menu-bar app, restart
+it, remove it, and open the Accessibility pane of System Settings. The
+install button builds and loads the app, and resets the Accessibility
+grant when the bundle is rebuilt, as `vocalize app install` does. If this
+`vocalize` is not in one of the three places the app looks, the button
+stops and tells you to run `vocalize app install` in a terminal. The page
+cannot grant Accessibility; only you can, in System Settings.
 
 ## Quit stays quit
 

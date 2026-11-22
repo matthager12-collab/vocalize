@@ -1,119 +1,64 @@
 # For reviewers
 
-vocalize reads your screen aloud and types what you say, without sending
-either one anywhere. It is a macOS command line tool with two small Swift
-apps attached, and it is the piece of my own work I point at when someone
-asks what I actually build.
+Vocalize is a macOS command-line tool with two capabilities, text to speech
+and speech to text, both run on the device. This page points at the parts of
+the code that matter most for review.
 
-This page is for people evaluating the project rather than installing it. If
-you want to run it, start at [getting-started.md](getting-started.md).
+| Area | Where to look | What to check |
+|---|---|---|
+| Text to speech | `vocalize/preprocess.py`, `vocalize/providers/`, `vocalize/chain.py` | Markdown is rewritten for listening; only local engines are accepted; a fallback is announced |
+| Audio cache | `vocalize/cache.py` | Private directory, regular-file checks, atomic replacement, size limits |
+| Dictation | `vocalize/dictate.py`, `vocalize/recorder/` | Session and delivery locks, cancel, pause, the recorder's microphone permission, fixed notification text |
+| Vocabulary | `vocalize/vocabulary.py` | Exact letter-and-digit matching only, no matching by sound; the correction step leaves text with no term in it unchanged (Whisper's hint, in `vocalize/dictate.py`, can still change a transcript) |
+| Cleanup | `vocalize/llm.py`, `vocalize/local/llm_worker.py` | Local or off only; the transcript is treated as data; the faithful guard keeps raw text when the model strays |
+| Transcription | `vocalize/notes.py` and the `transcribe` command in `vocalize/cli.py` | Bounded worker output, timeouts, private temporary files, skipping sources already processed |
+| Settings | `vocalize/settings_registry.py`, `vocalize/actions.py`, `vocalize/profiles.py` | One list of settings drives the checks, the writer, `vocalize settings`, the README table and the page; every action has a button or a written reason; a profile writes only registered keys |
+| Settings page | `vocalize/portal.py`, `vocalize/assets/` | Loopback only, one-time code, session header, Origin and Host checks, escaped content, compare-and-swap saves |
+| Warm servers | `vocalize/local/warm.py`, `vocalize/local/warm_protocol.py` | Private Unix sockets, peer identity, bounded frames |
+| Downloads | `vocalize/local/install.py` and the `*_manifest.py` files | Pinned addresses, redirects only to HTTPS, sha256 and size checks |
+| Engine environments | `vocalize/local/locks/`, `vocalize/local/runtime.py` | Hash-locked package lists, binary packages only, offline start with an allow-listed environment; Piper is pinned by version only |
+| Engine workers | `vocalize/local/*_worker.py` | Refusal of relative or missing paths, of a model folder holding Python code, and of malformed recordings |
 
-## The problem worth solving
+## Limits of the hash lock
 
-Screen readers are good at voices and bad at structure.
+The hash-locked lists cover the packages for Kokoro, Parakeet, Whisper and
+the cleanup model. They do not cover:
 
-Point one at a markdown report and it reads a table cell by cell. You get
-"Q1. 4.2 million. Q2. 5.1 million" with no sense of which row you are in.
-Headings, bullets and inline code get read exactly as typed, backticks and
-all.
+- **Piper.** Its package is pinned by version only.
+- **The Python that uv downloads** for the engine environments. uv checks
+  it itself; Vocalize does not pin it.
+- **A runtime chosen with `VOCALIZE_WHISPER_PYTHON` or
+  `VOCALIZE_LLM_PYTHON`.** These evaluation variables point at another
+  Python, which is checked by version only.
+- **uv's own user configuration.** It can change the package index. The
+  hashes still decide which files are accepted.
 
-I find it helpful to listen and read at the same time, so I run a lot of
-documents through a reader. That failure costs me time every week. I fixed
-the half of it that can be fixed without a vision model.
+## Swift apps
 
-`vocalize/preprocess.py` rewrites markdown into declarative sentences before
-any voice sees it. Tables become "for Q1, revenue is 4.2 million". Bullets
-become "First. Second." Links keep their text and drop the URL. Code blocks
-become a spoken placeholder instead of a minute of punctuation.
+Two small Swift apps hold the macOS permissions: **Vocalize Recorder** owns
+the microphone and **Vocalize.app** (the menu-bar app) owns the keyboard
+shortcuts. macOS ties each permission to the app's signature, so their
+source rarely changes.
 
-It is a text transform, so it tests without a network or an API key.
+## Tests
 
-## Three decisions I would defend
+CI runs on Python 3.10, 3.12 and 3.14. The suite uses fakes for every model
+and for the recorder, and needs no microphone. It blocks every connection
+that is not to the Mac itself. `tests/test_local_only.py` also scans the
+code's imports for network clients outside four allowed modules (the
+downloader, the settings page server and the two warm-server modules); the comment
+above that scan lists what it cannot see. `tests/test_settings_parity.py`
+fails when a setting has no control the page can draw, when code reads a
+setting that is not registered, when a profile sets one, or when the
+README's settings table is out of date.
 
-**Local by default, cloud by choice.** The on-device voice runs first and the
-cloud providers sit behind it in an ordered fallback chain. Six providers,
-one interface, and a machine with no keys still speaks. I got this backwards
-in the first version. ElevenLabs was the primary and everything else was a
-fallback, which meant the tool was useless offline and metered by the
-character.
+Tests against real models are separate and opt-in; see
+[local-model-evaluation.md](local-model-evaluation.md). Passing tests do not
+prove audio quality, real latency or the two macOS permissions; those need a
+person at a Mac. What was measured on real hardware is in
+[plans/2026-11-local-only/measurements.md](plans/2026-11-local-only/measurements.md).
 
-**The permission model is the architecture.** macOS will not give a
-microphone to a command line tool. So the recorder is a separate signed Swift
-bundle whose only job is to be a thing macOS can say yes to. The menu-bar app
-exists for the same reason, on the Accessibility side. Neither one reads your
-audio or your clipboard. They start a subprocess and get out of the way.
-
-**Notifications are an allowlist, not a format string.** A dictation
-transcript must never reach Notification Center, because notifications are
-readable by other software and survive on the lock screen. So `_notify()`
-refuses any string that is not in a fixed frozen set. There is no code path
-that can interpolate a transcript into a notification, because there is no
-interpolation at all.
-
-## The bug I want you to read
-
-macOS pins a keychain item to the binary that created it.
-
-Version 0.9 wrote API keys through Python's `keyring` library, which called
-the Security framework from whatever Python was running. That Python got
-pinned. Upgrade the tool, get a new virtual environment, and every key read
-now sits behind a password dialog forever. The tool looks broken and the
-error tells you nothing useful.
-
-The fix is in `vocalize/auth.py`. Reads and writes go through Apple's own
-`/usr/bin/security` binary instead of the framework. That binary is the same
-on every machine and never changes identity, so the pin holds across every
-upgrade after this one.
-
-The part I like is the migration. A `-U` update keeps the old pinning, so
-`set_password` deletes the item and adds it fresh. The delete is what
-migrates it. The comment explaining it runs several times the length of the code,
-because the next person to read it will otherwise "simplify" it back into
-the bug.
-
-I hit the old version of this bug on my own machine two days ago, on a tool I
-wrote, and it still took me twenty minutes to diagnose. The comment is
-longer than the code for a reason.
-
-## What I would do differently
-
-The planning documents outnumber the source files. There are 116 of them
-under `docs/plans` and `docs/research`, and they are public because the
-process is part of what I am showing. A reviewer looking for the code has to
-wade past them. If I were starting again I would keep the same discipline and
-put it in a separate repository.
-
-I would also pin a minimum macOS version. I never did, and I cannot tell you
-today what the real floor is.
-
-## Where to look
-
-| File | Why |
-|---|---|
-| `vocalize/preprocess.py` | The markdown-to-speech transform. The original idea. |
-| `vocalize/auth.py` | The keychain migration above. |
-| `vocalize/providers/` | Six providers behind one interface. |
-| `vocalize/dictate.py` | The notification allowlist and the session state machine. |
-| `vocalize/menubar/VocalizeApp.swift` | The hotkey owner. Two possible backends, one picked at compile time, with the measurement that decided it in the file. |
-| `docs/app.md` | Documentation written to be used, including the failure modes. |
-
-## The numbers
-
-One that matters: **24,556 lines of tests against 13,978 lines of code.**
-
-CI runs on Python 3.10, 3.12 and 3.14 and is green on the current release.
-It runs on Linux, so it covers the platform-independent half. The macOS
-paths are covered by fakes and verified by hand.
-
-Built in the open between 25 August and 9 September 2026. MIT licensed, on
-PyPI as `vocalize-cli`.
-
-## What it is not
-
-It is not cross-platform. Dictation depends on AVFoundation, LaunchServices
-and the TCC permission database, and there is no equivalent path on Linux or
-Windows. The speech half mostly works elsewhere. I have not tested it and I
-would not claim it.
-
-It is also not a product. It is a tool I use every day, documented well
-enough that someone else can too.
+`docs/plans/` and `docs/research/` hold design records, kept in the
+repository for history and left out of the source archive. Older records
+there describe features that 1.0 removed; the code and the guides in
+`docs/` describe current behavior. See [plans/README.md](plans/README.md).

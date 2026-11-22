@@ -14,19 +14,18 @@ from pathlib import Path
 import pytest
 
 from vocalize import audio as audio_module
-from vocalize import cache, chain, ledger
+from vocalize import cache, chain
 from vocalize.config import Settings
 from vocalize.exceptions import (
     AudioPlaybackError,
     ConfigError,
     PlaybackStopped,
-    ProviderAuthError,
     ProviderContentError,
-    ProviderQuotaError,
     ProviderTransientError,
     ProviderUnavailableError,
     TTSRequestError,
 )
+from vocalize.preprocess import split_for_synthesis
 
 
 def _wav(text: str) -> bytes:
@@ -62,7 +61,6 @@ class FakeProvider:
         error=None,
         check_error=None,
         streaming=False,
-        count_unit=None,
         max_bytes=None,
     ):
         self.NAME = name
@@ -70,8 +68,6 @@ class FakeProvider:
         self.MAX_CHARS = max_chars
         self.DEFAULTS = {"voice": f"{name}-voice"}
         self.STREAMING = streaming
-        if count_unit is not None:
-            self.COUNT_UNIT = count_unit
         if max_bytes is not None:
             self.MAX_BYTES = max_bytes
         self._audio = audio
@@ -108,6 +104,10 @@ class _Registry(dict):
     resolved: list
     cache_dir = None
 
+    def __init__(self):
+        super().__init__()
+        self.file_configs = []
+
 
 @pytest.fixture
 def registry(monkeypatch, tmp_path):
@@ -123,6 +123,7 @@ def registry(monkeypatch, tmp_path):
 
     def fake_resolve(name, file_config=None, *, primary=True, **overrides):
         resolved.append({"name": name, "primary": primary, **overrides})
+        modules.file_configs.append(file_config)
         return Settings(voice_id=f"{name}-voice", provider=name)
 
     monkeypatch.setattr("vocalize.providers.get", fake_get)
@@ -148,106 +149,88 @@ def _echoes():
 # --- falling through ---------------------------------------------------------
 
 
-def test_a_quota_error_moves_on_and_is_remembered_for_the_month(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderQuotaError("openai", "out of credit"))
-    registry["say"] = FakeProvider("say")
-
-    audio, name, ext = _run(registry)
-
-    assert (audio, name, ext) == (b"[say:hello]", "say", "mp3")
-    assert ledger.status("openai") == (0, True)
 
 
-def test_an_auth_error_moves_on_without_marking_exhausted(registry):
-    registry["openai"] = FakeProvider(
-        "openai", check_error=ProviderAuthError("openai", "invalid or missing API key")
-    )
-    registry["say"] = FakeProvider("say")
-
-    _audio, name, _ext = _run(registry)
-
-    assert name == "say"
-    assert ledger.status("openai") == (0, False)
 
 
 def test_a_transient_error_moves_on(registry):
-    registry["google"] = FakeProvider("google", error=ProviderTransientError("google", "HTTP 503"))
+    registry["piper"] = FakeProvider("piper", error=ProviderTransientError("piper", "HTTP 503"))
     registry["say"] = FakeProvider("say")
 
     assert _run(registry)[1] == "say"
 
 
 def test_an_unavailable_provider_moves_on(registry):
-    registry["polly"] = FakeProvider(
-        "polly", check_error=ProviderUnavailableError("polly", "needs boto3")
+    registry["piper"] = FakeProvider(
+        "piper", check_error=ProviderUnavailableError("piper", "model missing")
     )
     registry["say"] = FakeProvider("say")
 
     assert _run(registry)[1] == "say"
-    assert registry["polly"].calls == []
+    assert registry["piper"].calls == []
 
 
 def test_a_content_error_stops_the_chain(registry):
     boom = ProviderContentError("say", "invalid voice 'nope'")
     registry["say"] = FakeProvider("say", error=boom)
-    registry["elevenlabs"] = FakeProvider("elevenlabs")
+    registry["piper"] = FakeProvider("piper")
 
     with pytest.raises(ProviderContentError) as excinfo:
-        _run(registry, chain=["say", "elevenlabs"])
+        _run(registry, chain=["say", "piper"])
 
     # The same exception, not a rewrapped one: a misconfigured voice is a
     # bug to fix, not something to route around.
     assert excinfo.value is boom
-    assert registry["elevenlabs"].calls == []
+    assert registry["piper"].calls == []
 
 
 def test_a_forced_single_provider_chain_never_falls_back(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+    registry["piper"] = FakeProvider("piper", error=ProviderTransientError("piper", "worker exited"))
     registry["say"] = FakeProvider("say")
 
     with pytest.raises(TTSRequestError):
-        _run(registry, chain=["openai"])
+        _run(registry, chain=["piper"])
 
     assert registry["say"].calls == []
 
 
 def test_an_unexpected_exception_propagates_untouched(registry):
     registry["say"] = FakeProvider("say", error=TypeError("our own bug"))
-    registry["elevenlabs"] = FakeProvider("elevenlabs")
+    registry["piper"] = FakeProvider("piper")
 
     with pytest.raises(TypeError, match="our own bug"):
-        _run(registry, chain=["say", "elevenlabs"])
+        _run(registry, chain=["say", "piper"])
 
-    assert registry["elevenlabs"].calls == []
+    assert registry["piper"].calls == []
 
 
 # --- what the user is told ---------------------------------------------------
 
 
 def test_a_skip_names_the_provider_being_tried_next(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderQuotaError("openai", "out of credit"))
-    registry["google"] = FakeProvider("google", error=ProviderAuthError("google", "bad key"))
+    registry["kokoro"] = FakeProvider("kokoro", error=ProviderTransientError("kokoro", "worker unavailable"))
+    registry["piper"] = FakeProvider("piper", error=ProviderUnavailableError("piper", "binary missing"))
     registry["say"] = FakeProvider("say")
     lines, echo = _echoes()
 
     _run(registry, echo=echo)
 
-    assert "openai: out of credit — trying google" in lines
-    assert "google: bad key — trying say" in lines
+    assert "kokoro: worker unavailable — trying piper" in lines
+    assert "piper: binary missing — trying say" in lines
 
 
 def test_the_last_skip_says_there_is_nobody_left(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+    registry["piper"] = FakeProvider("piper", error=ProviderTransientError("piper", "worker exited"))
     lines, echo = _echoes()
 
     with pytest.raises(TTSRequestError):
         _run(registry, echo=echo)
 
-    assert lines[-1] == "openai: HTTP 500 — no providers left"
+    assert lines[-1] == "piper: worker exited — no providers left"
 
 
 def test_a_fallback_announces_which_provider_actually_spoke(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+    registry["piper"] = FakeProvider("piper", error=ProviderTransientError("piper", "worker exited"))
     registry["say"] = FakeProvider("say")
     lines, echo = _echoes()
 
@@ -257,7 +240,7 @@ def test_a_fallback_announces_which_provider_actually_spoke(registry):
 
 
 def test_the_primary_speaking_is_not_announced_as_a_fallback(registry):
-    registry["elevenlabs"] = FakeProvider("elevenlabs")
+    registry["piper"] = FakeProvider("piper")
     lines, echo = _echoes()
 
     _run(registry, echo=echo)
@@ -281,8 +264,8 @@ def test_fallback_note_names_the_kokoro_install_when_the_primary_is_missing(regi
     assert [line for line in lines if "Kokoro is not installed" in line] == [_KOKORO_NOTE]
 
 
-def test_fallback_note_is_not_added_when_the_primary_was_a_cloud_provider(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+def test_fallback_note_is_not_added_when_the_primary_was_another_local_provider(registry):
+    registry["piper"] = FakeProvider("piper", error=ProviderTransientError("piper", "worker exited"))
     registry["say"] = FakeProvider("say")
     lines, echo = _echoes()
 
@@ -293,7 +276,7 @@ def test_fallback_note_is_not_added_when_the_primary_was_a_cloud_provider(regist
 
 
 def test_fallback_note_is_not_added_when_kokoro_was_not_the_primary(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderTransientError("openai", "HTTP 500"))
+    registry["piper"] = FakeProvider("piper", error=ProviderTransientError("piper", "worker exited"))
     registry["kokoro"] = FakeProvider("kokoro", check_error=_KOKORO_MISSING)
     registry["say"] = FakeProvider("say")
     lines, echo = _echoes()
@@ -305,9 +288,9 @@ def test_fallback_note_is_not_added_when_kokoro_was_not_the_primary(registry):
 
 
 def test_every_failure_is_listed_when_the_whole_chain_fails(registry):
-    registry["openai"] = FakeProvider("openai", error=ProviderQuotaError("openai", "out of credit"))
-    registry["google"] = FakeProvider(
-        "google", check_error=ProviderUnavailableError("google", "no key stored")
+    registry["kokoro"] = FakeProvider("kokoro", error=ProviderTransientError("kokoro", "worker unavailable"))
+    registry["piper"] = FakeProvider(
+        "piper", check_error=ProviderUnavailableError("piper", "model missing")
     )
 
     with pytest.raises(TTSRequestError) as excinfo:
@@ -315,20 +298,20 @@ def test_every_failure_is_listed_when_the_whole_chain_fails(registry):
 
     message = str(excinfo.value)
     assert "Every provider in the chain failed:" in message
-    assert "  openai: out of credit" in message
-    assert "  google: no key stored" in message
+    assert "  kokoro: worker unavailable" in message
+    assert "  piper: model missing" in message
     assert 'add "say" to your chain' in message
 
 
 def test_the_fallback_hint_is_not_offered_when_the_user_forced_one_provider(registry):
     # --provider turns fallback off on purpose; "add say to your chain" is
     # advice about a chain this run never had.
-    registry["openai"] = FakeProvider(
-        "openai", error=ProviderQuotaError("openai", "out of credit")
+    registry["piper"] = FakeProvider(
+        "piper", error=ProviderTransientError("piper", "worker unavailable")
     )
 
     with pytest.raises(TTSRequestError) as excinfo:
-        _run(registry, chain=["openai"], forced=True)
+        _run(registry, chain=["piper"], forced=True)
 
     message = str(excinfo.value)
     assert "fallback is off with --provider" in message
@@ -336,12 +319,12 @@ def test_the_fallback_hint_is_not_offered_when_the_user_forced_one_provider(regi
 
 
 def test_the_local_fallback_hint_stays_when_the_chain_was_not_forced(registry):
-    registry["openai"] = FakeProvider(
-        "openai", error=ProviderQuotaError("openai", "out of credit")
+    registry["piper"] = FakeProvider(
+        "piper", error=ProviderTransientError("piper", "worker unavailable")
     )
 
     with pytest.raises(TTSRequestError) as excinfo:
-        _run(registry, chain=["openai"])
+        _run(registry, chain=["piper"])
 
     message = str(excinfo.value)
     assert 'add "say" to your chain' in message
@@ -357,109 +340,49 @@ def test_no_local_fallback_hint_when_say_is_already_in_the_chain(registry):
     assert "no local fallback" not in str(excinfo.value)
 
 
-# --- budgets and the ledger --------------------------------------------------
+# --- no usage is written (review L1) ---------------------------------------
 
 
-def test_the_local_budget_is_checked_before_anything_is_sent(registry):
-    registry["google"] = FakeProvider("google")
-    registry["say"] = FakeProvider("say")
-    file_config = {"providers": {"google": {"monthly_chars": 100}}}
-    ledger.record("google", 95)
-    lines, echo = _echoes()
+def test_speaking_writes_no_usage_file(registry, tmp_path, monkeypatch):
+    registry["piper"] = FakeProvider("piper", max_chars=20)
+    monkeypatch.setattr(chain, "DEFAULT_CACHE_DIR", tmp_path)
 
-    _audio, name, _ext = _run(
-        registry, text="a longer sentence than the budget allows", file_config=file_config, echo=echo
-    )
+    _run(registry, text="one two three four five six seven eight", chain=["piper"])
 
-    assert name == "say"
-    assert registry["google"].calls == []  # nothing was spent to find out
-    assert "local budget reached" in lines[0]
-    # A local budget is our own limit, not the provider's verdict: marking
-    # it exhausted would outlive a budget the user can raise in a minute.
-    assert ledger.status("google") == (95, False)
-
-
-def test_a_budget_with_room_left_is_not_a_skip(registry):
-    registry["google"] = FakeProvider("google")
-    file_config = {"providers": {"google": {"monthly_chars": 1000}}}
-    ledger.record("google", 10)
-
-    assert _run(registry, text="hello", file_config=file_config)[1] == "google"
-
-
-def test_a_provider_marked_exhausted_is_skipped_without_a_call(registry):
-    registry["openai"] = FakeProvider("openai")
-    registry["say"] = FakeProvider("say")
-    ledger.mark_exhausted("openai")
-    lines, echo = _echoes()
-
-    _audio, name, _ext = _run(registry, echo=echo)
-
-    assert name == "say"
-    assert registry["openai"].calls == []
-    assert registry["openai"].checked  # check still ran; the ledger came after
-    assert "openai: out of quota until next month — trying say" in lines
-
-
-def test_characters_are_recorded_for_every_chunk_that_cost_money(registry):
-    registry["elevenlabs"] = FakeProvider("elevenlabs", max_chars=20)
-    text = "one two three four five six seven eight"
-
-    _run(registry, text=text, chain=["elevenlabs"])
-
-    chunks = registry["elevenlabs"].calls
-    assert len(chunks) > 1
-    assert ledger.status("elevenlabs")[0] == sum(len(c) for c in chunks)
-
-
-def test_a_bytes_counting_provider_records_utf8_bytes(registry):
-    registry["google"] = FakeProvider("google", count_unit="bytes")
-    text = "ünïcödé — mit Umlauten"
-
-    _run(registry, text=text)
-
-    assert len(text.encode("utf-8")) > len(text)
-    assert ledger.status("google") == (len(text.encode("utf-8")), False)
-
-
-def test_a_bytes_counting_budget_is_measured_in_bytes(registry):
-    registry["google"] = FakeProvider("google", count_unit="bytes")
-    registry["say"] = FakeProvider("say")
-    text = "üüüüüüüüüü"  # 10 characters, 20 bytes
-    file_config = {"providers": {"google": {"monthly_chars": 15}}}
-
-    assert _run(registry, text=text, file_config=file_config)[1] == "say"
+    assert len(registry["piper"].calls) > 1
+    assert not (tmp_path / "usage.json").exists()
+    assert not (Path(registry.cache_dir) / "usage.json").exists()
+    assert not hasattr(chain, "ledger")
 
 
 # --- the cache ---------------------------------------------------------------
 
 
 def test_a_cache_hit_costs_neither_a_request_nor_a_character(registry, tmp_path):
-    registry["elevenlabs"] = FakeProvider("elevenlabs")
-    settings = Settings(voice_id="elevenlabs-voice", provider="elevenlabs")
+    registry["piper"] = FakeProvider("piper")
+    settings = Settings(voice_id="piper-voice", provider="piper")
     cache.put("hello", settings, b"cached-audio", tmp_path, "mp3")
 
     audio, name, _ext = _run(registry, cache_dir=tmp_path)
 
-    assert (audio, name) == (b"cached-audio", "elevenlabs")
-    assert registry["elevenlabs"].calls == []
-    assert ledger.status("elevenlabs") == (0, False)
+    assert (audio, name) == (b"cached-audio", "piper")
+    assert registry["piper"].calls == []
 
 
 def test_a_fresh_chunk_is_written_to_the_cache(registry, tmp_path):
-    registry["elevenlabs"] = FakeProvider("elevenlabs")
+    registry["piper"] = FakeProvider("piper")
 
     _run(registry, cache_dir=tmp_path)
 
-    settings = Settings(voice_id="elevenlabs-voice", provider="elevenlabs")
-    assert cache.get("hello", settings, tmp_path, "mp3") == b"[elevenlabs:hello]"
+    settings = Settings(voice_id="piper-voice", provider="piper")
+    assert cache.get("hello", settings, tmp_path, "mp3") == b"[piper:hello]"
 
 
 # --- chunking ----------------------------------------------------------------
 
 
 def test_long_text_is_split_at_the_providers_own_cap_and_rejoined(registry):
-    registry["elevenlabs"] = FakeProvider("elevenlabs", max_chars=30)
+    registry["piper"] = FakeProvider("piper", max_chars=30)
     # Distinct sentences on purpose: identical ones would be cache hits
     # after the first, and the split would look like one call.
     text = " ".join(f"Sentence number {n} here." for n in range(1, 7))
@@ -467,21 +390,21 @@ def test_long_text_is_split_at_the_providers_own_cap_and_rejoined(registry):
 
     audio, _name, _ext = _run(registry, text=text, echo=echo)
 
-    chunks = registry["elevenlabs"].calls
+    chunks = registry["piper"].calls
     assert len(chunks) > 1
     assert all(len(c) <= 30 for c in chunks)
-    assert audio == b"".join(f"[elevenlabs:{c}]".encode() for c in chunks)
+    assert audio == b"".join(f"[piper:{c}]".encode() for c in chunks)
     assert f"Long input: splitting into {len(chunks)} chunks." in lines
 
 
 def test_chunk_chars_wins_when_it_is_the_smaller_cap(registry):
-    registry["elevenlabs"] = FakeProvider("elevenlabs", max_chars=9500)
+    registry["piper"] = FakeProvider("piper", max_chars=9500)
     text = " ".join(f"Sentence number {n} here." for n in range(1, 11))
 
     _run(registry, text=text, chunk_chars=40)
 
-    assert len(registry["elevenlabs"].calls) > 1
-    assert all(len(c) <= 40 for c in registry["elevenlabs"].calls)
+    assert len(registry["piper"].calls) > 1
+    assert all(len(c) <= 40 for c in registry["piper"].calls)
 
 
 def test_a_provider_without_a_cap_gets_the_whole_text_in_one_call(registry):
@@ -494,23 +417,23 @@ def test_a_provider_without_a_cap_gets_the_whole_text_in_one_call(registry):
 
 
 def test_a_byte_cap_resplits_a_chunk_that_is_short_but_fat(registry):
-    registry["google"] = FakeProvider("google", max_chars=40, max_bytes=30, count_unit="bytes")
+    registry["piper"] = FakeProvider("piper", max_chars=40, max_bytes=30)
     text = "ü" * 39 + " " + "ö" * 39
 
     _run(registry, text=text)
 
-    chunks = registry["google"].calls
+    chunks = registry["piper"].calls
     assert len(chunks) > 2
     assert all(len(c.encode("utf-8")) <= 30 for c in chunks)
 
 
 def test_chunks_that_already_fit_the_byte_cap_are_left_alone(registry):
-    registry["google"] = FakeProvider("google", max_chars=40, max_bytes=4900)
+    registry["piper"] = FakeProvider("piper", max_chars=40, max_bytes=4900)
     text = "plain ascii sentence. " * 5
 
     _run(registry, text=text)
 
-    assert all(len(c) <= 40 for c in registry["google"].calls)
+    assert all(len(c) <= 40 for c in registry["piper"].calls)
 
 
 def test_an_unchunkable_format_refuses_to_be_joined(registry):
@@ -526,51 +449,25 @@ def test_an_unchunkable_format_refuses_to_be_joined(registry):
 
 
 def test_flags_reach_the_primary_provider_only(registry):
-    registry["elevenlabs"] = FakeProvider(
-        "elevenlabs", error=ProviderTransientError("elevenlabs", "HTTP 500")
+    registry["piper"] = FakeProvider(
+        "piper", error=ProviderTransientError("piper", "worker exited")
     )
     registry["say"] = FakeProvider("say")
 
     _run(registry, overrides={"voice_id": "Rachel", "speed": 1.1})
 
     primary, fallback = registry.resolved
-    assert primary == {"name": "elevenlabs", "primary": True, "voice_id": "Rachel", "speed": 1.1}
+    assert primary == {"name": "piper", "primary": True, "voice_id": "Rachel", "speed": 1.1}
     assert fallback == {"name": "say", "primary": False}
 
 
-def test_an_api_key_only_makes_sense_for_elevenlabs(registry):
-    registry["openai"] = FakeProvider("openai")
-
-    with pytest.raises(ConfigError, match="--api-key only applies to ElevenLabs"):
-        _run(registry, chain=["openai"], overrides={"api_key": "sk-secret"})
-
-    assert registry["openai"].checked == []
 
 
-def test_an_api_key_error_does_not_suggest_a_login_a_provider_cannot_do(registry):
-    # say has no key slot at all: `vocalize auth login --provider say` is
-    # a command that refuses itself.
-    registry["say"] = FakeProvider("say")
-
-    with pytest.raises(ConfigError) as excinfo:
-        _run(registry, chain=["say"], overrides={"api_key": "sk-secret"})
-
-    message = str(excinfo.value)
-    assert "macOS say takes no API key" in message
-    assert "auth login" not in message
-    assert registry["say"].checked == []
 
 
-def test_the_api_key_error_names_the_env_var_for_a_key_holding_provider(registry):
-    registry["openai"] = FakeProvider("openai")
-
-    with pytest.raises(ConfigError) as excinfo:
-        _run(registry, chain=["openai"], overrides={"api_key": "sk-secret"})
-
-    assert "OPENAI_API_KEY" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("first", ["say", "openai"])
+@pytest.mark.parametrize("first", ["say", "piper"])
 def test_the_api_key_guard_never_echoes_the_key_it_refuses(registry, first):
     # Both branches of the guard interpolate the provider name; neither may
     # ever put the rejected key into a message that reaches stderr.
@@ -584,16 +481,6 @@ def test_the_api_key_guard_never_echoes_the_key_it_refuses(registry, first):
     assert "supersecretcanary" not in str(excinfo.value)
 
 
-def test_the_api_key_reaches_elevenlabs_and_nothing_else(registry):
-    registry["elevenlabs"] = FakeProvider("elevenlabs")
-
-    _run(registry, overrides={"api_key": "sk-secret"})
-
-    assert registry["elevenlabs"].checked == [
-        (Settings(voice_id="elevenlabs-voice", provider="elevenlabs"), {"api_key": "sk-secret"})
-    ]
-    # The key is not a setting: it never reaches the settings resolver.
-    assert registry.resolved == [{"name": "elevenlabs", "primary": True}]
 
 
 # --- streaming ---------------------------------------------------------------
@@ -700,12 +587,12 @@ def test_a_stop_carries_the_audio_rendered_so_far(registry):
 
 
 def test_a_provider_without_streaming_is_never_handed_a_piece(registry):
-    registry["elevenlabs"] = FakeProvider("elevenlabs", max_chars=25)
+    registry["piper"] = FakeProvider("piper", max_chars=25)
     seen, on_chunk = _collect()
 
     _run(registry, text="First sentence here. Second sentence here.", on_chunk=on_chunk)
 
-    assert len(registry["elevenlabs"].calls) > 1
+    assert len(registry["piper"].calls) > 1
     assert seen == []
 
 
@@ -782,3 +669,166 @@ def test_a_stop_from_another_read_never_decides_where_this_one_resumes(registry)
         _run(registry, text=text, on_chunk=on_chunk)
 
     assert excinfo.value.remaining_text == " ".join(chunks[1:])
+
+
+@pytest.mark.parametrize("retired", ["elevenlabs", "openai", "google", "polly"])
+def test_entire_chain_rejected_before_any_local_side_effect(registry, retired):
+    registry["say"] = FakeProvider("say")
+    with pytest.raises(ConfigError):
+        _run(registry, chain=["say", retired])
+    assert registry["say"].checked == []
+    assert registry["say"].calls == []
+
+
+def test_providers_never_see_a_retired_setting(registry, capsys):
+    registry["say"] = FakeProvider("say")
+    file_config = {
+        "chain": ["elevenlabs", "say"],
+        "providers": {
+            "elevenlabs": {"api_key": "SECRET_CANARY"},
+            "say": {"voice": "Samantha", "api_key": "SECRET_CANARY", "monthly_chars": 10},
+        },
+    }
+
+    assert _run(registry, chain=["say"], file_config=file_config)[1] == "say"
+
+    seen = registry.file_configs
+    assert seen and all("SECRET_CANARY" not in repr(cfg) for cfg in seen)
+    assert seen[0]["providers"] == {"say": {"voice": "Samantha"}}
+    assert seen[0]["chain"] == ["say"]
+    assert file_config["providers"]["say"]["api_key"] == "SECRET_CANARY"  # input untouched
+    assert "SECRET_CANARY" not in capsys.readouterr().err
+
+
+# --- a short first chunk, so sound starts soon (Mac Studio run, F4) ------
+#
+# With Kokoro's model loaded, a ~390-character first chunk took 2.4-4.9 s
+# before any sound; one short sentence took 0.32 s. The first chunk of a
+# streamed read is now the first sentence — or, for a sentence longer than
+# about 120 characters, its first clause(s) — and every later boundary is
+# exactly where it was.
+
+_PARAGRAPH = (
+    "The installer downloads the weights and checks each file. "
+    "A file whose checksum does not match is deleted rather than kept, "
+    "and the install stops with a message naming the command to run again. "
+    "The verified models are stored under the cache directory. "
+    "A small stamp file records which hashes were accepted, so a later "
+    "status check can say whether the files on disk are the ones that "
+    "were verified. If the checksum step fails, run the install command "
+    "again with a stable network connection, then confirm the status "
+    "output reports every engine as ready before you continue with the "
+    "rest of the setup, which covers the recorder and the cleanup model."
+)
+
+_LONG_FIRST = (
+    "When the model is already loaded and the text is long, the first piece "
+    "of audio used to wait for the whole first chunk, which on this machine "
+    "meant several seconds of silence; now it does not. Then the rest follows."
+)
+
+
+def _streaming(max_chars=400):
+    return FakeProvider("kokoro", ext="wav", max_chars=max_chars, streaming=True)
+
+
+def _words(chunks):
+    return " ".join(chunks).split()
+
+
+def test_the_first_chunk_of_a_streamed_read_is_its_first_sentence():
+    chunks = chain._chunks_for(_streaming(), _PARAGRAPH, None)
+
+    assert chunks[0] == "The installer downloads the weights and checks each file."
+    assert _words(chunks) == _PARAGRAPH.split()  # the same words, in order
+
+
+def test_only_the_first_boundary_moves():
+    before = split_for_synthesis(_PARAGRAPH, 400)
+    chunks = chain._chunks_for(_streaming(), _PARAGRAPH, None)
+
+    assert len(before) > 1
+    assert chunks[2:] == before[1:]  # later chunks keep today's size and text
+    assert " ".join(chunks[:2]) == before[0]
+
+
+def test_text_under_the_cap_is_still_split_after_its_first_sentence():
+    text = "Hello there. This is the second sentence, which is a little longer."
+
+    assert chain._chunks_for(_streaming(), text, None) == [
+        "Hello there.", "This is the second sentence, which is a little longer.",
+    ]
+
+
+def test_a_long_first_sentence_is_cut_at_a_clause_never_inside_a_word():
+    chunks = chain._chunks_for(_streaming(), _LONG_FIRST, None)
+
+    assert len(chunks[0]) <= 120
+    assert chunks[0][-1] in ",;:"
+    assert _LONG_FIRST.startswith(chunks[0] + " ")
+    assert _words(chunks) == _LONG_FIRST.split()
+
+
+def test_a_long_first_sentence_without_a_clause_is_cut_between_words():
+    text = " ".join(["word"] * 60) + ". Next."
+
+    chunks = chain._chunks_for(_streaming(), text, None)
+
+    assert len(chunks[0]) <= 120
+    assert set(chunks[0].split()) == {"word"}
+    assert _words(chunks) == text.split()
+
+
+@pytest.mark.parametrize("text", [
+    "One sentence only.",
+    "  Leading space. And\nnewlines inside.\n\nA new paragraph here.  ",
+    "Heading without a stop\n\nBody text follows here.",
+    "a" * 450,
+    "Decimal 12.5% and 3.45 p.m. stay whole. Then more.",
+])
+def test_the_spoken_words_never_change(text):
+    before = split_for_synthesis(text, 400)
+    chunks = chain._chunks_for(_streaming(), text, None)
+
+    assert _words(chunks) == _words(before)
+    assert all(chunk.strip() for chunk in chunks)
+    assert all(len(chunk) <= 400 for chunk in chunks)
+
+
+def test_a_provider_that_does_not_stream_keeps_its_chunks():
+    provider = FakeProvider("piper", ext="wav", max_chars=400, streaming=False)
+
+    assert chain._chunks_for(provider, _PARAGRAPH, None) == split_for_synthesis(_PARAGRAPH, 400)
+
+
+def test_a_short_streamed_text_is_not_called_long_input(registry):
+    registry["kokoro"] = _streaming()
+    lines, echo = _echoes()
+
+    _run(registry, text="Hello there. And again.", echo=echo)
+
+    assert registry["kokoro"].calls == ["Hello there.", "And again."]
+    assert not any(line.startswith("Long input") for line in lines)
+
+
+def test_the_cache_answers_every_chunk_of_a_repeated_streamed_read(registry):
+    registry["kokoro"] = _streaming()
+
+    first, _, _ = _run(registry, text=_PARAGRAPH)
+    rendered = list(registry["kokoro"].calls)
+    again, _, _ = _run(registry, text=_PARAGRAPH)
+
+    assert registry["kokoro"].calls == rendered  # nothing rendered twice
+    assert again == first
+
+
+def test_a_stop_after_the_short_first_chunk_resumes_with_every_unheard_word(registry):
+    registry["kokoro"] = _streaming()
+    chunks = chain._chunks_for(registry["kokoro"], _PARAGRAPH, None)
+    _seen, on_chunk = _collect(results=[True, False])
+
+    with pytest.raises(PlaybackStopped) as excinfo:
+        _run(registry, text=_PARAGRAPH, on_chunk=on_chunk)
+
+    assert excinfo.value.remaining_text == " ".join(chunks[1:])
+    assert (chunks[0] + " " + excinfo.value.remaining_text).split() == _PARAGRAPH.split()

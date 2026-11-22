@@ -1,6 +1,7 @@
 # Installing vocalize
 
-Three commands get you fully set up:
+Vocalize runs on macOS with Apple Silicon. Three commands cover most of the
+setup:
 
 ```bash
 uv tool install vocalize-cli
@@ -15,10 +16,10 @@ still missing and the exact command to fix it.
 |---|---|
 | `uv tool install vocalize-cli` | Installs the `vocalize` binary, user-global |
 | `vocalize app install` | Builds and loads **Vocalize.app**, the menu-bar app that owns the dictate/speak/stop hotkeys everywhere |
-| `vocalize integrate claude` | Installs the `/speak` skill and the four Quick Actions into Claude Code and macOS |
+| `vocalize integrate claude` | Installs the `/speak` skill and the five Quick Actions into Claude Code and macOS |
 
 Everything below fills in the parts those three commands don't fully
-automate: providers, the model download, and two GUI-only steps macOS
+automate: the speech engines, the model downloads, and two GUI-only steps macOS
 reserves for a human.
 
 New to this, or handing it to someone who is? Send them to
@@ -55,25 +56,23 @@ it — an Electron app's shell can differ from your terminal:
 command -v vocalize && vocalize --version
 ```
 
-## 2. Providers and the chain
+## 2. Speech engines and the chain
 
-The chain is ordered fallback: the first provider that works, speaks.
-Default is `kokoro`, then `say` — nothing to configure for a keyless
-machine. To change it:
+The chain is ordered fallback: the first engine that works, speaks.
+Default is `kokoro`, then `say`. To change it:
 
 ```bash
-vocalize chain kokoro elevenlabs say
+vocalize chain kokoro piper say
 ```
 
 This writes `~/.config/vocalize/config.toml` — one config, every consumer
 (CLI, `/speak`, the Stop hook, Quick Actions) reads it.
 
 - **Kokoro (local, default primary):** `vocalize local install` fetches the
-  model (~340 MB, needs `uv`). Check readiness any time with
+  model (337 MB, needs `uv`). Check readiness any time with
   `vocalize local status` or `vocalize doctor`.
-- **ElevenLabs:** `vocalize auth login` stores the key in the OS keychain.
-  See [docs/provider-credentials.md](provider-credentials.md) for the other
-  cloud providers and the Electron keychain-visibility gotcha.
+- **Piper (optional):** `vocalize local install --piper` installs a second
+  local voice. Its licence is shown before the download.
 - **`say`:** zero-config macOS last resort. Keep it in the chain.
 
 Smoke test:
@@ -88,9 +87,14 @@ Or finish all of the above from a browser instead:
 vocalize portal
 ```
 
-It opens a one-time link at `127.0.0.1` (valid for 60 seconds) with tabs
-for providers, dictation, the app, and now **Setup** — a checklist view of
-everything on this page, see [docs/app.md](app.md#the-setup-tab).
+It opens the settings page through a one-time link at `127.0.0.1` (valid
+for 60 seconds). The page is one page with no tabs: a machine profile box
+that suggests settings sized for this Mac, then the sections Speaking,
+Reading, Dictation, Transcription, Hotkeys, Engines and Advanced. Every
+install and removal on this page has a button there, as do the menu-bar
+app, the Quick Actions, the `/speak` skill and the Claude Code hook. The
+two macOS permissions cannot be switched on by any program, so the page
+links to their System Settings panes instead.
 
 ## 3. Dictation (speech to text)
 
@@ -101,8 +105,11 @@ a small recorder bundle that holds the microphone permission:
 vocalize local install --stt
 ```
 
-Downloads the whisper.cpp model (~547 MB by default), compiles and
-ad-hoc signs **Vocalize Recorder**, and warms the runtime. Full detail,
+On Apple Silicon this installs Parakeet (2.3 GB). Add `--engine whisper` for
+Whisper (547 MB for the default model). Which engine `vocalize transcribe`
+uses is explained in [docs/transcribe.md](transcribe.md).
+Setup downloads the selected model,
+compiles and ad-hoc signs **Vocalize Recorder**, and warms the runtime. Full detail,
 including the config table and troubleshooting, lives in
 [docs/dictation.md](dictation.md).
 
@@ -123,7 +130,7 @@ hasn't happened yet.
 
 ### Then grant Accessibility — the app does nothing until you do
 
-`app install` finishes successfully, loads the agent, and registers the
+`app install` finishes successfully, loads the LaunchAgent, and registers the
 chords. None of them fire. macOS will not deliver a keypress to an app
 without an Accessibility grant, and it neither prompts nor logs when it
 withholds one.
@@ -153,21 +160,20 @@ vocalize integrate claude
 One command instead of a hand-rolled skill file and a separate installer
 script. It:
 
-1. Checks `vocalize`, `claude`, `node`, and `python3` are all on PATH and
+1. Checks `vocalize` and `python3` are on PATH and
    reports each as found or missing.
 2. Installs `~/.claude/skills/speak/SKILL.md` from the package — the
    generic `/speak` skill (speak Claude's last response, a file, the
-   clipboard, a web page, or pasted text). Leaves an existing file alone
-   unless you pass `--yes`.
-3. Installs the four Quick Actions into `~/Library/Services` and
+   clipboard, or pasted text) aloud. Leaves an existing file alone unless
+   you pass `--yes`.
+3. Installs the five Quick Actions into `~/Library/Services` and
    refreshes the Services registry: **Speak with Vocalize**, **Stop
-   Vocalize**, **Speak Latest Plan**, and **Dictate with Vocalize**.
+   Vocalize**, **Speak Latest Plan**, **Swap in What I Said**, and **Dictate with Vocalize**.
 4. Prints the GUI-only steps below.
 
-Re-run it after `brew upgrade claude-code` — the baked `claude` path is the
-stable symlink, not the version-pinned Caskroom target, so this rot is
-gone, but re-running after an upgrade is still the way to pick up a new
-`claude` binary at that symlink.
+The Quick Actions and the skill run local `vocalize` commands. If you
+installed the `/speak` skill from an older version, run
+`vocalize integrate claude --yes` to replace it.
 
 ### The two GUI-only steps
 
@@ -183,11 +189,12 @@ Neither is scriptable — macOS reserves both for a human:
    — it is a requirement of `vocalize app install`, not of this step. If you
    skipped the menu-bar app, you can skip it here too.
 
-## 6. The Stop hook (optional, still a repo script)
+## 6. The Stop hook (optional)
 
-Auto-speaking every Claude Code response is a separate opt-in, and it
-stays a script you run from a git clone — it isn't part of the package or
-`vocalize integrate claude`:
+Auto-speaking every Claude Code response is a separate opt-in. It isn't
+part of `vocalize integrate claude`. Install and remove it from the
+settings page, in its Advanced section; that works on a PyPI install too.
+From a git clone you can also run the installer script:
 
 ```bash
 git clone https://github.com/matthager12-collab/vocalize ~/code/vocalize
@@ -203,8 +210,8 @@ before a real Stop event:
 VOCALIZE_MAX_CHARS=150 python3 ~/code/vocalize/hooks/claude_stop_hook.py --latest
 ```
 
-Uninstall by deleting the vocalize entry from the `Stop` array in
-`~/.claude/settings.json`.
+To remove it, use the settings page button, or delete the vocalize entry
+from the `Stop` array in `~/.claude/settings.json`.
 
 > Field note from the reference install: running this in every open
 > session produced overlapping narration within the hour. On-demand speech
@@ -216,9 +223,9 @@ Uninstall by deleting the vocalize entry from the `Stop` array in
 ## `vocalize doctor`
 
 Everything `vocalize status` checks, plus the toolchain and environment:
-`cli path`, `uv`, `swiftc`, `claude` on PATH, the running console script's
+`cli path`, `uv`, `swiftc`, the running console script's
 shebang, a Hammerspoon or old Quick Action conflict, CLI cold-start time,
-app bundle state, and the notes folder's size on disk.
+app bundle state, and the transcripts folder's size on disk.
 
 ```bash
 vocalize doctor        # formatted rows, same shape as `status`
@@ -226,7 +233,7 @@ vocalize doctor --json # a JSON list of {name, state, detail, action}
 ```
 
 Exits 1 only when a row fails outright; a warn row (Hammerspoon running,
-`claude` missing, a slow cold start) is worth reading but doesn't fail a
+a slow cold start) is worth reading but doesn't fail a
 script.
 
 ## Post-install checklist
@@ -236,7 +243,7 @@ vocalize doctor                    # everything above, in one shot
 vocalize settings                  # chain + resolved config
 echo test | vocalize speak-file -  # audible, names the provider used
 vocalize listen --check            # dictation: model + recorder + microphone
-vocalize app status                # bundle built, agent loaded, ACCESSIBILITY GRANTED
+vocalize app status                # bundle built, LaunchAgent loaded, ACCESSIBILITY GRANTED
 ```
 
 Not verifiable from a shell: first-use TCC prompts, and whether audio is

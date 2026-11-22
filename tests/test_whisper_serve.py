@@ -42,6 +42,7 @@ def factory(monkeypatch):
         h.samples = object()
         h.wav = h.base / "take.wav"
         write_wav(h.wav)
+        (h.base / "model.bin").write_bytes(b"ggml")  # the worker builds only from an existing file
         h.payload = {"op": "transcribe", "id": "take", "wav": str(h.wav),
                      "language": "en", "initial_prompt": "private vocabulary"}
 

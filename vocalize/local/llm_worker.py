@@ -1,4 +1,4 @@
-"""LLM cleanup/summary worker.  Runs under uv, never imported by vocalize.
+"""LLM cleanup worker.  Runs under uv, never imported by vocalize.
 
 This file ships inside the vocalize package but is not part of it: uv
 executes it with its own Python 3.12 and its own copy of mlx-lm, so
@@ -21,6 +21,15 @@ stdout, then exit 0:
     stdout: {"ok": true, "text": "..."}
          or {"ok": false, "error": "one line"}
 
+mlx-lm executes a ``model_file`` named in config.json without a trust
+check, and treats a path that does not exist as a Hub repo to download.
+So before ``load`` the model folder is resolved to an absolute path that
+must be an existing directory, and it is refused if config.json names a
+``model_file``, either config names ``auto_map``, or any ``.py`` file sits
+anywhere inside it.  ``trust_remote_code`` is never passed.  Only
+``load``, ``generate`` and ``stream_generate`` are used.  A refusal exits
+2 with one fixed line on stderr that names no path.
+
 Protocol (``--selftest``): loads the model, runs a fixed cleanup, prints
 ``ok`` on success and exits 0, or prints an error to stderr and exits 1.
 """
@@ -29,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 # Error strings are clipped rather than passed through: an exception is
@@ -68,6 +78,30 @@ def _one_line(exc: BaseException) -> str:
     return message[:_MAX_ERROR_CHARS]
 
 
+class Refused(ValueError):
+    """A fixed, path-free reason to stop before mlx_lm is imported."""
+
+
+def _model_dir(value: str) -> str:
+    """The model folder, absolute and resolved, after every check; or Refused."""
+    if not isinstance(value, str) or not value or "\x00" in value or not os.path.isabs(value):
+        raise Refused("the model folder must be an absolute path")
+    resolved = os.path.realpath(value)
+    if not os.path.isdir(resolved):
+        raise Refused("the model folder does not exist")
+    for _root, dirs, files in os.walk(resolved, onerror=_walk_failed):
+        if any(name.lower().endswith(".py") for name in (*dirs, *files)):
+            raise Refused("the model folder contains Python code")
+    error = _check_config(resolved)
+    if error is not None:
+        raise Refused(f"config check failed: {error}")
+    return resolved
+
+
+def _walk_failed(_exc: OSError) -> None:
+    raise Refused("the model folder is unreadable")
+
+
 def _check_config(model_dir: str) -> str | None:
     """Validate config.json and tokenizer_config.json.  Returns an error string, or None.
 
@@ -94,8 +128,8 @@ def _check_config(model_dir: str) -> str | None:
         tokenizer_cfg = _json.loads(
             (dir_path / "tokenizer_config.json").read_text(encoding="utf-8")
         )
-    except (OSError, ValueError) as exc:
-        return f"unreadable config: {_one_line(exc)}"
+    except (OSError, ValueError):
+        return "unreadable config"
 
     if not isinstance(config, dict) or not isinstance(tokenizer_cfg, dict):
         return "config is not a JSON object"
@@ -106,11 +140,11 @@ def _check_config(model_dir: str) -> str | None:
                 return f"{bname} contains {key}"
 
     if config.get("model_type") != _MODEL_TYPE:
-        return f"wrong model_type: {config.get('model_type')}"
+        return "wrong model_type"
 
     tc = tokenizer_cfg.get("tokenizer_class", "")
     if tc and tc not in _TOKENIZER_ALLOWLIST:
-        return f"foreign tokenizer_class: {tc}"
+        return "foreign tokenizer_class"
 
     return None
 
@@ -171,8 +205,8 @@ def _generate(mlx_lm_mod, model, tokenizer, prompt_ids: list[int], max_tokens: i
             model, tokenizer, prompt=prompt_ids,
             max_tokens=max_tokens, verbose=False,
         )
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": _one_line(exc)}
+    except Exception:  # noqa: BLE001 -- the message could quote the text
+        return {"ok": False, "error": "generation failed"}
 
     # Check for truncation: if the output ends mid-think or with a length
     # finish, report it.
@@ -190,7 +224,7 @@ def _generate(mlx_lm_mod, model, tokenizer, prompt_ids: list[int], max_tokens: i
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="llm_worker",
-        description="On-device LLM cleanup/summary worker.  Never imported by vocalize.",
+        description="On-device LLM cleanup worker.  Never imported by vocalize.",
     )
     parser.add_argument(
         "--model-dir", required=True,
@@ -258,7 +292,6 @@ def _warm_complete(mlx, model, tokenizer, request, cancelled, clock):
 
 def _serve_server(args, **options):
     """Share the standalone transport and expose time for deterministic tests."""
-    import os
     import time
     from pathlib import Path
 
@@ -270,10 +303,9 @@ def _serve_server(args, **options):
 
     def load():
         nonlocal mlx, model, tokenizer
-        if _check_config(args.model_dir) is not None:
-            raise ValueError("invalid model config")
+        folder = _model_dir(args.model_dir)
         mlx = _mlx()
-        model, tokenizer = mlx.load(args.model_dir, tokenizer_config={"trust_remote_code": False})
+        model, tokenizer = mlx.load(folder)
 
     return protocol.Server(
         args.socket, load=load,
@@ -283,7 +315,8 @@ def _serve_server(args, **options):
         warm_seconds=args.warm_seconds, abandon_seconds=args.abandon_seconds,
         initial_lease=args.lease,
         fingerprint=protocol.fingerprint(
-            Path(__file__), "mlx-lm==0.31.3", Path(args.model_dir) / "model.safetensors"
+            Path(__file__), "mlx-lm==0.31.3", Path(args.model_dir) / "model.safetensors",
+            runtime_identity=os.environ.get("_VOCALIZE_RUNTIME_IDENTITY"),
         ),
         **options,
     )
@@ -291,6 +324,14 @@ def _serve_server(args, **options):
 
 def serve(args):
     """Fail closed on offline or startup errors without printing private data."""
+    # The offline check comes first and stays silent, as before the folder checks.
+    if any(os.environ.get(key) != "1" for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")):
+        return 2
+    try:
+        _model_dir(args.model_dir)
+    except Refused as exc:
+        print(f"llm_worker: refused: {exc}", file=sys.stderr)
+        return 2
     try:
         _serve_server(args).serve()
     except Exception:  # noqa: BLE001 -- contain runtime failures without disclosing private text
@@ -303,19 +344,17 @@ def main(argv=None) -> int:
     if args.serve:
         return serve(args)
 
-    # Config check runs before anything is loaded.
-    error = _check_config(args.model_dir)
-    if error is not None:
-        print(f"llm_worker: config check failed: {error}", file=sys.stderr)
-        return 1
+    # The folder and config checks run before mlx_lm is imported.
+    try:
+        folder = _model_dir(args.model_dir)
+    except Refused as exc:
+        print(f"llm_worker: refused: {exc}", file=sys.stderr)
+        return 2
 
     mlx_lm_mod = _mlx()
 
     try:
-        model, tokenizer = mlx_lm_mod.load(
-            args.model_dir,
-            tokenizer_config={"trust_remote_code": False},
-        )
+        model, tokenizer = mlx_lm_mod.load(folder)
     except Exception as exc:  # noqa: BLE001
         if args.selftest:
             print(f"llm_worker: could not load: {_one_line(exc)}", file=sys.stderr)
@@ -332,11 +371,7 @@ def main(argv=None) -> int:
             return 1
         text = result["text"]
         if not text.startswith(_SELFTEST_EXPECT_PREFIX):
-            print(
-                f"llm_worker: selftest output {text[:40]!r} does not start with "
-                f"{_SELFTEST_EXPECT_PREFIX!r}",
-                file=sys.stderr,
-            )
+            print("llm_worker: selftest output does not start with the expected word", file=sys.stderr)
             return 1
         print("ok")
         return 0

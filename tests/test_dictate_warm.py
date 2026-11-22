@@ -16,7 +16,15 @@ from test_dictate import TRANSCRIPT, lines, stt, write_wav
 
 from vocalize import config, dictate, llm, local
 from vocalize.exceptions import DictationError
-from vocalize.local import install, llm_manifest, warm, warm_protocol, whisper_manifest
+from vocalize.local import (
+    install,
+    llm_manifest,
+    locks,
+    runtime,
+    warm,
+    warm_protocol,
+    whisper_manifest,
+)
 
 # Reuse the existing executable fakes without changing their test module.
 harness = dictation_fakes.harness
@@ -112,18 +120,25 @@ def test_specs_keep_runtime_bounds_offline_env_and_fingerprints(models, tmp_path
     specs = dictate._warm_specs(stt(cleanup="local", warm_minutes=15), base=tmp_path)
     assert [spec[0] for spec in specs] == ["whisper", "llm"]
     for kind, argv, env, fingerprint in specs:
+        assert "--offline" in argv and "--no-python-downloads" in argv
         assert argv[argv.index("--socket") + 1] == str(tmp_path / f"{kind}.sock")
         assert argv[argv.index("--warm-seconds") + 1] == "900"
         assert argv[argv.index("--abandon-seconds") + 1] == "1860"
         manifest = whisper_manifest if kind == "whisper" else llm_manifest
         model = manifest.model_path("small.en") if kind == "whisper" else manifest.MODEL_DIR / "model.safetensors"
-        assert fingerprint == warm_protocol.fingerprint(manifest.worker_path(), manifest.RUNTIME_PACKAGE, model)
+        # Each warm server carries its lock's identity, matching its client.
+        identity = dictate._whisper_identity(manifest, None) if kind == "whisper" else llm.warm_identity(None)
+        assert identity == locks.identity(manifest.lock_file())
+        assert env[runtime.IDENTITY_ENV] == identity
+        assert fingerprint == warm_protocol.fingerprint(
+            manifest.worker_path(), manifest.RUNTIME_PACKAGE, model, runtime_identity=identity,
+        )
         assert "--once" not in argv
         if kind == "llm":
             assert "--offline" in argv
             assert env["HF_HUB_OFFLINE"] == env["TRANSFORMERS_OFFLINE"] == "1"
         else:
-            assert env is None
+            assert env["HF_HUB_OFFLINE"] == env["TRANSFORMERS_OFFLINE"] == "1"
             assert argv[argv.index("--beam-size") + 1] == "5"
 
 
@@ -178,15 +193,13 @@ def test_every_exit_releases_original_nonce(session, harness, monkeypatch, warm_
         assert harness.clipboard() == ""
 
 
-def test_cleanup_uses_warm_but_notes_never_do(models, monkeypatch):
+def test_cleanup_uses_warm(models, monkeypatch):
     requests, runs = [], []
     monkeypatch.setattr(warm, "request", lambda *a, **kw: requests.append((a, kw)) or {"ok": True, "text": TRANSCRIPT})
     monkeypatch.setattr(llm, "LOCAL_RUN_SEAM", lambda *a, **kw: runs.append((a, kw)) or subprocess.CompletedProcess(a, 0, json.dumps({"ok": True, "text": TRANSCRIPT})))
     assert llm.cleanup_transcript(TRANSCRIPT, "local") == (TRANSCRIPT, True)
     assert len(requests) == 1 and runs == []
     assert requests[0][0][1]["system"] == llm.CLEANUP_PROMPT.rstrip() + "\n\n" + llm.DATA_BOUNDARY
-    assert llm.summarize(TRANSCRIPT, "Summarize", "local") == TRANSCRIPT
-    assert len(requests) == 1 and len(runs) == 1
     llm._local("system", TRANSCRIPT, 10, 4096, warm_ok=True)
     assert requests[-1][0][1]["max_tokens"] == 1024
 
@@ -265,10 +278,50 @@ def test_hold_start_is_covered(models, recorder, warm_calls):
         dictate.cancel(stt())
 
 
-def test_wav_input_uses_warm_without_starting_servers(transcriber, tmp_path, monkeypatch, warm_calls):
+def test_wav_input_with_no_window_uses_warm_without_starting_servers(
+    models, transcriber, tmp_path, monkeypatch, warm_calls
+):
+    """warm_minutes 0: a file take reuses a running server and starts none."""
     transcriber()
     monkeypatch.setattr(warm, "request", lambda *a, **kw: {"ok": True, "text": TRANSCRIPT})
-    assert dictate.transcribe_wav(write_wav(tmp_path / "clip.wav"), stt()) == TRANSCRIPT
+    assert dictate.transcribe_wav(write_wav(tmp_path / "clip.wav"), stt(warm_minutes=0)) == TRANSCRIPT
+    assert warm_calls == []
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_wav_input_honours_warm_minutes_like_a_live_take(
+    models, transcriber, tmp_path, monkeypatch, warm_calls, fails
+):
+    """`listen --wav` with a window: hold what is warm during the take,
+    release it, then start what is not warm, exactly as `listen()` does."""
+    transcriber()
+
+    def transcribe(wav, settings):
+        if fails:
+            raise DictationError("failed")
+        return TRANSCRIPT
+
+    monkeypatch.setattr(dictate, "transcribe", transcribe)
+    settings = stt(cleanup="off", warm_minutes=15)
+    wav = write_wav(tmp_path / "clip.wav")
+    if fails:
+        with pytest.raises(DictationError):
+            dictate.transcribe_wav(wav, settings)
+    else:
+        assert dictate.transcribe_wav(wav, settings) == TRANSCRIPT
+    ops = [(op, a[0]) for op, a, kw in warm_calls]
+    assert ops == [("lease", "whisper"), ("release", "whisper"), ("release", "llm"),
+                   ("ensure", "whisper")]
+    nonce = warm_calls[0][1][2]
+    assert nonce and [a[1] for op, a, kw in warm_calls if op == "release"] == [nonce, nonce]
+    assert warm_calls[-1][1][3] is None  # started unleased, so it idles out after the window
+
+
+def test_a_silent_or_refused_wav_never_warms(models, tmp_path, warm_calls):
+    settings = stt(warm_minutes=15)
+    assert dictate.transcribe_wav(write_wav(tmp_path / "quiet.wav", amplitude=0), settings) == ""
+    with pytest.raises(DictationError):
+        dictate.transcribe_wav(tmp_path / "missing.wav", settings)
     assert warm_calls == []
 
 

@@ -1,22 +1,16 @@
-import io
 import os
-import sys
 import threading
 import time
-from types import SimpleNamespace
 
-import click
 import pytest
 from click.testing import CliRunner
 
-from vocalize import auth, wizard
+from vocalize import config, wizard
 from vocalize.cli import main
-from vocalize.config import DEFAULT_MODEL, load_config_file, resolve_settings
+from vocalize.config import load_config_file
 from vocalize.exceptions import (
     ConfigChangedError,
     ConfigError,
-    MissingAPIKeyError,
-    TTSRequestError,
 )
 
 UP = "\x1b[A"
@@ -26,511 +20,15 @@ ENTER = "\r"
 VOICES = [{"id": "abc123", "name": "Rachel"}, {"id": "def456", "name": "Josh"}]
 
 
-class FakeStdin:
-    """Just enough stdin for the wizard's TTY check."""
-
-    def __init__(self, tty=True):
-        self._tty = tty
-
-    def isatty(self):
-        return self._tty
-
-
-class FakeTTY(io.StringIO):
-    """A /dev/tty stand-in that stays readable after the wizard closes it."""
-
-    def __init__(self):
-        super().__init__()
-        self.closed_by_wizard = False
-
-    def close(self):
-        self.closed_by_wizard = True
-
-
-class Keyboard:
-    """A scripted keyboard: each getchar() call returns the next key."""
-
-    def __init__(self, keys):
-        self._keys = list(keys)
-        self.pressed = []
-
-    def __call__(self, *args, **kwargs):
-        if not self._keys:
-            raise AssertionError("the wizard asked for more keys than the test scripted")
-        key = self._keys.pop(0)
-        self.pressed.append(key)
-        return key
-
-
-def _setup(
-    monkeypatch,
-    tmp_path,
-    keys,
-    *,
-    voices=None,
-    prompts=(),
-    confirm=True,
-    api_key="fake-key",
-    patch_ui=True,
-    front_door=False,
-):
-    """Point the wizard at a throwaway config file and a scripted keyboard.
-
-    patch_ui=True aims the wizard's UI stream at sys.stdout, so capsys sees
-    the frames; the tty-seam tests pass False and drive the real factory.
-
-    front_door=False stubs out the "no API key — set one up?" question and
-    fakes resolve_api_key, so these tests only exercise the three steps;
-    the front-door tests pass True and drive the real key resolution.
-
-    `confirm` may be a bool, or a callable taking the prompt's label — the
-    front door and the final write both go through _confirm.
-    """
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED"):
-        monkeypatch.delenv(var, raising=False)
-    # Pin the viewport so rendering never depends on the runner's terminal.
-    monkeypatch.setenv("LINES", "40")
-
-    monkeypatch.setattr(sys, "stdin", FakeStdin(tty=True))
-    if patch_ui:
-        # Resolved lazily: sys.stdout is whatever capsys has installed.
-        monkeypatch.setattr(wizard, "_open_ui_stream", lambda: (sys.stdout, False))
-    keyboard = Keyboard(keys)
-    monkeypatch.setattr(click, "getchar", keyboard)
-
-    answers = list(prompts)
-
-    def fake_ask(ui, label, **kwargs):
-        if not answers:
-            raise AssertionError(f"unexpected prompt: {label}")
-        return answers.pop(0)
-
-    monkeypatch.setattr(wizard, "_ask", fake_ask)
-
-    confirms = []
-
-    def fake_confirm(ui, label, **kwargs):
-        confirms.append(label)
-        return confirm(label) if callable(confirm) else confirm
-
-    monkeypatch.setattr(wizard, "_confirm", fake_confirm)
-
-    if front_door:
-        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    elif api_key is None:
-        monkeypatch.setattr(wizard, "_offer_key_setup", lambda ui: None)
-
-        def no_key(*args, **kwargs):
-            raise MissingAPIKeyError()
-
-        monkeypatch.setattr(wizard, "resolve_api_key", no_key)
-    else:
-        monkeypatch.setattr(wizard, "_offer_key_setup", lambda ui: None)
-        monkeypatch.setattr(wizard, "resolve_api_key", lambda *args, **kwargs: api_key)
-
-    client = object()
-    monkeypatch.setattr(wizard, "build_client", lambda key: client)
-    monkeypatch.setattr(wizard, "list_voices", lambda c: list(VOICES if voices is None else voices))
-
-    synth_calls = []
-
-    def fake_synthesize(c, text, settings):
-        synth_calls.append((text, settings))
-        return b"fake-mp3-bytes"
-
-    monkeypatch.setattr(wizard, "synthesize", fake_synthesize)
-    monkeypatch.setattr(wizard, "save", lambda audio, path: path)
-    played = []
-    monkeypatch.setattr(wizard, "play", lambda path: played.append(path))
-
-    return SimpleNamespace(
-        keyboard=keyboard,
-        confirms=confirms,
-        synth_calls=synth_calls,
-        played=played,
-        path=tmp_path / "config" / "vocalize" / "config.toml",
-    )
-
-
-def test_happy_path_writes_all_three_keys(monkeypatch, tmp_path, capsys):
-    # voice: down to Rachel; model: down to flash; speed: down four rows to 0.9
-    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(monkeypatch, tmp_path, keys)
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == (
-        'voice = "abc123"\n'
-        'model = "eleven_flash_v2_5"\n'
-        "speed = 0.9\n"
-    )
-    assert "Step 1 of 3 — Voice" in capsys.readouterr().out
-
-
-def test_q_on_the_first_step_writes_nothing(monkeypatch, tmp_path, capsys):
-    ctx = _setup(monkeypatch, tmp_path, ["q"])
-
-    wizard.run_wizard()
-
-    assert not ctx.path.exists()
-    assert "Cancelled — nothing changed." in capsys.readouterr().out
-
-
-def test_preview_plays_the_highlighted_voice_without_advancing(monkeypatch, tmp_path, capsys):
-    ctx = _setup(monkeypatch, tmp_path, [DOWN, "p", "q"])
-
-    wizard.run_wizard()
-
-    assert [text for text, _settings in ctx.synth_calls] == [wizard.PREVIEW_TEXT]
-    assert ctx.synth_calls[0][1].voice_id == "abc123"
-    assert ctx.played == [wizard.PREVIEW_PATH]
-
-    out = capsys.readouterr().out
-    assert "Previewed abc123." in out
-    assert "Step 2 of 3" not in out  # p must not move the wizard along
-    assert not ctx.path.exists()
-
-
-def test_manual_speed_reprompts_until_it_is_in_range(monkeypatch, tmp_path, capsys):
-    # keep the voice, up to "keep current" for the model, then type a speed
-    keys = [ENTER, UP, ENTER, "m"]
-    ctx = _setup(monkeypatch, tmp_path, keys, prompts=["5", "0.9"])
-
-    wizard.run_wizard()
-
-    out = capsys.readouterr().out
-    assert "must be between 0.7 and 1.2" in out
-    # "keep current" wrote nothing for voice/model, so only speed lands
-    assert ctx.path.read_text() == "speed = 0.9\n"
-
-
-def test_unknown_keys_in_an_existing_file_survive(monkeypatch, tmp_path):
-    ctx = _setup(monkeypatch, tmp_path, [DOWN, ENTER, UP, ENTER, ENTER])
-    ctx.path.parent.mkdir(parents=True)
-    # `notes` became a reserved table in 0.12.0; any other unknown key still rides through.
-    ctx.path.write_text('voice = "old-voice"\nmemo = "keep me"\n')
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == 'voice = "abc123"\nmemo = "keep me"\n'
-
-
-def test_keyless_mode_falls_back_to_manual_entry(monkeypatch, tmp_path, capsys):
-    # m types a voice by hand; the rest of the wizard carries on normally
-    keys = ["m", DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(monkeypatch, tmp_path, keys, prompts=["manual-voice"], api_key=None)
-
-    wizard.run_wizard()
-
-    assert "No voice list" in capsys.readouterr().out
-    assert ctx.path.read_text() == (
-        'voice = "manual-voice"\n'
-        'model = "eleven_flash_v2_5"\n'
-        "speed = 0.9\n"
-    )
-
-
-def test_a_missing_key_is_offered_a_setup_and_the_new_one_is_used(
-    monkeypatch, tmp_path, capsys, fake_keychain
-):
-    # down to Rachel, up to "keep current" for the model, keep the speed
-    ctx = _setup(monkeypatch, tmp_path, [DOWN, ENTER, UP, ENTER, ENTER], front_door=True)
-    validated = []
-    monkeypatch.setattr("vocalize.auth.validate_key", validated.append)
-    monkeypatch.setattr(wizard, "prompt_for_key", lambda: "typed-key")
-
-    wizard.run_wizard()
-
-    assert "No API key found. Set one up now?" in ctx.confirms
-    assert validated == ["typed-key"]  # validated before it was stored
-    assert fake_keychain[(auth.SERVICE, auth.USERNAME)] == "typed-key"
-    # The stored key is what fetched the list, so there's no degradation note
-    out = capsys.readouterr().out
-    assert "No voice list" not in out
-    assert "abc123  Rachel" in out
-    assert ctx.path.read_text() == 'voice = "abc123"\n'
-
-
-def test_declining_the_key_setup_keeps_the_keyless_degradation(
-    monkeypatch, tmp_path, capsys, fake_keychain
-):
-    def never(*args, **kwargs):
-        raise AssertionError("declining must not ask for a key")
-
-    keys = ["m", DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(
-        monkeypatch, tmp_path, keys,
-        prompts=["manual-voice"],
-        front_door=True,
-        confirm=lambda label: "Set one up now" not in label,
-    )
-    monkeypatch.setattr(wizard, "prompt_for_key", never)
-
-    wizard.run_wizard()
-
-    assert fake_keychain == {}
-    assert "No voice list" in capsys.readouterr().out
-    assert ctx.path.read_text() == (
-        'voice = "manual-voice"\n'
-        'model = "eleven_flash_v2_5"\n'
-        "speed = 0.9\n"
-    )
-
-
-def test_a_failed_key_setup_names_the_reason_on_the_voice_frame(
-    monkeypatch, tmp_path, capsys, fake_keychain
-):
-    def reject(key):
-        raise TTSRequestError("401 unauthorized")
-
-    # m types a voice by hand, up to "keep current" for the model, keep speed
-    ctx = _setup(monkeypatch, tmp_path, ["m", UP, ENTER, ENTER],
-                 prompts=["manual-voice"], front_door=True)
-    monkeypatch.setattr(wizard, "prompt_for_key", lambda: "typed-key")
-    monkeypatch.setattr("vocalize.auth.validate_key", reject)
-
-    wizard.run_wizard()
-
-    captured = capsys.readouterr()
-    # The stderr line is erased from the screen by the next frame's clear,
-    # so the reason has to survive on the frame itself.
-    assert "No voice list (key setup failed: 401 unauthorized)" in captured.out
-    assert "could not store that key — 401 unauthorized" in captured.err
-    assert fake_keychain == {}
-    assert ctx.path.read_text() == 'voice = "manual-voice"\n'
-
-
-def test_non_tty_stdin_is_a_clean_error(monkeypatch, tmp_path):
+def test_config_prints_local_guidance_without_a_terminal(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     runner = CliRunner()
 
     result = runner.invoke(main, ["config"])
 
-    assert result.exit_code != 0
-    assert isinstance(result.exception, ConfigError)
-    assert "interactive terminal" in str(result.exception)
+    assert result.exit_code == 0
+    assert "portal --no-browser" in result.output
     assert not (tmp_path / "config" / "vocalize" / "config.toml").exists()
-
-
-def test_declining_the_confirm_writes_nothing(monkeypatch, tmp_path, capsys):
-    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(monkeypatch, tmp_path, keys, confirm=False)
-
-    wizard.run_wizard()
-
-    assert not ctx.path.exists()
-    assert "Cancelled — nothing changed." in capsys.readouterr().out
-
-
-def test_an_unusable_current_value_does_not_block_the_wizard(monkeypatch, tmp_path, capsys):
-    keys = [ENTER, UP, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(monkeypatch, tmp_path, keys)
-    ctx.path.parent.mkdir(parents=True)
-    ctx.path.write_text("speed = 5.0\n")
-
-    wizard.run_wizard()
-
-    assert "ignoring an unusable current setting" in capsys.readouterr().err
-    assert ctx.path.read_text() == "speed = 0.9\n"
-
-
-def test_unset_removes_an_existing_speed_key(monkeypatch, tmp_path):
-    # keep voice, up to "keep current" for the model, up to "unset" for speed
-    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, UP, UP, UP, ENTER])
-    ctx.path.parent.mkdir(parents=True)
-    ctx.path.write_text("speed = 0.9\n")
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == ""
-    assert load_config_file() == {}
-
-
-def test_quotes_and_backslashes_in_a_manual_value_round_trip(monkeypatch, tmp_path):
-    weird = r'say "hi"\now'
-    ctx = _setup(monkeypatch, tmp_path, ["m", UP, ENTER, ENTER], prompts=[weird])
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == 'voice = "say \\"hi\\"\\\\now"\n'
-    assert load_config_file()["voice"] == weird
-
-
-def test_control_characters_in_a_manual_value_round_trip(monkeypatch, tmp_path):
-    weird = "Bad\nNews"
-    ctx = _setup(monkeypatch, tmp_path, ["m", UP, ENTER, ENTER], prompts=[weird])
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == 'voice = "Bad\\nNews"\n'
-    assert load_config_file()["voice"] == weird
-
-
-def test_wizards_choice_removes_the_shadowing_provider_table_key(monkeypatch, tmp_path, capsys):
-    # voice: down to abc123; model: up to "keep current"; speed: keep current
-    ctx = _setup(monkeypatch, tmp_path, [DOWN, ENTER, UP, ENTER, ENTER])
-    ctx.path.parent.mkdir(parents=True)
-    ctx.path.write_text(
-        'voice = "old-voice"\n'
-        "\n[providers.elevenlabs]\n"
-        'voice = "table-voice"\n'
-        "monthly_chars = 1000000\n"
-    )
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == (
-        'voice = "abc123"\n'
-        "\n[providers.elevenlabs]\n"
-        "monthly_chars = 1000000\n"
-    )
-    data = load_config_file()
-    assert "voice" not in data["providers"]["elevenlabs"]
-    assert data["providers"]["elevenlabs"]["monthly_chars"] == 1000000
-    assert resolve_settings().voice_id == "abc123"
-    assert (
-        "[providers.elevenlabs] voice removed — the wizard's choice now applies"
-        in capsys.readouterr().out
-    )
-
-
-def test_a_table_in_the_config_file_is_refused_not_flattened(monkeypatch, tmp_path):
-    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
-    ctx.path.parent.mkdir(parents=True)
-    original = 'voice = "keep-me"\ntags = ["a", "b"]\n\n[extras]\nx = 1\n'
-    ctx.path.write_text(original)
-
-    with pytest.raises(ConfigError, match="edit that file by hand"):
-        wizard.run_wizard()
-
-    assert ctx.path.read_text() == original
-
-
-@pytest.mark.parametrize("key", ["\x1b", ""], ids=["escape", "eof"])
-def test_escape_and_eof_both_cancel(monkeypatch, tmp_path, capsys, key):
-    ctx = _setup(monkeypatch, tmp_path, [key])
-
-    wizard.run_wizard()
-
-    assert "Cancelled — nothing changed." in capsys.readouterr().out
-    assert not ctx.path.exists()
-
-
-def test_a_long_voice_list_is_windowed_onto_the_cursor(monkeypatch, tmp_path, capsys):
-    voices = [{"id": f"v{n:02d}", "name": f"Voice {n:02d}"} for n in range(20)]
-    _setup(monkeypatch, tmp_path, [DOWN] * 10 + ["q"], voices=voices)
-    monkeypatch.setenv("LINES", "12")  # 12 - 8 chrome lines = a 4-row window
-
-    wizard.run_wizard()
-
-    last_frame = capsys.readouterr().out.split("Step 1 of 3 — Voice")[-1]
-    assert "> v09" in last_frame  # the cursor is always on screen
-    assert last_frame.count("…") == 2  # truncated at both ends
-    assert "v00" not in last_frame
-    assert "v15" not in last_frame
-
-
-def test_keep_current_names_the_file_value_not_the_env_var(monkeypatch, tmp_path, capsys):
-    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, ENTER])
-    ctx.path.parent.mkdir(parents=True)
-    ctx.path.write_text('voice = "from-the-file"\n')
-    monkeypatch.setenv("VOCALIZE_VOICE", "from-the-env")
-
-    wizard.run_wizard()
-
-    out = capsys.readouterr().out
-    # Keeping writes nothing, so the row must name what the file holds
-    assert "keep current (from-the-file)" in out
-    assert "keep current (from-the-env)" not in out
-    assert "voice → unchanged (from-the-file)" in out
-    assert ctx.path.read_text() == 'voice = "from-the-file"\n'
-
-
-def _piped(monkeypatch):
-    """stdout relayed down a pipe (`op run`), with /dev/tty still openable."""
-    tty = FakeTTY()
-    monkeypatch.setattr(sys, "stdout", io.StringIO())
-    monkeypatch.setattr(wizard, "_open_tty", lambda: tty)
-    assert not sys.stdout.isatty()
-    return tty
-
-
-def test_piped_stdout_paints_to_dev_tty(monkeypatch, tmp_path):
-    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(monkeypatch, tmp_path, keys, patch_ui=False)
-    tty = _piped(monkeypatch)
-
-    wizard.run_wizard()  # not refused: the keyboard and /dev/tty are both there
-
-    painted = tty.getvalue()
-    assert "\x1b[2J\x1b[H" in painted  # our own clear; click.clear() would no-op
-    assert "Step 1 of 3 — Voice" in painted
-    assert "Step 2 of 3 — Model" in painted
-    assert "Step 3 of 3 — Speed" in painted
-    assert wizard.VOICE_HOTKEYS in painted
-    assert "About to write:" in painted
-    # None of it went down the pipe, and the stream we opened got closed
-    assert "Step 1 of 3 — Voice" not in sys.stdout.getvalue()
-    assert tty.closed_by_wizard
-    assert ctx.path.read_text() == (
-        'voice = "abc123"\n'
-        'model = "eleven_flash_v2_5"\n'
-        "speed = 0.9\n"
-    )
-
-
-def test_headless_still_refused(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setattr(sys, "stdin", FakeStdin(tty=False))
-    opened = []
-    monkeypatch.setattr(wizard, "_open_tty", lambda: opened.append(True))
-
-    with pytest.raises(ConfigError, match="interactive terminal"):
-        wizard.run_wizard()
-
-    assert opened == []  # a dead stdin is decided on its own, before any tty
-    assert not (tmp_path / "config" / "vocalize" / "config.toml").exists()
-
-
-def test_confirmation_line_reaches_stdout_too(monkeypatch, tmp_path):
-    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    ctx = _setup(monkeypatch, tmp_path, keys, patch_ui=False)
-    tty = _piped(monkeypatch)
-
-    wizard.run_wizard()
-
-    assert f"Wrote {ctx.path}" in tty.getvalue()
-    # Wrappers and logs only capture stdout, so the outcome has to land there
-    assert sys.stdout.getvalue().strip() == f"Wrote {ctx.path}"
-
-
-def test_chain_array_round_trips_byte_for_byte(monkeypatch, tmp_path):
-    # keep voice, up to "keep current" for the model, keep speed
-    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, ENTER])
-    ctx.path.parent.mkdir(parents=True)
-    original = 'chain = ["elevenlabs", "google"]\n'
-    ctx.path.write_text(original)
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == original
-
-
-def test_providers_table_round_trips_with_blank_line_and_key_order(monkeypatch, tmp_path):
-    ctx = _setup(monkeypatch, tmp_path, [ENTER, UP, ENTER, ENTER])
-    ctx.path.parent.mkdir(parents=True)
-    original = (
-        "\n[providers.polly]\n"
-        'region = "us-east-1"\n'
-        'profile = "default"\n'
-        "monthly_chars = 1000000\n"
-    )
-    ctx.path.write_text(original)
-
-    wizard.run_wizard()
-
-    assert ctx.path.read_text() == original
 
 
 def test_render_config_text_puts_flat_keys_before_provider_tables():
@@ -539,91 +37,22 @@ def test_render_config_text_puts_flat_keys_before_provider_tables():
     # bare key after a [section] header would parse into that section.
     data = {
         "providers": {
-            "google": {"language": "en-US", "monthly_chars": 1000000},
+            "piper": {"voice": "en_US-amy-medium"},
             "say": {"voice": "Samantha"},
         },
-        "voice": "keep-me",
-        "chain": ["elevenlabs", "google", "say"],
+        "overflow": "ask",
+        "chain": ["kokoro", "piper", "say"],
     }
 
     text = wizard._render_config_text(data)
 
     assert text == (
-        'voice = "keep-me"\n'
-        'chain = ["elevenlabs", "google", "say"]\n'
-        "\n[providers.google]\n"
-        'language = "en-US"\n'
-        "monthly_chars = 1000000\n"
+        'overflow = "ask"\n'
+        'chain = ["kokoro", "piper", "say"]\n'
+        "\n[providers.piper]\n"
+        'voice = "en_US-amy-medium"\n'
         "\n[providers.say]\n"
         'voice = "Samantha"\n'
-    )
-
-
-def test_nested_table_inside_a_provider_is_refused_not_flattened(monkeypatch, tmp_path):
-    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
-    ctx.path.parent.mkdir(parents=True)
-    original = '[providers.google]\nlanguage = "en-US"\n\n[providers.google.extra]\nx = 1\n'
-    ctx.path.write_text(original)
-
-    with pytest.raises(ConfigError, match="edit that file by hand"):
-        wizard.run_wizard()
-
-    assert ctx.path.read_text() == original
-
-
-def test_an_extras_table_is_still_refused_alongside_chain_and_providers(monkeypatch, tmp_path):
-    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
-    ctx.path.parent.mkdir(parents=True)
-    original = (
-        'chain = ["elevenlabs", "say"]\n\n'
-        '[providers.google]\nlanguage = "en-US"\n\n'
-        "[extras]\nx = 1\n"
-    )
-    ctx.path.write_text(original)
-
-    with pytest.raises(ConfigError, match="edit that file by hand"):
-        wizard.run_wizard()
-
-    assert ctx.path.read_text() == original
-
-
-def test_a_list_containing_a_table_is_refused(monkeypatch, tmp_path):
-    # an arbitrary key, not "chain" — that one has its own dedicated
-    # provider-name validation in config.py and raises before this does
-    ctx = _setup(monkeypatch, tmp_path, [])  # must fail before the first keypress
-    ctx.path.parent.mkdir(parents=True)
-    original = 'tags = [{name = "x"}]\n'
-    ctx.path.write_text(original)
-
-    with pytest.raises(ConfigError, match="edit that file by hand"):
-        wizard.run_wizard()
-
-    assert ctx.path.read_text() == original
-
-
-def test_step_titles_are_labelled_elevenlabs(monkeypatch, tmp_path, capsys):
-    keys = [DOWN, ENTER, DOWN, ENTER, DOWN, DOWN, DOWN, DOWN, ENTER]
-    _setup(monkeypatch, tmp_path, keys)
-
-    wizard.run_wizard()
-
-    out = capsys.readouterr().out
-    assert "Step 1 of 3 — Voice (ElevenLabs)" in out
-    assert "Step 2 of 3 — Model (ElevenLabs)" in out
-    assert "Step 3 of 3 — Speed (ElevenLabs)" in out
-
-
-def test_the_current_voice_starts_under_the_cursor(monkeypatch, tmp_path, capsys):
-    ctx = _setup(monkeypatch, tmp_path, [ENTER, ENTER, ENTER])
-    monkeypatch.setenv("VOCALIZE_VOICE", "def456")  # after _setup, which clears it
-
-    wizard.run_wizard()
-
-    assert "> def456  Josh  (current)" in capsys.readouterr().out
-    # Enter on the pre-selected rows re-affirms those values verbatim
-    assert ctx.path.read_text() == (
-        'voice = "def456"\n'
-        f'model = "{DEFAULT_MODEL}"\n'
     )
 
 
@@ -657,36 +86,127 @@ def test_an_stt_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
     path = tmp_path / "vocalize" / "config.toml"
     path.parent.mkdir(parents=True)
     path.write_text(
-        'chain = ["say"]\n\n[stt]\nmodel = "base.en"\ncleanup = true\n', encoding="utf-8"
+        'chain = ["say"]\n\n[stt]\nmodel = "base.en"\ncleanup = "local"\n', encoding="utf-8"
     )
 
     once = wizard._render_config_text(load_config_file())
     path.write_text(once, encoding="utf-8")
 
     assert "[stt]" in once  # not "unchanged" by being silently dropped
-    assert load_config_file()["stt"] == {"model": "base.en", "cleanup": True}
+    assert load_config_file()["stt"] == {"model": "base.en", "cleanup": "local"}
     assert wizard._render_config_text(load_config_file()) == once
 
 
-def test_a_notes_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
+def test_a_notes_table_is_written_back_as_transcribe(monkeypatch, tmp_path):
     """`_TABLE_KEYS` excludes a table from the flat pass; only an explicit
-    block writes it back. Without one, `vocalize chain` would drop [notes]."""
+    block writes it back. [notes] is the old name: its keys come back under
+    [transcribe], which wins a key both set, and the summary keys go."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     path = tmp_path / "vocalize" / "config.toml"
     path.parent.mkdir(parents=True)
     path.write_text(
-        'chain = ["say"]\n\n[notes]\nfolder = "~/Notes"\nsummarizer = "claude-cli"\n\n'
-        '[stt]\nmodel = "base.en"\n',
+        'chain = ["say"]\n\n[notes]\nfolder = "~/Old"\nkeep_audio = true\n'
+        'summarizer = "local"\ntemplate = "memo"\n\n'
+        '[transcribe]\nfolder = "~/New"\n\n[stt]\nmodel = "base.en"\n',
         encoding="utf-8",
     )
 
     once = wizard._render_config_text(load_config_file())
     path.write_text(once, encoding="utf-8")
 
-    assert "[notes]" in once
-    assert load_config_file()["notes"] == {"folder": "~/Notes", "summarizer": "claude-cli"}
+    assert "[notes]" not in once and "summarizer" not in once and "template" not in once
+    assert load_config_file()["transcribe"] == {"folder": "~/New", "keep_audio": True}
     assert load_config_file()["stt"] == {"model": "base.en"}
     assert wizard._render_config_text(load_config_file()) == once
+
+
+def test_a_speech_table_is_written_not_refused():
+    """The writer refused any config holding [speech]: it was missing from
+    `_TABLE_KEYS`, so the flat pass met a table and raised."""
+    text = wizard._render_config_text({"chain": ["say"], "speech": {"headings": "plain"}})
+
+    assert text == 'chain = ["say"]\n\n[speech]\nheadings = "plain"\n'
+
+
+def test_the_writer_drops_retired_keys_without_writing_their_values():
+    data = {
+        "voice": "old", "model": "eleven", "speed": 1.1, "api_key": "SECRET_CANARY",
+        "chain": ["openai", "kokoro"],
+        "providers": {"openai": {"api_key": "SECRET_CANARY"}, "kokoro": {"api_key": "x", "voice": "af_bella"}},
+        "stt": {"cleanup": "claude-cli"},
+    }
+
+    text = wizard._render_config_text(data)
+
+    assert text == (
+        'chain = ["kokoro"]\n'
+        '\n[stt]\ncleanup = "off"\n'
+        '\n[providers.kokoro]\nvoice = "af_bella"\n'
+    )
+    assert data["providers"]["openai"]["api_key"] == "SECRET_CANARY"  # input untouched
+
+
+def test_every_table_and_every_key_survives_a_save(monkeypatch, tmp_path):
+    from vocalize import config
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    for var in ("VOCALIZE_VOICE", "VOCALIZE_MODEL", "VOCALIZE_SPEED",
+                "VOCALIZE_OVERFLOW", "VOCALIZE_MAX_CHARS"):
+        monkeypatch.delenv(var, raising=False)
+    stt = {
+        "engine": "whisper", "model": "small.en", "language": "en",
+        "input_device": "Studio Mic", "cleanup": "local", "paste": True,
+        "max_seconds": 30, "sounds": False, "cues": "both", "beam_size": 3,
+        "verbatim": True, "max_take_seconds": 600, "vocabulary": ["Kokoro", "repository root"],
+        "warm_minutes": 15,
+    }
+    speech = {
+        "headings": "plain", "blockquotes": "off", "nested_lists": "flat",
+        "parentheticals": "drop", "abbreviations": "protect", "citations": "speak",
+        "references": False, "furniture": False, "urls": "full", "emoji": False,
+        "bracket_max_chars": 200, "furniture_max_chars": 80, "furniture_min_repeats": 4,
+        "SPEECH_BRACKET_MAX_CHARS": 200, "SPEECH_FURNITURE_MAX_CHARS": 80,
+        "SPEECH_FURNITURE_MIN_REPEATS": 4,
+    }
+    data = {
+        "max_chars": 4000,
+        "overflow": "never",
+        "chain": ["piper", "kokoro", "say"],
+        "providers": {
+            "kokoro": {"voice": "af_bella", "language": "en-us", "speed": 0.9},
+            "piper": {"voice": "en_US-amy-medium", "speed": 1.1},
+            "say": {"voice": "Samantha", "speed": 1.0},
+        },
+        "stt": stt,
+        "transcribe": {"folder": "~/Transcripts", "keep_audio": True, "model": "base.en"},
+        "app": {
+            "dictate": "ctrl+cmd+d", "dictate_mode": "hold", "speak": "ctrl+cmd+s",
+            "stop": "ctrl+cmd+x", "stop_hotkey": "pause",
+        },
+        "speech": speech,
+    }
+    # Every key the loader knows is set, so a key added later fails here.
+    assert set(data) == set(config.KNOWN_CONFIG_KEYS) - {"notes"}
+    assert set(stt) == set(config.KNOWN_STT_KEYS)
+    assert set(speech) == set(config.KNOWN_SPEECH_KEYS)
+    assert set(data["transcribe"]) == set(config.KNOWN_TRANSCRIBE_KEYS)
+    assert set(data["app"]) == set(config.KNOWN_APP_KEYS)
+    assert all(set(t) == set(config.KNOWN_PROVIDER_KEYS[name])
+               for name, t in data["providers"].items())
+
+    path = config.config_path()
+    wizard.write_config_if_unchanged(path, data, wizard.ABSENT_CONFIG)
+    loaded = load_config_file()
+
+    assert loaded == data
+    for resolve in (config.resolve_stt, config.resolve_transcribe, config.resolve_app,
+                    config.resolve_speech, config.resolve_chain):
+        assert resolve(file_config=loaded) == resolve(file_config=data)
+    assert config.resolve_overflow(file_config=loaded) == ("never", 4000)
+    for name in data["providers"]:
+        assert (config.resolve_provider_settings(name, loaded)
+                == config.resolve_provider_settings(name, data))
 
 
 def test_a_non_table_stt_value_is_refused_not_stringified():
@@ -993,27 +513,6 @@ def test_a_failed_rename_leaves_no_temp_file_behind(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_the_wizard_refuses_to_write_over_a_file_that_changed_while_it_asked(
-    monkeypatch, tmp_path
-):
-    """The widest window of the three writers: three interactive questions."""
-    ctx = _setup(monkeypatch, tmp_path, [ENTER, ENTER, ENTER])
-    ctx.path.parent.mkdir(parents=True, exist_ok=True)
-    ctx.path.write_text('voice = "before"\n')
-    real_confirm = wizard._confirm
-
-    def confirm_then_race(ui, label):
-        ctx.path.write_text('voice = "somebody-else"\n')
-        return real_confirm(ui, label)
-
-    monkeypatch.setattr(wizard, "_confirm", confirm_then_race)
-
-    with pytest.raises(ConfigChangedError, match="reload"):
-        wizard.run_wizard()
-
-    assert ctx.path.read_text() == 'voice = "somebody-else"\n'
-
-
 def test_an_app_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
     """The same rule as [notes]: `_TABLE_KEYS` only excludes; an explicit
     block writes [app] back, or `vocalize chain` would drop it."""
@@ -1032,3 +531,209 @@ def test_an_app_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
     assert "[app]" in once
     assert load_config_file()["app"] == {"dictate": "ctrl+cmd+d", "dictate_mode": "hold"}
     assert wizard._render_config_text(load_config_file()) == once
+
+
+# --- a save that would drop comments keeps a backup first (L4) ---------------
+
+
+COMMENTED = '# my voices\nchain = ["say"]\n\n[stt]\n  # tuned by hand\nmax_seconds = 30\n'
+
+
+def test_the_first_save_over_a_commented_file_backs_it_up_at_0600(tmp_path):
+    import stat as stat_module
+
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+
+    backup = tmp_path / "config.toml.bak"
+    assert result.backup == backup
+    assert backup.read_text() == COMMENTED
+    assert stat_module.S_IMODE(backup.stat().st_mode) == 0o600
+    text, fingerprint = result  # callers that unpack two values keep working
+    assert path.read_text() == text == 'chain = ["kokoro"]\n'
+    assert fingerprint == wizard.fingerprint_config(path)
+
+
+def test_an_existing_backup_is_never_overwritten(tmp_path):
+    path = tmp_path / "config.toml"
+    backup = tmp_path / "config.toml.bak"
+    backup.write_text("older backup\n")
+    path.write_text(COMMENTED)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+
+    assert result.backup is None
+    assert backup.read_text() == "older backup\n"
+    assert path.read_text() == 'chain = ["kokoro"]\n'
+
+
+def test_a_second_save_makes_no_second_backup(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED)
+    first = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+    path.write_text("# a new comment\n" + path.read_text())
+
+    second = wizard.write_config_if_unchanged(path, {"chain": ["say"]}, wizard.fingerprint_config(path))
+
+    assert first.backup is not None and second.backup is None
+    assert (tmp_path / "config.toml.bak").read_text() == COMMENTED
+
+
+@pytest.mark.parametrize("before", [None, 'chain = ["say"]\nvoice_label = "a # b"\n'])
+def test_no_backup_without_a_comment_line(tmp_path, before):
+    path = tmp_path / "config.toml"
+    if before is not None:
+        path.write_text(before)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+
+    assert result.backup is None
+    assert not (tmp_path / "config.toml.bak").exists()
+
+
+def test_a_backup_that_cannot_be_written_stops_the_save(tmp_path, monkeypatch):
+    import os
+
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED)
+    real_open = os.open
+
+    def refuse_backup(name, flags, *args, **kwargs):
+        if str(name).endswith(".bak"):
+            raise PermissionError(13, "denied")
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse_backup)
+    with pytest.raises(ConfigError, match="back up"):
+        wizard.write_config_if_unchanged(path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path))
+    assert path.read_text() == COMMENTED
+
+
+# --- a table vocalize does not use never blocks a save (review L5) -----------
+
+
+def _parse(text):
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        import tomli as tomllib
+    return tomllib.loads(text)
+
+
+UNKNOWN_TABLES = (
+    'chain = ["say"]\n\n[meetings]\ntitle = "Weekly \\"sync\\""\nminutes = 30\nratio = 0.5\n'
+    'on = true\nnames = ["a", "b", [1, 2]]\nrows = [{x = 1}, {x = 2}]\n\n'
+    '[meetings.room]\nfloor = 3\n\n[meetings.room.desk]\nlamp = false\n\n'
+    '[later_feature]\n"odd key" = "kept"\n'
+)
+
+
+def test_an_unknown_table_is_kept_as_it_was_with_one_notice(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(UNKNOWN_TABLES)
+    data = _parse(UNKNOWN_TABLES)
+
+    result = wizard.write_config_if_unchanged(
+        path, {**data, "chain": ["kokoro"]}, wizard.fingerprint_config(path))
+
+    reread = _parse(path.read_text())
+    assert reread == {**data, "chain": ["kokoro"]}
+    assert len(result.notices) == 2
+    assert "[meetings]" in result.notices[0] and "does not use it" in result.notices[0]
+    assert "[later_feature]" in result.notices[1]
+    assert all("Weekly" not in notice and "odd key" not in notice for notice in result.notices)
+    assert result.backup is None  # nothing was lost
+
+
+def test_an_array_of_tables_vocalize_does_not_use_is_kept(tmp_path):
+    body = 'chain = ["say"]\n\n[[later]]\nname = "one"\n\n[[later]]\nname = "two"\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+
+    result = wizard.write_config_if_unchanged(path, _parse(body), wizard.fingerprint_config(path))
+
+    assert _parse(path.read_text()) == _parse(body)
+    assert len(result.notices) == 1 and "[later]" in result.notices[0]
+
+
+def test_an_unknown_table_that_cannot_be_copied_is_dropped_after_a_backup(tmp_path):
+    body = 'chain = ["say"]\n\n[meetings]\nwhen = 1979-05-27\nkept = "x"\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+
+    result = wizard.write_config_if_unchanged(path, _parse(body), wizard.fingerprint_config(path))
+
+    assert _parse(path.read_text()) == {"chain": ["say"]}
+    assert result.backup == tmp_path / "config.toml.bak"
+    assert result.backup.read_text() == body
+    (notice,) = result.notices
+    assert "[meetings]" in notice and "1979" not in notice
+    assert result.backup_has_retired is False
+
+
+def test_a_trailing_comment_alone_is_backed_up(tmp_path):
+    body = 'chain = ["say"]  # the quiet voice\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path))
+
+    assert result.backup == tmp_path / "config.toml.bak"
+    assert result.backup.read_bytes() == body.encode()
+
+
+@pytest.mark.parametrize("body", [
+    'chain = ["say"]\nlabel = "a # b"\n',
+    "chain = [\"say\"]\nlabel = 'a # b'\n",
+    'chain = ["say"]\nlabel = """\nline # not a comment\n"""\n',
+    'chain = ["say"]\nlabel = "quote \\" # still inside"\n',
+])
+def test_a_hash_inside_a_string_is_not_a_comment(tmp_path, body):
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    _parse(body)  # a real TOML file
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path))
+
+    assert result.backup is None
+
+
+def test_a_save_that_drops_a_retired_setting_is_backed_up_and_says_so(tmp_path):
+    body = 'chain = ["say"]\n\n[providers.kokoro]\nvoice = "af_bella"\nmodel = "x"\n' \
+           '\n[providers.openai]\napi_key = "SECRET_CANARY"\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    data = config.without_retired_settings(_parse(body))  # what the loader hands on
+
+    result = wizard.write_config_if_unchanged(path, data, wizard.fingerprint_config(path))
+
+    assert "SECRET_CANARY" not in path.read_text() and "model" not in path.read_text()
+    assert result.backup == tmp_path / "config.toml.bak"
+    assert result.backup.read_bytes() == body.encode()  # byte for byte, key included
+    assert result.backup_has_retired is True
+    text, fingerprint = result
+    assert text == path.read_text() and fingerprint == wizard.fingerprint_config(path)
+
+
+def test_no_retired_flag_without_a_backup(tmp_path):
+    path = tmp_path / "config.toml"
+    (tmp_path / "config.toml.bak").write_text("older\n")
+    path.write_text('api_key = "SECRET_CANARY"\nchain = ["say"]\n')
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["say"]}, wizard.fingerprint_config(path))
+
+    assert result.backup is None and result.backup_has_retired is False
+    assert (tmp_path / "config.toml.bak").read_text() == "older\n"

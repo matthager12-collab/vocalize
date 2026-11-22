@@ -1,1076 +1,479 @@
-# vocalize
+# Vocalize
 
-[![CI](https://github.com/matthager12-collab/vocalize/actions/workflows/ci.yml/badge.svg)](https://github.com/matthager12-collab/vocalize/actions/workflows/ci.yml)
+Vocalize is a command-line tool for macOS. It does two things, both on your
+Mac:
 
-A command-line tool that turns text, markdown files, or piped stdin into
-natural-sounding speech on your own machine by default, with cloud voices as
-an option — plus a hook that wires it directly into
-[Claude Code](https://claude.com/claude-code), so Claude's responses get read
-aloud in your terminal or IDE.
+- **Text to speech.** It reads text, Markdown files, the clipboard or piped
+  input aloud.
+- **Speech to text.** It turns what you say into text on the clipboard
+  (dictation), and turns audio files into Markdown transcripts.
 
-## Quickstart
+The models run on your Mac. Vocalize has no cloud engine, no account and no
+key. See [What local only means](#what-local-only-means).
 
-**New here?** [docs/getting-started.md](docs/getting-started.md) walks the
-whole install one step at a time, including the two System Settings switches
-macOS reserves for a human. This section assumes you're comfortable in a
-terminal.
+New to the command line? [docs/getting-started.md](docs/getting-started.md)
+walks through the whole setup one step at a time.
 
-**Evaluating rather than installing?**
-[docs/for-reviewers.md](docs/for-reviewers.md) covers what the project does
-and the decisions behind it.
+## What you need
 
-```bash
-xcode-select --install          # if you've never installed Apple's dev tools
-uv tool install vocalize-cli
-```
-
-```bash
-vocalize local install
-```
-
-Downloads the on-device Kokoro voice once (about 350 MB; needs
-[`uv`](https://docs.astral.sh/uv/)). Skip it and `vocalize` speaks through
-macOS `say` until you come back to it — the fallback line tells you so.
-
-```bash
-vocalize speak "hello"
-```
-
-Prefer a cloud voice? See [Providers and fallback](#providers-and-fallback):
-`vocalize config` walks you through a key, a voice and a speed.
-
-## Why this exists
-
-Text-to-speech readers are good at *voices* and bad at *structure*. Point one
-at a markdown report and it reads a table cell-by-cell, left to right, with
-no sense of which row or column you're in — "Q1. 4.2 million. Q2. 5.1
-million" instead of "for Q1, revenue is 4.2 million." Headings, bullet
-lists, and inline code fare the same way: read exactly as typed, syntax and
-all.
-
-`vocalize` fixes the part of that problem that's actually fixable without a
-vision model: a preprocessing pass (`vocalize/preprocess.py`) rewrites
-markdown into short, declarative sentences *before* it ever reaches the TTS
-API — a table is announced with its size and column names, each row is read
-as its own numbered paragraph ("Row 1: Plan A. Cost: $5."), and "End of
-table." marks where it stops; bullets become "First, ...
-Second, ...", links keep their text and drop the URL, and fenced code blocks
-are replaced with a spoken placeholder instead of being read character by
-character. It's a text transform, so it's fully unit tested without any
-API key or network access (see `tests/test_preprocess.py`).
+- **A Mac.** Vocalize was built and measured on macOS with Apple Silicon.
+  Parakeet (speech to text) and the cleanup model need Apple Silicon. The
+  other engines were not tested on an Intel Mac.
+- **[uv](https://docs.astral.sh/uv/).** Vocalize uses it to install each
+  engine into its own environment. The first engine install also has uv
+  fetch a copy of Python 3.12 (about 70 MB).
+- **Apple's command line tools** (`xcode-select --install`). Dictation and
+  the menu-bar app each build a small Swift app on your Mac.
 
 ## Install
 
 ```bash
 uv tool install vocalize-cli
+vocalize local install      # download the Kokoro voice (337 MB)
+vocalize doctor             # check what is ready and what is missing
 ```
 
-`pipx install vocalize-cli` works identically. Pick one, not both.
-[`uv`](https://docs.astral.sh/uv/) is the one shown throughout because
-`vocalize local install` needs it anyway for the on-device voice, so it's one
-tool instead of two. For a one-off run without installing anything at all,
-`uvx --from vocalize-cli vocalize`.
+`vocalize local install` asks before it downloads anything. Full detail is
+in [docs/installation.md](docs/installation.md).
 
-The package is published on PyPI as `vocalize-cli`; the command it installs
-is still `vocalize`.
+**Upgrading from 0.15?** Version 1.0 removes cloud voices, account keys,
+usage budgets, summaries and note templates. If you need those, stay on
+0.15: `uv tool install 'vocalize-cli==0.15.0'`. An old config file still
+loads: each setting that no longer exists prints a notice and is ignored,
+and the next save removes it.
 
-Building the recorder and the menu-bar app needs `swiftc`, from Apple's
-command line tools:
+After upgrading, install every engine you use once more. 1.0.0 runs each
+engine from its own hash-locked environment, and an install from 0.15 does
+not have one. Until you do, speech falls back to the macOS voice and
+dictation reports that it is not ready.
 
 ```bash
-xcode-select --install
+vocalize local install                        # Kokoro
+vocalize local install --stt                  # dictation: Parakeet on Apple Silicon (2.3 GB download)
+vocalize local install --stt --engine whisper # or keep Whisper instead
+vocalize local install --llm                  # only if you use cleanup
+vocalize integrate claude --yes               # replace the old /speak skill
 ```
 
-Already present on any Mac that has had Xcode or its command line tools. Not
-present on a fresh one, and the failure arrives late, at build time.
+Model files already on disk are checked and not downloaded again. The old
+`/speak` skill file still describes web and summary modes that Vocalize no
+longer has, so replace it once with `vocalize integrate claude --yes`. See
+[CHANGELOG.md](CHANGELOG.md).
 
-For a from-source or dev install:
+### Downloads and memory
 
-```bash
-git clone <this-repo>
-cd vocalize
-pip install -e .
-```
+Each engine is a separate download. Sizes are what the installer reports.
+Memory is the largest resident memory seen while the engine worked, measured
+on one Mac Studio (Apple M5 Max, 128 GB, macOS 27.2). For Parakeet and the
+cleanup model that figure may undercount, because memory they hold for the
+graphics processor is not always counted. Details are in
+[docs/plans/2026-11-local-only/measurements.md](docs/plans/2026-11-local-only/measurements.md).
 
-Cloud voices need an API key; storing one is covered under
-[Providers and fallback](#providers-and-fallback).
-
-## Usage
-
-```bash
-# Speak a string directly
-vocalize speak "Hello, this is a test."
-
-# Speak a markdown file — tables and formatting get flattened first
-vocalize speak-file report.md
-
-# Pipe anything in
-cat notes.md | vocalize speak-file -
-
-# Speak whatever is on the macOS clipboard
-vocalize clip
-
-# List available voices and grab an ID
-vocalize voices
-
-# Check your quota and cache
-vocalize usage
-
-# Use a specific voice/model, save without playing
-vocalize speak-file report.md --voice <voice-id> --model eleven_flash_v2_5 \
-  --output out.mp3 --no-play
-
-# Cap how much gets sent (handy for free-tier character budgets)
-vocalize speak-file long-report.md --max-chars 2000
-
-# Slow it down a little
-vocalize speak-file report.md --speed 0.9
-
-# Skip the markdown flattening entirely
-vocalize speak "raw **markdown** stays raw" --raw
-
-# Speak through one specific provider, no fallback
-vocalize speak "Test" --provider google
-
-# See (or set) the order providers are tried in
-vocalize chain
-
-# Set up the offline, opt-in local voice (downloads ~354 MB once)
-vocalize local install
-```
-
-Every synthesis result is cached on disk under `~/.cache/vocalize/`, keyed
-by a hash of (text, voice, model, format, speed) — re-running the same
-command twice doesn't burn API quota twice.
-
-`vocalize stop` (from any terminal) stops playback immediately — the
-player's identity (process ID plus launch timestamp) is tracked in
-`~/.cache/vocalize/play.pid`, and stop refuses to touch a process that no
-longer matches the full record — a recycled PID is never killed. A
-stopped read exits cleanly; the mp3 stays cached.
-
-Long inputs are also split automatically — at paragraph boundaries where
-possible, then sentences, then words — into requests no bigger than
-`--chunk-chars` (default 9500), so a long read no longer fails the API's
-own per-request cap.
-
-`vocalize clip` stops any current playback first, then speaks the
-clipboard. It refuses content shaped like a secret — a single
-high-entropy token, or one starting with a known credential prefix
-(`sk-`, `pypi-`, `ghp_`, `op://`, `eyJ`, …) — without echoing it anywhere;
-`--allow-secret` bypasses the guard when you're sure. This is a
-habit-breaking guard for text copied out of a password manager, not a
-full secret scanner.
-
-## Configuration
-
-Each setting is resolved on its own, taking the first source that supplies
-it: CLI flag, then environment variable, then config file, then the
-built-in default.
-
-There's an interactive way to set the file up, if you'd rather not write
-TOML by hand. It walks through three lists — voice (with a live preview of
-the highlighted one), model, and speed — shows you a summary, and writes the
-config file below. Unrecognised top-level keys already in that file are
-carried through; comments and layout are not preserved. A file containing a
-TOML table or array is left alone entirely, with a message saying to edit it
-by hand. The wizard paints on the controlling terminal rather than on stdout,
-so it still works under output-capturing wrappers like `op run`.
-
-```bash
-vocalize config
-```
-
-Hotkeys: `↑`/`↓` or `k`/`j` move, `Enter` selects, `p` previews the
-highlighted voice, `m` types a value by hand, `q` or `Esc` cancels without
-writing anything.
-
-There's also a settings page in the browser — see
-[Settings portal](#settings-portal) below.
-
-| Setting | Flag | Env var | Config file key | Default |
+| Engine | Install command | Model download | Engine environment | Memory while working |
 |---|---|---|---|---|
-| API key | `--api-key` | `ELEVENLABS_API_KEY` | not read from the config file | stored via `vocalize auth` |
-| Voice ID | `--voice` | `VOCALIZE_VOICE` | `voice` | `21m00Tcm4TlvDq8ikWAM` ("Rachel") |
-| Model ID | `--model` | `VOCALIZE_MODEL` | `model` | `eleven_multilingual_v2` |
-| Speed | `--speed` | `VOCALIZE_SPEED` | `speed` | unset — the API's own 1.0 |
-| Max characters | `--max-chars` | `VOCALIZE_MAX_CHARS` | `max_chars` | unset on the CLI; the hook supplies a 500 fallback |
-| Overflow mode | `--overflow` | `VOCALIZE_OVERFLOW` | `overflow` | `truncate` |
-| Provider chain | `--provider` (forces one, no fallback) | `VOCALIZE_CHAIN` (comma-separated) | `chain` (array) | `["elevenlabs", "say"]` |
-| Hook binary | — | `VOCALIZE_BIN` | not read from the config file | `vocalize` as found on `PATH` |
+| Kokoro (voice) | `vocalize local install` | 337 MB | 145 MB | about 1.5 GB |
+| Piper (voice) | `vocalize local install --piper` | about 60 MB per voice | not measured | not measured |
+| Whisper large-v3-turbo-q5_0 | `vocalize local install --stt --engine whisper` | 547 MB | 41 MB | about 0.87 GB |
+| Whisper large-v3-turbo-q8_0 | the same, plus `--model large-v3-turbo-q8_0` | 834 MB | shared with q5_0 | about 1.2 GB |
+| Parakeet | `vocalize local install --stt` | 2.3 GB | 450 MB | 1.2 to 1.6 GB |
+| Cleanup model (Qwen3.5-4B, 4-bit) | `vocalize local install --llm` | 2.8 GB | 371 MB | about 3 GB |
 
-`--voice`/`--model`/`--speed` and their `VOCALIZE_*` env vars only ever apply
-to the **primary** provider — the first in the chain, or the one `--provider`
-forces. Every other link reads only its own `[providers.<name>]` table and
-its own built-in defaults; see
-[Providers and fallback](#providers-and-fallback) below.
+The cleanup install refuses on a Mac with less than 12 GB of memory unless
+you add `--force`. uv also keeps a download cache of its own; in the
+measurements it grew by a few hundred MB per engine.
 
-The config file is TOML at `$XDG_CONFIG_HOME/vocalize/config.toml`, falling
-back to `~/.config/vocalize/config.toml`. Flat keys, no sections:
+## Text to speech
+
+```bash
+vocalize speak "Hello, this is a test."
+vocalize speak-file report.md        # a Markdown or text file
+cat notes.md | vocalize speak-file - # piped input
+vocalize clip                        # whatever is on the clipboard
+vocalize pause                       # pause what is playing
+vocalize resume                      # continue a paused or interrupted read
+vocalize stop                        # stop what is playing
+```
+
+### Speech engines
+
+| Engine | How to get it | Role |
+|---|---|---|
+| Kokoro | `vocalize local install` | The default voice |
+| Piper | `vocalize local install --piper` | Optional. Its licence is shown before the download |
+| macOS `say` | Built in | The fallback. Nothing to download |
+
+Vocalize tries the engines in order. The default order is Kokoro, then
+`say`. If an engine fails before playback starts, the next one is tried and
+Vocalize tells you which engine spoke.
+
+```bash
+vocalize chain                     # show the current order
+vocalize chain kokoro piper say    # set a new order
+vocalize voices                    # list Kokoro voices
+vocalize voices --provider piper   # list Piper voices
+vocalize speak "Hi" --provider say # use one engine, with no fallback
+```
+
+On the Mac Studio, Kokoro took about 0.11 to 0.13 seconds to make each
+second of speech. Vocalize makes the first piece of a text short, so it can
+start playing sooner. With the model loaded, the first audio of three test
+passages was ready in 0.24 to 0.63 s.
+
+### Markdown and tables
+
+Before speaking, Vocalize rewrites Markdown into plain sentences. A table is
+announced with its size and column names, each row is read as its own
+numbered paragraph ("Row 1: Plan A. Cost: $5."), and "End of table." marks
+where it stops. Bullets become "First, ... Second, ...", links keep their
+text and drop the address, and code blocks are replaced with a short spoken
+note. Use `--raw` to skip this and speak the text exactly as written.
+
+## Speech to text
+
+Two engines are available:
+
+- **Parakeet** runs on Apple Silicon and is the default there. English only.
+- **Whisper** runs on any Mac, handles other languages, and also takes the
+  vocabulary list as a hint.
+
+`[stt] engine` chooses: `auto` (the default) uses Parakeet when it is
+installed and Whisper otherwise.
+
+### Dictation
+
+```bash
+vocalize local install --stt   # Parakeet on Apple Silicon; add --engine whisper for Whisper
+vocalize dictate               # run once to record, again to stop
+```
+
+When you stop, the text is copied to the clipboard. Set `[stt] paste = true`
+to also paste it into the app you were using.
+
+The time from the end of a live recording to text on the clipboard has not
+been measured. What was measured is transcribing a saved file on the Mac
+Studio: Parakeet took 0.6 to 0.7 s for an 18 to 23 second recording, and
+Whisper took 1.1 to 1.2 s for a 45 to 55 second one.
+
+**Optional cleanup.** An on-device language model can remove filler words
+and fix punctuation before the text is copied:
+
+```bash
+vocalize local install --llm   # 2.8 GB; needs 12 GB of memory
+vocalize dictate --cleanup     # or set [stt] cleanup = "local"
+```
+
+If the cleaned text drifts from what you said, Vocalize keeps your original
+words. Cleanup is off by default. One cleanup took about 1.9 s on the Mac
+Studio. The full guide is [docs/dictation.md](docs/dictation.md).
+
+### Transcribe audio files
+
+```bash
+vocalize transcribe recording.m4a
+vocalize transcribe ~/Recordings     # every supported file in a folder
+```
+
+Each file becomes a Markdown file with timestamped lines, written to your
+transcripts folder. Files already transcribed are skipped. With
+`[stt] engine = "parakeet"` files are transcribed by Parakeet. With
+`whisper` they go to Whisper, and with `auto` to Whisper when a Whisper
+model is installed, otherwise to Parakeet. On the Mac Studio, Parakeet
+transcribed a 10 minute file in 7.4 s (word error rate 2.0 percent) and a
+60 minute file in 27.6 s (1.6 percent); Whisper took 19.4 s for the same
+10 minute file (1.5 percent). See [docs/transcribe.md](docs/transcribe.md).
+
+### Vocabulary
+
+Speech engines often misspell names and technical words. List them once and
+Vocalize puts them right:
 
 ```toml
-chain = ["elevenlabs", "google", "say"]
-
-# Flat keys are the original cloud voice's settings, unchanged since
-# before there was a chain; see Providers and fallback.
-voice = "21m00Tcm4TlvDq8ikWAM"
-model = "eleven_flash_v2_5"
-speed = 0.95
-max_chars = 1000
-overflow = "ask"
-
-[providers.google]
-voice = "en-US-Neural2-F"
-language = "en-US"
-monthly_chars = 1000000
-
-[providers.say]
-voice = "Samantha"
-
-[providers.kokoro]
-voice = "af_heart"
+[stt]
+vocabulary = ["pyproject", "sha256", "Kokoro", "DuckDB"]
 ```
 
-Every other provider gets its own `[providers.<name>]` table. The keys it
-can hold: `voice`, `model`, `engine` (an alias for `model` — Polly's field is
-called that), `speed`, `language`, `region`, `profile`, and `monthly_chars`.
-A key outside that set warns on stderr rather than failing the run.
+After either engine, Vocalize looks for one to four heard words that spell
+a term's letters and digits, and replaces them with the term as you wrote
+it ("py project" becomes "pyproject", "duck db" becomes "DuckDB"). This
+correction step leaves text with no term in it unchanged. There is no
+matching by sound, so a term heard as a different word is not corrected,
+and a term shorter than three letters or digits is never matched. This
+applies to dictation and to `vocalize transcribe`. The list holds up to 50
+terms.
 
-`overflow` decides what happens when input is longer than the resolved
-`max_chars` cap: `truncate` (the default) cuts it at the cap, `ask` prompts
-on the controlling terminal first — and degrades to `truncate` with a note
-when there is no terminal to ask on (the Stop hook runs vocalize detached
-from the terminal precisely so this always happens there; pipes and scripts
-usually have no terminal either) — and `never` speaks the whole thing
-regardless. With no cap set anywhere there is no overflow, so the mode
-never fires. Hook-triggered speech still lives under the hook's 15-minute
-watchdog described below, whatever the mode.
+Whisper also gets the list as a hint before it starts, and the hint can
+change the transcript, even of text with no term in it. On the Mac Studio,
+a technical take's word error rate fell from 7.7 to 1.5 percent with the
+list, on both engines. On two plain prose takes, the hint made Whisper's
+word error rate go from 2.54 to 3.94 percent on one and from 0.84 to 0.28
+percent on the other. Parakeet takes no hint.
 
-`vocalize settings` prints the resolved values (one `key=value` per
-line, env and config applied) — handy for wrapper scripts and for checking
-which source won.
+## Machine profiles
 
-Not having a config file is normal and silent. A file that isn't valid TOML
-is an error naming the file; a key that isn't recognised is a warning on
-stderr, so a typo doesn't pass unnoticed but doesn't stop the run either.
-`speed` must be a number between 0.7 and 1.2 — anything else is a one-line
-error naming the source it came from.
+A machine profile is a ready-made set of five settings sized for how much
+memory your Mac has. The settings page suggests a profile for your Mac and
+applies one with a button. Applying a profile changes only these five
+settings. It installs nothing; it names the installs it recommends.
 
-The API key is separate and never read from this file. It resolves in its
-own order: `--api-key` flag, then `ELEVENLABS_API_KEY`, then a `.env` file
-in the current directory, then the OS keychain. `vocalize auth login` sets
-up the keychain entry; `vocalize auth status` shows which of those sources
-is currently supplying the key.
+| Profile | Memory | `stt.engine` | `stt.model` (Whisper) | `stt.beam_size` | `stt.warm_minutes` | `stt.cleanup` | Recommended installs |
+|---|---|---|---|---|---|---|---|
+| small | under 16 GB | `auto` | `large-v3-turbo-q5_0` | 5 | 0 | `off` | Kokoro, Whisper |
+| standard | 16 GB and up | `parakeet` | `large-v3-turbo-q5_0` | 5 | 0 | `off` | Kokoro, Parakeet, Whisper |
+| large | 32 GB and up | `parakeet` | `large-v3-turbo-q8_0` | 5 | 0 | `off` | Kokoro, Parakeet, Whisper |
+| studio | 64 GB and up | `parakeet` | `large-v3-turbo-q8_0` | 5 | 240 | `local` | Kokoro, Parakeet, cleanup model; the `large-v3-turbo-q8_0` Whisper model for use if you switch the engine to Whisper |
 
-A `[stt]` table configures dictation the same way `[providers.<name>]`
-configures a TTS provider — see
-[Configuration: the `[stt]` table](#configuration-the-stt-table) under
-[Dictation](#dictation-speech-to-text) below for every key and its
-allowlist.
+`small` holds the package defaults. The values are provisional: engines
+were measured only on the 128 GB Mac Studio, never on a smaller Mac.
+`stt.warm_minutes` keeps Whisper and the cleanup model loaded between takes;
+Parakeet starts fresh for each take. So with Parakeet and cleanup off there
+is nothing to keep loaded, and standard and large set 0; studio's 240 keeps
+the cleanup model loaded. `vocalize local stop` unloads whatever is loaded.
+The Whisper model and beam settings matter only when Whisper is the engine
+in use.
 
-## Settings portal
-
-A page in your own browser for the whole config surface above, so you don't
-have to hand-edit `config.toml` or click through `vocalize config` one
-setting at a time.
+## Settings
 
 ```bash
-vocalize portal              # opens your browser at a one-time link
-vocalize portal --no-browser # prints the link instead (headless, SSH)
+vocalize portal     # open the settings page in your browser
+vocalize settings   # print the current settings, one per line
 ```
 
-Five tabs:
+The settings page runs on your Mac at `127.0.0.1`. It opens with a one-time
+link and closes after 15 minutes with nothing to do. It is a single page: a
+machine profile box, then the sections Speaking, Reading, Dictation,
+Transcription, Hotkeys, Engines and Advanced. Every setting below has a
+control there, and every install, removal and integration has a button.
 
-- **Chain** — reorder providers, or add and remove one.
-- **Providers** — each provider's voice, model, speed, and monthly budget,
-  with a live preview of the voice you're looking at.
-- **Keys** — store, test or remove an API key for each provider and for
-  Anthropic (the dictation cleanup backend, not a voice); the field is
-  masked and never offers to autocomplete, a stored key is never shown
-  again, and each card says when the key was last checked.
-- **Usage** — this month's spend and quota per provider.
-- **Local** — install or update the on-device Kokoro and whisper models,
-  with progress.
+Every setting is stored in one file, `~/.config/vocalize/config.toml`,
+which you can also edit by hand. A save from Vocalize does not keep
+comments or retired settings, so the first save over a file that has them
+keeps one backup copy, `config.toml.bak`. That copy holds everything the
+old file held, which can include a service key from an older version.
+Delete it when you no longer need it. A table Vocalize does not know does
+not block a save.
 
-The opening link works once and for 60 seconds; after that, run the command
-again for a new one. The server only ever listens on `127.0.0.1`, and it
-closes itself on Ctrl-C or after fifteen minutes with nothing to do. Nothing
-you change on the page reaches disk until you press Save on that tab — and
-a save made against a config file that's changed on disk since the page
-loaded is refused rather than silently overwritten, the same protection
-`vocalize chain` and `vocalize config` already have.
+The tables below are generated from the same list of settings the page is
+built from, and a test fails if they differ.
 
-It assumes a single-user machine: everything that reads or changes your
-settings is behind that one-time token, but any other process on the Mac
-can still reach the port and close the portal under you. Nothing leaks if
-that happens — it's a shutdown, not a read — just run the command again.
+<!-- settings-table:start -->
+### Speaking
 
-## Providers and fallback
+Which voice engines read text aloud, and how they sound.
 
-vocalize tries providers in order — a **chain** — until one speaks. The
-default is `elevenlabs, say`: ElevenLabs behaves exactly as before, and a
-failure now degrades to the always-free `say` instead of erroring out.
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `chain` | `["kokoro", "say"]` | `"kokoro"`, `"piper"`, `"say"` | The engines tried in turn to speak text; the next one is used when one is not installed or fails. |
+| `providers.kokoro.voice` | `"af_heart"` | up to 128 characters | The voice Kokoro speaks with. Unset uses the engine's own default. |
+| `providers.kokoro.speed` | unset | 0.7 to 1.2 | How fast Kokoro speaks; 1.0 is normal speed. Unset uses the engine's own pace. |
+| `providers.piper.voice` | `"lessac"` | up to 128 characters | The voice Piper speaks with. Unset uses the engine's own default. |
+| `providers.piper.speed` | unset | 0.7 to 1.2 | How fast Piper speaks; 1.0 is normal speed. Unset uses the engine's own pace. |
+| `providers.say.voice` | unset | up to 128 characters | The voice macOS say speaks with. Unset uses the engine's own default. |
+| `providers.say.speed` | unset | 0.7 to 1.2 | How fast macOS say speaks; 1.0 is normal speed. Unset uses the engine's own pace. |
 
-| Provider | Credentials | Config table | Per-request cap | Free tier | What `check` needs |
-|---|---|---|---|---|---|
-| `elevenlabs` | keychain / env / `.env` / `--api-key` | `[providers.elevenlabs]` or the flat legacy keys | 9,500 chars | 10,000 chars/month | an API key |
-| `openai` | keychain / env / `.env` | `[providers.openai]` | 4,000 chars | none — prepaid credit only, ~$15/million chars | an API key |
-| `google` | keychain / env / `.env` | `[providers.google]` | 4,500 chars (also a 4,900-byte hard cap) | ~4M Standard or ~1M Neural2/WaveNet chars/month, then bills | an API key |
-| `polly` | your normal AWS credentials (env, `~/.aws/credentials`, a profile, or a role) — vocalize stores none of it | `[providers.polly]` | 2,900 chars | Standard 5M/month ongoing; Neural 1M/month for 12 months, then $4–$16/million | `boto3` installed + AWS credentials discoverable |
-| `say` | none | `[providers.say]` | none (one call, any length) | free, offline | macOS with the `say` binary |
-| `kokoro` | none | `[providers.kokoro]` | 400 chars per streamed piece | free, offline, one-time ~354 MB download | `uv` + `vocalize local install` done |
+### Reading
 
-**Fallback rules**, decided by typed errors, not string-matching:
+How long text is handled and how written text is turned into speech.
 
-- **Unavailable / auth / transient** errors (missing key, bad credentials, a
-  5xx or rate limit) skip straight to the next provider in the chain.
-- **Quota** errors do the same, but also mark that provider exhausted in the
-  local ledger for the rest of the calendar month — see
-  [Budgets and the usage ledger](#budgets-and-the-usage-ledger).
-- **Content** errors — a bad voice name, text longer than the API actually
-  accepts — **stop the chain immediately**, loudly, naming the bad config
-  key. A silent misconfiguration would be the worse bug to ship.
-- Anything else (a bug in vocalize itself) is never treated as "try the next
-  one" — it propagates as a real error.
-- Once Kokoro's streaming playback has started, a later failure can't fall
-  through to another provider either — you can't un-hear the first half of
-  a read.
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `max_chars` | unset | at least 1 | The most characters read in one go. Unset means no limit. |
+| `overflow` | `"truncate"` | `"truncate"`, `"ask"`, `"never"` | What happens when text is longer than the longest read: cut it, ask first, or refuse it. |
+| `speech.headings` | `"cue"` | `"cue"`, `"plain"`, `"off"` | How headings are read: with a spoken cue, as plain text, or skipped. |
+| `speech.blockquotes` | `"cue"` | `"cue"`, `"plain"`, `"off"` | How quoted blocks are read: with a spoken cue, as plain text, or skipped. |
+| `speech.nested_lists` | `"cue"` | `"cue"`, `"flat"`, `"off"` | How lists inside lists are read: with a cue, flattened, or skipped. |
+| `speech.parentheticals` | `"pause"` | `"pause"`, `"drop"`, `"off"` | How text in brackets is read: with a pause around it, dropped, or read as written. |
+| `speech.abbreviations` | `"expand"` | `"expand"`, `"protect"`, `"off"` | Whether abbreviations such as e.g. are expanded into words, kept whole, or left alone. |
+| `speech.citations` | `"drop"` | `"drop"`, `"speak"`, `"off"` | Whether citation and footnote marks are dropped, spoken, or left alone. |
+| `speech.references` | `true` | `true`, `false` | Skip a references or bibliography section at the end of a document. |
+| `speech.furniture` | `true` | `true`, `false` | Skip running heads, footers and page numbers that repeat through a document. |
+| `speech.urls` | `"domain"` | `"domain"`, `"full"`, `"drop"` | How a web address is read: just its site name, in full, or not at all. |
+| `speech.emoji` | `true` | `true`, `false` | Remove emoji before reading, so they are not spoken. |
 
-You'll see the handoff on stderr as it happens:
+### Dictation
 
-```
-openai: out of credit — trying google
-google: local budget reached (1,004,233/1,000,000 chars this month) — trying polly
-Spoke via say (fallback).
-```
+What happens when you dictate: cues, cleanup, pasting and recording limits.
 
-If every provider fails, the error lists each one's reason, plus a hint to
-add `say` to the chain if it's missing.
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `stt.paste` | `false` | `true`, `false` | Paste the transcript into the app you were using when dictation ends. |
+| `stt.cues` | `"sounds"` | `"sounds"`, `"words"`, `"both"` | How dictation tells you it started and stopped: sounds, spoken words, or both. |
+| `stt.sounds` | `true` | `true`, `false` | Turn the start and stop cues on or off. |
+| `stt.verbatim` | `false` | `true`, `false` | Keep filler words and false starts instead of tidying the transcript. |
+| `stt.cleanup` | `"off"` | `"off"`, `"local"` | Tidy a transcript with a local language model on this Mac, or leave it as heard. |
+| `stt.vocabulary` | `[]` | up to 50 items; up to 40 characters | Names and terms to spell right. They are corrected in the transcript after either engine, and Whisper also gets them as a hint. |
+| `stt.max_seconds` | `120` | 1 to 600 | Recording stops by itself after this many seconds. |
+| `stt.max_take_seconds` | `1800` | 60 to 7200 | The most seconds one dictation may last in total, counting every pause and resume. |
+| `stt.input_device` | `""` | up to 128 characters | The microphone to record from. Empty uses the system default. |
 
-`--provider` is the opt-out: it forces exactly one provider with no
-fallback at all, same as vocalize behaved before it had a chain.
+### Transcription
 
-**A chain is multi-vendor egress.** `elevenlabs, google, say` can, on a bad
-day, send the same text to both ElevenLabs and Google before `say` finally
-speaks it — every attempt that reaches a provider's `synthesize` call is a
-real request to that vendor. `say` and `kokoro` are the exception: they
-never send text off the machine.
+Where `vocalize transcribe` writes its transcripts and what it keeps.
 
-Amazon Polly needs the optional extra:
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `transcribe.folder` | `"~/Documents/Vocalize Notes"` | up to 512 characters | The folder `vocalize transcribe` writes its transcripts to. |
+| `transcribe.keep_audio` | `false` | `true`, `false` | Keep a copy of each recording next to its transcript. |
+| `transcribe.model` | `""` | `""`, `"base.en"`, `"small.en"`, `"large-v3-turbo-q5_0"`, `"large-v3-turbo-q8_0"` | The Whisper model for transcribing files. Empty uses the dictation model. |
 
-```bash
-pip install "vocalize-cli[polly]"
-```
+### Hotkeys
 
-For the click-by-click setup of each provider — where to go, what to click,
-the one command that stores the credential, the one command that proves it
-works — see [docs/provider-credentials.md](docs/provider-credentials.md).
+The menu-bar app's keyboard shortcuts.
 
-### Storing a cloud API key
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `app.dictate` | `"ctrl+alt+cmd+d"` | a chord such as `ctrl+alt+cmd+d`, or empty | Starts and stops dictation. Must include ctrl or cmd; empty turns it off. |
+| `app.dictate_mode` | `"toggle"` | `"toggle"`, `"hold"` | Press once to start and again to stop, or hold the shortcut while you speak. |
+| `app.speak` | `"ctrl+alt+cmd+s"` | a chord such as `ctrl+alt+cmd+d`, or empty | Reads the selected text aloud. Must include ctrl or cmd; empty turns it off. |
+| `app.stop` | `"ctrl+alt+cmd+x"` | a chord such as `ctrl+alt+cmd+d`, or empty | Stops reading. Must include ctrl or cmd; empty turns it off. |
+| `app.stop_hotkey` | `"stop"` | `"stop"`, `"pause"` | Stop reading for good, or pause it so it can be resumed. |
 
-For ElevenLabs, get a free API key at
-[elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)
-(free tier: 10,000 characters/month, API access included, no commercial
-license). Then, recommended, store it in your OS keychain:
+### Engines
 
-```bash
-vocalize auth login
-```
+Which speech-to-text engine and model run on this Mac.
 
-This prompts for the key (input hidden), validates it against the
-ElevenLabs API, and stores it via your OS's own keychain (macOS Keychain,
-Windows Credential Locker, Linux Secret Service) — no plaintext file to
-manage. On macOS the item is written and read through Apple's own
-`security` tool, so the same key is readable from every Python and app
-that runs vocalize — your terminal, Claude Code's shell, the portal —
-with no keychain dialog, and `vocalize auth status` shows the date it was
-last validated. Piping it in from a secret manager works too:
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `stt.engine` | `"auto"` | `"auto"`, `"parakeet"`, `"whisper"` | Which speech-to-text engine runs. Auto uses Parakeet on Apple silicon where it is installed, and Whisper everywhere else. |
+| `stt.model` | `"large-v3-turbo-q5_0"` | `"base.en"`, `"small.en"`, `"large-v3-turbo-q5_0"`, `"large-v3-turbo-q8_0"` | The Whisper model used for dictation. Larger models are more accurate and slower. |
+| `stt.language` | `"en"` | one of 101 names | The language you dictate in, or auto to detect it. English-only models need en. |
+| `stt.warm_minutes` | `0` | 0 to 240 | Minutes Whisper and the cleanup model stay loaded after a take, so the next one starts at once. Parakeet is never kept loaded: with Parakeet this keeps only the cleanup model, when cleanup is on. 0 keeps nothing loaded. |
 
-```bash
-op read op://vault/elevenlabs/key | vocalize auth login --stdin
-```
+### Advanced
 
-An environment variable or `.env` file work as well, and take priority over
-the keychain if both are set:
+Fine tuning most people never need to change.
 
-```bash
-export ELEVENLABS_API_KEY=your-key-here
-```
+| Key | Default | Allowed | What it does |
+|---|---|---|---|
+| `providers.kokoro.language` | `"en-us"` | up to 128 characters | The language code Kokoro is asked to speak. Unset uses the engine's own default. |
+| `stt.beam_size` | `5` | 1 to 8 | How many guesses Whisper weighs at once. Higher can be more accurate and is slower; 1 is the fastest. |
+| `speech.bracket_max_chars` | `120` | 10 to 1000 | Brackets longer than this many characters are read as written. |
+| `speech.furniture_max_chars` | `60` | 10 to 500 | Only lines up to this many characters can count as page furniture. |
+| `speech.furniture_min_repeats` | `3` | 2 to 20 | A line must repeat at least this many times to be skipped as page furniture. |
+<!-- settings-table:end -->
 
-or copy `.env.example` to `.env` and fill it in (requires the optional
-`python-dotenv` extra: `pip install -e ".[dotenv]"`).
+### Choices with no control on the settings page
 
+A few choices can only be made in a shell. Each is meant for one command,
+for testing, or for a step that should not happen by accident.
 
-## Budgets and the usage ledger
+| Choice | How to make it | Why there is no control |
+|---|---|---|
+| Run Whisper or the cleanup model under another Python, outside its hash-locked environment | `VOCALIZE_WHISPER_PYTHON`, `VOCALIZE_LLM_PYTHON` | For evaluation only; such a runtime is checked by version only |
+| Override a setting for one command | `VOCALIZE_CHAIN`, `VOCALIZE_VOICE`, `VOCALIZE_SPEED`, `VOCALIZE_OVERFLOW`, `VOCALIZE_MAX_CHARS` | They last for one command; the file keeps its value, and the settings page shows when one is set |
+| Size of each piece sent to a voice engine | `--chunk-chars` on `speak`, `speak-file` and `clip` (default 9500) | A per-command tuning option |
+| The Claude Code hook's own length cap (500 characters) | a constant in the hook script | It applies only when `max_chars` is unset, so the `max_chars` setting overrides it |
+| Install the cleanup model on a Mac with less than 12 GB | `vocalize local install --llm --force` | The memory check protects small Macs |
+| Replace an existing `/speak` skill | `vocalize integrate claude --yes` | The button never overwrites a skill file you may have edited |
 
-Cloud providers don't stop at their free tier — they bill past it. vocalize
-can't see your vendor invoice, so it keeps its own local estimate instead
-and stops using a provider once you say where the line is.
-
-Set `monthly_chars` under that provider's `[providers.<name>]` table:
-
-```toml
-[providers.google]
-monthly_chars = 1000000
-```
-
-Usage is tracked in `~/.cache/vocalize/usage.json`, one entry per provider
-per calendar month, decided by your machine's local time. A provider that
-comes back with a real quota error from the vendor is remembered as
-exhausted for the rest of that month — no further requests to it, even if
-you raise `monthly_chars` in between; only the new month clears it.
-
-`vocalize usage` prints every provider's tally against its budget (or
-"unlimited" with no `monthly_chars` set), flags any that are exhausted, then
-ElevenLabs's own remote quota (skipped gracefully, not a failure, when no
-key is configured), then local disk-cache stats.
-
-The ledger is per-machine and an estimate, not a bill: a cached (repeat)
-request costs nothing and isn't counted, and usage from a different machine
-never shows up here. Google's own limits and billing are byte-based, not
-character-based, so vocalize counts Google's usage in UTF-8 bytes too — the
-same text can cost a different amount against Google's cap than everyone
-else's.
-
-## Local providers
-
-Two providers never leave the machine.
-
-**`say`** is built in — macOS only, no setup, no network, no quota. Output
-is `.m4a`, not `.mp3`. It uses whichever voices `say -v ?` lists on your
-Mac; set one with `[providers.say] voice = "Samantha"`.
-
-**Kokoro** is opt-in. `pip install vocalize-cli` brings none of it — no
-model weights, no extra runtime — until you ask for it:
-
-```bash
-vocalize local install
-```
-
-This prints exactly what it's about to download before asking to confirm:
-`kokoro-v1.0.onnx` (326 MB) and `voices-v1.0.bin` (28 MB) from a pinned
-GitHub release, into `~/.cache/vocalize/models/kokoro/`, plus about 230 MB
-more that `uv` fetches into its own cache (Python 3.12 and the `kokoro-onnx`
-runtime). Every file is checked against a pinned sha256 before it's kept —
-a mismatch deletes it and refuses rather than installing anything
-unverified. The runtime runs under `uv run --python 3.12`, entirely apart
-from vocalize's own environment, so installing Kokoro never touches or
-upgrades the Python vocalize itself runs in. `vocalize local status`
-reports what's present, missing, or unverified.
-
-Use it for one read with `--provider kokoro`, or add it to your chain in
-`config.toml`.
-
-Long text streams: it's broken into ~400-character pieces, and playback
-starts after the first one is ready — roughly 20–25 seconds of speech —
-instead of waiting for the whole thing to render. Measured on this Mac
-(M3): about 5x faster than real time, peaking around 760 MB of RAM (measured
-on an M4 on 2026-09-07; the M3 spike saw 870 MB) while
-rendering. `vocalize stop`, run from any terminal, halts a Kokoro read
-mid-sentence the same as any other provider.
-
-## Dictation (speech to text)
-
-Everything above turns text into speech. Dictation runs the other way:
-press a hotkey, speak, press it again, and the words land on your
-clipboard. It's [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via
-[`pywhispercpp`](https://github.com/absadiki/pywhispercpp), entirely
-on-device — nothing you say leaves the Mac unless you turn on `--cleanup`
-(below), and even then only the *transcript* goes anywhere, never the audio.
-
-### Install
-
-```bash
-vocalize local install --stt
-```
-
-A separate opt-in from Kokoro's `vocalize local install` — nothing here is
-downloaded or built until you run this. It:
-
-1. Downloads one whisper.cpp model (`large-v3-turbo-q5_0` by default, ~547 MB) from a
-   pinned Hugging Face revision, verified against a pinned sha256 before
-   it's kept.
-2. Compiles and ad-hoc signs a small Swift recorder bundle, **Vocalize
-   Recorder** — the thing that actually owns the microphone permission;
-   macOS won't grant that to a bare command-line tool.
-3. Warms the runtime, paying a one-time ~8-second Metal shader compile
-   right here, so no dictation ever stalls on it later.
-
-The first real dictation prompts for microphone access naming **"Vocalize
-Recorder"** — approve it once, like any other app's first-run permission
-prompt. Pick a different model with `--model large-v3-turbo-q5_0` (~547 MB,
-more accurate) or `--model base.en` (~141 MB, fastest, least accurate).
-
-### The hotkey
+## The menu-bar app
 
 ```bash
 vocalize app install
 ```
 
-installs and starts **Vocalize.app**, a menu-bar app that owns the
-dictation hotkey (and speak/stop) system-wide, no Services menu or
-per-app shortcut assignment needed — see [docs/app.md](docs/app.md) for
-install, uninstall, status and restart. `vocalize dictate` is the same
-command from a terminal, if you'd rather trigger it that way.
+This builds **Vocalize.app**, a menu-bar app that owns three keyboard
+shortcuts that work in any app:
 
-**Then grant Accessibility, or none of the chords fire.** System Settings →
-Privacy & Security → Accessibility → enable Vocalize, then
-`vocalize app restart`. macOS neither prompts for this nor logs the refusal,
-so an ungranted app looks exactly like a working one that ignores you.
-`vocalize app status` reports the grant; note that it can read `hotkeys: ok`
-and `accessibility: not granted` together, and the accessibility row is the
-one that matters.
-
-Prefer a Quick Action instead? That still works:
-
-```bash
-vocalize integrate claude
-```
-
-then assign a shortcut under **System Settings › Keyboard › Keyboard
-Shortcuts › Services › Text › "Dictate with Vocalize"** — ⌃⌥⌘D is free by
-default and a sensible pick.
-
-### How a dictation works
-
-- **Press** the hotkey — a Tink plays, the recorder starts, and any read
-  currently playing is stopped first (dictation and playback never
-  overlap; vocalize remembers where the read was cut off — see
-  [Continuing an interrupted read](#continuing-an-interrupted-read)).
-- **Speak.**
-- **Press again** — a Pop plays, recording stops, and the audio is
-  transcribed on-device. If anything was heard, a Glass plays and the
-  transcript is on your clipboard; nothing is typed for you automatically.
-- **Nothing heard** (silence, or a microphone that isn't actually picking
-  anything up) ends the dictation quietly — no clipboard write.
-- **Cancel** with a second press *within two seconds* of the first (but
-  not within half a second — that's a held key, and it's ignored), or at
-  any point with `vocalize listen --cancel` — the audio is discarded, never
-  transcribed.
-- **A third press while transcribing is refused**: a Pop, and "Still
-  transcribing the last dictation." Wait for the clipboard notification, or
-  `--cancel`, before dictating again.
-- Can't tell Tink from Pop from Glass yet? Set `[stt] cues = "words"` and
-  vocalize says "Start.", "Stopped.", "Ready." instead.
-
-### Saying what you meant
-
-Turn on local cleanup and dictation writes what you meant, not just what you
-said: fillers and stutters go, "Tuesday, no, Wednesday" becomes "Wednesday",
-and "nine thirty" becomes "9:30". A deterministic check keeps your own words
-whenever the cleaned text adds, drops or changes too much.
-
-```toml
-[stt]
-cleanup = "local"          # needs: vocalize local install --llm
-vocabulary = ["pyproject", "sha256", "Kokoro"]   # words whisper should expect
-warm_minutes = 15          # keep the models loaded between takes; 0 loads nothing
-```
-
-If cleanup changed a take and you wanted it word for word, run the
-**Swap in What I Said** Quick Action (or `vocalize dictate --swap`), then
-undo and paste again: your raw words were on the clipboard all along, beside
-the cleaned ones. Say "verbatim" as the first word of a take to keep every
-word from the start.
-
-### `vocalize listen`
-
-`vocalize dictate` (the hotkey's command) is `vocalize listen --toggle`
-under another name. `listen` is the general primitive:
-
-```bash
-vocalize listen                     # record until Enter/Ctrl-C, print to stdout
-vocalize listen --toggle            # start, or stop and copy to the clipboard
-vocalize listen --cancel            # discard whatever is in progress
-vocalize listen --wav clip.wav      # transcribe a file you already have
-vocalize listen --check             # microphone + install readiness
-vocalize listen --list-devices      # input device names for [stt] input_device
-vocalize listen --max-seconds 30    # cap this one recording
-```
-
-`--wav` is trusted input — the file has to be 16 kHz mono 16-bit WAV
-(exactly what the recorder, and `say --data-format=LEI16@16000`, produce);
-a malformed file gets a plain error naming the format, not a crash.
-`--cleanup` tidies the transcript with Claude before it's delivered; it
-applies to a live recording (`--toggle`/`dictate`, or plain `listen`) and
-has no effect on `--wav`, which transcribes literally. `--max-seconds`
-overrides `[stt] max_seconds` for one invocation.
-
-### Configuration: the `[stt]` table
-
-```toml
-[stt]
-model = "large-v3-turbo-q5_0"  # base.en | small.en | large-v3-turbo-q5_0 | large-v3-turbo-q8_0
-language = "en"        # a whisper.cpp language code ("auto" to detect)
-input_device = ""      # "" = system default; else an exact name from --list-devices
-cleanup = "off"        # off | local | claude-cli | anthropic — what tidies the transcript (never audio)
-verbatim = false       # true keeps every word even when cleanup is on
-beam_size = 5          # 1-8 whisper.cpp beams; 1 is the greedy decoder
-max_seconds = 120      # 1-600; the recorder self-stops here, dictate backstops it
-sounds = true          # the Tink/Pop/Glass feedback sounds
-cues = "sounds"        # "sounds" | "words" | "both" — speak "Start."/"Stopped."/"Ready." instead
-```
-
-| Key | Allowed values | Default |
-|---|---|---|
-| `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` |
-| `language` | a whisper.cpp language code (`en`, `es`, `fr`, …); an `.en` model must stay `en` | `en` |
-| `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable, can't start with `-` | `""` |
-| `cleanup` | `off`, `local`, `claude-cli`, `anthropic`; an old `true`/`false` reads as `claude-cli`/`off` | `off` |
-| `verbatim` | `true` / `false` — keep every word even when cleanup is on | `false` |
-| `beam_size` | integer, 1–8 | `5` |
-| `paste` | `true` / `false` — paste into the app you dictated in, after copying (see docs/dictation.md § Auto-paste) | `false` |
-| `max_seconds` | integer, 1–600 | `120` |
-| `sounds` | `true` / `false` | `true` |
-| `cues` | `sounds`, `words`, `both` | `sounds` |
-
-An unknown key warns on stderr; a bad value is a `ConfigError` naming it —
-every one of these becomes a subprocess argument eventually, so nothing
-here is trusted on the way in.
-
-**The input-device gotcha:** a pair of Bluetooth earbuds that are *paired*
-but not actually in your ears still shows up as the default input device —
-and delivers digital silence. If dictation keeps saying nothing was heard,
-run `vocalize listen --list-devices`, copy the real microphone's name, and
-set it:
-
-```toml
-[stt]
-input_device = "MacBook Pro Microphone"
-```
-
-### Configuration: the `[app]` table
-
-The chords the menu-bar app owns, system-wide. A change needs
-`vocalize app restart` before the app picks it up.
-
-```toml
-[app]
-dictate = "ctrl+alt+cmd+d"   # start/stop dictation
-dictate_mode = "toggle"      # toggle | hold
-speak = "ctrl+alt+cmd+s"     # speak the selection
-stop = "ctrl+alt+cmd+x"      # stop whatever is playing
-```
-
-| Key | Allowed values | Default |
-|---|---|---|
-| `dictate` | a chord, or `""` to disable | `ctrl+alt+cmd+d` |
-| `dictate_mode` | `toggle`, `hold` | `toggle` |
-| `speak` | a chord, or `""` to disable | `ctrl+alt+cmd+s` |
-| `stop` | a chord, or `""` to disable | `ctrl+alt+cmd+x` |
-
-**Chord grammar:** tokens joined by `+`. Modifiers are `ctrl`, `alt`,
-`cmd`, `shift` (long spellings `control`, `option`, `command` also work);
-the key is one of `a`-`z`, `0`-`9`, `f1`-`f12`. A chord must include
-`ctrl` or `cmd` — macOS refuses to register the rest. The three chords
-must differ from each other, and `""` disables one.
-
-A bad chord is a `ConfigError` naming the key, the value and the legal
-keys — and, like any bad config value, it stops the command you ran, so
-fix it before anything else works. `vocalize settings` prints the four
-`app.*` values in their canonical spelling.
-
-### `vocalize status`
-
-```bash
-vocalize status
-```
-
-prints one row per provider in your chain, plus four dictation rows once
-dictation has been set up at all — an `[stt]` table in your config, a
-built recorder, or a model on disk (a machine that never opted in doesn't
-get four permanent red rows for a feature nobody asked for):
-
-| Row | Reports |
+| Shortcut | Action |
 |---|---|
-| `stt model` | whether a whisper.cpp model is on disk |
-| `recorder` | whether Vocalize Recorder is built |
-| `microphone` | authorized / denied / not asked yet — from the last `listen --check`, never by launching the recorder itself |
-| `input device` | whether the configured (or default) input device is actually present |
+| Control-Option-Command-D | Start or stop dictation |
+| Control-Option-Command-S | Speak the selected text |
+| Control-Option-Command-X | Stop speaking |
 
-`--json` prints the same rows as a list. Exit code is 0 when every row —
-providers and dictation both — is `ok`, 1 otherwise, so it composes with
-`&&` in a script.
+macOS asks for two permissions, and only you can grant them:
 
-### `vocalize doctor`
+1. **Accessibility for Vocalize.app.** Without it, the shortcuts do nothing.
+   Turn it on in System Settings › Privacy & Security › Accessibility, then
+   run `vocalize app restart`.
+2. **Microphone for Vocalize Recorder.** The recorder is a small separate app
+   that `vocalize local install --stt` builds. macOS asks the first time you
+   dictate. Click Allow.
 
-Everything `status` checks plus the machine itself: the CLI's own path and
-start-up time, `uv`, `swiftc`, `claude`, the console script's interpreter,
-Hammerspoon, the app bundle and the notes folder. Every row regardless of the
-chain, exit 1 when any row fails. `--json` for scripts.
+`vocalize app status` shows whether both are in place. See
+[docs/app.md](docs/app.md).
 
-```bash
-vocalize doctor
-```
+## Claude Code and Quick Actions
 
-### Continuing an interrupted read
+`vocalize integrate claude` installs a `/speak` skill for Claude Code and
+five macOS Quick Actions (Speak with Vocalize, Stop Vocalize, Speak Latest
+Plan, Swap in What I Said, Dictate with Vocalize). They run the same local
+commands. An optional Claude Code hook that reads each response aloud can
+be installed and removed from the settings page, on a PyPI install too. See [docs/installation.md](docs/installation.md#5-vocalize-integrate-claude--claude-code-and-quick-actions).
 
-Starting a dictation stops any read in progress, but doesn't throw the rest
-of it away (DEC-003). The process that was speaking remembers exactly
-where it stopped, and once your transcript has landed, vocalize asks:
-**"Continue the read you interrupted?"** — answer, or let the dialog give
-up after 15 seconds (counted as no). From a terminal, the same thing is:
+## What local only means
 
-```bash
-vocalize pause             # pause live playback and save your place
-vocalize resume            # continue where the last read left off
-vocalize resume --forget   # discard it instead
-```
+- **No cloud engine, key or account exists in the code.**
+- **Only installing an engine uses the network**, and only when you ask:
+  `vocalize local install`, or an install button on the settings page.
+  Model files come from a pinned address. A redirect must stay on HTTPS.
+  Every model file is checked against a pinned sha256 and size before it is
+  used.
+- **Engine packages come from hash-locked lists.** Each engine gets its own
+  environment, installed from a list that pins every package by hash, with
+  no builds from source. Piper is the exception: its packages are pinned by
+  version only, not yet by hash.
+- **Every engine starts offline.** Each one is a separate process started
+  with `uv run --offline --no-python-downloads` and an environment built
+  from an allow-list, so no password or token is passed on. If an engine
+  cannot start offline, the error tells you to run `vocalize local install`
+  again. Nothing falls back to the network.
+- **The settings page and the speed-up servers stay on your Mac.** The page
+  listens only on `127.0.0.1`. The servers that keep models loaded use local
+  Unix sockets.
+- **The tests check it.** The test suite blocks every connection that is
+  not to the Mac itself. It also reads the code's imports and fails if a
+  network client is imported anywhere except in the model downloader, the
+  settings page server and the two modules of the warm servers' Unix
+  sockets.
+  That scan reads imports only, and its limits are written down in
+  `tests/test_local_only.py`. It is a check, not a proof that no connection
+  can ever be opened.
+- **Tried with the network cut off.** Kokoro, Parakeet and Whisper were run
+  with all network access denied by the macOS sandbox. All three still
+  worked.
 
-The record — one piece of audio and the text not yet spoken — lives at
-`~/.cache/vocalize/interrupted.*`, mode 0600, for at most an hour, and is
-deleted the moment you resume, decline, or `--forget` it. This is the
-interrupted *read*, not dictation audio or a transcript — see Privacy,
-below.
+What Vocalize cannot control: the clipboard is readable by other apps, and
+files saved in a synced folder (iCloud, Dropbox) leave the Mac through that
+service. Choose a transcripts folder that does not sync if that matters to
+you.
 
-### Uninstall
+## Known limits
 
-```bash
-vocalize local uninstall --stt
-```
+- Everything was measured on one Mac, a Mac Studio with 128 GB. The
+  profiles for smaller Macs are untested.
+- Not measured: the time from the end of a live dictation to text, and the
+  first start after a restart, when the model is not yet in the file cache.
+- Silent recordings are checked before they are transcribed: live takes,
+  `vocalize listen --wav` and `vocalize transcribe`. Before that check,
+  Whisper wrote "Thank you." for a silent file.
+- Faint noise with no speech in it can still get past the silence check.
+  A transcript with no letters or digits now counts as nothing heard, but
+  Whisper can do worse than that: in a final check it wrote a whole
+  invented sentence for 10 s of faint noise. Parakeet returned nothing for
+  the same file. If this matters to you, use Parakeet for dictation.
+- Nothing was measured through the microphone or the speakers.
 
-Removes the downloaded model file and the recorder bundle. The microphone
-permission grant itself stays in System Settings — remove it there
-(Privacy & Security › Microphone) if you want that gone too.
+## Development
 
-### Privacy
-
-vocalize writes no transcript to disk and shows none in a notification —
-it's held in memory and goes to your clipboard (or stdout, for
-`vocalize listen`) and nowhere else. Recorded audio lives only in a
-private temporary directory deleted the moment a dictation ends, one way
-or another (a sweep clears anything a hard kill leaves behind after 24
-hours). The **only** thing that ever leaves the machine is the transcript,
-and only when you turn on `--cleanup`: it's sent to `claude -p` with every
-tool denied, purely to fix punctuation and casing. The audio itself is
-never sent anywhere.
-
-With `cleanup = "local"` (`vocalize local install --llm`), the transcript
-stays on the machine: a local language model does the cleanup, and nothing
-is sent to any API.
-
-`--cleanup` with `claude-cli` or `anthropic` has one consequence worth
-knowing before you turn it on: Claude Code logs the prompt and stdin of
-every print-mode run, so the transcript is written in plaintext to
-`~/.claude/projects/…`. vocalize cannot suppress that. It is off by
-default. Full accounting in
-[docs/dictation.md](docs/dictation.md#privacy).
-
-## Notes (transcribe and summarize)
-
-`vocalize notes` transcribes audio recordings or text transcripts and generates structured markdown notes with timestamps and summaries:
-
-```bash
-vocalize notes recording.m4a
-vocalize notes *.mp3 --template meeting
-vocalize notes memo.txt --summarizer local
-```
-
-- **Built-in templates:** `memo` (default), `meeting`, `lecture`, `journal` (or custom `--template /path/to/prompt.md`).
-- **Summarizers:** `local` (on-device Qwen 3.5 4B), `claude-cli`, `anthropic`, or `off` (transcript only).
-- **Ledger:** The notes folder (`~/Documents/Vocalize Notes`) is the ledger — previously processed files are skipped unless `--force`.
-- **Security:** Notes are written `0600` with `trust: "untrusted-transcript"` in frontmatter.
-
-See [docs/notes.md](docs/notes.md) for full documentation.
-
-## macOS Quick Actions (highlight → speak)
-
-Four Services let you use vocalize from any app without a terminal:
-
-- **Speak with Vocalize** — highlight text anywhere, right-click →
-  Services → Speak with Vocalize. It stops whatever was already playing
-  and reads the selection. If the selection is over your cap and your
-  overflow mode is `ask`, a picker offers **Speak all**, three summary
-  depths (**light** ~25s, **medium** ~1 min, **detailed** ~2.5 min), or
-  **Truncate**. Summaries are produced by `claude -p --model haiku` (with
-  tools denied) — picking one has a few seconds of silent cold-start
-  before audio begins. If no `claude` binary was found when you ran the
-  installer, the picker simply omits the three summary depths.
-- **Stop Vocalize** — appears in every app's application menu → Services;
-  silences playback from anywhere.
-- **Speak Latest Plan** — reads the newest Claude Code plan file
-  (`~/.claude/plans/`) aloud on demand. Made for the plan-approval moment:
-  the proposal card is up, you press your shortcut, hear the plan, then
-  accept or reject. Nothing reads unless you trigger it.
-- **Dictate with Vocalize** — the dictation hotkey (see
-  [Dictation](#dictation-speech-to-text) above). Takes no input and shows
-  no window; press it, speak, press it again.
-
-Install all four:
+Python 3.10 or later. Runtime dependencies are listed in `pyproject.toml`.
 
 ```bash
-vocalize integrate claude
+ruff check .
+pytest -q
 ```
 
-This installs the `/speak` skill plus the four Quick Action bundles into
-`~/Library/Services/`, with this machine's `vocalize`, `claude`, and
-helper paths baked in (the stable symlinks, not their resolved targets —
-survives a `brew upgrade claude-code`), then refreshes the Services
-registry. Run it from a normal terminal — its PATH is what gets captured.
-To trigger the actions from the keyboard, assign shortcuts under System
-Settings → Keyboard → Keyboard Shortcuts → Services (Stop Vocalize is worth a
-shortcut of its own so you can silence a read from anywhere).
+The tests use fakes and need no model, microphone or network. Tests against
+real models are separate; see
+[docs/local-model-evaluation.md](docs/local-model-evaluation.md).
+[docs/for-reviewers.md](docs/for-reviewers.md) explains how the code is laid
+out, and [docs/roadmap.md](docs/roadmap.md) lists what is planned.
 
-Some Electron apps (Claude Code desktop among them) don't expose the
-Services menu for text selected in their own window. There, copy the
-selection and use `/speak clip` (or `vocalize clip` in a terminal)
-instead.
+## Licence
 
-## Claude Code integration
+Vocalize is MIT licensed; see [LICENSE](LICENSE). The engines and models
+keep their own licences:
 
-The hook scripts ship in the git repository, not the PyPI package — clone
-the repo to install the hook (it shells out to the `vocalize` command, so a
-pipx-installed CLI plus a cloned repo works fine together).
-
-`hooks/claude_stop_hook.py` is a [Claude Code Stop
-hook](https://docs.claude.com/en/docs/claude-code/hooks): a script Claude
-Code runs every time it finishes a response. This one reads the transcript,
-pulls out Claude's last message, and pipes it through the same `vocalize`
-CLI — so it works identically whether Claude Code is running in a bare
-terminal or inside an IDE's integrated terminal (VS Code, Cursor, etc.),
-since both use the same `~/.claude/settings.json` hook config.
-
-Whatever speaks a response is whichever provider your chain resolves to —
-`vocalize settings` now prints a `chain=` line alongside `overflow=` and
-`max_chars=`, which is how a wrapper script like `/speak` can check it.
-
-**On-demand mode.** If you'd rather trigger speech yourself than have every
-response spoken, skip the install and run the script with `--latest`. It
-finds your most recent Claude Code response — in any session — and speaks
-that one:
-
-```bash
-python3 hooks/claude_stop_hook.py --latest
-```
-
-Combine it with `VOCALIZE_MAX_CHARS` to control how much gets read.
-
-To install it as an automatic hook instead:
-
-```bash
-python3 hooks/install_hook.py
-```
-
-This merges a `Stop` hook entry into `~/.claude/settings.json` (backing up
-the existing file first) rather than overwriting your other hooks. Every
-Claude Code response after that gets spoken aloud automatically. Uninstall
-by removing the `vocalize` entry from the `Stop` array in that file.
-
-By default the hook caps each response at 500 characters before speaking
-it — a Stop hook fires after every turn, so a long response would burn
-through the ElevenLabs free-tier quota fast. That 500 is only a fallback
-(`--default-max-chars`, supplied by the hook): a `VOCALIZE_MAX_CHARS` env
-var, a `max_chars` in the config file, or an `overflow` mode of `never`
-all override it, resolved by `vocalize` itself with the usual precedence.
-
-The hook launches `vocalize` in its own session, detached from the
-terminal, so an `overflow` of `ask` degrades to truncate there instead of
-writing a Y/n prompt into the middle of a session nobody is watching. Its
-subprocess timeout scales with the length of the text being spoken (about
-twelve characters a second, plus a minute of headroom), capped at a hard
-15-minute ceiling as a watchdog against hung processes — a read that
-would outlast the ceiling is stopped there, and the whole process group
-is killed so no orphaned audio keeps playing.
-
-The hook looks up the `vocalize` binary on `PATH`, but Claude Code hooks
-run in Claude Code's own environment, not your interactive shell — if
-`vocalize` was installed into a virtualenv that isn't on that `PATH`, set
-`VOCALIZE_BIN` to the full path (e.g. `/path/to/.venv/bin/vocalize`) to
-point the hook at it directly.
-
-### Speaking files, artifacts, and more
-
-Two primitives cover almost everything: `vocalize speak-file <path>` speaks
-any local file (markdown flattened first), and the hook's `--latest` mode
-speaks the most recent Claude Code response. Anything Claude itself has to
-fetch — a claude.ai artifact, for instance — has to be fetched *by Claude*
-(the CLI has no session), summarized, written to a file, and spoken from
-the file:
-
-```bash
-vocalize speak-file /path/to/summary.txt
-```
-
-Never interpolate the summary into the command line itself — see guard 4.
-
-**Web pages.** The CLI has no URL support, by design — it can't fetch
-anything. For a URL, Claude fetches the page itself, in an isolated
-subagent with a locked-down tool set, and produces either a short spoken
-digest or a verbatim extract of the core content. That text comes back to
-the main session the same way any other summary does: written to a file
-and passed to `speak-file`.
-
-If you wire this into a slash command of your own, treat it as a security
-surface, because **every character you speak is sent to whichever provider
-in your chain ends up speaking it** — unless that provider is `say` or
-`kokoro`. The guard principles that matter, in order:
-
-1. Resolve paths (`realpath`, expand `~`, casefold) and check an
-   **allow-list** of speakable directories — symlinks and `../` defeat
-   string matching on the raw argument.
-2. Hard-refuse secret-shaped files (`.env*`, keys, credentials) and your
-   sensitive directories; confirm before speaking anything else unusual.
-3. Summarize long or fetched content in an **isolated subagent** that
-   returns only the summary — content you fetched can carry instructions
-   aimed at your session.
-4. Pass summaries as a file path (as above) — never build the shell
-   command by interpolating model-written text into a quoted string. A
-   summary a model wrote can contain `$(...)`, and the shell will run it;
-   `printf '%s' "<summary>"` is exactly that bug.
-5. Confirm before any read that will spend real quota; a free tier is
-   10,000 characters a month.
-6. Remember the disk cache: everything spoken leaves an mp3 under
-   `~/.cache/vocalize/`.
-7. Fetching is a second egress. Fetch only the URL the user typed — a page
-   can carry text telling its reader to fetch another URL, with data
-   smuggled out in the query string.
-8. Refuse non-public hosts. `localhost` and `169.254.169.254` are
-   reachable from your machine and nowhere else; parse the URL with the
-   `ipaddress` module rather than pattern-matching the string.
-
-## How it's built
-
-Four decisions shaped the design:
-
-- **The markdown flattener is a pure function.** The hardest logic in the
-  project — deciding what a table, list, or code block should *sound* like —
-  takes a string and returns a string. No I/O, no client, no key. That's why
-  it has the deepest test coverage in the repo, including the edge cases
-  that bit during review: prose containing a stray `|`, single-dash GFM
-  separators, ragged rows, duplicate column names.
-- **One code path for humans and hooks.** The Claude Code hook doesn't
-  reimplement synthesis; it shells out to the same `vocalize` CLI you'd
-  type by hand (with an `--` argv guard so a response starting with a
-  bullet isn't parsed as a flag). Anything the hook can do, you can
-  reproduce and debug from your own terminal.
-- **The hook may fail; the session may not.** Every failure path in the
-  Stop hook logs one line to stderr and exits 0. A dead API key or a hung
-  request costs you the audio, never the coding session.
-- **The cache is an optimization, never a failure source.** Synthesis
-  results are content-addressed on disk; an unreadable or unwritable cache
-  degrades to a fresh API call instead of an error.
-
-## Architecture
-
-```
-vocalize/
-  __init__.py     # package version
-  __main__.py     # python -m vocalize entry point
-  preprocess.py   # markdown -> speakable text (pure function, fully unit tested)
-  config.py       # API key resolution + settings: flag > env > config.toml > default
-  exceptions.py   # VocalizeError / TTSRequestError / typed ProviderError family
-  tts.py          # ElevenLabs API wrapper (client is injected, so
-                   # it's mockable in tests without hitting the network)
-  cache.py        # disk cache: cache_key/get/put, shared by every provider
-  chain.py        # tries each provider in the chain in turn until one speaks
-  ledger.py       # ~/.cache/vocalize/usage.json — local monthly budget tracking
-  providers/      # elevenlabs.py, openai.py, google.py, polly.py, say.py, kokoro.py
-  local/          # opt-in download/verify + the uv-run worker scripts —
-                   # kokoro_manifest.py/kokoro_worker.py (TTS) and
-                   # whisper_manifest.py/whisper_worker.py (dictation)
-  recorder/       # VocalizeRecorder.swift + Info.plist.in — the ad-hoc-signed
-                   # .app bundle that owns the microphone permission
-  audio.py        # save to disk + play via the OS's native player
-                   # (afplay / mpg123 / ffplay / PowerShell, whichever exists)
-  dictate.py      # the hotkey's toggle state machine: record, transcribe,
-                   # clipboard — nothing here ever becomes a file or a log line
-  interrupted.py  # the record of a read a dictation interrupted, and the
-                   # slice `vocalize resume` plays to continue it
-  readiness.py    # vocalize status's per-provider + per-dictation-row probes,
-                   # each on a timed daemon thread so a wedged keychain or
-                   # microphone check can never hang the command
-  cli.py          # click-based CLI wiring the above together
-hooks/
-  claude_stop_hook.py  # Claude Code Stop hook -> calls the vocalize CLI
-  install_hook.py      # safely merges the hook into ~/.claude/settings.json
-tests/                  # pytest, all mocked — no API key, network, or
-                        # microphone needed to run these
-```
-
-## Testing
-
-```bash
-pip install -e ".[dev]"
-pytest
-```
-
-Over 1,180 tests, all offline: the ElevenLabs client is dependency-injected
-into `tts.py`, so tests pass in a fake client instead of hitting the real
-API, and dictation's tests fake the recorder (a tiny shell script honoring
-a stop file) and the whisper worker instead of touching a microphone or a
-model.
-
-## Known limitations
-
-- **Charts and images aren't described.** Flattening markdown tables is a
-  text problem; a rendered chart is an image, and describing it well needs
-  a vision model in the loop, not a text transform. That's out of scope for
-  the CLI itself, but the next step now lives outside it, where it belongs:
-  the `/speak` command's web-page mode renders a page in a browser, hands it
-  to a vision-capable subagent, and the diagram description comes back as
-  plain text — same as any other content this tool speaks.
-- **Free tier is 10,000 characters/month** — plenty for reading a handful
-  of documents aloud, not for continuous use. `--max-chars` and the disk
-  cache both help stretch it.
-- Table flattening handles standard GFM pipe tables; it doesn't attempt to
-  handle merged cells or nested tables (rare enough in practice that it
-  wasn't worth the complexity).
-- **Windows playback is untested.** The PowerShell `SoundPlayer` fallback
-  only plays WAV, so the mp3 files this tool generates likely won't play
-  there. Use `--no-play` and open the saved file with whatever's on hand.
-- **The disk cache under `~/.cache/vocalize` grows unbounded.** It's
-  content-addressed (keyed by a hash of text, voice, model, format, and
-  speed), so it's always safe to delete — except `bin/`, which holds
-  Vocalize Recorder and is tied to your microphone grant; deleting that
-  forces a rebuild and a re-grant. Delete anything else and nothing will
-  break, you'll just re-pay for a re-synthesized clip.
-- **`--api-key` on the command line is visible to other local processes**
-  (anything that can run `ps`). Prefer `vocalize auth login`, the
-  `ELEVENLABS_API_KEY` environment variable, or a `.env` file instead.
-- `vocalize voices` lists only the first page of results from the
-  ElevenLabs API.
-- **A chain is multi-vendor egress.** A fallback chain can send the same
-  text to more than one cloud vendor before one of them succeeds — see
-  [Providers and fallback](#providers-and-fallback).
-- **The usage ledger is local and an estimate, not a bill.** It doesn't see
-  what your vendor actually charges, doesn't know about usage from another
-  machine, and a cached (repeat) request isn't counted at all.
-- **Polly ignores `--speed`.** Its rate control needs SSML, which this
-  release doesn't wrap plain text into; `[providers.polly]` has no speed
-  knob yet.
-- **Joined MP3 chunks are a byte concatenation, not a re-encode.** Most
-  players handle it fine, but the frame boundary between chunks can
-  occasionally produce an audible click.
-- **`vocalize config`'s wizard only sets up ElevenLabs.** Configure the rest
-  of the chain with `vocalize chain` or by hand-editing `config.toml`.
-- **Kokoro needs `uv`**, and its shipped pack carries 54 voices across nine
-  languages but is phonemized for `en-us` unless you set `language` under
-  `[providers.kokoro]` to match a non-English voice; it's opt-in for a
-  reason — see [Local providers](#local-providers).
-- **A locked or first-use macOS keychain blocks silently.** Reading a stored
-  key can raise a macOS permission dialog ("python wants to use your
-  confidential information"); until you click Always Allow, every command
-  that needs that key waits. Click it once per Python binary, or supply the
-  key through its environment variable instead.
-- **Dictation is macOS only.** It depends on `AVFoundation`, LaunchServices,
-  and a Swift-compiled `.app` bundle for the microphone permission — there's
-  no equivalent path on Linux or Windows.
-- **Rebuilding the recorder means re-granting the microphone.** Vocalize
-  Recorder's ad-hoc code signature is what macOS ties the permission grant
-  to; when its Swift source changes (a vocalize upgrade that touches it),
-  `vocalize local install --stt` rebuilds the bundle and warns you to
-  re-approve it in System Settings › Privacy & Security › Microphone. An
-  install that doesn't change the source never re-signs, so this isn't
-  every upgrade — only ones that touch the recorder.
-- **The smaller models mishear jargon.** `large-v3-turbo-q5_0` is the
-  default because it was the first model to keep "the merge" as two words
-  on the owner's own voice; `small.en` (465 MB) is the lighter choice for a
-  slow Mac but can mangle project-specific words (`pyproject`, a function
-  name) — stay on the default for accuracy, or turn on
-  `[stt] cleanup` so Claude fixes obvious transcription noise before it
-  reaches your clipboard (it still can't guess a word it never heard
-  correctly).
-
-## License
-
-MIT
+- Kokoro's phonemizer and the espeak-ng library bundled with it are
+  GPL-3.0-or-later. They run only inside the separate Kokoro worker process.
+- Piper's engine is GPL-3.0-or-later. It also runs only in its own process.
+- Parakeet's weights are CC-BY-4.0.

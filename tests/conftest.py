@@ -1,3 +1,5 @@
+import ipaddress
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -7,6 +9,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 import pytest
 
 import vocalize.audio as audio_module
+
+
+@pytest.fixture(autouse=True)
+def _bounded_evaluation(request, monkeypatch):
+    """Only opted-in evals may restore real caches, and only under supervision."""
+    if request.node.get_closest_marker("eval") is None:
+        return
+    from eval_runner import contained_popen, owned_group
+
+    from vocalize import llm
+
+    owned_group()
+    monkeypatch.setattr(subprocess, "Popen", contained_popen(subprocess.Popen))
+    # The outer supervisor owns the whole group. Production's per-worker
+    # killpg must not target this shared group; worker argv and inference stay
+    # unchanged. This evaluation therefore does not qualify production teardown.
+    monkeypatch.setattr(llm, "LOCAL_RUN_SEAM", subprocess.run)
 
 
 class FakeToolchain:
@@ -49,10 +68,56 @@ class FakeToolchain:
         return [Path(argv[0]).name for argv, _ in self.calls]
 
 
+_LOOPBACK_NAMES = {"localhost", "localhost.", "ip6-localhost"}
+
+
+def _is_loopback(host) -> bool:
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    if not isinstance(host, str):
+        return False
+    if host.lower() in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False  # any other name would need DNS: that is the network too
+
+
 @pytest.fixture(autouse=True)
-def _no_dotenv(monkeypatch):
-    """Prevent tests from loading the developer's real .env file."""
-    monkeypatch.setattr("vocalize.config._load_dotenv_if_present", lambda: None)
+def _no_network(monkeypatch):
+    """Fail any test that tries to reach a host other than this machine.
+
+    The suite runs with network sockets disabled (design.md § Local-only
+    contract): a test that would download a model or call a hosted API
+    fails loudly here instead of quietly using the network. Loopback
+    (the settings page) and Unix sockets (the warm workers) stay open.
+    `pytest.fail` raises a BaseException, so code that swallows
+    `Exception` cannot hide the attempt.
+    """
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def _check(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            host = address[0] if isinstance(address, tuple) and address else address
+            if not _is_loopback(host):
+                pytest.fail(
+                    f"test tried to open a non-loopback network connection to {address!r}; "
+                    "the suite runs offline — fake the call instead",
+                    pytrace=False,
+                )
+
+    def connect(self, address):
+        _check(self, address)
+        return real_connect(self, address)
+
+    def connect_ex(self, address):
+        _check(self, address)
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
 
 
 @pytest.fixture(autouse=True)
@@ -60,8 +125,7 @@ def _no_real_config_file(monkeypatch, tmp_path):
     """Keep every test off the developer's real ~/.config/vocalize/config.toml.
 
     `config_path()` reads `XDG_CONFIG_HOME`, so pointing that at tmp_path
-    is the whole isolation. Autouse for the same reason as the keychain
-    fixture: a real `[stt] input_device` or `chain` on this machine would
+    is the whole isolation. A real `[stt] input_device` or `chain` on this machine would
     otherwise reach a command under test and turn an assertion green (or
     red) for a reason that has nothing to do with the code. A test that
     wants a config writes one into this directory.
@@ -84,46 +148,11 @@ def _no_real_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
-class _FakeKeychain(dict):
-    """The stored entries, plus the switches a test needs to break them."""
-
-    deny_delete = False
-    deny_read = False  # a locked keychain: every read raises, nothing is absent
-
-
-class _FakeKeyring:
-    """An in-memory stand-in for the keyring module's three calls."""
-
-    def __init__(self, store):
-        self._store = store
-
-    def get_password(self, service, username):
-        if self._store.deny_read:
-            from keyring.errors import KeyringError
-
-            raise KeyringError("User interaction is not allowed.")
-        return self._store.get((service, username))
-
-    def set_password(self, service, username, password):
-        self._store[(service, username)] = password
-
-    def delete_password(self, service, username):
-        from keyring.errors import PasswordDeleteError
-
-        if self._store.deny_delete:
-            # The macOS backend's worst habit: a denied or locked keychain
-            # raises the very same error a missing entry does, while the
-            # entry is still sitting there.
-            raise PasswordDeleteError("failed to delete password")
-        if self._store.pop((service, username), None) is None:
-            raise PasswordDeleteError("no such password")
-
-
 @pytest.fixture(autouse=True)
 def _no_real_playback_lock(monkeypatch, tmp_path):
     """Keep every test off the real playback lock at ~/.cache/vocalize.
 
-    Autouse for the same reason as the ledger fixture: a real lock held by
+    Autouse to isolate application state: a real lock held by
     an actual read on the developer's machine would otherwise make any
     play() test block until the audio finished — a hang with no error.
     """
@@ -141,21 +170,10 @@ def _no_real_playback_lock(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_ledger(monkeypatch, tmp_path):
-    """Keep every test off the real usage ledger at ~/.cache/vocalize.
-
-    Autouse for the same reason as fake_keychain: a real usage.json on the
-    developer's machine could satisfy or skew a status()/record() call and
-    quietly turn a test green (or exhausted) for the wrong reason.
-    """
-    monkeypatch.setattr("vocalize.ledger.DEFAULT_CACHE_DIR", tmp_path)
-
-
-@pytest.fixture(autouse=True)
-def _no_real_model_cache(monkeypatch, tmp_path):
+def _no_real_model_cache(monkeypatch, tmp_path, request):
     """Keep every test off the real model caches at ~/.cache/vocalize/models.
 
-    Autouse for the same reason as the ledger and playback-lock fixtures:
+    Autouse for the same reason as the playback-lock fixture:
     a test that forgets to override a manifest's MODEL_DIR (or does not
     need to, like a `local status` test focused on the other manifest)
     would otherwise stat — or worse, delete — the developer's real Kokoro,
@@ -164,11 +182,42 @@ def _no_real_model_cache(monkeypatch, tmp_path):
     needs a populated or specifically-shaped directory still overrides
     this with its own monkeypatch, applied after this one.
     """
-    from vocalize.local import kokoro_manifest, llm_manifest, whisper_manifest
+    from vocalize.local import (
+        kokoro_manifest,
+        llm_manifest,
+        parakeet_manifest,
+        piper_manifest,
+        whisper_manifest,
+    )
+
+    if request.node.get_closest_marker("eval") is None:
+        for name in ("VOCALIZE_LLM_PYTHON", "VOCALIZE_WHISPER_PYTHON", "_VOCALIZE_RUNTIME_IDENTITY"):
+            monkeypatch.delenv(name, raising=False)
 
     monkeypatch.setattr(kokoro_manifest, "MODEL_DIR", tmp_path / "default-kokoro-cache")
+    monkeypatch.setattr(llm_manifest, "MODEL_DIR", tmp_path / "default-qwen-cache")
     monkeypatch.setattr(whisper_manifest, "MODEL_DIR", tmp_path / "default-whisper-cache")
-    monkeypatch.setattr(llm_manifest, "MODEL_DIR", tmp_path / "default-llm-cache")
+    monkeypatch.setattr(piper_manifest, "MODEL_DIR", tmp_path / "default-piper-cache")
+    monkeypatch.setattr(parakeet_manifest, "MODEL_DIR", tmp_path / "default-parakeet-cache")
+    # Parakeet is the default engine only where it can run. Pinning this
+    # False keeps the whisper tests identical on every machine; the
+    # Parakeet tests turn it back on.
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_warm_workers(monkeypatch, tmp_path):
+    """Keep model requests and stop markers off the user's warm workers."""
+    from vocalize.local import warm, warm_protocol
+
+    monkeypatch.setattr(
+        warm_protocol, "warm_dir",
+        lambda base=None: Path(base) if base is not None else tmp_path / "warm",
+    )
+    # tmp_path is often too long for a Unix socket. The short fallback
+    # folder lives in a shared temporary directory, so it is off unless a
+    # test turns it on: a too-long path keeps meaning "no warm server".
+    monkeypatch.setattr(warm, "_fallback_parents", list)
 
 
 @pytest.fixture(autouse=True)
@@ -189,7 +238,7 @@ def _no_real_recorder_bin(monkeypatch, tmp_path):
 def _no_real_audio_cache(monkeypatch, tmp_path):
     """Keep the portal's previews out of the real audio cache.
 
-    Autouse for the same reason as the ledger fixture, and sharper: a
+    Autouse for the same reason as the playback-lock fixture, and sharper: a
     preview writes a *fake* provider's bytes into `~/.cache/vocalize`
     under the cache key of a real voice's settings, and the developer's
     next real `vocalize speak` of that sentence would play them back.
@@ -261,17 +310,3 @@ def fake_browser(monkeypatch):
         webbrowser, "open", lambda url, *a, **k: (opened.append(url), True)[1]
     )
     return opened
-
-
-@pytest.fixture(autouse=True)
-def fake_keychain(monkeypatch):
-    """Keep every test off the real OS keychain.
-
-    Autouse because the damage of missing one is silent: a stored key on
-    the developer's machine would otherwise satisfy resolve_api_key and
-    quietly turn the "no key found" tests green for the wrong reason.
-    Request it by name to seed, inspect, or break the store.
-    """
-    store = _FakeKeychain()
-    monkeypatch.setattr("vocalize.auth._backend", lambda: _FakeKeyring(store))
-    return store

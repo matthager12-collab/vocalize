@@ -3,15 +3,170 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 1.0.0 - 2026-11-21
+
+This release makes Vocalize local only. It does two things, text to speech
+and speech to text, and every model runs on your Mac. If you use cloud
+voices, keys, usage budgets, summaries or note templates, stay on 0.15:
+`uv tool install 'vocalize-cli==0.15.0'`.
+
+### Upgrading from 0.15
+
+- **Install every engine once more.** 1.0.0 runs each engine from its own
+  hash-locked environment, and an install from 0.15 does not have one.
+  Until you install again, speech falls back to the macOS voice and
+  dictation reports that it is not ready. Run `vocalize local install` for
+  Kokoro; `vocalize local install --stt` for dictation (on Apple Silicon
+  this installs Parakeet, a 2.3 GB download; add `--engine whisper` to keep
+  Whisper); and `vocalize local install --llm` if you use cleanup. Model
+  files already on disk are checked and not downloaded again.
+- **Replace the `/speak` skill.** Run `vocalize integrate claude --yes`
+  once. The old skill file still describes web and summary modes that
+  Vocalize no longer has, and the settings page button keeps an existing
+  file.
+
+### Removed
+
+- **Cloud voices.** ElevenLabs, OpenAI, Google Cloud TTS and Amazon Polly are
+  gone. The voice chain holds only `kokoro`, `piper` and `say`.
+- **API keys and accounts.** `vocalize auth`, the Keys tab of the settings
+  page and every credential lookup are gone. Vocalize no longer reads any
+  key, and it does not delete keys you stored before.
+- **Usage budgets.** `vocalize usage` and the monthly character budgets are
+  gone.
+- **Summaries and note templates.** `vocalize summarize-text`, the summaries
+  in `vocalize notes`, the note templates, the summary choices in the Speak
+  Quick Action and the digest and web modes of the `/speak` skill are gone.
+  Optional on-device cleanup of dictation stays.
+- **Hosted cleanup.** Dictation cleanup runs only with the on-device model
+  (`[stt] cleanup = "local"`) or not at all.
+- **Five settings that did nothing.** `providers.kokoro.model`,
+  `providers.piper.model`, `providers.say.model`, `providers.piper.language`
+  and `providers.say.language` are retired, along with the `--model` option
+  of `speak`, `speak-file` and `clip` and the `VOCALIZE_MODEL` variable. An
+  old config file that has them loads with a notice.
+- **The usage counter.** Vocalize no longer writes a usage count file.
+- **Leftover files.** The `.env.example` file is gone, and `docs/plans` and
+  `docs/research` are no longer in the source archive.
 
 ### Changed
 
-- **Tables read aloud with clear pauses.** A table now opens with its size
-  and column names, reads each row as its own numbered paragraph with a full
-  stop between cells ("Row 1: Plan A. Cost: $5. Time: 2 weeks."), and closes
-  with "End of table." Every engine pauses at a paragraph break and a full
-  stop, so rows and columns are audibly separate.
+- **`vocalize notes` is now `vocalize transcribe`.** It writes a transcript
+  with no summary. `vocalize notes` still works as a hidden alias and ignores
+  `--template` and `--summarizer`. The `[notes]` config table is read as
+  `[transcribe]`, and `vocalize settings` still prints
+  `notes.summarizer=off`. Files a 0.15 run already processed are not
+  transcribed again.
+- **Old config files still load.** A setting that no longer exists, such as
+  a cloud provider table, a cloud entry in `chain`, a flat `voice`, `model`
+  or `speed`, or `cleanup = "claude-cli"`, prints a notice and is ignored.
+  The chain falls back to local engines and cleanup to `off`. A bad value
+  for a setting that still exists is still an error. The next save from
+  Vocalize writes the file without the retired settings.
+- **A config file is backed up once.** A save does not keep comments or
+  retired settings, so before the first save over a file that has them,
+  Vocalize keeps one copy, `config.toml.bak` (readable only by you). An
+  existing backup is never replaced. The copy holds everything the old file
+  held, which can include a service key from an older version; delete it
+  when you no longer need it.
+- **An unknown table no longer blocks a save.** A config file with a table
+  Vocalize does not know can be saved from the settings page.
+- **`vocalize local uninstall` matches the settings page.** It removes what
+  the page's remove buttons remove: an engine, one Whisper model, or the
+  cleanup model, each with its environment.
+- **`vocalize listen --wav` keeps models loaded** for `[stt] warm_minutes`,
+  as a live take does. Parakeet is never kept loaded.
+- **The studio profile** uses Parakeet for dictation and files, keeps the
+  cleanup model loaded for four hours, uses the default Whisper beam size,
+  and recommends installing the large-v3-turbo-q8_0 Whisper model for use
+  if you switch the engine to Whisper.
+- **`vocalize transcribe` under `engine = "auto"`** uses Whisper when a
+  Whisper model is installed, otherwise Parakeet.
+- **The settings page is rebuilt.** It is one page, with no tabs: a machine
+  profile box, then the sections Speaking, Reading, Dictation,
+  Transcription, Hotkeys, Engines and Advanced. The page, the config
+  checks, the config writer, `vocalize settings` and the README's settings
+  table are all generated from one list of settings, so every setting has a
+  control. Saves go through one route and refuse to overwrite a file that
+  changed since the page read it.
+- **Engines are installed from hash-locked lists.** Each engine (Kokoro,
+  Parakeet, Whisper and the cleanup model) gets its own environment, built
+  from a list that pins every package by hash, with no builds from source.
+  Piper's packages are pinned by version only, not yet by hash. The install
+  step passes uv only the environment variables it needs.
+- **Model downloads are stricter.** Model files come from a pinned address,
+  a redirect must stay on HTTPS, and every file is checked against a pinned
+  sha256 and size before it is used.
+- **Engines run offline.** Every engine starts with
+  `uv run --offline --no-python-downloads` and an environment built from an
+  allow-list, so no keys or tokens are passed on. If one cannot start, the
+  error tells you to run `vocalize local install` again. Only installing an
+  engine downloads anything.
+- **Engine workers refuse unsafe input.** Each worker refuses a model folder
+  or file that is not an absolute path to something that exists, a cleanup
+  model folder that contains Python code, and a recording that is not a
+  plain WAV file of a sane size. A refusal prints one fixed line that names
+  no path.
+- **Tables are read row by row.** A table is announced with its size and
+  column names, each row is read as its own numbered paragraph
+  ("Row 1: Plan A. Cost: $5."), and "End of table." marks where it stops.
+- **Package metadata.** The package now says it is for macOS, not for any
+  operating system.
+
+### Added
+
+- **Parakeet for dictation.** On Apple Silicon, `vocalize local install --stt`
+  installs Parakeet (`--engine whisper` for Whisper). `[stt] engine` is
+  `auto`, `parakeet` or `whisper`; `auto` uses Parakeet only when it is
+  installed, so existing Whisper installs keep working.
+- **Parakeet for file transcription.** With `[stt] engine = "parakeet"`,
+  `vocalize transcribe` uses Parakeet and writes timestamped lines, long
+  recordings included. A long file is cut into overlapping pieces, and the
+  spoken order is kept at each join.
+- **Vocabulary corrections for every engine.** The `[stt] vocabulary` list
+  now corrects the transcript after either engine, in dictation and in
+  `vocalize transcribe`: one to four heard words that spell a term's letters
+  and digits are replaced by the term as you wrote it. Whisper still gets
+  the list as a hint as well.
+- **Machine profiles.** Four presets, small, standard (16 GB and up), large
+  (32 GB and up) and studio (64 GB and up), set the speech-to-text engine,
+  Whisper model and beams, how long models stay loaded, and cleanup. The
+  settings page suggests one for your Mac and applies it with a button.
+  The values are provisional until measured on smaller Macs.
+- **Unload kept models.** `vocalize local stop`, and a button on the
+  settings page, unload the models kept in memory between takes.
+- **A button for every install, removal and integration.** The settings page
+  can install and remove Kokoro, Piper voices, Parakeet, each Whisper model
+  and the cleanup model; preview a voice; install, restart and remove the
+  menu-bar app; install and remove the Quick Actions, the `/speak` skill and
+  the Claude Code hook (on a PyPI install too); and clear the audio cache. The two macOS permission
+  switches cannot be set by any program, so the page links to them.
+- **Piper, an optional voice.** `vocalize local install --piper
+  [--voice lessac|ryan]`, then `--provider piper`. Each voice's licence is
+  shown before the download, and Piper runs as a separate program. Kokoro
+  stays the default.
+
+### Fixed
+
+- **Silence.** Whisper wrote "Thank you." for a silent file. Live takes,
+  `vocalize listen --wav` and `vocalize transcribe` now check for silence
+  first, and a transcript with no letters or digits counts as nothing
+  heard. Known limit: Whisper can still write invented words for faint
+  noise with no speech in it; Parakeet did not.
+- **`vocalize listen --wav`** accepts a relative path, and `--cleanup` now
+  cleans up a file take too.
+- **First audio comes sooner.** The first piece of a text is short, so
+  Kokoro starts speaking sooner: 0.24 to 0.63 s with the model loaded on a
+  Mac Studio, against 2.4 to 4.9 s for a test build that still used long
+  first pieces.
+- **The warm server starts with a long home folder path.** When the usual
+  socket path is too long, it uses a short private folder instead.
+- **An engine that cannot start offline says how to fix it.** It used to
+  fail with a general error; it now tells you to run `vocalize local
+  install` again.
+- **The tests stay out of your home folder.** The test suite no longer
+  reads or writes the real home folder, the installed cleanup model or any
+  running warm server.
 
 ## 0.15.0 - 2026-09-28
 

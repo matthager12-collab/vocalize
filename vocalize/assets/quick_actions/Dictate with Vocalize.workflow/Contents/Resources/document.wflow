@@ -61,10 +61,8 @@
 					<key>COMMAND_STRING</key>
 					<string># No input: one press starts a dictation, the next stops it.
 # A Services environment has almost nothing on PATH, so the optional
-# cleanup pass is handed claude's location rather than left to find it.
+# cleanup runs locally through the Vocalize CLI.
 BIN="__VOCALIZE_BIN__"
-export CLAUDE_BIN="__CLAUDE_BIN__"
-export CLAUDE_EXTRA_PATH="__CLAUDE_EXTRA_PATH__"
 if [[ -x "$BIN" ]]; then
   exec "$BIN" dictate &gt;/dev/null 2&gt;&amp;1
 fi

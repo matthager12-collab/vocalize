@@ -447,7 +447,7 @@ def test_the_dictate_command_passes_the_cleanup_flag_through(monkeypatch):
 
     CliRunner().invoke(main, ["dictate", "--cleanup", "--verbatim", "--max-seconds", "45"])
 
-    assert calls[0]["cleanup"] == "claude-cli"  # a bare --cleanup keeps its 0.10 meaning
+    assert calls[0]["cleanup"] == "local"
     assert calls[0]["verbatim"] is True
     assert calls[0]["max_seconds"] == 45
 
@@ -509,12 +509,58 @@ def test_the_wav_flag_transcribes_the_named_file(monkeypatch, tmp_path):
 
     clip = tmp_path / "clip.wav"
     clip.write_bytes(b"")
-    monkeypatch.setattr(dictate, "transcribe_wav", lambda path, stt: f"read {path.name}")
+    monkeypatch.setattr(dictate, "transcribe_wav", lambda path, stt, **kw: f"read {path.name}")
 
     result = run("--wav", str(clip))
 
     assert result.exit_code == 0
     assert result.output.strip() == "read clip.wav"
+
+
+def test_the_wav_flag_hands_on_an_absolute_path(monkeypatch, tmp_path):
+    """F1: the worker runs in another folder, so a relative name must not leave the CLI."""
+    seen = []
+    monkeypatch.setattr(dictate, "transcribe_wav", lambda path, stt, **kw: seen.append(path) or "ok")
+    monkeypatch.chdir(tmp_path)
+
+    result = run("--wav", "clip.wav")
+
+    assert result.exit_code == 0
+    assert seen == [tmp_path / "clip.wav"] and seen[0].is_absolute()
+
+
+def test_a_silent_wav_prints_no_words_and_says_so_on_stderr(monkeypatch, tmp_path):
+    """F2: silence gives no words (not "Thank you."), and ends like "Nothing heard."."""
+    monkeypatch.setattr(dictate, "transcribe_wav", lambda path, stt, **kw: "")
+
+    result = run("--wav", str(tmp_path / "quiet.wav"))
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert dictate.WAV_SILENT_NOTICE in result.stderr
+
+
+def test_a_wav_cleanup_that_did_not_run_is_reported_on_stderr(monkeypatch, tmp_path):
+    def fake(path, stt, *, notice=None):
+        assert stt["cleanup"] == "local"  # --cleanup reaches the file path
+        notice(dictate.WAV_CLEANUP_SKIPPED_NOTICE)
+        return "as heard"
+
+    monkeypatch.setattr(dictate, "transcribe_wav", fake)
+
+    result = run("--wav", str(tmp_path / "take.wav"), "--cleanup")
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "as heard"
+    assert dictate.WAV_CLEANUP_SKIPPED_NOTICE in result.stderr
+
+
+def test_a_missing_wav_says_so_through_the_command(tmp_path):
+    result = run("--wav", str(tmp_path / "nowhere.wav"))
+
+    assert result.exit_code == 1
+    assert "does not exist" in result.output
+    assert "failed to run" not in result.output
 
 
 def test_a_malformed_wav_is_a_clean_error_not_a_traceback(tmp_path, monkeypatch):
@@ -590,3 +636,57 @@ def test_a_recorder_that_never_reports_records_an_incomplete_install(fake_open):
     run("--check")
 
     assert dictate.read_mic_status() == "incomplete"
+
+
+# --- where the warm sockets are (Mac Studio run, F3) -------------------
+
+
+def _warm_line(output: str) -> str:
+    return next(line for line in output.splitlines() if line.startswith("Warm sockets:"))
+
+
+def test_the_check_names_the_warm_socket_folder(fake_open, monkeypatch):
+    import tempfile
+    from pathlib import Path
+
+    from vocalize.local import warm_protocol
+
+    with tempfile.TemporaryDirectory(prefix="vw", dir="/tmp") as short:
+        monkeypatch.setattr(warm_protocol, "warm_dir", lambda base=None: Path(short))
+
+        fake_open()
+        line = _warm_line(run("--check").output)
+
+    assert line == f"Warm sockets: {short}"
+
+
+def test_the_check_says_when_the_sockets_moved_to_a_short_folder(fake_open, monkeypatch):
+    import tempfile
+    from pathlib import Path
+
+    from vocalize.local import warm, warm_protocol
+
+    with tempfile.TemporaryDirectory(prefix="vw", dir="/tmp") as short:
+        long_dir = Path(short) / ("d" * 60) / ("e" * 60)
+        monkeypatch.setattr(warm_protocol, "warm_dir", lambda base=None: long_dir)
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [short])
+
+        fake_open()
+        line = _warm_line(run("--check").output)
+
+    assert line.startswith(f"Warm sockets: {short}/vocalize-")
+    assert "too long for a socket" in line
+    assert "no warm server can start" not in line
+
+
+def test_the_check_says_when_no_warm_server_can_start(fake_open, monkeypatch):
+    from pathlib import Path
+
+    from vocalize.local import warm_protocol
+
+    monkeypatch.setattr(warm_protocol, "warm_dir", lambda base=None: Path("/" + "x" * 120))
+
+    fake_open()
+    line = _warm_line(run("--check").output)
+
+    assert "no warm server can start" in line and "too long" in line

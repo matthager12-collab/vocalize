@@ -68,10 +68,12 @@ def _run(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
             argv, capture_output=True, text=True, timeout=_TIMEOUT_SECONDS, check=False
         )
-    except subprocess.TimeoutExpired as exc:
-        raise ProviderTransientError(NAME, "say timed out") from exc
-    except OSError as exc:
-        raise ProviderTransientError(NAME, f"could not run say: {exc.__class__.__name__}") from exc
+    except subprocess.TimeoutExpired:
+        raise ProviderTransientError(NAME, "say timed out") from None
+    except (OSError, subprocess.SubprocessError):
+        raise ProviderTransientError(
+            NAME, "could not run say; check macOS speech availability"
+        ) from None
 
 
 def synthesize(text: str, settings: Settings) -> bytes:
@@ -96,13 +98,14 @@ def synthesize(text: str, settings: Settings) -> bytes:
 
         result = _run(argv)
         if result.returncode != 0:
-            stderr = (result.stderr or "").strip().splitlines()
-            raise ProviderTransientError(NAME, stderr[0] if stderr else "say failed")
+            raise ProviderTransientError(
+                NAME, "say synthesis failed; check the selected macOS voice"
+            )
 
         try:
             audio = out.read_bytes()
-        except OSError as exc:
-            raise ProviderTransientError(NAME, "say wrote no audio file") from exc
+        except OSError:
+            raise ProviderTransientError(NAME, "say wrote no audio file") from None
 
     if not audio:
         raise ProviderTransientError(NAME, "say produced no audio")

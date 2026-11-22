@@ -37,6 +37,67 @@ def _already_installed(settings: dict) -> bool:
     return False
 
 
+def _is_ours(hook) -> bool:
+    return isinstance(hook, dict) and str(HOOK_SCRIPT) in str(hook.get("command", ""))
+
+
+def installed() -> bool:
+    """Whether the Stop hook is in the settings file. Never exits: a file
+    that is missing or not valid JSON simply has no hook in it."""
+    try:
+        settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(settings, dict):
+        return False
+    try:
+        return _already_installed(settings)
+    except (AttributeError, TypeError):
+        return False
+
+
+def _backup() -> Path:
+    backup = SETTINGS_PATH.with_suffix(f".json.bak.{int(time.time())}")
+    shutil.copy2(SETTINGS_PATH, backup)
+    print(f"Backed up existing settings to {backup}")
+    return backup
+
+
+def remove() -> int:
+    """Take out exactly the Stop hook entries `main()` adds — those whose
+    command runs this checkout's hook script — and leave every other hook
+    and setting as it was. A Stop group left empty by that goes too, and
+    so do a `Stop` list and a `hooks` table left empty. Backs the file up
+    first, like `main()`."""
+    settings = _load_settings()
+
+    if not _already_installed(settings):
+        print("vocalize Stop hook is not installed. Nothing to do.")
+        return 0
+
+    _backup()
+    hooks = settings["hooks"]
+    kept_groups = []
+    for group in hooks.get("Stop", []):
+        entries = group.get("hooks", [])
+        remaining = [hook for hook in entries if not _is_ours(hook)]
+        if len(remaining) == len(entries):
+            kept_groups.append(group)
+        elif remaining:
+            kept_groups.append({**group, "hooks": remaining})
+    if kept_groups:
+        hooks["Stop"] = kept_groups
+    else:
+        del hooks["Stop"]
+    if not hooks:
+        del settings["hooks"]
+
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    print(f"Removed the vocalize Stop hook from {SETTINGS_PATH}")
+    print("Restart Claude Code (or start a new session) for it to take effect.")
+    return 0
+
+
 def main() -> int:
     settings = _load_settings()
 

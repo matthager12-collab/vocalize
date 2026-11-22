@@ -19,6 +19,12 @@ The WAV path arrives as an argument — unlike dictated text, a file path
 is not the secret here — but its CONTENTS never reach argv, a log, or a
 second process; only the transcribed text does, and only on stdout.
 
+pywhispercpp downloads a model when its argument is not an existing file
+and runs ffmpeg for any audio path not ending in `.wav`. So the model
+must be an absolute path to an existing file and the recording an
+existing path ending in `.wav`; anything else is refused before the
+model is built, with exit 2 and one fixed stderr line that names no path.
+
 `--selftest` loads the model and transcribes 0.5s of a generated tone,
 printing `ok`. This is where the one-time Metal shader compile (~8s on
 the reference Mac) gets paid, during `local install --stt`, never during
@@ -47,10 +53,36 @@ _N_THREADS = 4
 _EXPECTED_FORMAT = (1, 2, 16000)  # (channels, sample width bytes, frame rate)
 
 
+class Refused(ValueError):
+    """A fixed, path-free reason to stop before the model is built."""
+
+
 def _one_line(exc: BaseException) -> str:
     """An exception as a single short line, safe to put on a pipe."""
     message = " ".join(str(exc).split()) or exc.__class__.__name__
     return message[:_MAX_ERROR_CHARS]
+
+
+def _model_file(value: str) -> str:
+    """An absolute existing model file, never a name pywhispercpp would fetch."""
+    import os
+
+    if not isinstance(value, str) or not value or "\x00" in value or not os.path.isabs(value):
+        raise Refused("the model must be an absolute path")
+    if not os.path.isfile(value):
+        raise Refused("the model file does not exist")
+    return value
+
+
+def _audio_file(value) -> str:
+    """An existing `.wav` path; pywhispercpp hands anything else to ffmpeg."""
+    import os
+
+    if not isinstance(value, str) or not value.endswith(".wav") or "\x00" in value:
+        raise Refused("the recording must be a .wav file")
+    if not os.path.isfile(value):
+        raise Refused("the recording does not exist")
+    return value
 
 
 def _model_class():
@@ -75,8 +107,9 @@ def _check_wav(path: str) -> str | None:
     try:
         with wave.open(path, "rb") as reader:
             got = (reader.getnchannels(), reader.getsampwidth(), reader.getframerate())
-    except (OSError, wave.Error, EOFError) as exc:
-        return f"not a valid WAV file: {_one_line(exc)}"
+    except (OSError, wave.Error, EOFError):
+        # The exception's words can carry the path; the reason is fixed.
+        return "not a valid WAV file"
     if got != _EXPECTED_FORMAT:
         channels, width, rate = got
         return (
@@ -151,6 +184,10 @@ def transcribe(
     model, wav_path: str, language: str, initial_prompt: str = "", emit_segments: bool = False
 ) -> dict:
     """One transcription attempt -> the reply dict `main` prints. Never raises."""
+    try:
+        _audio_file(wav_path)
+    except Refused as exc:
+        return {"ok": False, "error": str(exc)}
     error = _check_wav(wav_path)
     if error is not None:
         return {"ok": False, "error": error}
@@ -240,6 +277,10 @@ def _warm_transcribe(model, request, cancelled):
     ):
         return {"ok": False, "error": "bad-request"}
     try:
+        _audio_file(request.get("wav"))
+    except Refused:
+        return {"ok": False, "error": "bad-request"}
+    try:
         fd = os.open(request["wav"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as source:
             info = os.fstat(source.fileno())
@@ -268,6 +309,7 @@ def _warm_transcribe(model, request, cancelled):
 
 def _serve_server(args, **options):
     """Expose lifecycle seams without installing a model in the host interpreter."""
+    import os
     from pathlib import Path
 
     protocol = _warm_protocol()
@@ -275,20 +317,28 @@ def _serve_server(args, **options):
 
     def load():
         nonlocal model
-        model = _model_class()(args.model, n_threads=_N_THREADS, **_model_kwargs(args.beam_size))
+        model = _model_class()(_model_file(args.model), n_threads=_N_THREADS, **_model_kwargs(args.beam_size))
 
     return protocol.Server(
         args.socket, load=load,
         handle=lambda request, cancelled: _warm_transcribe(model, request, cancelled),
         warm_seconds=args.warm_seconds, abandon_seconds=args.abandon_seconds,
         initial_lease=args.lease,
-        fingerprint=protocol.fingerprint(Path(__file__), "pywhispercpp==1.5.1", args.model),
+        fingerprint=protocol.fingerprint(
+            Path(__file__), "pywhispercpp==1.5.1", args.model,
+            runtime_identity=os.environ.get("_VOCALIZE_RUNTIME_IDENTITY"),
+        ),
         **options,
     )
 
 
 def serve(args):
     """Keep serve failures private; the caller always has the one-shot fallback."""
+    try:
+        _model_file(args.model)
+    except Refused as exc:
+        print(f"whisper: refused: {exc}", file=sys.stderr)
+        return 2
     try:
         _serve_server(args).serve()
     except Exception:  # noqa: BLE001 -- contain runtime failures without disclosing private text
@@ -302,8 +352,16 @@ def main(argv=None) -> int:
         return serve(args)
 
     try:
+        model_path = _model_file(args.model)
+        if not args.selftest:
+            _audio_file(args.transcribe)
+    except Refused as exc:
+        print(f"whisper: refused: {exc}", file=sys.stderr)
+        return 2
+
+    try:
         model = _model_class()(
-            args.model, n_threads=_N_THREADS, **_model_kwargs(args.beam_size)
+            model_path, n_threads=_N_THREADS, **_model_kwargs(args.beam_size)
         )
     except Exception as exc:  # noqa: BLE001 -- pywhispercpp can raise anything
         if args.selftest:

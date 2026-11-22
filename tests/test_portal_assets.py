@@ -15,7 +15,7 @@ pinned here:
 
 Two behavioural constraints are pinned by reading the script as text. That
 is a blunt instrument, and deliberate: both are rules about what the page
-must *never* do, and the cheapest way to keep a later tab from doing it is a
+must *never* do, and the cheapest way to keep a later change from doing it is a
 check that fails the moment the words appear a second time.
 """
 
@@ -162,9 +162,9 @@ def test_the_script_exchanges_the_one_time_code_in_exactly_one_place():
 def test_the_script_builds_the_page_without_a_raw_html_sink():
     """Everything the page shows is somebody's text, and some of it is hostile.
 
-    A readiness `detail`, a provider `error`, `config_error` and
-    `config_path` all come from a config file, an exception or a probe, and
-    the page renders them into the sidebar and the banners. They are put
+    A readiness `detail`, a setting's value, a 400's message, `config_error`
+    and `config_path` all come from a config file, an exception or a probe,
+    and the page renders them into the cards and the banners. They are put
     there as text nodes — there is no raw-markup sink in this file — so a
     `<img onerror=…>` in a hand-edited voice name is displayed, not run.
     The CSP would refuse the script anyway; this is the layer that means it
@@ -183,9 +183,9 @@ def test_the_script_builds_the_page_without_a_raw_html_sink():
 def test_every_other_request_goes_through_the_one_helper():
     """Two `fetch` calls: the exchange, and `api()`, which adds the token.
 
-    The gate asks that every tab's requests carry the session token header.
-    A tab that calls `fetch` itself is how that stops being true, so there
-    is no room in this file for a third call — tabs use `portal.api`.
+    The gate asks that every request carry the session token header. Code
+    that calls `fetch` itself is how that stops being true, so there is no
+    room in this file for a third call — everything uses `api()`.
     """
     script = JS.read_text(encoding="utf-8")
 
@@ -227,126 +227,54 @@ def test_the_assets_ship_in_the_wheel():
         assert done.returncode == 1, f"{asset.name} is git-ignored, so the wheel loses it"
 
 
-# --- the panels -------------------------------------------------------
+# --- the page drawn from the schema --------------------------------------
 
 
-def _js_list(script: str, opening: str) -> tuple[str, ...]:
-    """The string literals of one array in the script, in order."""
-    start = script.index(opening) + len(opening)
-    return tuple(re.findall(r'"([^"]+)"', script[start : script.index("]", start)]))
+def _renderer_names(script: str) -> set[str]:
+    """The keys of the `RENDERERS` map, read from the script's text."""
+    start = script.index("var RENDERERS = {")
+    end = script.index("\n};", start)
+    return set(re.findall(r"^  ([a-z_]+): function", script[start:end], re.MULTILINE))
 
 
-def test_the_page_offers_the_models_the_cli_knows():
-    """The model list is a copy of the manifest's, so it can drift."""
+def test_the_renderer_map_covers_every_control_kind_the_registry_can_produce():
+    """A kind with no renderer would fall back to a plain text field.
+
+    That fallback keeps the page working, but a registry kind landing in it
+    means a setting lost its real control, so the map has to cover every
+    entry of `settings_registry.CONTROLS`, not only the kinds in use today.
+    The harness `kinds` scenario checks the same against the running map.
+    """
+    from vocalize import settings_registry
+
+    script = JS.read_text(encoding="utf-8")
+
+    assert set(settings_registry.CONTROLS) <= _renderer_names(script)
+    assert {s.control for s in settings_registry.SETTINGS} <= _renderer_names(script)
+
+
+def test_the_page_ships_no_list_of_settings_or_choices_of_its_own():
+    """Every key, label and choice comes from `/api/schema` and `/api/state`.
+
+    A copy in the page is the drift the old model and cleanup lists were;
+    a new setting must appear with no page change.
+    """
+    from vocalize import settings_registry
     from vocalize.local import whisper_manifest
 
     script = JS.read_text(encoding="utf-8")
 
-    assert _js_list(script, "var STT_MODELS = [") == whisper_manifest.MODELS
-
-
-def test_the_page_offers_the_cleanup_backends_the_config_knows():
-    """Same drift for the cleanup select on the Local tab."""
-    from vocalize import config
-
-    script = JS.read_text(encoding="utf-8")
-
-    assert _js_list(script, "var STT_CLEANUP = [") == config.STT_CLEANUP_BACKENDS
-
-
-def test_the_page_asks_the_server_for_voices_and_ships_no_list_of_its_own():
-    """`GET /api/voices/<name>` is where a voice list comes from — the server
-    holds the keys and the page stays offline-clean. A copy of a list in the
-    page is the drift the old test pinned; there is nothing left to pin.
-
-    The options are built as properties on a created node — `.value` and
-    `.textContent`, never `.label` (an attribute string) and never markup.
-    `test_the_page_behaves_when_driven[voices]` proves that with two hostile
-    names; this is the text check that fails the moment someone reaches for
-    a shortcut. The picker is a `<select>`, not a `<datalist>`: a datalist
-    filters its options by the field's current text, so a field already
-    holding "af_heart" offered one voice, or none.
-    """
-    script = JS.read_text(encoding="utf-8")
-
-    assert "openai: [" not in script
-    assert "kokoro: [" not in script
-    assert len(re.findall(r"""api\(\s*"GET",\s*"/api/voices/" \+ name\)""", script)) == 1
+    assert script.count('"/api/schema"') == 1
     assert "datalist" not in script
     assert 'el("option")' in script
     assert "item.value = value" in script
     assert "item.textContent = text" in script
-    assert ".label =" not in script
-    assert "String(voice.id)" in script
-    assert "String(voice.name)" in script
-
-
-def test_the_keys_hint_names_the_command_that_removes_a_key():
-    """The page can remove a key since 0.12.0, and the hint still names the
-    terminal command that does the same — it used to send the user to
-    Keychain Access, a GUI that knows nothing about vocalize. There are
-    four `vocalize` entries in there, named only by username slug, and a
-    keychain delete that is denied shows nothing. `auth logout` reads the
-    entry back and refuses to claim a removal it cannot verify, so that is
-    the command the sentence has to name. Cross-checked against the CLI, so
-    a renamed command fails here rather than in a user's terminal."""
-    from vocalize.cli import main
-
-    script = JS.read_text(encoding="utf-8")
-    logout = main.commands["auth"].commands["logout"]
-
-    assert "Keychain Access" not in script
-    assert "vocalize auth logout --provider <name>" in script
-    assert logout.name == "logout"
-    assert "provider" in {param.name for param in logout.params}
-
-
-def test_the_sidebar_maps_a_row_to_a_button_by_name_and_never_by_its_action():
-    """`ROW_ACTIONS` is keyed by the row's name; the action is shown, not read.
-
-    A readiness row's action is text from a probe. The one place it may
-    go is a `<code>` node's text. `test_the_page_behaves_when_driven
-    [sidebar]` drives it with a hostile action; this pins that the script
-    has no other use for the field.
-    """
-    script = JS.read_text(encoding="utf-8")
-
-    assert "var ROW_ACTIONS = {" in script
-    assert script.count("row.action") == 2  # the `if`, and the <code> node's text
-    assert 'el("code", "row-action", row.action)' in script
-    assert "hasOwnProperty.call(ROW_ACTIONS, row.name)" in script
-
-
-def test_every_tab_has_a_panel():
-    """A tab with no renderer draws "Nothing here yet." and is a dead end."""
-    script = JS.read_text(encoding="utf-8")
-    page = HTML.read_text(encoding="utf-8")
-
-    for name in ("chain", "providers", "keys", "usage", "local", "setup"):
-        assert f'id="panel-{name}"' in page
-        assert f"renderers.{name} = function" in script
-
-
-def test_an_api_key_has_nowhere_to_leak_to():
-    """The Keys tab handles a secret, and three sinks would spill it.
-
-    A `<form>` with no action submits to the current URL as a GET, which
-    puts the key in the address bar, in history, and in the one place this
-    server refuses to read a secret from. `localStorage` outlives the tab
-    and every later portal on this origin. And a key typed into a field the
-    browser offers to remember is a key in the browser's password store.
-    """
-    script = JS.read_text(encoding="utf-8")
-    page = HTML.read_text(encoding="utf-8")
-
-    assert "<form" not in page.lower()
-    assert 'createElement("form")' not in script
-    assert 'el("form"' not in script
-    assert "localStorage" not in script
-    assert 'keyBox.type = "password"' in script
-    # "off" is the value Safari and Chrome ignore on a password field.
-    assert 'keyBox.autocomplete = "new-password"' in script
-    assert 'autocomplete = "off"' not in script.split("function keyCard")[1].split("\n}\n")[0]
+    # An option's text is a text node, never the `label` attribute.
+    assert not re.search(r"\.label\s*=(?!=)", script)
+    for model in whisper_manifest.MODELS:
+        assert model not in script
+    for setting in settings_registry.SETTINGS:
+        assert f'"{setting.key}"' not in script, setting.key
 
 
 def test_the_readiness_list_keeps_its_role_under_list_style_none():
@@ -356,43 +284,93 @@ def test_the_readiness_list_keeps_its_role_under_list_style_none():
     assert re.search(r'<ol id="rows"[^>]*\brole="list"', page)
 
 
+def test_the_header_names_the_page_address_for_what_it_is():
+    """127.0.0.1 and a port is this page's address, not the name of a Mac."""
+    page = HTML.read_text(encoding="utf-8")
+
+    assert "<dt>Machine</dt>" not in page
+    assert re.search(r'<dt>This page&rsquo;s local address</dt><dd id="page-address">', page)
+
+
+def test_the_save_message_can_take_the_focus():
+    """After a save the Save button turns off; the message it leaves takes focus."""
+    page = HTML.read_text(encoding="utf-8")
+
+    assert re.search(r'<div id="save-note" class="banner mild" tabindex="-1" hidden>', page)
+
+
+def test_the_script_names_no_setting_key_part():
+    """Labels for a setting's values come from the data, not from the page."""
+    script = JS.read_text(encoding="utf-8")
+
+    assert not re.search(r"transcribe\.model|stt\.[a-z_]+|providers\.", script)
+
+
+def test_status_changes_are_announced_through_a_live_region():
+    page = HTML.read_text(encoding="utf-8")
+
+    assert re.search(r'<p id="status" role="status" aria-live="polite">', page)
+    assert re.search(r'<div id="alert" class="banner" role="alert" hidden>', page)
+
+
 # --- the page, driven without a browser --------------------------------
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "race",
-        "keys",
-        "fatal",
-        "lists",
-        "voices",
-        "keystate",
-        "keyslots",
-        "sidebar",
-        "setup",
-        "setup_progress",
-    ],
-)
-def test_the_page_behaves_when_driven(scenario):
+SCENARIOS = [
+    "every_setting",
+    "kinds",
+    "round_trip",
+    "reset",
+    "errors",
+    "conflict",
+    "actions",
+    "unknown",
+    "notices",
+    "race",
+    "fatal",
+    "lists",
+    "empty_choice",
+    "empty_choice_help",
+    "save_message",
+    "save_message_retired",
+    "overrides",
+    "keyboard",
+    "devices",
+    "devices_unexplained",
+]
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_the_page_behaves_when_driven(scenario, tmp_path):
     """`portal.js` under node, over a stub DOM and a hand-answered `fetch`.
 
-    One scenario per behaviour a reviewer found broken: a save reverting on
-    screen behind an older poll, a refused key left in the field, a live
-    region filled while hidden, a list stripped of its role. Three more from
-    the owner's UX pass: the voice picker as a `<select>` that never fetches
-    or saves on its own, the key state as the first line of every card, and
-    the sidebar's buttons mapped by row name. The scenarios live in the
-    harness; this runs one per process because the page keeps module state.
-    Skipped where node is missing — the page has no other runtime, and a
-    text check on the script could not fail for the right reason.
+    The fixture is the real `settings_registry.schema()` plus the actions
+    the harness declares from the API contract. The scenarios: every
+    setting gets exactly one control under its group; the renderer map
+    covers `CONTROLS`; a change of each control kind saves exactly that key
+    with a value of the right type; reset sends null; a 400 shows its error
+    by its control and keeps the edits; a 409 offers a reload and discards
+    nothing; every action gets one button and asks first when it must; an
+    unknown control kind still renders; notices and restart needs are
+    shown; an older poll never overwrites a newer save. One per process,
+    because the page keeps module state. Skipped where node is missing —
+    the page has no other runtime.
     """
+    import json
+
+    from vocalize import settings_registry
+
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
 
+    schema = tmp_path / "schema.json"
+    schema.write_text(json.dumps(settings_registry.schema()), encoding="utf-8")
+    controls = tmp_path / "controls.json"
+    controls.write_text(json.dumps(list(settings_registry.CONTROLS)), encoding="utf-8")
+
     done = subprocess.run(
-        [node, str(HARNESS), str(JS), scenario],
+        [node, str(HARNESS), str(JS), scenario, str(schema), str(controls)],
         capture_output=True,
         text=True,
         timeout=60,
@@ -403,15 +381,27 @@ def test_the_page_behaves_when_driven(scenario):
 
 
 def test_a_config_write_can_only_go_out_with_a_fingerprint():
-    """The three write routes go through `save`, which carries the fingerprint.
+    """One write route, written from one place, which carries the fingerprint.
 
-    `save` is also what refuses to re-send after a 409 — the refusal that
-    stops a write nobody saw from being overwritten. A panel that called
-    `api` directly for one of these would skip both.
+    `saveSettings` is also what refuses to re-send after a 409 — the refusal
+    that stops a write nobody saw from being overwritten.
     """
     script = JS.read_text(encoding="utf-8")
 
-    direct = re.compile(r"""api\(\s*["']POST["'],\s*["']/api/(chain|stt|provider/)""")
-    assert not direct.search(script)
-    for route in ('"/api/chain"', '"/api/stt"', '"/api/provider/" + name'):
-        assert script.count(route) == 1, f"{route} is written from exactly one place"
+    assert script.count('"/api/settings"') == 1
+    assert 'api("POST", "/api/settings", { changes: changes, fingerprint: fingerprint })' in script
+
+
+def test_portal_has_only_local_processing_controls():
+    script = JS.read_text(encoding="utf-8")
+    html = HTML.read_text(encoding="utf-8")
+    for removed in ("/api/auth/", "anthropic", "claude-cli", "elevenlabs", "monthly_chars"):
+        assert removed not in script
+    for route in ("/api/chain", "/api/provider", "/api/stt", "/api/voices", "/api/local"):
+        assert route not in script, f"{route} was removed from the server"
+    for word in ("openai", "polly", "api key", "usage", "budget", "summar"):
+        assert word not in script.lower()
+        assert word not in html.lower()
+    assert 'role="tab"' not in html
+    assert 'id="tab-keys"' not in html
+    assert 'id="tab-usage"' not in html

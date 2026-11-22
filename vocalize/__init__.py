@@ -1,10 +1,8 @@
-"""vocalize: a local-first text-to-speech and dictation CLI for macOS.
+"""vocalize: local-only text to speech and speech to text for macOS.
 
-Converts plain text, markdown, or piped stdin into natural-sounding
-speech, with a preprocessing pass that flattens markdown tables and
-formatting into something that actually sounds good spoken aloud
-(most TTS tools just read a table's raw cell text left to right,
-which is close to useless).
+Reads plain text, Markdown or piped input aloud, after rewriting Markdown
+and tables into sentences that make sense when heard. Turns speech into
+text by dictation or from audio files. Every model runs on the Mac.
 """
 
-__version__ = "0.15.0"
+__version__ = "1.0.0"
