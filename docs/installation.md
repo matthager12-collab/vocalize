@@ -69,7 +69,7 @@ This writes `~/.config/vocalize/config.toml` — one config, every consumer
 (CLI, `/speak`, the Stop hook, Quick Actions) reads it.
 
 - **Kokoro (local, default primary):** `vocalize local install` fetches the
-  model (~340 MB, needs `uv`). Check readiness any time with
+  model (337 MB, needs `uv`). Check readiness any time with
   `vocalize local status` or `vocalize doctor`.
 - **Piper (optional):** `vocalize local install --piper` installs a second
   local voice. Its licence is shown before the download.
@@ -88,8 +88,13 @@ vocalize portal
 ```
 
 It opens the settings page through a one-time link at `127.0.0.1` (valid
-for 60 seconds). The page has a **Setup** checklist of everything on this
-page; see [docs/app.md](app.md#the-setup-tab).
+for 60 seconds). The page is one page with no tabs: a machine profile box
+that suggests settings sized for this Mac, then the sections Speaking,
+Reading, Dictation, Transcription, Hotkeys, Engines and Advanced. Every
+install and removal on this page has a button there, as do the menu-bar
+app, the Quick Actions, the `/speak` skill and the Claude Code hook. The
+two macOS permissions cannot be switched on by any program, so the page
+links to their System Settings panes instead.
 
 ## 3. Dictation (speech to text)
 
@@ -100,8 +105,10 @@ a small recorder bundle that holds the microphone permission:
 vocalize local install --stt
 ```
 
-On Apple Silicon this installs Parakeet. Add `--engine whisper` for Whisper,
-which `vocalize transcribe` needs. Setup downloads the selected model,
+On Apple Silicon this installs Parakeet (2.3 GB). Add `--engine whisper` for
+Whisper (547 MB for the default model). Which engine `vocalize transcribe`
+uses is explained in [docs/transcribe.md](transcribe.md).
+Setup downloads the selected model,
 compiles and ad-hoc signs **Vocalize Recorder**, and warms the runtime. Full detail,
 including the config table and troubleshooting, lives in
 [docs/dictation.md](dictation.md).
@@ -123,7 +130,7 @@ hasn't happened yet.
 
 ### Then grant Accessibility — the app does nothing until you do
 
-`app install` finishes successfully, loads the agent, and registers the
+`app install` finishes successfully, loads the LaunchAgent, and registers the
 chords. None of them fire. macOS will not deliver a keypress to an app
 without an Accessibility grant, and it neither prompts nor logs when it
 withholds one.
@@ -182,11 +189,12 @@ Neither is scriptable — macOS reserves both for a human:
    — it is a requirement of `vocalize app install`, not of this step. If you
    skipped the menu-bar app, you can skip it here too.
 
-## 6. The Stop hook (optional, still a repo script)
+## 6. The Stop hook (optional)
 
-Auto-speaking every Claude Code response is a separate opt-in, and it
-stays a script you run from a git clone — it isn't part of the package or
-`vocalize integrate claude`:
+Auto-speaking every Claude Code response is a separate opt-in. It isn't
+part of `vocalize integrate claude`. Install and remove it from the
+settings page, in its Advanced section; that works on a PyPI install too.
+From a git clone you can also run the installer script:
 
 ```bash
 git clone https://github.com/matthager12-collab/vocalize ~/code/vocalize
@@ -202,8 +210,8 @@ before a real Stop event:
 VOCALIZE_MAX_CHARS=150 python3 ~/code/vocalize/hooks/claude_stop_hook.py --latest
 ```
 
-Uninstall by deleting the vocalize entry from the `Stop` array in
-`~/.claude/settings.json`.
+To remove it, use the settings page button, or delete the vocalize entry
+from the `Stop` array in `~/.claude/settings.json`.
 
 > Field note from the reference install: running this in every open
 > session produced overlapping narration within the hour. On-demand speech
@@ -235,7 +243,7 @@ vocalize doctor                    # everything above, in one shot
 vocalize settings                  # chain + resolved config
 echo test | vocalize speak-file -  # audible, names the provider used
 vocalize listen --check            # dictation: model + recorder + microphone
-vocalize app status                # bundle built, agent loaded, ACCESSIBILITY GRANTED
+vocalize app status                # bundle built, LaunchAgent loaded, ACCESSIBILITY GRANTED
 ```
 
 Not verifiable from a shell: first-use TCC prompts, and whether audio is

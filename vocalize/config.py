@@ -1,6 +1,6 @@
 """Local-only configuration.
 
-Voice/model/speed precedence is flag, environment, provider table, default.
+Voice and speed precedence is flag, environment, provider table, default.
 Settings retired with the cloud providers and the summaries are ignored with
 one stderr notice each (DEC-005); a malformed value for a live key is an error.
 """
@@ -17,7 +17,6 @@ from . import auth
 from .exceptions import ConfigError
 
 DEFAULT_VOICE = "af_heart"
-DEFAULT_MODEL = ""
 DEFAULT_OUTPUT_FORMAT = "wav"
 
 # Supported speech speed range; 1.0 is normal speed.
@@ -30,16 +29,16 @@ KNOWN_CONFIG_KEYS = (
 
 # Keys inside a [providers.<name>] table that become a request field or an
 # argument: short printable strings, or the file is refused (issue #5).
-PROVIDER_TEXT_KEYS = ("voice", "model", "language")
+PROVIDER_TEXT_KEYS = ("voice", "language")
 PROVIDER_TEXT_MAX_CHARS = 128
 
-# Keys allowed inside a [providers.<name>] table.
-KNOWN_PROVIDER_KEYS = (
-    "voice",
-    "model",
-    "language",
-    "speed",
-)
+# Keys allowed inside each [providers.<name>] table: only what that engine
+# reads. Kokoro alone takes a language; no engine takes a model name.
+KNOWN_PROVIDER_KEYS = {
+    "kokoro": ("voice", "language", "speed"),
+    "piper": ("voice", "speed"),
+    "say": ("voice", "speed"),
+}
 
 # What to do when input is longer than the resolved character cap.
 OVERFLOW_MODES = ("truncate", "ask", "never")
@@ -113,6 +112,10 @@ STT_MAX_TAKE_SECONDS_MAX = 7200
 STT_BEAM_SIZE_MIN = 1
 STT_BEAM_SIZE_MAX = 8
 
+# `warm_minutes` keeps the dictation model loaded between takes; 0 is off.
+STT_WARM_MINUTES_MIN = 0
+STT_WARM_MINUTES_MAX = 240
+
 # `input_device` is passed to the recorder as one argv entry. It is a device
 # name a human copied out of `vocalize listen --list-devices`, so the shape
 # check is all that is needed — but it has to be a real one: a control
@@ -169,11 +172,15 @@ def config_path() -> Path:
 # old file can hold an API key.
 
 CLOUD_PROVIDER_NAMES = ("elevenlabs", "openai", "google", "polly")
+# 0.15 also read a [providers.anthropic] table (the hosted cleanup's key
+# slot and its monthly_chars budget). It was never a chain engine, so it
+# is retired as a table only; a chain naming it is still refused.
+RETIRED_PROVIDER_TABLES = CLOUD_PROVIDER_NAMES + ("anthropic",)
 
 _REMOVE_IT = "nothing leaves this Mac any more; delete it"
 _RETIRED_ROOT_KEYS = {
     "voice": "set voice in a [providers.kokoro], [providers.piper] or [providers.say] table",
-    "model": "set model in a [providers.kokoro], [providers.piper] or [providers.say] table",
+    "model": "no engine reads a model setting; delete it",
     "speed": "set speed in a [providers.kokoro], [providers.piper] or [providers.say] table",
     "api_key": _REMOVE_IT,
     "api-key": _REMOVE_IT,
@@ -183,6 +190,13 @@ _RETIRED_ROOT_KEYS = {
 _RETIRED_PROVIDER_KEYS = (
     "api_key", "key", "base_url", "endpoint", "region", "profile", "monthly_chars", "engine",
 )
+#: Engine keys that were offered but that the engine never read.
+_UNUSED_IT = "the engine never used it; delete it"
+_RETIRED_ENGINE_KEYS = {
+    "kokoro": ("model",),
+    "piper": ("model", "language"),
+    "say": ("model", "language"),
+}
 _RETIRED_TRANSCRIBE_KEYS = ("template", "summarizer")
 _HOSTED_CLEANUP = ("claude-cli", "anthropic")
 
@@ -202,6 +216,17 @@ def _migrate(data) -> tuple[dict, list[str]]:
 
     def retire(key_path: str, advice: str) -> None:
         notice = f"vocalize: ignoring retired setting {key_path} in {path}: {advice}."
+        if notice not in notices:
+            notices.append(notice)
+
+    def unknown_table(name: str) -> None:
+        # 0.15 only warned about a provider table it did not know, so this
+        # does too. The name is the file's own key, shown printable only.
+        label = name if name.isprintable() and len(name) <= 64 else repr(name[:64])
+        notice = (
+            f"vocalize: ignoring unknown provider table [providers.{label}] in {path}: "
+            f"known: {', '.join(auth.PROVIDER_NAMES)}; delete it."
+        )
         if notice not in notices:
             notices.append(notice)
 
@@ -225,15 +250,27 @@ def _migrate(data) -> tuple[dict, list[str]]:
     if isinstance(tables, dict):
         kept_tables = {}
         for name, table in tables.items():
-            if name in CLOUD_PROVIDER_NAMES:
-                retire(f"[providers.{name}]", "cloud engines were removed; delete the table")
+            if name in RETIRED_PROVIDER_TABLES:
+                removed = (
+                    "cloud engines were" if name in CLOUD_PROVIDER_NAMES else "hosted cleanup was"
+                )
+                retire(f"[providers.{name}]", f"{removed} removed; delete the table")
                 continue
-            if name in auth.PROVIDER_NAMES and isinstance(table, dict):
+            if name not in auth.PROVIDER_NAMES:
+                # Dropped whatever its type: a value under a name nobody
+                # reads could be a key, and it is never echoed.
+                unknown_table(str(name))
+                continue
+            if isinstance(table, dict):
                 table = dict(table)
                 for key in _RETIRED_PROVIDER_KEYS:
                     if key in table:
                         del table[key]
                         retire(f"providers.{name}.{key}", _REMOVE_IT)
+                for key in _RETIRED_ENGINE_KEYS.get(name, ()):
+                    if key in table:
+                        del table[key]
+                        retire(f"providers.{name}.{key}", _UNUSED_IT)
             kept_tables[name] = table
         clean["providers"] = kept_tables
 
@@ -362,7 +399,7 @@ def _validate_providers_table(value, path: Path) -> None:
     for name, table in value.items():
         _validate_provider_name(name, "provider table")
         for key, val in table.items():
-            if key not in KNOWN_PROVIDER_KEYS:
+            if key not in KNOWN_PROVIDER_KEYS.get(name, ()):
                 _warn(
                     f"vocalize: unknown config key {key!r} in [providers.{name}] in {path}"
                 )
@@ -371,7 +408,7 @@ def _validate_providers_table(value, path: Path) -> None:
 
 
 def _validate_provider_text(key: str, val, name: str, path: Path) -> None:
-    """A provider's voice, model or language is a
+    """A provider's voice or language is a
     short printable string: it becomes a request field or an argument, so
     an int, a table or a flag-shaped value is refused, not passed along."""
     if (
@@ -494,9 +531,14 @@ def _validate_stt_table(value, path: Path) -> None:
 
     if "warm_minutes" in value:
         minutes = value["warm_minutes"]
-        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 0 <= minutes <= 240:
+        if (
+            isinstance(minutes, bool)
+            or not isinstance(minutes, int)
+            or not STT_WARM_MINUTES_MIN <= minutes <= STT_WARM_MINUTES_MAX
+        ):
             raise ConfigError(
-                f"Invalid stt.warm_minutes in {path}: expected an integer between 0 and 240."
+                f"Invalid stt.warm_minutes in {path}: expected an integer between "
+                f"{STT_WARM_MINUTES_MIN} and {STT_WARM_MINUTES_MAX}."
             )
 
     vocabulary = value.get("vocabulary")
@@ -1123,7 +1165,6 @@ def _first(*values):
 @dataclass(frozen=True)
 class Settings:
     voice_id: str = DEFAULT_VOICE
-    model_id: str = DEFAULT_MODEL
     output_format: str = DEFAULT_OUTPUT_FORMAT
     speed: float | None = None
     # Local defaults; hosted provider settings are never reinterpreted.
@@ -1136,13 +1177,12 @@ def resolve_provider_settings(
     file_config: dict | None = None,
     *,
     voice_id: str | None = None,
-    model_id: str | None = None,
     speed: float | None = None,
     primary: bool = True,
 ) -> Settings:
     """Build one chain link's Settings.
 
-    Per-key precedence: flag > VOCALIZE_VOICE/MODEL/SPEED env > this
+    Per-key precedence: flag > VOCALIZE_VOICE/SPEED env > this
     provider's `[providers.<name>]` table > the provider module's defaults.
     A top-level speed is a retired 0.15 setting and is ignored (DEC-005).
 
@@ -1166,13 +1206,6 @@ def resolve_provider_settings(
         defaults.get("voice"),
     )
 
-    resolved_model = _first(
-        model_id if primary else None,
-        os.environ.get("VOCALIZE_MODEL") if primary else None,
-        table.get("model"),
-        defaults.get("model", DEFAULT_MODEL),
-    )
-
     resolved_speed = None
     for value, source in (
         (speed if primary else None, "--speed"),
@@ -1183,13 +1216,11 @@ def resolve_provider_settings(
             resolved_speed = _coerce_speed(value, source)
             break
 
-    for key, value in (("voice", resolved_voice), ("model", resolved_model)):
-        if value is not None and value != "":
-            _validate_provider_text(key, value, name, config_path())
+    if resolved_voice is not None and resolved_voice != "":
+        _validate_provider_text("voice", resolved_voice, name, config_path())
 
     return Settings(
         voice_id=resolved_voice,
-        model_id=resolved_model,
         speed=resolved_speed,
         provider=name,
         language=_first(table.get("language"), defaults.get("language")),
@@ -1198,7 +1229,6 @@ def resolve_provider_settings(
 
 def resolve_settings(
     voice_id: str | None = None,
-    model_id: str | None = None,
     speed: float | None = None,
     file_config: dict | None = None,
 ) -> Settings:
@@ -1210,7 +1240,6 @@ def resolve_settings(
         "kokoro",
         file_config,
         voice_id=voice_id,
-        model_id=model_id,
         speed=speed,
         primary=True,
     )

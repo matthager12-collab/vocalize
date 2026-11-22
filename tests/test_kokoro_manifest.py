@@ -70,9 +70,8 @@ def test_selftest_argv_reproduces_the_pre_generalization_hardcoded_list(tmp_path
     model, voices = manifest.file_paths(tmp_path)
 
     assert manifest.selftest_argv(tmp_path) == [
-        "run", "--no-project",
-        "--python", manifest.PYTHON_VERSION,
-        "--with", manifest.RUNTIME_PACKAGE,
+        "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
+        "--python", str(manifest.runtime_python()),
         str(manifest.worker_path()),
         "--model", str(model),
         "--voices", str(voices),

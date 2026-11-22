@@ -1,0 +1,19 @@
+# The config a Mac Studio has after applying the studio profile
+# (vocalize/profiles.py) to an empty config file. The settings page's
+# "apply profile" button produces the same settings. Every other setting
+# keeps its package default. The values follow the engines as measured on
+# a Mac Studio (Apple M5 Max, 128 GB).
+
+[stt]
+# Dictate and transcribe files with Parakeet.
+engine = "parakeet"
+# The 8-bit Whisper turbo model, used only if the engine is switched to
+# Whisper. The profile installs this model.
+model = "large-v3-turbo-q8_0"
+# The package default; it applies only to Whisper.
+beam_size = 5
+# Keep the cleanup model loaded for 4 hours, the most the registry allows.
+# Parakeet is never kept loaded, so this keeps only the cleanup model.
+warm_minutes = 240
+# Tidy transcripts with the local cleanup model.
+cleanup = "local"

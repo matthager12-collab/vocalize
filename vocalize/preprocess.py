@@ -574,8 +574,8 @@ def flatten_markdown(text: str, speech: dict[str, Any] | None = None) -> str:
 def truncate_for_budget(text: str, max_chars: int | None) -> tuple[str, bool]:
     """Truncate to max_chars, returning (text, was_truncated).
 
-    Useful for keeping a free-tier ElevenLabs quota from being blown
-    through by one long document.
+    Keeps one long document from turning into a read that goes on far
+    longer than anyone meant to listen to (`max_chars`).
     """
     if max_chars is None or len(text) <= max_chars:
         return text, False

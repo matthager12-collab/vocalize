@@ -34,16 +34,27 @@ from click.testing import CliRunner
 from vocalize import notes
 from vocalize.cli import main
 
+# One quiet but audible sample pair (+1000, -1000): well above the silence floor.
+_SOUND = b"\xe8\x03\x18\xfc"
 
-def write_wav(path: Path, duration_seconds: float = 1.0) -> None:
-    """Create a minimal valid 16 kHz mono 16-bit WAV file."""
+
+def write_wav(path: Path, duration_seconds: float = 1.0, *, silent: bool = False) -> None:
+    """Create a minimal valid 16 kHz mono 16-bit WAV file, with sound unless `silent`."""
     rate = 16000
     n_frames = int(rate * duration_seconds)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(rate)
-        w.writeframes(b"\x00\x00" * n_frames)
+        w.writeframes(b"\x00\x00" * n_frames if silent else _SOUND * (n_frames // 2))
+
+
+def _is_silent_wav(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as w:
+            return not any(w.readframes(w.getnframes()))
+    except (OSError, wave.Error, EOFError):
+        return False
 
 
 def _use_folder(monkeypatch, tmp_path: Path, folder: Path) -> None:
@@ -75,7 +86,7 @@ def notes_env(tmp_path, monkeypatch):
     def fake_afconvert(cmd, **kw):
         if cmd[0] == "afconvert":
             dest = Path(cmd[-1])
-            write_wav(dest, duration_seconds=2.0)
+            write_wav(dest, duration_seconds=2.0, silent=_is_silent_wav(Path(cmd[-2])))
             return subprocess.CompletedProcess(cmd, 0, "", "")
         kw.pop("check", None)
         return subprocess.run(cmd, check=False, **kw)
@@ -143,7 +154,7 @@ def test_self_ingestion_guard(notes_env, capsys):
     created = notes.process_sources([inside_file])
     assert len(created) == 0
     out = capsys.readouterr().out
-    assert "inside notes folder (self-ingestion guard)" in out
+    assert "inside transcripts folder (self-ingestion guard)" in out
 
 
 # --- Done-Scan On Hash AND Resolved Path ---------------------------------
@@ -163,6 +174,40 @@ def test_done_scan_skips_when_hash_and_path_match(notes_env, tmp_path, capsys):
     assert len(created2) == 0
     out = capsys.readouterr().out
     assert "Skipping recording.txt: already processed" in out
+
+
+def test_done_scan_finds_the_source_behind_a_very_long_non_ascii_title(notes_env, tmp_path):
+    """L6: only the first 1024 characters were read, so a long title in a
+    script that JSON escapes (six characters a letter) hid `source:` and
+    the file was transcribed twice."""
+    src = tmp_path / "talk.txt"
+    src.write_text("Some words", encoding="utf-8")
+    (created,) = notes.process_sources([src])
+    text = created.read_text(encoding="utf-8")
+    long_title = "\u6771\u4eac" * 900
+    text = text.replace("title: ", f"title: {json.dumps(long_title)} #", 1)
+    created.write_text(text, encoding="utf-8")
+    assert text.index("source:") > 4096
+
+    _ledger, by_source = notes._done(notes_env["dir"])
+    assert str(src.resolve()) in by_source
+    assert notes.process_sources([src]) == []
+
+
+def test_done_scan_reads_only_the_frontmatter(notes_env, tmp_path):
+    """A `source:` line in the transcript body is not provenance."""
+    note = notes_env["dir"] / "body.md"
+    note.write_text('---\ntitle: "x"\n---\nsource: "/elsewhere/a.wav"\n', encoding="utf-8")
+    assert notes._done(notes_env["dir"]) == ({}, {})
+
+
+def test_done_scan_stops_at_a_sane_bound(notes_env, monkeypatch):
+    """A frontmatter block with no closing line is not read to the end of a
+    huge file."""
+    monkeypatch.setattr(notes, "_FRONTMATTER_MAX_BYTES", 2048)
+    note = notes_env["dir"] / "open.md"
+    note.write_text("---\n" + "pad: 1\n" * 1000 + 'source: "/far/away.wav"\n', encoding="utf-8")
+    assert notes._done(notes_env["dir"]) == ({}, {})
 
 
 def test_done_scan_does_not_skip_different_file_with_same_hash(notes_env, tmp_path):
@@ -301,7 +346,7 @@ def test_run_lock_prevents_concurrent_execution(notes_env, tmp_path):
         runner = CliRunner()
         res = runner.invoke(main, ["transcribe", str(src)])
         assert res.exit_code == 1
-        assert "another notes run is in progress" in res.output
+        assert "another transcription run is in progress" in res.output
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -341,7 +386,7 @@ def test_cli_handles_dash_filename_without_flag_error(notes_env, tmp_path):
     runner = CliRunner()
     res = runner.invoke(main, ["transcribe", str(src)])
     assert res.exit_code == 0
-    assert "Wrote note:" in res.output
+    assert "Wrote transcript:" in res.output
 
 
 # --- Folder Never Re-moded -----------------------------------------------
@@ -428,3 +473,229 @@ def test_directory_sync_failure_is_not_reported_as_success(tmp_path, monkeypatch
     with pytest.raises(OSError, match="directory sync"):
         notes._write_note_atomic(tmp_path, target, "fixture")
     assert target.read_text() == "fixture"
+
+
+# --- engine choice and vocabulary (T-32) ----------------------------------
+
+
+def _engine_config(folder: Path, **stt) -> dict:
+    return {"notes": {"folder": str(folder)}, "stt": stt}
+
+
+def _frontmatter(note: Path) -> str:
+    return note.read_text(encoding="utf-8").split("---", 2)[1]
+
+
+@pytest.mark.parametrize("engine", ["auto", "whisper"])
+def test_auto_and_whisper_keep_whisper_for_files(notes_env, tmp_path, monkeypatch, engine):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)  # and "installed" is faked
+    calls = []
+
+    def transcribe(cmd, duration, *, env=None):
+        calls.append(cmd)
+        return "Hello", [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+    monkeypatch.setattr(notes, "_transcribe_long", transcribe)
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    [note] = notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine=engine))
+    assert "whisper_worker.py" in " ".join(calls[0])
+    assert 'transcribed_by: "whisper:' in _frontmatter(note)
+
+
+def test_parakeet_transcribes_files_with_segments_when_asked(notes_env, tmp_path, monkeypatch):
+    from vocalize.local import parakeet_manifest, runtime
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    monkeypatch.setenv("OPENAI_API_KEY", "SECRET_CANARY")
+    calls = []
+
+    def transcribe(cmd, duration, *, env=None, install_hint=None):
+        calls.append((cmd, env, install_hint))
+        return "First part. Second part.", [
+            {"start": 0.0, "end": 1.0, "text": "First part."},
+            {"start": 1.0, "end": 2.0, "text": "Second part."},
+        ]
+
+    monkeypatch.setattr(notes, "_transcribe_long", transcribe)
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    [note] = notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="parakeet"))
+    cmd, env, hint = calls[0]
+    assert cmd[0] == "/usr/bin/true"  # uv
+    assert "parakeet_worker.py" in " ".join(cmd) and "--offline" in cmd
+    assert cmd[-3:-1] == ["--transcribe", cmd[-2]] and cmd[-1] == "--segments"
+    assert env == runtime.environment() and "SECRET_CANARY" not in str(env)
+    assert hint == "vocalize local install --stt --engine parakeet"
+    text = note.read_text(encoding="utf-8")
+    assert 'transcribed_by: "parakeet:parakeet-tdt-0.6b-v2"' in text
+    assert "[00:00] First part.\n[00:01] Second part.\n" in text
+    # Every other key is the same as a Whisper note's.
+    keys = [line.split(":", 1)[0] for line in _frontmatter(note).strip().splitlines()]
+    assert keys == ["title", "date", "type", "captured", "license", "topics", "source",
+                    "source_sha256", "duration_seconds", "template", "transcribed_by",
+                    "summarized_by", "left_machine", "trust", "vocalize"]
+
+
+def test_parakeet_not_installed_says_so_with_the_install_command(notes_env, tmp_path, monkeypatch):
+    from vocalize.local import install, parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    monkeypatch.setattr(install, "installed", lambda manifest, **kw: (
+        (False, f"not installed — run: {kw['install_hint']}") if manifest is parakeet_manifest else (True, "")
+    ))
+    monkeypatch.setattr(notes, "_transcribe_long", lambda *a, **k: pytest.fail("no silent Whisper"))
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    with pytest.raises(notes.NotesError) as err:
+        notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="parakeet"))
+    assert "parakeet" in str(err.value) and "vocalize local install --stt --engine parakeet" in str(err.value)
+
+
+def test_parakeet_on_an_unsupported_machine_is_refused(notes_env, tmp_path, monkeypatch):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: False)
+    monkeypatch.setattr(notes, "_transcribe_long", lambda *a, **k: pytest.fail("no silent Whisper"))
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    with pytest.raises(notes.NotesError, match="Apple Silicon"):
+        notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="parakeet"))
+
+
+@pytest.mark.parametrize("engine", ["whisper", "parakeet"])
+def test_vocabulary_corrects_file_transcripts_for_every_engine(notes_env, tmp_path, monkeypatch, engine):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    monkeypatch.setattr(notes, "_transcribe_long", lambda *a, **k: (
+        "Open the py project in duck db.", [{"start": 0.0, "end": 1.0, "text": "Open the py project in duck db."}]
+    ))
+    seen = []
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    [note] = notes.process_sources(
+        [src], transcript_checkpoint=seen.append,
+        config_dict=_engine_config(notes_env["dir"], engine=engine, vocabulary=["pyproject", "DuckDB"]),
+    )
+    assert seen == ["Open the pyproject in DuckDB."]
+    assert "[00:00] Open the pyproject in DuckDB.\n" in note.read_text(encoding="utf-8")
+
+
+# --- auto picks an installed engine for files (W5-A) ----------------------
+
+
+def _only_installed(monkeypatch, *, whisper: bool, parakeet: bool) -> None:
+    from vocalize.local import install, parakeet_manifest, whisper_manifest
+
+    def installed(manifest, **kw):
+        ready = whisper if manifest is whisper_manifest else parakeet if manifest is parakeet_manifest else True
+        return (True, "ready") if ready else (False, f"not installed — run: {kw.get('install_hint')}")
+
+    monkeypatch.setattr(install, "installed", installed)
+
+
+def _recording_worker(monkeypatch) -> list:
+    calls = []
+
+    def transcribe(cmd, duration, *, env=None, install_hint=None):
+        calls.append(cmd)
+        return "Hello", [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+    monkeypatch.setattr(notes, "_transcribe_long", transcribe)
+    return calls
+
+
+def test_auto_uses_parakeet_for_files_when_no_whisper_model_is_installed(notes_env, tmp_path, monkeypatch):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    _only_installed(monkeypatch, whisper=False, parakeet=True)
+    calls = _recording_worker(monkeypatch)
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    [note] = notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="auto"))
+    assert "parakeet_worker.py" in " ".join(calls[0])
+    assert 'transcribed_by: "parakeet:parakeet-tdt-0.6b-v2"' in _frontmatter(note)
+
+
+def test_auto_keeps_whisper_when_both_are_installed(notes_env, tmp_path, monkeypatch):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    _only_installed(monkeypatch, whisper=True, parakeet=True)
+    calls = _recording_worker(monkeypatch)
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    [note] = notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="auto"))
+    assert "whisper_worker.py" in " ".join(calls[0])
+    assert 'transcribed_by: "whisper:' in _frontmatter(note)
+
+
+@pytest.mark.parametrize("supported, parakeet", [(True, False), (False, True), (False, False)])
+def test_auto_with_no_usable_engine_names_both_install_commands(notes_env, tmp_path, monkeypatch,
+                                                                supported, parakeet):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: supported)
+    _only_installed(monkeypatch, whisper=False, parakeet=parakeet)
+    monkeypatch.setattr(notes, "_transcribe_long", lambda *a, **k: pytest.fail("no worker"))
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    with pytest.raises(notes.NotesError) as err:
+        notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="auto"))
+    message = str(err.value)
+    assert "vocalize local install --stt --engine whisper" in message
+    assert "vocalize local install --stt --engine parakeet" in message
+    assert "\n" not in message
+
+
+def test_whisper_chosen_but_not_installed_never_switches_to_parakeet(notes_env, tmp_path, monkeypatch):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    _only_installed(monkeypatch, whisper=False, parakeet=True)
+    monkeypatch.setattr(notes, "_transcribe_long", lambda *a, **k: pytest.fail("no silent Parakeet"))
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    with pytest.raises(notes.NotesError) as err:
+        notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="whisper"))
+    # G5: the plain `--stt` installs Parakeet on Apple Silicon, not Whisper.
+    assert "not installed — run: vocalize local install --stt --engine whisper" in str(err.value)
+    assert "parakeet" not in str(err.value)
+
+
+# --- a silent recording has no words (W5-A) --------------------------------
+
+
+@pytest.mark.parametrize("engine", ["whisper", "parakeet"])
+def test_a_silent_recording_is_noted_as_silent_without_running_the_worker(notes_env, tmp_path, monkeypatch,
+                                                                         capsys, engine):
+    from vocalize.local import parakeet_manifest
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    monkeypatch.setattr(notes, "_transcribe_long", lambda *a, **k: pytest.fail("the worker must not run"))
+    src = tmp_path / "silence.m4a"
+    write_wav(src, 10.0, silent=True)
+    config_dict = _engine_config(notes_env["dir"], engine=engine)
+    [note] = notes.process_sources([src], config_dict=config_dict)
+    text = note.read_text(encoding="utf-8")
+    assert text.split("\n## Transcript\n\n", 1)[1] == notes.SILENT_TRANSCRIPT + "\n"
+    assert "\n" not in notes.SILENT_TRANSCRIPT and "silent" in notes.SILENT_TRANSCRIPT
+    assert f'source_sha256: "{notes._sha256_file(src)}"' in text
+    assert 'transcribed_by: "' + ("whisper:" if engine == "whisper" else "parakeet:") in text
+    # A re-run skips it like any processed source.
+    capsys.readouterr()
+    assert notes.process_sources([src], config_dict=config_dict) == []
+    assert f"Skipping {src.name}: already processed as {note.name}" in capsys.readouterr().out
+
+
+def test_a_recording_with_some_sound_is_transcribed(notes_env, tmp_path, monkeypatch):
+    calls = _recording_worker(monkeypatch)
+    src = tmp_path / "take.m4a"
+    write_wav(src)
+    [note] = notes.process_sources([src], config_dict=_engine_config(notes_env["dir"], engine="whisper"))
+    assert len(calls) == 1
+    assert notes.SILENT_TRANSCRIPT not in note.read_text(encoding="utf-8")

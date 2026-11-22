@@ -123,6 +123,18 @@ class BrokenModel:
         raise RuntimeError("no such file:\nggml-base.en.bin")
 
 
+# An absolute, existing model file: the worker refuses anything else.
+MODEL = ""
+
+
+@pytest.fixture(autouse=True)
+def model_file(tmp_path, monkeypatch):
+    path = tmp_path / "ggml-test.bin"
+    path.write_bytes(b"ggml")
+    monkeypatch.setitem(globals(), "MODEL", str(path))
+    return str(path)
+
+
 @pytest.fixture
 def worker(monkeypatch):
     module = load_worker()
@@ -140,7 +152,7 @@ def write_wav(path, frames=b"\x00\x00" * 8000, channels=1, width=2, rate=16000):
 
 
 def run_transcribe(worker, wav, language="en", beam_size=None):
-    argv = ["--model", "m.bin", "--language", language, "--transcribe", str(wav)]
+    argv = ["--model", MODEL, "--language", language, "--transcribe", str(wav)]
     if beam_size is not None:
         argv += ["--beam-size", str(beam_size)]
     code = worker.main(argv)
@@ -223,6 +235,7 @@ def test_the_model_path_and_language_reach_the_call(worker, tmp_path):
     wav = tmp_path / "clip.wav"
     write_wav(wav)
     model_path = str(tmp_path / "ggml-small.en.bin")
+    (tmp_path / "ggml-small.en.bin").write_bytes(b"ggml")
 
     worker.main(["--model", model_path, "--language", "en-gb", "--transcribe", str(wav)])
 
@@ -247,7 +260,7 @@ def test_a_transcription_error_is_reported_as_one_line(worker, tmp_path, capsys)
 
 
 def test_a_file_that_is_not_a_wav_at_all_is_refused(worker, tmp_path, capsys):
-    bad = tmp_path / "not-a-wav.bin"
+    bad = tmp_path / "not-a-wav.wav"
     bad.write_bytes(b"this is definitely not a RIFF/WAVE file")
 
     code = run_transcribe(worker, bad)
@@ -319,7 +332,7 @@ def test_a_model_that_will_not_load_exits_one_with_a_single_stderr_line_in_selft
 ):
     monkeypatch.setattr(worker, "_model_class", lambda: BrokenModel)
 
-    code = worker.main(["--model", "m.bin", "--selftest"])
+    code = worker.main(["--model", MODEL, "--selftest"])
 
     err = capsys.readouterr().err
     assert code == 1
@@ -330,7 +343,7 @@ def test_a_model_that_will_not_load_exits_one_with_a_single_stderr_line_in_selft
 def test_selftest_says_ok(worker, capsys):
     pytest.importorskip("numpy")  # only installed inside uv's runtime
 
-    code = worker.main(["--model", "m.bin", "--selftest"])
+    code = worker.main(["--model", MODEL, "--selftest"])
 
     assert code == 0
     assert capsys.readouterr().out.strip() == "ok"
@@ -345,7 +358,7 @@ def test_a_failing_transcription_inside_selftest_exits_one(worker, monkeypatch, 
 
     monkeypatch.setattr(worker, "_model_class", lambda: FailsToTranscribe)
 
-    code = worker.main(["--model", "m.bin", "--selftest"])
+    code = worker.main(["--model", MODEL, "--selftest"])
 
     assert code == 1
     assert "selftest failed" in capsys.readouterr().err
@@ -353,14 +366,14 @@ def test_a_failing_transcription_inside_selftest_exits_one(worker, monkeypatch, 
 
 def test_a_mode_is_required(worker):
     with pytest.raises(SystemExit):
-        worker.parse_args(["--model", "m.bin"])
+        worker.parse_args(["--model", MODEL])
 
 
 def test_transcribe_and_selftest_are_mutually_exclusive(worker, tmp_path):
     wav = tmp_path / "clip.wav"
     write_wav(wav)
     with pytest.raises(SystemExit):
-        worker.parse_args(["--model", "m.bin", "--transcribe", str(wav), "--selftest"])
+        worker.parse_args(["--model", MODEL, "--transcribe", str(wav), "--selftest"])
 
 
 # --- --segments contract (T-140) --------------------------------------
@@ -393,14 +406,14 @@ def test_segments_contract_with_centisecond_timestamps(worker, monkeypatch, tmp_
     write_wav(wav)
 
     # Without --segments: byte-identical to today (single line, no segments key)
-    code = worker.main(["--model", "m.bin", "--transcribe", str(wav)])
+    code = worker.main(["--model", MODEL, "--transcribe", str(wav)])
     assert code == 0
     lines = capsys.readouterr().out.strip().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0]) == {"ok": True, "text": "hello there"}
 
     # With --segments: emits progress lines then final JSON with segments list
-    code = worker.main(["--model", "m.bin", "--transcribe", str(wav), "--segments"])
+    code = worker.main(["--model", MODEL, "--transcribe", str(wav), "--segments"])
     assert code == 0
     lines = capsys.readouterr().out.strip().splitlines()
     assert len(lines) == 3

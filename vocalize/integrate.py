@@ -242,5 +242,67 @@ def integrate_claude(*, yes: bool) -> int:
     return 0
 
 
+def installed_paths() -> list[Path]:
+    """What `integrate_claude` put on this machine and is still there: each
+    Quick Action bundle directory, and the /speak skill when it is the
+    shipped file. Read-only and cheap: a few stats and one small read."""
+    found = [
+        SERVICES_DIR / name for name in BUNDLE_NAMES
+        if (SERVICES_DIR / name).is_dir() and not (SERVICES_DIR / name).is_symlink()
+    ]
+    if _skill_is_ours():
+        found.append(SKILL_DEST)
+    return found
+
+
+def _skill_is_ours() -> bool:
+    if SKILL_DEST.is_symlink() or not SKILL_DEST.is_file():
+        return False
+    try:
+        return SKILL_DEST.read_bytes() == SKILL_SRC.read_bytes()
+    except OSError:
+        return False
+
+
+def remove_claude() -> tuple[list[Path], list[Path]]:
+    """Undo `integrate_claude`: remove the five Quick Action bundles and the
+    /speak skill. Returns (removed, kept).
+
+    Exactly what the installer wrote, by name, and nothing else: a symlink
+    or a plain file at a bundle's name is kept (the installer refuses to
+    replace those too), and so is a SKILL.md that differs from the shipped
+    one — the installer keeps a user's own file without --yes, so a
+    different file there is not ours to delete. The skill's directory goes
+    only when that leaves it empty. `~/.claude/commands/` is never touched.
+    Raises OSError when a removal fails.
+    """
+    removed: list[Path] = []
+    kept: list[Path] = []
+    for name in BUNDLE_NAMES:
+        dest = SERVICES_DIR / name
+        if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+            kept.append(dest)
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+            removed.append(dest)
+
+    if _skill_is_ours():
+        SKILL_DEST.unlink()
+        removed.append(SKILL_DEST)
+        try:
+            SKILL_DEST.parent.rmdir()  # only succeeds when empty
+        except OSError:
+            pass
+    elif SKILL_DEST.exists() or SKILL_DEST.is_symlink():
+        kept.append(SKILL_DEST)
+
+    if removed:
+        try:
+            subprocess.run([PBS, "-update"], check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass  # the Services menu catches up at the next login
+    return removed, kept
+
+
 if __name__ == "__main__":
     sys.exit(main())

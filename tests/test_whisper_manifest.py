@@ -155,12 +155,12 @@ def test_selftest_argv_names_the_selected_models_own_file(tmp_path):
     argv = manifest.selftest_argv(tmp_path, model="base.en")
 
     # No leading `uv` here: install.py owns prepending the executable.
-    assert argv[:6] == [
-        "run", "--no-project",
-        "--python", manifest.PYTHON_VERSION,
-        "--with", manifest.RUNTIME_PACKAGE,
+    assert argv[:7] == [
+        "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
+        "--python", str(manifest.runtime_python()),
     ]
-    assert argv[6] == str(manifest.worker_path())
+    assert "--with" not in argv
+    assert argv[7] == str(manifest.worker_path())
     assert argv[argv.index("--model") + 1] == str(tmp_path / "ggml-base.en.bin")
     assert argv[-1] == "--selftest"
 

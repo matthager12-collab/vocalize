@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import locks
+
 # Pinned to the commit whisper.cpp's `main` branch pointed at when the
 # spike verified these hashes (2026-09-01) — the moving branch itself is
 # not an acceptable source, because a later push to `main` would change
@@ -66,11 +68,27 @@ MODELS = tuple(entry["name"][len("ggml-") : -len(".bin")] for entry in FILES)
 
 DEFAULT_MODEL = "large-v3-turbo-q5_0"
 
-# Pinned exactly, same reasoning as kokoro_manifest.RUNTIME_PACKAGE: the
-# worker runs under uv's own Python, and an unpinned `--with` would
-# silently change the runtime under the user's feet.
+# Pinned exactly, and its whole tree with it: see LOCK_FILE below.
+# pywhispercpp 1.5.1 has no Intel macOS wheel, so there is only an arm64
+# lock: building from source is never an option.
 RUNTIME_PACKAGE = "pywhispercpp==1.5.1"
 PYTHON_VERSION = "3.12"
+
+# The engine's whole dependency tree, pinned by version and sha256
+# (locks/__init__.py). RUNTIME_PACKAGE above is what the lock was compiled
+# from and is kept as the runtime's name; it is never handed to uv.
+ENGINE = "whisper"
+LOCK_FILE = locks.lock_file("whisper.txt")
+
+
+def lock_file() -> Path:
+    """The lock this machine installs from."""
+    return LOCK_FILE
+
+
+def runtime_python() -> Path:
+    """The locked environment's interpreter, created by `local install`."""
+    return locks.env_python(ENGINE, lock_file())
 
 # Written only after the selected file verifies. Its presence is what
 # `installed()` trusts, so a half-finished install never looks done.
@@ -142,8 +160,19 @@ def model_path(model: str, model_dir: Path | None = None) -> Path:
     return base / file_for(model)["name"]
 
 
+def runtime_prefix() -> list[str]:
+    """Everything after `uv` up to the worker's own arguments: the locked
+    environment's interpreter, offline, and no `--with` — nothing is
+    resolved or fetched when a worker starts."""
+    return [
+        "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
+        "--python", str(runtime_python()),
+        str(worker_path()),
+    ]
+
+
 def selftest_argv(model_dir: Path | None = None, *, model: str = DEFAULT_MODEL) -> list[str]:
-    """The argv `local install --stt` runs (after `uv run --no-project ...`)
+    """The argv `local install --stt` runs (after `uv`, once the locked environment exists)
     to warm the runtime — this is also where the one-time Metal shader
     compile (~8s on the reference Mac) gets paid, never during a dictation.
 
@@ -152,10 +181,7 @@ def selftest_argv(model_dir: Path | None = None, *, model: str = DEFAULT_MODEL) 
     installed.
     """
     return [
-        "run", "--no-project",
-        "--python", PYTHON_VERSION,
-        "--with", RUNTIME_PACKAGE,
-        str(worker_path()),
+        *runtime_prefix(),
         "--model", str(model_path(model, model_dir)),
         "--language", "en" if is_english_only(model) else "auto",
         "--selftest",

@@ -25,27 +25,85 @@ def cleanup_module():
     return module
 
 
+def _locked_llm_env(monkeypatch, envs: Path) -> None:
+    """A finished locked LLM environment under `envs`, as an install leaves it."""
+    from vocalize.local import locks
+
+    monkeypatch.setattr(locks, "ENVS_DIR", envs)
+    python = locks.env_python(llm_manifest.ENGINE, llm_manifest.lock_file())
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    locks.write_marker(llm_manifest.ENGINE, llm_manifest.lock_file())
+    monkeypatch.setattr(locks, "ENVS_DIR", None)
+
+
 def test_cleanup_restores_real_manifest_after_unit_isolation(monkeypatch, tmp_path):
+    from vocalize.local import locks
+
     real_home = tmp_path / "home"
     real = real_home / ".cache/vocalize/models/qwen"
     real.mkdir(parents=True)
     (real / "config.json").write_text("{}")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: real_home))
+    monkeypatch.delenv("VOCALIZE_LLM_PYTHON", raising=False)
+    _locked_llm_env(monkeypatch, real_home / ".cache/vocalize/envs")
     module = cleanup_module()
     monkeypatch.setattr(module, "REAL_LLM", real, raising=False)
+    # The suite's HOME fixture has moved on by the time the eval runs.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "isolated-home"))
     observed = []
 
     class StopBeforeInference(BaseException):
         pass
 
     def stop(*args, **kwargs):
-        observed.append(llm_manifest.MODEL_DIR)
+        observed.append((llm_manifest.MODEL_DIR, locks.envs_dir()))
         raise StopBeforeInference
 
     monkeypatch.setattr(llm, "cleanup_transcript", stop)
     with pytest.raises(StopBeforeInference):
         module.test_cleanup_eval(monkeypatch)
-    assert observed == [real]
+    # Both real locations, captured when the module loaded (F5, Mac Studio run).
+    assert observed == [(real, real_home / ".cache/vocalize/envs")]
+
+
+def test_cleanup_eval_without_a_locked_environment_fails_at_once_naming_what_to_set(
+    monkeypatch, tmp_path
+):
+    real_home = tmp_path / "home"
+    real = real_home / ".cache/vocalize/models/qwen"
+    real.mkdir(parents=True)
+    (real / "config.json").write_text("{}")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: real_home))
+    monkeypatch.delenv("VOCALIZE_LLM_PYTHON", raising=False)
+    module = cleanup_module()
+    monkeypatch.setattr(module, "REAL_LLM", real, raising=False)
+    monkeypatch.setattr(llm, "cleanup_transcript", lambda *a, **k: pytest.fail("must not run"))
+
+    with pytest.raises(pytest.fail.Exception, match="VOCALIZE_LLM_PYTHON"):
+        module.test_cleanup_eval(monkeypatch)
+
+
+def test_cleanup_eval_with_an_explicit_runtime_needs_no_locked_environment(monkeypatch, tmp_path):
+    real = tmp_path / "qwen"
+    real.mkdir()
+    (real / "config.json").write_text("{}")
+    monkeypatch.setenv("VOCALIZE_LLM_PYTHON", sys.executable)
+    module = cleanup_module()
+    monkeypatch.setattr(module, "REAL_LLM", real, raising=False)
+    calls = []
+
+    class StopBeforeInference(BaseException):
+        pass
+
+    def stop(*args, **kwargs):
+        calls.append(args)
+        raise StopBeforeInference
+
+    monkeypatch.setattr(llm, "cleanup_transcript", stop)
+    with pytest.raises(StopBeforeInference):
+        module.test_cleanup_eval(monkeypatch)
+    assert calls
 
 
 @pytest.mark.parametrize("reply", [None, "", "  "])

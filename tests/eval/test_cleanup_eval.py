@@ -7,10 +7,14 @@ from pathlib import Path
 import pytest
 
 from vocalize import llm
-from vocalize.local import llm_manifest
+from vocalize.local import llm_manifest, locks, runtime
 
 pytestmark = pytest.mark.eval
 REAL_LLM = llm_manifest.MODEL_DIR
+# Captured at import, like REAL_LLM: the suite's HOME fixture points
+# Path.home() at an empty folder before the test runs, and the locked
+# environment would be looked for there (Mac Studio run, F5).
+REAL_ENVS = locks.envs_dir()
 
 
 def inferred_cleanup(raw):
@@ -43,6 +47,15 @@ def test_cleanup_eval(monkeypatch):
     # Root autouse fixtures deliberately isolate model caches. Restore only
     # this eval's captured path, after those fixtures have run.
     monkeypatch.setattr(llm_manifest, "MODEL_DIR", REAL_LLM)
+    if runtime.selection(llm_manifest.RUNTIME_PACKAGE) is None:
+        monkeypatch.setattr(locks, "ENVS_DIR", REAL_ENVS)
+        if not locks.env_ready(llm_manifest.ENGINE, llm_manifest.lock_file()):
+            pytest.fail(
+                f"no finished locked LLM environment under {REAL_ENVS}; run "
+                "`vocalize local install --llm` with this HOME, or set "
+                "VOCALIZE_LLM_PYTHON to an existing absolute Python executable "
+                "that has the LLM runtime; evaluation is not qualified"
+            )
     from vocalize.local import install
 
     monkeypatch.setattr(install, "installed", lambda *args, **kwargs: (True, ""))

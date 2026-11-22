@@ -27,7 +27,7 @@ from pathlib import Path
 
 import click
 
-from . import __version__, dictate, interrupted, providers, wizard
+from . import __version__, dictate, interrupted, providers, settings_registry, wizard
 from .audio import play as play_audio
 from .audio import play_sequence, stop_playback, take_gap_stop
 from .audio import save as save_audio
@@ -36,9 +36,7 @@ from .chain import run as chain_run
 from .chain import unheard_text as chain_unheard
 from .clipboard import read_clipboard
 from .config import (
-    DEFAULT_MODEL,
     DEFAULT_VOICE,
-    KNOWN_APP_KEYS,
     OVERFLOW_MODES,
     chain_source,
     config_path,
@@ -46,7 +44,6 @@ from .config import (
     resolve_app,
     resolve_chain,
     resolve_overflow,
-    resolve_settings,
     resolve_speech,
     resolve_stt,
 )
@@ -63,7 +60,7 @@ from .preprocess import (
     flatten_markdown,
     truncate_for_budget,
 )
-from .readiness import Row, doctor_rows, readiness
+from .readiness import Row, doctor_rows, readiness, upgrade_commands, upgrade_line
 from .tts import DEFAULT_CACHE_DIR
 from .wizard import run_wizard
 
@@ -76,14 +73,12 @@ def _common_options(f):
     # built-in default is applied further down, by resolve_settings.
     f = click.option("--voice", "voice_id", default=None,
                       help=f"Voice ID to use (default: {DEFAULT_VOICE}).")(f)
-    f = click.option("--model", "model_id", default=None,
-                      help=f"Local model ID (default: {DEFAULT_MODEL}).")(f)
     f = click.option("--speed", type=float, default=None,
                       help="Speech speed, 0.7–1.2; 1.0 is normal.")(f)
     f = click.option("-o", "--output", "output_path", type=click.Path(path_type=Path), default=None,
                       help="Save the generated audio to this path (default: "
-                      "~/.cache/vocalize/last.<ext> — mp3, m4a or wav depending on the "
-                      "provider — overwritten each run).")(f)
+                      "~/.cache/vocalize/last.<ext> — wav, or m4a for say — overwritten "
+                      "each run).")(f)
     f = click.option("--play/--no-play", default=True, help="Play the audio after generating it.")(f)
     f = click.option("--raw", is_flag=True, help="Skip markdown flattening; speak the text verbatim.")(f)
     f = click.option("--max-chars", type=int, default=None, help="Truncate input to this many characters first.")(f)
@@ -278,7 +273,7 @@ class _StreamPlayer:
         self._thread.join()
 
 
-def _run_tts(raw_text: str, *, voice_id, model_id, speed, output_path, play, raw, max_chars,
+def _run_tts(raw_text: str, *, voice_id, speed, output_path, play, raw, max_chars,
              chunk_chars, overflow, default_max_chars, ask_dialog=False, provider=None) -> None:
     # When this read began, for `take_gap_stop`: a stop older than this
     # belongs to somebody else and must never silence this read.
@@ -318,11 +313,10 @@ def _run_tts(raw_text: str, *, voice_id, model_id, speed, output_path, play, raw
         raise TTSRequestError("Nothing to speak: input text is empty.")
 
     chain = resolve_chain(provider, file_config)
-    overrides = {"voice_id": voice_id, "model_id": model_id, "speed": speed}
+    overrides = {"voice_id": voice_id, "speed": speed}
     # What a resume has to be given back to be the *same* read. Built
     # separately from `overrides` to preserve the exact local speech settings.
-    spoken_with = {"voice_id": voice_id, "model_id": model_id, "speed": speed,
-                   "chunk_chars": chunk_chars}
+    spoken_with = {"voice_id": voice_id, "speed": speed, "chunk_chars": chunk_chars}
 
     def echo(message: str) -> None:
         click.echo(message, err=True)
@@ -390,10 +384,10 @@ def _run_tts(raw_text: str, *, voice_id, model_id, speed, output_path, play, raw
 @main.command()
 @click.argument("text")
 @_common_options
-def speak(text, provider, voice_id, model_id, speed, output_path, play, raw, max_chars,
+def speak(text, provider, voice_id, speed, output_path, play, raw, max_chars,
           chunk_chars, overflow, default_max_chars, ask_dialog) -> None:
     """Speak TEXT directly."""
-    _run_tts(text, voice_id=voice_id, model_id=model_id, speed=speed,
+    _run_tts(text, voice_id=voice_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
               chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars,
               ask_dialog=ask_dialog, provider=provider)
@@ -402,14 +396,14 @@ def speak(text, provider, voice_id, model_id, speed, output_path, play, raw, max
 @main.command("speak-file")
 @click.argument("path", type=click.File("r", encoding="utf-8"))
 @_common_options
-def speak_file(path, provider, voice_id, model_id, speed, output_path, play, raw,
+def speak_file(path, provider, voice_id, speed, output_path, play, raw,
                max_chars, chunk_chars, overflow, default_max_chars, ask_dialog) -> None:
     """Speak the contents of PATH (a markdown/text file), or "-" for stdin."""
     try:
         raw_text = path.read()
     except UnicodeDecodeError as exc:
         raise click.FileError(getattr(path, "name", "input"), hint="file is not valid UTF-8 text") from exc
-    _run_tts(raw_text, voice_id=voice_id, model_id=model_id, speed=speed,
+    _run_tts(raw_text, voice_id=voice_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
               chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars,
               ask_dialog=ask_dialog, provider=provider)
@@ -420,7 +414,7 @@ def speak_file(path, provider, voice_id, model_id, speed, output_path, play, raw
               help="Bypass the credential-shaped-clipboard guard. Only when you are "
               "certain the clipboard is not a secret.")
 @_common_options
-def clip(allow_secret, provider, voice_id, model_id, speed, output_path, play, raw,
+def clip(allow_secret, provider, voice_id, speed, output_path, play, raw,
          max_chars, chunk_chars, overflow, default_max_chars, ask_dialog) -> None:
     """Speak the current macOS clipboard contents."""
     text = read_clipboard()
@@ -439,7 +433,7 @@ def clip(allow_secret, provider, voice_id, model_id, speed, output_path, play, r
         raise refusal
     if play:
         stop_playback()  # fresh content replaces whatever is mid-playback
-    _run_tts(text, voice_id=voice_id, model_id=model_id, speed=speed,
+    _run_tts(text, voice_id=voice_id, speed=speed,
               output_path=output_path, play=play, raw=raw, max_chars=max_chars,
               chunk_chars=chunk_chars, overflow=overflow, default_max_chars=default_max_chars,
               ask_dialog=ask_dialog, provider=provider)
@@ -447,41 +441,18 @@ def clip(allow_secret, provider, voice_id, model_id, speed, output_path, play, r
 
 @main.command()
 def settings() -> None:
-    """Print the resolved settings, env and config precedence applied.
+    """Print the resolved settings, one per line, as key=value.
 
-    One key=value per line, made for wrapper scripts (the /speak slash
-    command reads overflow and max_chars from here) — no API call, no key
-    needed.
+    Environment and config file precedence applied. Made for scripts and
+    the menu-bar app (the /speak slash command reads overflow and
+    max_chars from here); it changes nothing and loads no model.
     """
-    file_config = load_config_file()
-    resolved = resolve_settings(file_config=file_config)
-    mode, cap = resolve_overflow(file_config=file_config)
-    click.echo(f"voice={resolved.voice_id}")
-    click.echo(f"model={resolved.model_id}")
-    click.echo(f"speed={resolved.speed if resolved.speed is not None else 'unset'}")
-    click.echo(f"max_chars={cap if cap is not None else 'unset'}")
-    click.echo(f"overflow={mode}")
-    click.echo(f"chain={','.join(resolve_chain(None, file_config))}")
-    # Additive, per DEC-006: hooks/speak_options.py reads only the lines it
-    # knows and ignores the rest, so new keys can never break the picker.
-    stt = resolve_stt(file_config)
-    click.echo(f"stt.model={stt['model']}")
-    click.echo(f"stt.language={stt['language']}")
-    click.echo(f"stt.beam_size={stt['beam_size']}")
-    click.echo(f"stt.cleanup={stt['cleanup']}")
-    click.echo(f"stt.verbatim={'true' if stt['verbatim'] else 'false'}")
-    click.echo(f"stt.max_seconds={stt['max_seconds']}")
-    click.echo(f"stt.max_take_seconds={stt['max_take_seconds']}")
-    click.echo(f"stt.cues={stt['cues']}")
-    click.echo(f"stt.paste={'true' if stt['paste'] else 'false'}")
-    # Summaries were removed; a caller still parses this line (DEC-007).
-    click.echo("notes.summarizer=off")
-    # The menu-bar app reads these lines (0.13.0): canonical chords, and
-    # dictate_mode as this release honours it.
-    app = resolve_app(file_config)
-    for key in KNOWN_APP_KEYS:
-        click.echo(f"app.{key}={app[key]}")
-
+    # The lines come from the settings registry. The ones other programs
+    # parse keep their spelling and order (design.md § Commands the
+    # menu-bar app depends on); every other setting follows. Additive, per
+    # DEC-006: hooks/speak_options.py reads only the lines it knows.
+    for line in settings_registry.settings_lines(load_config_file()):
+        click.echo(line)
 
 @main.command()
 @click.argument("provider_names", nargs=-1)
@@ -516,9 +487,18 @@ def chain(provider_names) -> None:
     data = dict(load_config_file())
     data["chain"] = list(provider_names)
     wizard._render_config_text(data)  # fail fast before writing anything
-    wizard.write_config_if_unchanged(path, data, fingerprint)
+    written = wizard.write_config_if_unchanged(path, data, fingerprint)
     click.echo(f"chain={','.join(provider_names)}")
     click.echo(f"wrote {path}")
+    for notice in written.notices:
+        click.echo(notice, err=True)
+    if written.backup is not None:
+        click.echo(f"saved a copy of the old file to {written.backup} (the rewrite drops "
+                   "comments and retired settings)")
+        if written.backup_has_retired:
+            click.echo("that copy still holds the retired settings the old file had, an old "
+                       "service key included if there was one; delete it once you have "
+                       "checked it")
 
 
 def resume_interrupted() -> bool:
@@ -565,12 +545,11 @@ def resume_interrupted() -> bool:
     if record.text.strip():
         # raw=True: this text was flattened before it was ever spoken.
         # Anything raised here leaves the record for another try.
-        # The voice, model, speed and chunking the read was stopped in.
+        # The voice, speed and chunking the read was stopped in.
         # Without them the rest is spoken in the config-default voice, and
         # every already-rendered chunk misses the cache and must render a
         # second time (DEC-014).
-        _run_tts(record.text, voice_id=record.voice_id,
-                  model_id=record.model_id, speed=record.speed,
+        _run_tts(record.text, voice_id=record.voice_id, speed=record.speed,
                   output_path=None, play=True, raw=True, max_chars=None,
                   chunk_chars=record.chunk_chars,
                   overflow=None, default_max_chars=None, provider=record.provider)
@@ -696,9 +675,17 @@ def status(as_json) -> None:
             if row.action:
                 line += f" — {row.action}"
             click.echo(line)
+        _echo_upgrade_line()
 
     if any(row.state != "ok" for row in rows):
         sys.exit(1)
+
+
+def _echo_upgrade_line() -> None:
+    """The one line an upgrade from an older version needs, when it does."""
+    commands = upgrade_commands()
+    if commands:
+        click.echo(upgrade_line(commands))
 
 
 @main.command()
@@ -888,6 +875,24 @@ def _installed_stt_models(install_module, manifest) -> list[str]:
     ]
 
 
+def _report_warm_sockets() -> None:
+    """Where the warm servers' sockets are, and why none can start there.
+
+    A socket path past the AF_UNIX limit once disabled every warm server
+    with no word anywhere; this line is where that is said.
+    """
+    from .local import warm, warm_protocol
+
+    folder = warm.socket_path("whisper").parent
+    line = f"Warm sockets: {folder}"
+    if folder != warm_protocol.warm_dir():
+        line += " (a short private folder: the usual path is too long for a socket)"
+    problem = warm.socket_problem("whisper")
+    if problem:
+        line += f" — no warm server can start: {problem}"
+    click.echo(line)
+
+
 def _listen_check() -> None:
     install_module, _ = _recorder_or_exit()
     _, manifest = _stt_modules()
@@ -896,6 +901,7 @@ def _listen_check() -> None:
     click.echo(f"Model: {', '.join(models) if models else f'none — run: {_STT_INSTALL_HINT}'}")
     bundle = install_module.recorder_bundle()
     click.echo(f"Recorder: {bundle}")
+    _report_warm_sockets()
 
     try:
         wanted = resolve_stt(load_config_file())["input_device"]
@@ -1034,6 +1040,7 @@ def _print_transcript(text: str | None) -> None:
               help="Start a dictation, or stop the one already running (the hotkey's path).")
 @click.option("--cancel", is_flag=True, help="Discard a dictation in progress.")
 @click.option("--wav", type=click.Path(path_type=Path), default=None,
+              callback=lambda _ctx, _param, value: None if value is None else value.absolute(),
               help="Transcribe an existing 16 kHz mono 16-bit WAV instead of recording.")
 @click.option("--cleanup", is_flag=True,
               help="Tidy the transcript with the installed local language model "
@@ -1075,7 +1082,15 @@ def listen(check_only, list_devices, toggle, cancel, wav, cleanup, verbatim, max
         if wav is not None:
             # Trusted input: the user named this file. The format is still
             # checked, here and again inside the worker.
-            _print_transcript(dictate.transcribe_wav(wav, stt))
+            text = dictate.transcribe_wav(
+                wav, stt, notice=lambda message: click.echo(message, err=True),
+            )
+            if text == "":
+                # No words: say why on stderr and end like "Nothing heard."
+                # does, so a script sees one exit code for "no transcript".
+                click.echo(dictate.WAV_SILENT_NOTICE, err=True)
+                sys.exit(1)
+            _print_transcript(text)
             return
         _print_transcript(dictate.listen(stt, wait=_wait_for_enter))
     except DictationError as exc:
@@ -1434,7 +1449,7 @@ def integrate_claude_cmd(yes) -> None:
 
 @main.group("local")
 def local() -> None:
-    """Install and inspect the on-device speech providers (Kokoro, Whisper)."""
+    """Install, inspect and unload the on-device engines (Kokoro, Piper, Parakeet, Whisper, cleanup model)."""
 
 
 def _kokoro_modules():
@@ -1463,7 +1478,47 @@ def _llm_modules():
 
 
 _STT_INSTALL_HINT = "vocalize local install --stt"
+_WHISPER_INSTALL_HINT = "vocalize local install --stt --engine whisper"
 _LLM_INSTALL_HINT = "vocalize local install --llm"
+
+
+#: What every install plan says about model files. A redirect is followed
+#: only to another https:// URL, on any host; the bytes, not the host, are
+#: what is pinned, by sha256 and size (review M2).
+_MODEL_FILES_NOTE = (
+    "  Model files come from the pinned address shown; a redirect must stay on HTTPS,\n"
+    "  and every model file is checked against its sha256 and size before it is kept."
+)
+
+
+def _runtime_source(install_module, manifest) -> str:
+    """Where an engine's Python packages come from, without overstating it:
+    a locked engine installs exactly its hash-locked list; Piper is pinned
+    by version only (review M3)."""
+    if install_module.locked(manifest):
+        return (
+            f"{manifest.RUNTIME_PACKAGE} with its dependencies, from the hash-locked list "
+            f"{manifest.lock_file().name} (uv refuses any package whose sha256 differs)"
+        )
+    return (
+        f"{manifest.RUNTIME_PACKAGE}, pinned by version only "
+        "(its packages are not hash-locked yet)"
+    )
+
+
+def _runtime_status(install_module, manifest, install_hint: str) -> str:
+    """The runtime line: installed only when the locked environment really is."""
+    if not install_module.locked(manifest):
+        return f"  runtime: {manifest.RUNTIME_PACKAGE}, pinned by version only"
+    if install_module.runtime_installed(manifest):
+        return (
+            f"  runtime: {manifest.RUNTIME_PACKAGE}, installed from the hash-locked list "
+            f"{manifest.lock_file().name}"
+        )
+    return (
+        f"  runtime: {manifest.RUNTIME_PACKAGE}, not installed yet (hash-locked list "
+        f"{manifest.lock_file().name}) — run: {install_hint}"
+    )
 
 
 def _require_uv(uv: str | None) -> str:
@@ -1480,7 +1535,8 @@ def _require_uv(uv: str | None) -> str:
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
 @click.option(
     "--stt", is_flag=True,
-    help="Install the on-device speech-to-text runtime (whisper.cpp) instead of Kokoro.",
+    help="Install the on-device speech-to-text runtime instead of Kokoro "
+         "(Parakeet on Apple Silicon, else whisper.cpp; choose with --engine).",
 )
 @click.option(
     "--llm", is_flag=True,
@@ -1564,9 +1620,10 @@ def _install_kokoro(yes: bool) -> None:
         click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
         click.echo(f"    {entry['url']}")
     click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo(_MODEL_FILES_NOTE)
     click.echo("")
     click.echo("It will also have uv fetch, into its own cache (about 230 MB):")
-    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {_runtime_source(install_module, manifest)}")
     click.echo("  (which brings onnxruntime, numpy and espeakng-loader)")
     click.echo("")
 
@@ -1638,10 +1695,11 @@ def _install_piper(yes: bool, voice_name: str | None) -> None:
         click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
         click.echo(f"    {entry['url']}")
     click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo(_MODEL_FILES_NOTE)
     click.echo("")
     click.echo(f"Voice licence: {manifest.VOICE_LICENCES[voice]}.")
     click.echo("It will also have uv fetch, into its own cache (about 100 MB):")
-    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {_runtime_source(install_module, manifest)}")
     click.echo("  (the engine is GPL-3.0-or-later; vocalize runs it as a separate program)")
     click.echo("")
 
@@ -1743,9 +1801,10 @@ def _install_stt(yes: bool, model_name: str | None) -> None:
     click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
     click.echo(f"    {entry['url']}")
     click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo(_MODEL_FILES_NOTE)
     click.echo("")
     click.echo("It will also have uv fetch, into its own cache:")
-    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {_runtime_source(install_module, manifest)}")
     click.echo("")
 
     if not yes and not click.confirm("Download and install now?", default=False):
@@ -1819,10 +1878,11 @@ def _install_parakeet(yes: bool) -> None:
         click.echo(f"  {entry['name']}  ({_human_readable_size(entry['size'])})")
         click.echo(f"    {entry['url']}")
     click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo(_MODEL_FILES_NOTE)
     click.echo("")
     click.echo("Weights: NVIDIA parakeet-tdt-0.6b-v2, CC-BY-4.0 (attribution required).")
-    click.echo("It will also have uv fetch, into its own cache:")
-    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI (binary wheels only)")
+    click.echo("It will also have uv fetch, into its own cache (binary wheels only):")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {_runtime_source(install_module, manifest)}")
     click.echo("")
 
     if not yes and not click.confirm("Download and install now?", default=False):
@@ -1903,9 +1963,10 @@ def _install_llm(yes: bool, force: bool) -> None:
         click.echo(f"  {entry['name']}{size_str}")
         click.echo(f"    {entry['url']}")
     click.echo(f"  into {manifest.MODEL_DIR}")
+    click.echo(_MODEL_FILES_NOTE)
     click.echo("")
     click.echo("It will also have uv fetch, into its own cache:")
-    click.echo(f"  Python {manifest.PYTHON_VERSION} and {manifest.RUNTIME_PACKAGE} from PyPI")
+    click.echo(f"  Python {manifest.PYTHON_VERSION} and {_runtime_source(install_module, manifest)}")
     click.echo("")
 
     if not yes and not click.confirm("Download and install now?", default=False):
@@ -1968,6 +2029,20 @@ def _download_progress():
     return progress
 
 
+@local.command("stop")
+def local_stop() -> None:
+    """Unload the models kept loaded between takes (see [stt] warm_minutes).
+
+    Stops each warm server that is running and says, per model, whether
+    one was. The next dictation loads its models again. Exits 0 either way.
+    """
+    from .local import warm
+
+    labels = {"whisper": "Whisper", "llm": "Cleanup model"}
+    for kind, stopped in warm.stop_all().items():
+        click.echo(f"{labels[kind]} warm server: {'stopped' if stopped else 'none was running'}.")
+
+
 @local.command("status")
 def local_status() -> None:
     """Report whether the on-device providers are ready, and what is missing."""
@@ -1985,11 +2060,30 @@ def local_status() -> None:
     click.echo("")
     _status_piper(uv)
     click.echo("")
-    _status_parakeet(uv)
+    engine, choice = _dictation_engine()
+    _status_parakeet(uv, engine)
     click.echo("")
-    _status_stt(uv)
+    _status_stt(uv, engine, choice)
     click.echo("")
     _status_llm(uv)
+    commands = upgrade_commands()
+    if commands:
+        click.echo("")
+        click.echo(upgrade_line(commands))
+
+
+def _dictation_engine() -> tuple[str, str]:
+    """(the engine dictation would use, the configured `[stt] engine`).
+
+    The speech-to-text verdict is about that engine — never Whisper alone
+    while Parakeet is the one doing the work. A config this command cannot
+    read is reported by the commands that use it; status assumes "auto".
+    """
+    try:
+        stt = resolve_stt(load_config_file())
+    except VocalizeError:
+        stt = {}
+    return dictate.engine_for(stt), stt.get("engine", "auto")
 
 
 def _status_kokoro(uv: str | None) -> None:
@@ -2037,7 +2131,7 @@ def _status_piper(uv: str | None) -> None:
         click.echo("  uv is missing, so Piper cannot run.")
 
 
-def _status_parakeet(uv: str | None) -> None:
+def _status_parakeet(uv: str | None, engine: str = "parakeet") -> None:
     from .local import install as install_module
     from .local import parakeet_manifest as manifest
 
@@ -2046,11 +2140,22 @@ def _status_parakeet(uv: str | None) -> None:
         click.echo("  not available: needs an Apple Silicon Mac")
         return
     click.echo(f"  Model directory: {manifest.MODEL_DIR}")
-    ready, reason = install_module.installed(manifest, install_hint=_STT_INSTALL_HINT)
-    click.echo("  ready" if ready and uv else f"  {reason or 'uv is missing'}")
+    # Its own install command, not the bare `--stt`: on a machine whose
+    # Whisper already works, that is the one thing worth naming.
+    ready, reason = install_module.installed(manifest, install_hint=dictate.PARAKEET_INSTALL_HINT)
+    if ready and uv:
+        click.echo("  ready")
+        return
+    line = f"  {reason or 'uv is missing'}"
+    _, whisper = _stt_modules()
+    if engine == "whisper" and _installed_stt_models(install_module, whisper):
+        line += " (optional: dictation uses Whisper)"
+    click.echo(line)
 
 
-def _status_stt(uv: str | None) -> None:
+def _status_stt(uv: str | None, engine: str = "whisper", choice: str = "auto") -> None:
+    from .local import parakeet_manifest
+
     install_module, manifest = _stt_modules()
 
     click.echo("STT (speech-to-text):")
@@ -2075,7 +2180,8 @@ def _status_stt(uv: str | None) -> None:
     if not any_present:
         click.echo("  no models installed")
 
-    click.echo(f"  runtime: {manifest.RUNTIME_PACKAGE} via uv")
+    whisper_hint = _WHISPER_INSTALL_HINT if parakeet_manifest.supported() else _STT_INSTALL_HINT
+    click.echo(_runtime_status(install_module, manifest, whisper_hint))
 
     if install_module.recorder_binary().is_file():
         click.echo(f"  recorder: built ({install_module.recorder_bundle()})")
@@ -2086,20 +2192,32 @@ def _status_stt(uv: str | None) -> None:
     # `local install --stt --model base.en` is a real, complete install,
     # and reporting it as "not ready" tells the user to redo work they
     # already did.
-    ready_models = [
-        m for m in manifest.MODELS
-        if install_module.installed(
-            manifest, files=[manifest.file_for(m)], install_hint=_STT_INSTALL_HINT,
-        )[0]
-    ]
+    if engine == "parakeet":
+        # The engine dictation actually uses (`dictate.engine_for`).
+        ready, reason = install_module.installed(
+            parakeet_manifest, install_hint=dictate.PARAKEET_INSTALL_HINT,
+        )
+        if ready and uv:
+            click.echo("STT: ready (parakeet)")
+        elif ready:
+            click.echo("STT: not ready — uv is missing")
+        else:
+            click.echo(f"STT: not ready — parakeet {reason}")
+        return
+    ready_models = _installed_stt_models(install_module, manifest)
     if ready_models and uv:
         click.echo(f"STT: ready ({', '.join(ready_models)})")
     elif ready_models:
         click.echo("STT: not ready — uv is missing")
+    elif choice == "auto" and parakeet_manifest.supported():
+        # Nothing installed yet: the bare command installs the default engine.
+        click.echo(f"STT: not ready — no speech-to-text engine installed — run: {_STT_INSTALL_HINT}")
     else:
+        # On Apple Silicon the bare `--stt` installs Parakeet, not this.
+        hint = _WHISPER_INSTALL_HINT if parakeet_manifest.supported() else _STT_INSTALL_HINT
         _, reason = install_module.installed(
             manifest, files=[manifest.file_for(manifest.DEFAULT_MODEL)],
-            install_hint=_STT_INSTALL_HINT,
+            install_hint=hint,
         )
         click.echo(f"STT: not ready — default model ({manifest.DEFAULT_MODEL}) {reason}")
 
@@ -2129,7 +2247,7 @@ def _status_llm(uv: str | None) -> None:
     if not any_present:
         click.echo("  no model files installed")
 
-    click.echo(f"  runtime: {manifest.RUNTIME_PACKAGE} via uv")
+    click.echo(_runtime_status(install_module, manifest, _LLM_INSTALL_HINT))
 
     ready, reason = install_module.installed(
         manifest, install_hint=_LLM_INSTALL_HINT,
@@ -2145,70 +2263,100 @@ def _status_llm(uv: str | None) -> None:
 @local.command("uninstall")
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
 @click.option(
+    "--piper", is_flag=True,
+    help="Remove every downloaded Piper voice instead of Kokoro.",
+)
+@click.option(
     "--stt", is_flag=True,
-    help="Remove the speech-to-text model files and recorder bundle.",
+    help="Remove speech-to-text instead of Kokoro: both engines and the recorder, "
+         "or only the engine --engine names.",
+)
+@click.option(
+    "--engine", "engine_name", type=click.Choice(["parakeet", "whisper"]), default=None,
+    help="Which speech-to-text engine to remove (--stt only). The recorder stays.",
+)
+@click.option(
+    "--model", "model_name", default=None, metavar="NAME",
+    help="Remove only this Whisper model (--stt only). The recorder stays.",
 )
 @click.option(
     "--llm", is_flag=True,
-    help="Remove the language model files.",
+    help="Remove the cleanup model instead of Kokoro.",
 )
-def local_uninstall(yes, stt, llm) -> None:
-    """Remove a local runtime's downloaded files."""
-    if stt and llm:
-        raise click.ClickException("--stt and --llm are mutually exclusive")
-    if stt:
-        _uninstall_stt(yes)
-        return
-    if llm:
-        _uninstall_llm(yes)
-        return
-    raise click.ClickException("Specify what to uninstall: --stt or --llm")
+def local_uninstall(yes, piper, stt, engine_name, model_name, llm) -> None:
+    """Remove a local engine's model files and its runtime environment.
 
+    With no flag, removes Kokoro. Each choice removes what the settings
+    page's matching remove button removes; your settings stay.
+    """
+    from . import actions
+    from .local import whisper_manifest
 
-def _uninstall_stt(yes: bool) -> None:
-    install_module, manifest = _stt_modules()
+    if sum((piper, stt, llm)) > 1:
+        raise click.ClickException("--piper, --stt and --llm are mutually exclusive")
+    if (engine_name or model_name) and not stt:
+        raise click.ClickException("--engine and --model only apply together with --stt")
+    if model_name is not None:
+        if engine_name == "parakeet":
+            raise click.ClickException("--model only applies to --engine whisper")
+        if model_name not in whisper_manifest.MODELS:
+            raise click.ClickException(
+                f"Unknown Whisper model {model_name!r}. Known: "
+                f"{', '.join(whisper_manifest.MODELS)}"
+            )
+        engine_name = "whisper"
 
-    model_dir = manifest.MODEL_DIR
-    # The recorder bundle `local install --stt` compiles, and its stamp,
-    # under ~/.cache/vocalize/bin — plus any `.recorder-build-*` or
-    # `.recorder-old-*` bundle a build killed mid-swap left behind (the
-    # latter carries the granted signature). Removing the bundle drops the
-    # ad-hoc signature the microphone grant is attached to; the grant itself
-    # stays in System Settings. Only the recorder's own files go, by name:
-    # this command removes what it built, never a directory wholesale.
-    bundle = install_module.recorder_bundle()
-    stamp = install_module.recorder_stamp_path()
-    leftovers = sorted(
-        path for pattern in (".recorder-build-*.app", ".recorder-old-*.app")
-        for path in install_module.BIN_DIR.glob(pattern)
-    ) if install_module.BIN_DIR.is_dir() else []
-    # is_dir() + not is_symlink(): path.exists() follows symlinks, and a
-    # bare `shutil.rmtree()` on a symlinked target raises OSError instead
-    # of removing anything — a user who pointed the model dir at an
-    # external disk gets a clean message instead.
-    candidates = (model_dir, bundle, stamp, *leftovers)
-    targets = [
-        path for path in candidates
-        if (path.is_dir() or path.is_file()) and not path.is_symlink()
-    ]
-    symlinked = [path for path in candidates if path.is_symlink()]
+    steps: list[tuple[str, dict]] = []
+    recorder = False
+    if piper:
+        what, done = ["every downloaded Piper voice"], None
+        steps.append(("uninstall_piper", {}))
+    elif llm:
+        what, done = ["the cleanup model's files and its runtime environment"], (
+            "Language model uninstalled.")
+        steps.append(("uninstall_cleanup", {}))
+    elif stt:
+        what, done = [], "Speech-to-text uninstalled."
+        if engine_name in (None, "parakeet"):
+            what.append("Parakeet's model files and its runtime environment")
+            steps.append(("uninstall_parakeet", {}))
+        if engine_name in (None, "whisper"):
+            models = [model_name] if model_name else _whisper_models_on_disk(whisper_manifest)
+            what.append(f"Whisper {', '.join(models)}" if models else "Whisper's runtime environment")
+            what[-1] += " (its runtime environment goes with the last model)"
+            steps += [("uninstall_whisper", {"model": model})
+                      for model in models or [whisper_manifest.DEFAULT_MODEL]]
+        recorder = engine_name is None
+    else:
+        what, done = ["Kokoro's model files and its runtime environment"], None
+        steps.append(("uninstall_kokoro", {}))
 
-    if not targets and not symlinked:
+    targets, symlinked = _recorder_targets() if recorder else ([], [])
+    if not _anything_to_uninstall(steps) and not targets and not symlinked:
         click.echo("Nothing to remove.")
         return
 
     click.echo("This will remove:")
+    for line in what:
+        click.echo(f"  {line}")
     for path in targets:
         click.echo(f"  {path}")
     for path in symlinked:
         click.echo(f"  {path} (a symlink — remove it yourself)")
+    click.echo("Your settings stay.")
+    if recorder:
+        click.echo("The microphone permission grant, if any, stays in System Settings.")
     click.echo("")
-    click.echo("The microphone permission grant, if any, stays in System Settings.")
 
     if not yes and not click.confirm("Remove now?", default=False):
         click.echo("Aborted, nothing removed.")
         sys.exit(1)
 
+    for action_id, params in steps:
+        try:
+            click.echo(actions.run(action_id, params))
+        except actions.ActionError as exc:
+            raise click.ClickException(str(exc)) from None
     for path in targets:
         try:
             if path.is_dir():
@@ -2218,52 +2366,81 @@ def _uninstall_stt(yes: bool) -> None:
         except OSError as exc:
             raise click.ClickException(f"Could not remove {path}: {exc}") from exc
         click.echo(f"  removed {path}")
+    if done:
+        click.echo(done)
 
-    click.echo("Speech-to-text uninstalled.")
+
+def _whisper_models_on_disk(manifest) -> list[str]:
+    """Every Whisper model with a file (or a partial download) on disk."""
+    out = []
+    for model in manifest.MODELS:
+        name = manifest.file_for(model)["name"]
+        if any((manifest.MODEL_DIR / n).is_file() for n in (name, name + ".part")):
+            out.append(model)
+    return out
 
 
-def _uninstall_llm(yes: bool) -> None:
-    _, manifest = _llm_modules()
+def _anything_to_uninstall(steps) -> bool:
+    """Whether any of these remove actions finds something on disk: a model
+    file or partial download, the stamp, or one of the engine's locked
+    environments."""
+    from .local import install as install_module
+    from .local import (
+        kokoro_manifest,
+        llm_manifest,
+        locks,
+        parakeet_manifest,
+        piper_manifest,
+        whisper_manifest,
+    )
+
+    manifests = {
+        "uninstall_kokoro": kokoro_manifest, "uninstall_piper": piper_manifest,
+        "uninstall_parakeet": parakeet_manifest, "uninstall_whisper": whisper_manifest,
+        "uninstall_cleanup": llm_manifest,
+    }
+    envs = locks.envs_dir()
+    env_names = [child.name for child in envs.iterdir()] if envs.is_dir() else []
+    for action_id, _params in steps:
+        manifest = manifests[action_id]
+        names = [n for e in manifest.FILES for n in (e["name"], e["name"] + ".part")]
+        if any((manifest.MODEL_DIR / name).is_file() for name in names):
+            return True
+        if install_module.stamp_path(manifest=manifest).is_file():
+            return True
+        engine = getattr(manifest, "ENGINE", None)
+        if action_id != "uninstall_piper" and engine and any(
+                name.startswith(f"{engine}-") for name in env_names):
+            return True
+    return False
+
+
+def _recorder_targets() -> tuple[list[Path], list[Path]]:
+    """(the recorder's files to remove, symlinks to leave), by name.
+
+    The recorder bundle `local install --stt` compiles, and its stamp,
+    under ~/.cache/vocalize/bin — plus any `.recorder-build-*` or
+    `.recorder-old-*` bundle a build killed mid-swap left behind (the
+    latter carries the granted signature). Removing the bundle drops the
+    ad-hoc signature the microphone grant is attached to; the grant itself
+    stays in System Settings. Only the recorder's own files go, never a
+    directory wholesale, and never through a symlink.
+    """
     from .local import install as install_module
 
-    model_dir = manifest.MODEL_DIR
-    stamp = install_module.stamp_path(manifest=manifest)
-
-    candidates = (model_dir, stamp)
+    bundle = install_module.recorder_bundle()
+    stamp = install_module.recorder_stamp_path()
+    leftovers = sorted(
+        path for pattern in (".recorder-build-*.app", ".recorder-old-*.app")
+        for path in install_module.BIN_DIR.glob(pattern)
+    ) if install_module.BIN_DIR.is_dir() else []
+    candidates = (bundle, stamp, *leftovers)
     targets = [
         path for path in candidates
         if (path.is_dir() or path.is_file()) and not path.is_symlink()
     ]
     symlinked = [path for path in candidates if path.is_symlink()]
-
-    if not targets and not symlinked:
-        click.echo("Nothing to remove.")
-        return
-
-    click.echo("This will remove:")
-    for path in targets:
-        click.echo(f"  {path}")
-    for path in symlinked:
-        click.echo(f"  {path} (a symlink — remove it yourself)")
-    click.echo("")
-
-    if not yes and not click.confirm("Remove now?", default=False):
-        click.echo("Aborted, nothing removed.")
-        sys.exit(1)
-
-    for path in targets:
-        try:
-            if not path.exists() and not path.is_symlink():
-                continue
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise click.ClickException(f"Could not remove {path}: {exc}") from exc
-        click.echo(f"  removed {path}")
-
-    click.echo("Language model uninstalled.")
+    return targets, symlinked
 
 
 # --- `vocalize transcribe` (T-12), with `notes` as its hidden old name ------
@@ -2293,12 +2470,12 @@ def _transcribe_options(f):
         "--keep-audio",
         is_flag=True,
         default=None,
-        help="Save audio file in notes folder alongside the transcript.",
+        help="Save the audio file in the transcripts folder alongside the transcript.",
     )(f)
     f = click.option(
         "--force",
         is_flag=True,
-        help="Re-process files even if already transcribed in notes folder.",
+        help="Re-process files even if already transcribed in the transcripts folder.",
     )(f)
     return f
 

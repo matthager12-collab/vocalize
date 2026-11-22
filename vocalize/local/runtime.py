@@ -58,7 +58,10 @@ def environment(selected: Selection | None = None) -> dict[str, str]:
     ) if name in os.environ}
     # uv's own spellings of --offline and --no-python-downloads: a command
     # line that ever lost its flags would still not reach the network.
-    env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+    # Nothing else is copied: engine switches such as LOG_LEVEL,
+    # ONNX_PROVIDER, PHONEMIZER_ESPEAK_LIBRARY, GGML_BACKEND_PATH,
+    # HF_ENDPOINT, MLXLM_USE_MODELSCOPE or PARAKEET_* never reach a worker.
+    env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
                UV_OFFLINE="1", UV_PYTHON_DOWNLOADS="never")
     if selected is not None:
         env[IDENTITY_ENV] = selected.identity

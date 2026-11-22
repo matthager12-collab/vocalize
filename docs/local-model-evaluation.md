@@ -55,3 +55,18 @@ python tests/eval_runner.py all --exclusive-window-confirmed
 A stage that runs out of time is an incomplete run, not proof that a model is
 poor. Run it again rather than raising the limit; the limit cannot be
 changed.
+
+Plain `pytest` refuses to run these tests; use the runner. The runner finds
+the engines installed under your home folder by itself; the two variables
+above are needed only to use other environments.
+
+## Last result
+
+On 2026-11-21, on a Mac Studio (Apple M5 Max, 128 GB, macOS 27.2), the
+`cleanup` stage passed twice: 25 of 26 everyday cases and 10 of 10 guarded
+cases (8 adversarial and 2 instruction-like), in about 50 s the first time
+and 48.55 s the second. The second run used the runner with no extra
+variables. The one failed case was a self-correction with "or
+rather", which the faithful guard kept as the original text. The `whisper`
+and `warm` stages were not run that day. See
+[measurements.md](plans/2026-11-local-only/measurements.md).

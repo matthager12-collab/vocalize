@@ -14,7 +14,7 @@ xcode-select --install
 
 This installs Apple's command line tools. If they are already installed, the
 command says so. Then install [uv](https://docs.astral.sh/uv/) by following
-its instructions.
+its instructions. Vocalize uses uv to install each speech engine.
 
 ## 2. Install Vocalize
 
@@ -31,8 +31,8 @@ You should see a version number.
 vocalize local install
 ```
 
-This downloads the Kokoro voice (about 340 MB). It asks first and checks
-every file before keeping it. Then try it:
+This downloads the Kokoro voice (337 MB). It asks first and checks every
+file before keeping it. Then try it:
 
 ```bash
 vocalize speak "Vocalize is working."
@@ -56,9 +56,9 @@ fixes it.
 vocalize local install --stt
 ```
 
-This downloads a speech-to-text model (Parakeet on Apple Silicon) and builds
-**Vocalize Recorder**, a small app that holds the microphone permission.
-Then run:
+On Apple Silicon this downloads the Parakeet speech-to-text model (2.3 GB)
+and builds **Vocalize Recorder**, a small app that holds the microphone
+permission. Then run:
 
 ```bash
 vocalize dictate
@@ -92,15 +92,22 @@ vocalize portal
 ```
 
 This opens the settings page in your browser. It runs on your Mac only.
+At the top, a machine profile box suggests settings sized for your Mac's
+memory; one button applies them. Below it are the sections Speaking,
+Reading, Dictation, Transcription, Hotkeys, Engines and Advanced, with a
+button for every install and removal.
 
 ## 8. Transcribe recordings (optional)
 
 ```bash
-vocalize local install --stt --engine whisper
 vocalize transcribe recording.m4a
 ```
 
-See [transcribe.md](transcribe.md).
+With the default `[stt] engine = "auto"`, files are transcribed by Whisper,
+so install it first with `vocalize local install --stt --engine whisper`.
+To use Parakeet for files instead, set `[stt] engine = "parakeet"`, or
+apply any machine profile other than small. See
+[transcribe.md](transcribe.md).
 
 ## If something does not work
 

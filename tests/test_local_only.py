@@ -7,6 +7,7 @@ faked, and inspected.
 
 import ast
 import io
+import re
 import socket
 import subprocess
 from pathlib import Path
@@ -38,40 +39,168 @@ UV = "/synthetic/uv"
 OFFLINE_FLAGS = ("--offline", "--no-python-downloads")
 
 # --- 1. no network or hosted SDK outside the named modules -----------------
+#
+# What this scan covers, in every *.py file under vocalize/ and hooks/
+# (parsed with ast, not grepped):
+#   * an import of a BANNED module in any statement spelling, aliases included;
+#   * a bare `import urllib` / `import http` (or an alias of either) followed
+#     by an attribute path such as `urllib.request.urlopen`;
+#   * `importlib.import_module` and `__import__` called with a constant string:
+#     the module it names is checked like any import. Every other use of
+#     either name is an offence in itself — a computed argument,
+#     `getattr(importlib, "import_module")`, the function passed around or
+#     renamed. Two exceptions, both of which can only reach modules inside
+#     vocalize/, every one of which this scan reads: a relative name resolved
+#     against `__package__` (providers/__init__.py), and `f"{__package__}.x"`
+#     with a constant module path after it (portal.py);
+#   * a call named `open_connection`, `create_connection` or `start_server`
+#     on any receiver (asyncio's TCP openers, `loop.create_connection`);
+#   * a string literal naming a network tool (curl, wget, nc, ssh, scp, ftp,
+#     telnet) as the first item of a list or tuple literal anywhere, or as any
+#     word of a string passed to a subprocess or os call.
+# ALLOWED names, per file, the only modules that file may import; nothing
+# is allowed a network tool.
+#
+# What it cannot see: code run through exec/eval/compile or loaded from a
+# file path (`importlib.util` in the workers checks for, and loads, the
+# engine's own packages); `getattr` with a computed attribute name; argv
+# assembled by string operations or read from data; a call through a seam
+# whose target is chosen elsewhere; what an allowed module does with the
+# module it may import (warm.py opening AF_INET rather than AF_UNIX would
+# pass); non-Python files (workflow shell, JXA, Swift, SKILL.md); and the
+# third-party engine code inside the workers, which sections 2 and 3 hold
+# offline by command line and environment instead.
 
 BANNED = (
     "urllib.request", "http.client", "http.server", "socket", "ssl", "requests",
     "httpx", "aiohttp", "websockets", "ftplib", "smtplib", "boto3", "elevenlabs",
-    "openai", "anthropic", "google.cloud",
+    "openai", "anthropic", "google.cloud", "xmlrpc", "socketserver", "urllib3",
+    "multiprocessing.connection", "telnetlib", "imaplib", "poplib", "nntplib",
 )
 ALLOWED = {
-    "vocalize/local/install.py",        # the pinned model downloader
-    "vocalize/portal.py",               # the loopback settings page
-    "vocalize/local/warm.py",           # Unix sockets to warm workers
-    "vocalize/local/warm_protocol.py",  # Unix sockets to warm workers
+    "vocalize/local/install.py": ("urllib.request", "http.client"),  # the model downloader
+    "vocalize/portal.py": ("http.server",),                          # the loopback settings page
+    "vocalize/local/warm.py": ("socket",),                           # Unix sockets to warm workers
+    "vocalize/local/warm_protocol.py": ("socket",),                  # Unix sockets to warm workers
 }
+NETWORK_TOOLS = ("curl", "wget", "nc", "ssh", "scp", "ftp", "telnet")
+CONNECTION_CALLS = ("open_connection", "create_connection", "start_server")
+DYNAMIC_IMPORTS = ("import_module", "__import__")
+PROCESS_CALLS = (
+    "run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput",
+    "system", "popen", "execl", "execlp", "execv", "execve", "execvp", "execvpe",
+    "spawnl", "spawnlp", "spawnv", "spawnvp", "create_subprocess_exec",
+    "create_subprocess_shell",
+)
+DYNAMIC_IMPORT = "a dynamic import"
 
 
 def _banned(name: str) -> bool:
     return any(name == b or name.startswith(b + ".") for b in BANNED)
 
 
+def _called(func) -> str:
+    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+
+def _dotted(node) -> list[str] | None:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return [node.id, *reversed(parts)]
+
+
+def _names_tool(text: str) -> bool:
+    words = (w.rsplit("/", 1)[-1] for w in re.split(r"[\s;|&()`'\"]+", text))
+    return any(word in NETWORK_TOOLS for word in words)
+
+
+def _package_relative(call) -> bool:
+    """`import_module(f".{name}", __package__)` or
+    `import_module(f"{__package__}.actions")`: both stay inside vocalize/."""
+    first = call.args[0]
+    if isinstance(first, ast.JoinedStr) and len(first.values) == 2:
+        head, tail = first.values
+        if (
+            isinstance(head, ast.FormattedValue) and isinstance(head.value, ast.Name)
+            and head.value.id == "__package__" and isinstance(tail, ast.Constant)
+            and re.fullmatch(r"(\.[A-Za-z_][A-Za-z0-9_]*)+", str(tail.value))
+        ):
+            return True
+    package = call.args[1] if len(call.args) > 1 else next(
+        (k.value for k in call.keywords if k.arg == "package"), None)
+    return (
+        isinstance(first, ast.JoinedStr) and first.values
+        and isinstance(first.values[0], ast.Constant)
+        and str(first.values[0].value).startswith(".")
+        and isinstance(package, ast.Name) and package.id == "__package__"
+    )
+
+
 def _imported_names(tree) -> set[str]:
-    """Every absolute module a file can reach by import statement or by a
-    literal `importlib.import_module` / `__import__` call."""
-    names = set()
+    """Every module a file reaches, plus a marker for each other offence."""
+    names, aliases, vetted = set(), {}, set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
+            for alias in node.names:
+                names.add(alias.name)
+                if alias.asname:
+                    aliases[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    aliases[top] = top
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names.add(node.module)
-            names.update(f"{node.module}.{alias.name}" for alias in node.names)
-        elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):
-            func = node.func
-            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if called in ("import_module", "__import__") and isinstance(node.args[0].value, str):
-                names.add(node.args[0].value)
+            for alias in node.names:
+                names.add(f"{node.module}.{alias.name}")
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+                if alias.name in DYNAMIC_IMPORTS and alias.asname not in (None, alias.name):
+                    names.add(DYNAMIC_IMPORT)  # renamed, so its calls are not recognised
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            path = _dotted(node)
+            if path and path[0] in aliases:
+                resolved = [*aliases[path[0]].split("."), *path[1:]]
+                names.update(".".join(resolved[:i]) for i in range(1, len(resolved) + 1))
+        if not isinstance(node, ast.Call):
+            continue
+        called = _called(node.func)
+        if called in DYNAMIC_IMPORTS:
+            vetted.add(id(node.func))
+            first = node.args[0] if node.args else None
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                if not first.value.startswith("."):
+                    names.add(first.value)
+            elif first is None or not _package_relative(node):
+                names.add(DYNAMIC_IMPORT)
+        elif called in CONNECTION_CALLS:
+            names.add(f"a connection call: {called}")
+        if called in PROCESS_CALLS:
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                for leaf in ast.walk(arg):
+                    if isinstance(leaf, ast.Constant) and isinstance(leaf.value, str) \
+                            and _names_tool(leaf.value):
+                        names.add(f"a network tool: {leaf.value!r}")
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
+            first = node.elts[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str) \
+                    and first.value.rsplit("/", 1)[-1] in NETWORK_TOOLS:
+                names.add(f"a network tool: {first.value!r}")
+        elif id(node) in vetted:
+            continue
+        elif isinstance(node, ast.Name) and node.id in DYNAMIC_IMPORTS \
+                or isinstance(node, ast.Attribute) and node.attr in DYNAMIC_IMPORTS \
+                or isinstance(node, ast.Constant) and node.value in DYNAMIC_IMPORTS:
+            names.add(DYNAMIC_IMPORT)
     return names
+
+
+def _offences(names) -> set[str]:
+    return {n for n in names if _banned(n) or n == DYNAMIC_IMPORT or n.startswith("a ")}
 
 
 def _sources():
@@ -83,16 +212,21 @@ def _sources():
 def test_no_module_imports_a_network_client_or_hosted_sdk_outside_the_allowlist():
     offenders = {}
     for rel, path in _sources():
-        if rel in ALLOWED:
-            continue
-        found = sorted(n for n in _imported_names(ast.parse(path.read_text(), rel)) if _banned(n))
+        allowed = ALLOWED.get(rel, ())
+        found = sorted(
+            n for n in _offences(_imported_names(ast.parse(path.read_text(), rel)))
+            if not any(n == a or n.startswith(a + ".") for a in allowed)
+        )
         if found:
             offenders[rel] = found
     assert offenders == {}
 
 
-def test_the_allowlist_names_files_that_exist():
-    assert all((ROOT / rel).is_file() for rel in ALLOWED)
+def test_the_allowlist_names_files_that_exist_and_modules_they_import():
+    for rel, modules in ALLOWED.items():
+        assert (ROOT / rel).is_file()
+        names = _imported_names(ast.parse((ROOT / rel).read_text(), rel))
+        assert all(module in names for module in modules), (rel, modules)
 
 
 @pytest.mark.parametrize("source,caught", [
@@ -105,13 +239,40 @@ def test_the_allowlist_names_files_that_exist():
     ("from google import cloud", True),
     ("import importlib; importlib.import_module('requests')", True),
     ("__import__('ssl')", True),
+    ("import urllib\nurllib.request.urlopen('x')", True),
+    ("import urllib as u\nu.request.Request", True),
+    ("import http\nhttp.client.HTTPSConnection('h')", True),
+    ("import xmlrpc.client", True),
+    ("import socketserver", True),
+    ("import asyncio\nasyncio.open_connection('h', 1)", True),
+    ("loop.create_connection(factory, 'h', 1)", True),
+    ("asyncio.start_server(callback, 'h', 1)", True),
+    ("import importlib\nimportlib.import_module(name)", True),
+    ("__import__(name)", True),
+    ("getattr(importlib, 'import_module')('json')", True),
+    ("load = importlib.import_module", True),
+    ("from importlib import import_module as im", True),
+    ("importlib.import_module(f'{name}', __package__)", True),
+    ("subprocess.run(['curl', url])", True),
+    ("subprocess.run(['/usr/bin/wget', url])", True),
+    ("argv = ('ssh', host)", True),
+    ("os.system('nc -l 80')", True),
+    ("subprocess.run('echo hi | telnet h', shell=True)", True),
     ("from urllib.parse import urlsplit", False),
     ("import urllib.parse", False),
+    ("import urllib\nurllib.parse.quote('x')", False),
     ("from .socket_helpers import x", False),
     ("import sockets_are_not_socket", False),
+    ("importlib.import_module('json')", False),
+    ("importlib.import_module(f'.{name}', __package__)", False),
+    ("importlib.import_module(f'{__package__}.actions')", False),
+    ("importlib.import_module(f'{__package__}.{name}')", True),
+    ("importlib.import_module(f'{__package__}' + name)", True),
+    ("subprocess.run(['afconvert', '-f', 'WAVE', src, dst])", False),
+    ("print('curl is not run here')", False),
 ])
 def test_the_import_scan_catches_every_spelling(source, caught):
-    assert any(_banned(n) for n in _imported_names(ast.parse(source))) is caught
+    assert bool(_offences(_imported_names(ast.parse(source)))) is caught
 
 
 # --- 2. every worker command line is offline --------------------------------
@@ -240,15 +401,24 @@ def test_warm_spawn_defaults_to_the_allowlisted_environment(monkeypatch, tmp_pat
     assert spawned and spawned[0]["env"] == runtime.environment()
 
 
-@pytest.mark.parametrize("manifest", [
-    kokoro_manifest, piper_manifest, parakeet_manifest, whisper_manifest, llm_manifest,
-])
-def test_only_the_install_selftest_may_fetch(manifest):
-    """`vocalize local install` is the one step a user asks to download:
-    its selftest populates uv's cache, so it alone carries no offline flags."""
-    argv = manifest.selftest_argv()
+def test_only_the_unlocked_install_selftest_may_fetch():
+    """Piper is not yet hash-locked: its install selftest still populates
+    uv's cache, so it alone carries no offline flags."""
+    argv = piper_manifest.selftest_argv()
     assert argv[0] == "run"
     assert not set(OFFLINE_FLAGS) & set(argv)
+
+
+@pytest.mark.parametrize("manifest", [
+    kokoro_manifest, parakeet_manifest, whisper_manifest, llm_manifest,
+])
+def test_a_locked_install_selftest_is_offline_too(manifest):
+    """A locked engine's environment is built from its lock before the
+    selftest runs, so the selftest has nothing to fetch either."""
+    argv = manifest.selftest_argv()
+    assert argv[0] == "run"
+    _assert_offline([UV, *argv])
+    assert "--with" not in argv
 
 
 # --- 3. the worker environment is an allowlist ------------------------------

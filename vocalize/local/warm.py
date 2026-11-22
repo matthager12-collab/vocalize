@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import math
 import os
 import socket
@@ -12,9 +13,67 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from vocalize.local import runtime
 from vocalize.local import warm_protocol as protocol
+
+# AF_UNIX's sun_path is 104 bytes on macOS; the server's pending name adds
+# up to 3 more, so the protocol caps a socket path at 100.
+_SOCKET_PATH_MAX = 100
+
+
+def _fits(path) -> bool:
+    return len(os.fsencode(path)) <= _SOCKET_PATH_MAX
+
+
+def _fallback_parents() -> list[str]:
+    """Where a short private socket folder may go, in order. A seam: the
+    test suite turns the fallback off so no test reaches a shared folder."""
+    # Each folder made under these is 0700 and owner-checked (ensure_private_dir).
+    return [tempfile.gettempdir(), "/tmp"]
+
+
+def socket_path(kind, base=None) -> Path:
+    """The usual socket path, or a short private one when it is too long.
+
+    A long HOME (or `base`) once disabled every warm server without a word.
+    The fallback folder is named for this user and for the usual folder, so
+    two homes never share a server, and every caller — client, spawner,
+    `listen --check` — computes the same one. It is created 0700 and
+    checked like the usual folder (`protocol.ensure_private_dir`) before
+    anything binds or connects there.
+    """
+    path = protocol.socket_path(kind, base)
+    if _fits(path):
+        return path
+    tag = hashlib.sha256(os.fsencode(path.parent)).hexdigest()[:12]
+    for parent in _fallback_parents():
+        candidate = Path(parent) / f"vocalize-{os.getuid()}-{tag}" / path.name
+        if _fits(candidate):
+            return candidate
+    return path  # nothing short enough: socket_problem says so
+
+
+def socket_problem(kind, base=None) -> str | None:
+    """Why no warm server can use `socket_path(kind, base)`, or None.
+
+    Read-only: a folder that does not exist yet is fine, it is created on
+    first use. Never raises.
+    """
+    try:
+        path = socket_path(kind, base)
+        if not _fits(path):
+            return "the socket path is too long and no short private folder is available"
+        try:
+            info = path.parent.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            return "the socket folder is not a private folder owned by you"
+    except Exception:  # noqa: BLE001 -- a report, never a crash
+        return "the socket folder could not be checked"
+    return None
 
 # A detached uv process needs time to bind. Keep the reservation across
 # short-lived CLI processes, without ever treating a wrapper PID as a worker.
@@ -43,7 +102,7 @@ def _exchange(path, payload, deadline, *, answer=True):
 def live(kind, expected_fingerprint, base=None, timeout=0.1) -> dict | None:
     """A fingerprint match is required before any transcript is sent."""
     try:
-        reply = _exchange(protocol.socket_path(kind, base), {"op": "hello"},
+        reply = _exchange(socket_path(kind, base), {"op": "hello"},
                           time.monotonic() + timeout)
         if reply.get("ok") is True and reply.get("fingerprint") == expected_fingerprint:
             return reply
@@ -92,9 +151,9 @@ def _ensure(kind, spawn_argv, expected, lease_id, base, env, spawn, deadline):
     """Serialize spawn and reserve startup time even after this CLI exits."""
     fd = None
     try:
-        path = protocol.socket_path(kind, base)
-        if len(os.fsencode(path)) > 100:
-            return
+        path = socket_path(kind, base)
+        if not _fits(path):
+            return  # no short private folder either; `listen --check` says so
         protocol.ensure_private_dir(path.parent)
         reply = _hello(path, min(deadline, time.monotonic() + 0.1))
         if reply and reply.get("ok") is True and reply.get("fingerprint") == expected:
@@ -177,7 +236,7 @@ def lease(kind, expected_fingerprint, lease_id, base=None) -> bool:
     """Hold a live, matching server for this take; never spawn one (DEC-050).
     Bounded to 0.2 s. False when nothing warm is there to hold."""
     try:
-        path = protocol.socket_path(kind, base)
+        path = socket_path(kind, base)
         deadline = time.monotonic() + 0.2
         reply = _hello(path, deadline)
         if not (reply and reply.get("ok") is True and reply.get("fingerprint") == expected_fingerprint):
@@ -190,7 +249,7 @@ def lease(kind, expected_fingerprint, lease_id, base=None) -> bool:
 def release(kind, lease_id, base=None):
     """A missed release is harmless because leases also expire automatically."""
     try:
-        _exchange(protocol.socket_path(kind, base), {"op": "release", "id": lease_id},
+        _exchange(socket_path(kind, base), {"op": "release", "id": lease_id},
                   time.monotonic() + 0.2)
     except Exception:  # noqa: BLE001, S110 -- warm failures must be silent and preserve fallback
         pass
@@ -212,6 +271,79 @@ def _stop(path, ident, deadline):
             pass
 
 
+#: Every kind of warm server. Parakeet has none: it runs one-shot.
+KINDS = ("whisper", "llm")
+# How long a stop on request waits for a server to let go of its model.
+_STOP_SECONDS = 0.5
+
+
+def _private_folder(path) -> bool:
+    """The socket's folder exists, is a real folder, is yours and is 0700:
+    what `ensure_private_dir` demands before anything binds or connects
+    there, checked without creating or repairing anything."""
+    try:
+        info = Path(path).parent.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and not info.st_mode & 0o077)
+
+
+def _known(kind) -> None:
+    if kind not in KINDS:
+        raise ValueError("unknown worker kind")
+
+
+def is_running(kind, base=None) -> bool:
+    """Whether a warm server of this kind answers at its socket now.
+
+    Read-only, bounded to 0.1 s, never raises for a known kind: it creates
+    no folder, and a hello is not use, so asking never keeps a model loaded.
+    """
+    _known(kind)
+    try:
+        path = socket_path(kind, base)
+        if not (_private_folder(path) and protocol.check_socket_path(path)):
+            return False
+        reply = _hello(path, time.monotonic() + 0.1)
+        return bool(reply) and reply.get("ok") is True
+    except Exception:  # noqa: BLE001 -- a report, never a crash
+        return False
+
+
+def stop(kind, base=None) -> bool:
+    """Stop the warm server of this kind, if one is running. True when one
+    answered and was told to stop; False when none was running.
+
+    Looks where the server really is (`socket_path`, short fallback folder
+    included) and only behind the client's own checks: a private folder
+    and a socket owned by you. A listener that no longer answers is still
+    told to stop, but is not reported as a stopped server.
+    """
+    _known(kind)
+    try:
+        path = socket_path(kind, base)
+        if not (_private_folder(path) and protocol.check_socket_path(path)):
+            return False
+        deadline = time.monotonic() + _STOP_SECONDS
+        reply = _hello(path, min(deadline, time.monotonic() + 0.1))
+        _stop(path, None, deadline)
+        return bool(reply) and reply.get("ok") is True
+    except Exception:  # noqa: BLE001 -- a stop on request must never crash its caller
+        return False
+
+
+def stop_all(base=None) -> dict:
+    """Stop every kind of warm server: {kind: whether one was stopped}."""
+    stopped = {}
+    for kind in KINDS:
+        try:
+            stopped[kind] = stop(kind, base)
+        except Exception:  # noqa: BLE001 -- one failure must not skip the other kind
+            stopped[kind] = False
+    return stopped
+
+
 def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) -> dict | None:
     """Retry loading within one deadline; any other failure retires the warm model."""
     path = ident = None
@@ -222,7 +354,7 @@ def request(kind, payload: dict, expected_fingerprint, deadline_s, base=None) ->
         deadline += deadline_s
         # Reserve a small part of the same deadline for fallback control messages.
         work_deadline = deadline - min(0.02, deadline_s / 10)
-        path = protocol.socket_path(kind, base)
+        path = socket_path(kind, base)
         give_up = min(work_deadline, time.monotonic() + _LOADING_GRACE)
         while time.monotonic() < give_up:
             if not protocol.check_socket_path(path) and _spawn_pending(path):

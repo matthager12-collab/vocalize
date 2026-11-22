@@ -28,3 +28,7 @@ control or an action in the settings page, or a written exemption.
 
 Exempt by nature, shown as guidance with a link to the right pane of System
 Settings: the microphone grant and the Accessibility grant.
+
+The choices that still have no control in 1.0.0, and why, are listed in
+the README section
+[Choices with no control on the settings page](../../../README.md#choices-with-no-control-on-the-settings-page).

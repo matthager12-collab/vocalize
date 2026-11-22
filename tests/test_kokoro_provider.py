@@ -184,14 +184,43 @@ def no_uv(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def installed(model_dir):
-    """Both files at their manifest size (sparse), plus a valid stamp."""
+def installed(model_dir, monkeypatch):
+    """Both files at their manifest size (sparse), plus a valid stamp and
+    the environment built from the lock."""
     for entry in manifest.FILES:
         path = model_dir / entry["name"]
         path.write_bytes(b"")
         os.truncate(path, entry["size"])
     install_module.write_stamp(model_dir)
+    _fake_locked_runtime(monkeypatch, model_dir, manifest)
     return model_dir
+
+
+def test_a_missing_locked_runtime_says_to_install_again(model_dir, monkeypatch, with_uv):
+    from vocalize.local import locks
+
+    for entry in manifest.FILES:
+        path = model_dir / entry["name"]
+        path.write_bytes(b"")
+        os.truncate(path, entry["size"])
+    install_module.write_stamp(model_dir)
+    monkeypatch.setattr(locks, "ENVS_DIR", model_dir / "envs")
+
+    with pytest.raises(ProviderUnavailableError, match="run `vocalize local install` again"):
+        kokoro.check()
+
+
+def _fake_locked_runtime(monkeypatch, tmp_path, *manifests):
+    """What `local install` leaves for a locked engine: an environment for
+    the current lock and its marker. Nothing is installed in it."""
+    from vocalize.local import locks
+
+    monkeypatch.setattr(locks, "ENVS_DIR", tmp_path / "envs")
+    for m in manifests:
+        python = locks.env_python(m.ENGINE, m.lock_file())
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_bytes(b"")
+        locks.write_marker(m.ENGINE, m.lock_file())
 
 
 def settings(**kwargs):
@@ -322,12 +351,14 @@ def test_the_argv_is_the_uv_invocation_the_worker_expects(with_uv, installed, sp
     # --no-project is a guard, not a nicety: without it uv treats a cwd that
     # holds a pyproject.toml as a project and rebuilds ITS .venv (this bit us
     # live — the repo's 3.14 venv was replaced by a uv-managed 3.12 one).
-    assert argv[:9] == [
-        with_uv, "run", "--no-project", "--offline", "--no-python-downloads",
-        "--python", manifest.PYTHON_VERSION,
-        "--with", manifest.RUNTIME_PACKAGE,
+    # No `--with`: the hash-locked environment's own interpreter, so uv
+    # resolves and fetches nothing at speak time.
+    assert argv[:8] == [
+        with_uv, "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
+        "--python", str(manifest.runtime_python()),
     ]
-    assert argv[9] == str(manifest.worker_path())
+    assert "--with" not in argv
+    assert argv[8] == str(manifest.worker_path())
     assert argv[argv.index("--model") + 1] == str(model)
     assert argv[argv.index("--voices") + 1] == str(voices)
     assert argv[argv.index("--voice") + 1] == "af_heart"
@@ -514,3 +545,10 @@ def test_speak_before_install_fails_loud_with_no_side_effects(
     assert "vocalize local install" in result.output
     assert spawned == []  # no worker, no uv, no network
     assert list(model_dir.iterdir()) == []  # and not one file written
+
+
+def test_the_memory_figure_is_the_one_measured_on_the_mac_studio():
+    """M5 Max, 2026-11-21: ~1.5 GB resident for the worker, not 760 MB."""
+    doc = " ".join(kokoro.__doc__.split())
+    assert "760 MB" not in doc
+    assert "1.5 GB" in doc

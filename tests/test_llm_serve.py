@@ -97,7 +97,7 @@ def test_stream_uses_ids_and_caps_tokens(factory):
         assert h.tokenizer.decode_calls == []
         user = next(c for c in h.tokenizer.encode_calls if c["text"] == h.payload["text"])
         assert user["split_special_tokens"] is True
-        assert h.load_args == {"tokenizer_config": {"trust_remote_code": False}}
+        assert h.load_args == {}  # trust_remote_code is never passed, not even as False
 
 
 @pytest.mark.parametrize("stop", ["cancel", "deadline"])

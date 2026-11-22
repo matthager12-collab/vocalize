@@ -1,16 +1,22 @@
 # Transcribing audio files
 
 `vocalize transcribe` turns recordings you already have into Markdown
-transcripts. It runs on your Mac with the Whisper engine. It does not
+transcripts. It runs on your Mac with Parakeet or Whisper. It does not
 record; for live speech, use [dictation](dictation.md).
 
 ## Before you start
 
-`transcribe` needs Whisper, even if you dictate with Parakeet:
+Which engine transcribes files depends on `[stt] engine`:
 
-```bash
-vocalize local install --stt --engine whisper
-```
+| `[stt] engine` | Files are transcribed by | Install it with |
+|---|---|---|
+| `parakeet` | Parakeet (Apple Silicon only) | `vocalize local install --stt` |
+| `whisper` | Whisper | `vocalize local install --stt --engine whisper` |
+| `auto` (the default) | Whisper when a Whisper model is installed, otherwise Parakeet | either of the above |
+
+Under `auto`, dictation prefers Parakeet when it is installed, but files
+prefer Whisper. Set `engine = "parakeet"`, or apply any machine profile
+other than small on the settings page, to use Parakeet for both.
 
 ## Use it
 
@@ -66,30 +72,65 @@ point it at a folder repeatedly and only new recordings are processed. Use
 ## How it works
 
 1. `afconvert`, which is built into macOS, converts the audio to 16 kHz mono.
-2. One Whisper run produces timestamped segments. Whisper runs as a
-   separate process, offline.
-3. The transcript is written to a temporary file and then moved into place,
+2. A silent recording is not sent to the engine. Its transcript says
+   "This recording is silent: it has no words."
+3. One engine run produces timestamped segments. The engine runs as a
+   separate process, offline. Parakeet cuts a long file into overlapping
+   two-minute pieces and keeps the spoken order at each join.
+4. Your `[stt] vocabulary` list corrects the text of every segment (see
+   [dictation.md](dictation.md#vocabulary)).
+5. The transcript is written to a temporary file and then moved into place,
    so a crash never leaves a half-written transcript.
 
-If Whisper is not installed, or cannot start offline, the command stops and
-tells you to run `vocalize local install` again. It never downloads anything
-on its own.
+If the engine is not installed, or cannot start offline, the command stops
+and tells you to run `vocalize local install` again. It never downloads
+anything on its own.
+
+## How fast it is
+
+Measured with `vocalize transcribe` on a Mac Studio (Apple M5 Max,
+128 GB), with speech made by the macOS voice:
+
+| File | Engine | Time | Memory | Word error rate |
+|---|---|---|---|---|
+| 10 minutes | Parakeet | 7.4 s | 944 MB | 2.0 % |
+| 60 minutes | Parakeet | 27.6 s | 1.5 GB | 1.6 % |
+| 10 minutes | Whisper large-v3-turbo-q5_0 | 19.4 s | 1.03 GB | 1.5 % |
+
+No word was repeated or dropped where Parakeet's pieces join. In that run
+two sentences swapped places at one join; 1.0.0 fixes that. Memory is the
+largest resident memory and may undercount Parakeet. See
+[measurements.md](plans/2026-11-local-only/measurements.md).
+
+## Known limits
+
+- The silence check looks at the level of the whole file. Faint noise
+  with no speech in it can get past it. In testing, Whisper wrote "." for
+  one such file and a whole invented sentence for another; Parakeet
+  returned nothing for either.
+  Speakers are not told apart, and video files are not supported.
 
 ## Settings
 
 ```toml
 [transcribe]
 folder = "~/Documents/Vocalize Notes"
+keep_audio = false
+model = ""
 ```
 
 `folder` is where transcripts are written. If the recordings are private,
 pick a folder that does not sync to iCloud or Dropbox; a synced folder copies
-the transcripts off your Mac.
+the transcripts off your Mac. `keep_audio` saves a copy of each recording
+next to its transcript. `model` picks the Whisper model for files; empty
+uses the dictation model, `[stt] model`. All three are also on the settings
+page, under Transcription.
 
 ## Coming from 0.15
 
 `vocalize transcribe` replaces `vocalize notes`. The old name still works as
-a hidden alias. Because summaries and note templates were removed, the alias accepts and ignores `--template` and `--summarizer off`.
+a hidden alias. Because summaries and note templates were removed, the alias
+accepts and ignores `--template` and `--summarizer`.
 
 A `[notes]` table in your config file is read as `[transcribe]`. A file you
 already processed with `notes` is not transcribed again.

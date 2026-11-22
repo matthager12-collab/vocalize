@@ -2,7 +2,6 @@ import pytest
 
 from vocalize.config import (
     DEFAULT_CHAIN,
-    DEFAULT_MODEL,
     DEFAULT_VOICE,
     load_config_file,
     resolve_chain,
@@ -313,7 +312,7 @@ def test_an_unknown_transcribe_key_warns_but_still_loads(monkeypatch, tmp_path, 
 # --- provider values are short strings (issue #5) -----------------------------
 
 
-@pytest.mark.parametrize("key", ["voice", "model", "language"])
+@pytest.mark.parametrize("key", ["voice", "language"])
 def test_a_provider_voice_type_that_is_not_a_string_is_refused(monkeypatch, tmp_path, key):
     with pytest.raises(ConfigError) as excinfo:
         _load_stt(monkeypatch, tmp_path, f"[providers.kokoro]\n{key} = 12345\n")
@@ -635,7 +634,8 @@ def test_unknown_speech_key_warns(monkeypatch, tmp_path, capsys):
 def test_local_default_settings(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
     settings = resolve_settings()
-    assert (settings.provider, settings.voice_id, settings.model_id) == ("kokoro", DEFAULT_VOICE, DEFAULT_MODEL)
+    assert (settings.provider, settings.voice_id) == ("kokoro", DEFAULT_VOICE)
+    assert not hasattr(settings, "model_id")
     assert resolve_chain() == list(DEFAULT_CHAIN)
 
 
@@ -665,6 +665,10 @@ voice = "alloy"
 [providers.kokoro]
 voice = "af_bella"
 
+[providers.anthropic]
+monthly_chars = 1000
+api_key = "{CANARY}"
+
 [stt]
 cleanup = "claude-cli"
 
@@ -678,7 +682,8 @@ V015_RETIRED_PATHS = (
     "voice", "model", "speed",
     "chain entry 'elevenlabs'", "chain entry 'openai'", "chain entry 'google'",
     "chain entry 'polly'",
-    "[providers.openai]", "stt.cleanup", "notes.template", "notes.summarizer",
+    "[providers.openai]", "[providers.anthropic]", "stt.cleanup", "notes.template",
+    "notes.summarizer",
 )
 
 
@@ -771,7 +776,7 @@ def test_a_chain_of_only_cloud_engines_falls_back_to_the_default(monkeypatch):
     'chain = "kokoro"',
     '[stt]\ncleanup = "claude"',
     '[providers.kokoro]\nvoice = 5',
-    '[providers.nonesuch]\nvoice = "x"',
+    'providers = {kokoro = "x"}',
     'max_chars = 0\n[providers.kokoro]\napi_key = "k"',
 ])
 def test_a_malformed_live_value_beside_retired_keys_is_still_an_error(
@@ -809,3 +814,142 @@ def test_ambient_cloud_credentials_are_not_loaded_or_selected(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "SECRET_CANARY")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "SECRET_CANARY")
     assert resolve_chain(file_config={}) == ["kokoro", "say"]
+
+
+# --- [providers.anthropic] and unknown provider tables (H1, M1) -------------
+
+
+@pytest.mark.parametrize("body, path", [
+    ("[providers.anthropic]\nmonthly_chars = 1000", "[providers.anthropic]"),
+    ('[providers.anthropic]\napi_key = "SECRET_CANARY"', "[providers.anthropic]"),
+])
+def test_the_015_anthropic_table_is_retired_not_an_error(monkeypatch, tmp_path, capsys, body, path):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, body + "\n")
+
+    data = load_config_file()
+
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert f"retired setting {path} in " in err[0]
+    assert "SECRET_CANARY" not in repr(err) + repr(data)
+    assert "1000" not in err[0]
+    assert "anthropic" not in data.get("providers", {})
+    assert config.without_retired_settings(_parse_toml(body)) == {"providers": {}}
+
+
+def test_an_unknown_provider_table_is_ignored_with_one_notice(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(
+        monkeypatch, tmp_path,
+        '[providers.nonesuch]\nvoice = "SECRET_CANARY"\nspeed = 99\n'
+        '[providers.kokoro]\nvoice = "af_bella"\n',
+    )
+
+    data = load_config_file()
+    load_config_file()  # the portal re-reads: still one notice
+
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert "[providers.nonesuch]" in err[0]
+    assert "SECRET_CANARY" not in err[0] and "99" not in err[0]
+    assert data["providers"] == {"kokoro": {"voice": "af_bella"}}
+    assert resolve_settings(file_config=data).voice_id == "af_bella"
+
+
+def test_a_non_table_under_an_unknown_provider_name_is_dropped_without_echo(
+    monkeypatch, tmp_path, capsys,
+):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, '[providers]\nanthropic = "SECRET_CANARY"\nnonesuch = 3\n')
+
+    data = load_config_file()
+
+    err = capsys.readouterr().err
+    assert "SECRET_CANARY" not in err + repr(data)
+    assert data["providers"] == {}
+
+
+def test_an_unknown_provider_table_is_dropped_by_the_writer_too():
+    from vocalize import config
+
+    raw = {"providers": {"nonesuch": {"voice": "x"}, "say": {"voice": "Alex"}}}
+    assert config.without_retired_settings(raw) == {"providers": {"say": {"voice": "Alex"}}}
+    (notice,) = config.retired_notices(raw)
+    assert "[providers.nonesuch]" in notice
+
+
+# --- settings no engine read are retired (review M2) -------------------------
+
+
+@pytest.mark.parametrize("body, path", [
+    ('[providers.kokoro]\nmodel = "SECRET_CANARY"', "providers.kokoro.model"),
+    ("[providers.kokoro]\nmodel = 12345", "providers.kokoro.model"),
+    ('[providers.piper]\nmodel = "SECRET_CANARY"', "providers.piper.model"),
+    ('[providers.say]\nmodel = "SECRET_CANARY"', "providers.say.model"),
+    ('[providers.piper]\nlanguage = "SECRET_CANARY"', "providers.piper.language"),
+    ('[providers.say]\nlanguage = "SECRET_CANARY"', "providers.say.language"),
+])
+def test_an_engine_key_no_engine_reads_is_retired_with_one_notice(
+    monkeypatch, tmp_path, capsys, body, path
+):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, body + '\nvoice = "x_voice"\n')
+
+    data = load_config_file()
+    load_config_file()
+
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1
+    assert f"retired setting {path} in " in err[0]
+    assert "SECRET_CANARY" not in repr(err) + repr(data) and "12345" not in err[0]
+    name = path.split(".")[1]
+    assert data["providers"][name] == {"voice": "x_voice"}
+    assert config.without_retired_settings(_parse_toml(body)) == {"providers": {name: {}}}
+
+
+def test_the_kokoro_language_is_still_a_setting(monkeypatch, tmp_path, capsys):
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    _isolate(monkeypatch, tmp_path, '[providers.kokoro]\nlanguage = "b"\n')
+
+    data = load_config_file()
+
+    assert capsys.readouterr().err == ""
+    assert resolve_provider_settings("kokoro", data).language == "b"
+
+
+def test_vocalize_model_no_longer_changes_anything(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    before = resolve_provider_settings("kokoro", {})
+    monkeypatch.setenv("VOCALIZE_MODEL", "anything")
+    assert resolve_provider_settings("kokoro", {}) == before
+    with pytest.raises(TypeError):
+        resolve_provider_settings("kokoro", {}, model_id="x")
+
+
+def test_a_flat_model_key_stays_retired():
+    from vocalize import config
+
+    (notice,) = config.retired_notices({"model": "SECRET_CANARY"})
+    assert "retired setting model in " in notice and "SECRET_CANARY" not in notice
+    assert config.without_retired_settings({"model": "x"}) == {}
+
+
+def test_each_engine_table_knows_only_what_its_engine_reads():
+    from vocalize import config
+
+    assert config.KNOWN_PROVIDER_KEYS == {
+        "kokoro": ("voice", "language", "speed"),
+        "piper": ("voice", "speed"),
+        "say": ("voice", "speed"),
+    }

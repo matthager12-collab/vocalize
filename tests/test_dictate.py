@@ -1789,8 +1789,11 @@ def test_sounds_can_be_turned_off(recorder, harness):
 def test_the_worker_argv_pins_the_runtime_and_avoids_the_project(monkeypatch):
     argv = dictate.worker_argv("/opt/uv", Path("/tmp/take.wav"), stt())
 
-    assert argv[:5] == ["/opt/uv", "run", "--no-project", "--offline", "--no-python-downloads"]
-    assert "pywhispercpp==1.5.1" in argv
+    from vocalize.local import whisper_manifest
+
+    assert argv[:6] == ["/opt/uv", "run", "--no-project", "--no-build", "--offline", "--no-python-downloads"]
+    assert "--with" not in argv
+    assert argv[argv.index("--python") + 1] == str(whisper_manifest.runtime_python())
     assert argv[argv.index("--transcribe") + 1] == "/tmp/take.wav"
     assert argv[argv.index("--language") + 1] == "en"
     assert argv[argv.index("--model") + 1].endswith("ggml-small.en.bin")
@@ -1881,6 +1884,240 @@ def test_a_wav_error_message_never_quotes_the_file(transcriber, tmp_path):
         dictate.transcribe_wav(junk, stt())
 
     assert "\x1b" not in str(excinfo.value)
+
+
+@pytest.fixture
+def strict_worker(tmp_path, monkeypatch, harness):
+    """A fake `uv` that refuses a recording path it cannot see, the way
+    both real workers do — they run from the system temporary directory."""
+    monkeypatch.setattr(install_module, "installed", lambda manifest, **kw: (True, ""))
+    fake_uv = script(
+        tmp_path / "strict-uv",
+        f'for a in "$@"; do printf "%s\\n" "$a"; done >> "{harness.uv_argv}"\n'
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '  if [ "$prev" = "--transcribe" ] && [ ! -f "$a" ]; then\n'
+        '    echo "refused: the recording does not exist" >&2; exit 2\n'
+        '  fi\n'
+        '  prev="$a"\n'
+        "done\n"
+        f"cat <<'EOF'\n{json.dumps({'ok': True, 'text': TRANSCRIPT})}\nEOF\n",
+    )
+    monkeypatch.setattr(dictate, "_uv_or_raise", lambda: str(fake_uv))
+    return fake_uv
+
+
+@pytest.mark.parametrize("engine", ["whisper", "parakeet"])
+def test_a_relative_wav_path_reaches_the_worker_as_an_absolute_one(
+    strict_worker, harness, tmp_path, monkeypatch, engine
+):
+    """F1 (Mac Studio run): the worker runs in another folder, so a path
+    relative to the user's folder must be made absolute before it goes."""
+    from vocalize.local import parakeet_manifest
+
+    if engine == "parakeet":
+        monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    folder = tmp_path / "where-the-user-is"
+    folder.mkdir()
+    write_wav(folder / "clip.wav")
+    monkeypatch.chdir(folder)
+
+    assert dictate.transcribe_wav(Path("clip.wav"), stt(engine=engine)) == TRANSCRIPT
+    argv = lines(harness.uv_argv)
+    handed = argv[argv.index("--transcribe") + 1]
+    assert handed == str(folder / "clip.wav")
+
+
+def test_a_missing_wav_says_it_does_not_exist(transcriber, tmp_path):
+    transcriber()
+
+    with pytest.raises(DictationError) as excinfo:
+        dictate.transcribe_wav(tmp_path / "nowhere.wav", stt())
+
+    assert "does not exist" in str(excinfo.value)
+    assert "nowhere" not in str(excinfo.value)
+
+
+def test_a_folder_named_like_a_wav_says_it_is_not_a_regular_file(transcriber, tmp_path):
+    transcriber()
+    (tmp_path / "folder.wav").mkdir()
+
+    with pytest.raises(DictationError) as excinfo:
+        dictate.transcribe_wav(tmp_path / "folder.wav", stt())
+
+    assert "not a regular file" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("name", ["UPPER.WAV", "Mixed.Wav"])
+@pytest.mark.parametrize("engine", ["whisper", "parakeet"])
+def test_a_wav_ending_in_any_letter_case_is_transcribed(
+    strict_worker, harness, tmp_path, monkeypatch, engine, name
+):
+    """G2: `listen --wav UPPER.WAV` was refused. The Whisper worker takes
+    only a lower-case `.wav` name and both open the file without following
+    a link, so the worker gets a hard link (same file, no copy) named
+    `.wav` in a private folder, removed afterwards."""
+    from vocalize.local import parakeet_manifest
+
+    if engine == "parakeet":
+        monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    clip = write_wav(tmp_path / name)
+
+    assert dictate.transcribe_wav(clip, stt(engine=engine)) == TRANSCRIPT
+    argv = lines(harness.uv_argv)
+    handed = Path(argv[argv.index("--transcribe") + 1])
+    assert handed.name.endswith(".wav")
+    assert handed.parent != clip.parent
+    assert not handed.exists() and not handed.parent.exists()  # cleaned up
+    assert clip.is_file()  # the user's file is untouched
+
+
+def test_the_link_for_an_upper_case_name_is_the_same_file_and_not_a_symlink(
+    transcriber, tmp_path, monkeypatch
+):
+    clip = write_wav(tmp_path / "TAKE.WAV")
+    seen = {}
+
+    def engine(path, s):
+        seen["link"] = not path.is_symlink() and os.path.samefile(path, clip)
+        seen["mode"] = stat.S_IMODE(path.parent.stat().st_mode)
+        seen["name"] = path.name
+        return "hello"
+
+    monkeypatch.setattr(dictate, "transcribe", engine)
+    assert dictate.transcribe_wav(clip, stt(cleanup="off")) == "hello"
+    assert seen == {"link": True, "mode": 0o700, "name": "take.wav"}
+
+
+def test_an_upper_case_name_that_cannot_be_linked_says_to_rename_it(
+    transcriber, tmp_path, harness, monkeypatch
+):
+    """A file on another volume cannot be hard-linked into the temporary
+    folder; the message says what to do and never quotes the file."""
+    transcriber()
+    clip = write_wav(tmp_path / "secret-name.WAV")
+
+    def refuse(*_a, **_k):
+        raise OSError(18, "Cross-device link")
+
+    monkeypatch.setattr(dictate.os, "link", refuse)
+    with pytest.raises(DictationError) as excinfo:
+        dictate.transcribe_wav(clip, stt())
+
+    assert "Rename it to end in .wav" in str(excinfo.value)
+    assert "secret-name" not in str(excinfo.value)
+    assert lines(harness.uv_argv) == []
+
+
+def test_a_name_that_does_not_end_in_wav_is_still_refused(transcriber, tmp_path, harness):
+    transcriber()
+    clip = write_wav(tmp_path / "clip.wave")
+
+    with pytest.raises(DictationError) as excinfo:
+        dictate.transcribe_wav(clip, stt())
+
+    assert ".wav" in str(excinfo.value)
+    assert lines(harness.uv_argv) == []
+
+
+def test_a_silent_wav_produces_no_words_and_never_reaches_the_engine(
+    transcriber, tmp_path, harness
+):
+    """F2: whisper hears "Thank you." in digital silence; the live guard
+    must apply to a file too. Silence is "", not None ("nothing heard"),
+    so the command can say which of the two it was."""
+    transcriber("Thank you.")
+
+    assert dictate.transcribe_wav(write_wav(tmp_path / "quiet.wav", amplitude=0), stt()) == ""
+    assert lines(harness.uv_argv) == []
+
+
+@pytest.mark.parametrize("heard", [".", " . ", "...", "?!", "\u2026", "-- _ --", "\u3002"])
+@pytest.mark.parametrize("engine", ["whisper", "parakeet", "auto"])
+def test_a_transcript_with_no_letter_or_digit_is_nothing_heard(monkeypatch, tmp_path, heard, engine):
+    """G1: low-level noise got past the silence guard and Whisper printed
+    "." with exit 0. Punctuation alone is nothing heard, for every engine,
+    for a live take and for a file alike."""
+    (text, skipped, raw), seen = _finish_with(monkeypatch, tmp_path, heard, engine=engine,
+                                              cleanup="local")
+    assert (text, skipped, raw) == (None, False, None) and seen == []
+    monkeypatch.setattr(dictate, "_is_silent", lambda take: False)
+    assert dictate.transcribe_wav(write_wav(tmp_path / "noise.wav"), stt(engine=engine)) is None
+
+
+@pytest.mark.parametrize("heard", ["7", "ok.", "\u00e9t\u00e9", "\u6771\u4eac"])
+def test_a_transcript_with_a_letter_or_digit_is_kept(monkeypatch, tmp_path, heard):
+    (text, _skipped, _raw), _seen = _finish_with(monkeypatch, tmp_path, heard, cleanup="off")
+    assert text == heard
+
+
+@pytest.mark.parametrize("engine", ["whisper", "parakeet"])
+def test_listen_wav_on_noise_says_nothing_heard_and_exits_1_for_every_engine(monkeypatch, tmp_path,
+                                                                            engine):
+    """G1: Whisper's "." used to print on stdout with exit 0, while
+    Parakeet's empty answer said "Nothing heard." with exit 1. Both now end
+    the way the live path does: the notice on stderr, nothing on stdout,
+    exit 1."""
+    monkeypatch.setattr(dictate, "transcribe", lambda path, s: "." if engine == "whisper" else "")
+    result = CliRunner().invoke(main, ["listen", "--wav", str(write_wav(tmp_path / "noise.wav"))])
+    assert (result.exit_code, result.stdout.strip()) == (1, "")
+    assert "Nothing heard." in result.stderr
+
+
+def _wav_steps(monkeypatch, heard, *, cleaned=True):
+    steps = []
+
+    def engine(path, s):
+        steps.append("engine")
+        return heard
+
+    def correct(text, words):
+        steps.append("vocabulary")
+        return text.replace("duck db", "DuckDB")
+
+    def cleanup(text, backend, verbatim):
+        steps.append(("cleanup", backend, verbatim))
+        return (text.upper(), True) if cleaned else (text, False)
+
+    monkeypatch.setattr(dictate, "transcribe", engine)
+    monkeypatch.setattr(dictate.vocabulary, "correct", correct)
+    monkeypatch.setattr(dictate.llm, "cleanup_transcript", cleanup)
+    return steps
+
+
+def test_a_wav_with_cleanup_on_runs_the_live_take_steps_in_order(monkeypatch, tmp_path):
+    """F2 (m2): `listen --wav --cleanup` used to skip cleanup silently."""
+    steps = _wav_steps(monkeypatch, "open duck db")
+    notices = []
+
+    text = dictate.transcribe_wav(
+        write_wav(tmp_path / "take.wav"), stt(cleanup="local", verbatim=True),
+        notice=notices.append,
+    )
+
+    assert text == "OPEN DUCKDB"
+    assert steps == ["engine", "vocabulary", ("cleanup", "local", True)]
+    assert notices == []
+
+
+def test_a_wav_with_cleanup_off_never_runs_cleanup(monkeypatch, tmp_path):
+    steps = _wav_steps(monkeypatch, "open duck db")
+
+    assert dictate.transcribe_wav(write_wav(tmp_path / "take.wav"), stt(cleanup="off")) == "open DuckDB"
+    assert steps == ["engine", "vocabulary"]
+
+
+def test_a_wav_whose_cleanup_fails_keeps_the_uncleaned_text_and_says_so(monkeypatch, tmp_path):
+    _wav_steps(monkeypatch, "open duck db", cleaned=False)
+    notices = []
+
+    text = dictate.transcribe_wav(
+        write_wav(tmp_path / "take.wav"), stt(cleanup="local"), notice=notices.append,
+    )
+
+    assert text == "open DuckDB"
+    assert len(notices) == 1 and "skipped" in notices[0]
+    assert "open" not in notices[0] and "DuckDB" not in notices[0]  # never the transcript
 
 
 # --- the silence guard ------------------------------------------------
@@ -2837,7 +3074,6 @@ def test_a_resume_speaks_the_rest_in_the_voice_the_read_was_stopped_in(
     assert cli_module.resume_interrupted() is True
 
     assert calls[0]["voice_id"] == "a-particular-voice"
-    assert calls[0]["model_id"] == "a-particular-model"
     assert calls[0]["speed"] == 1.15
     assert calls[0]["chunk_chars"] == 400
 
@@ -3357,3 +3593,42 @@ def test_paused_workdir_younger_than_24h_is_not_swept(tmp_path, monkeypatch):
         assert workdir.is_dir()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# --- vocabulary corrections (T-32) -------------------------------------
+
+
+def _finish_with(monkeypatch, tmp_path, heard, **settings):
+    for name in ("_trim_cue", "_join_segments", "_refresh_claim"):
+        monkeypatch.setattr(dictate, name, lambda *a: None)
+    monkeypatch.setattr(dictate, "_is_silent", lambda take: False)
+    monkeypatch.setattr(dictate, "transcribe", lambda take, s: heard)
+    seen = []
+    monkeypatch.setattr(dictate.llm, "cleanup_transcript",
+                        lambda text, *a, **k: seen.append(text) or (text, True))
+    return dictate._finish_take(tmp_path, stt(**settings)), seen
+
+
+@pytest.mark.parametrize("engine", ["whisper", "parakeet", "auto"])
+def test_vocabulary_corrects_a_take_from_any_engine_before_cleanup(monkeypatch, tmp_path, engine):
+    (text, _skipped, raw), seen = _finish_with(
+        monkeypatch, tmp_path, "Open the py project in duck db.",
+        engine=engine, cleanup="local", vocabulary=["pyproject", "DuckDB"],
+    )
+    assert seen == ["Open the pyproject in DuckDB."]  # cleanup sees the corrected take
+    assert text == raw == "Open the pyproject in DuckDB."
+
+
+def test_vocabulary_corrects_without_cleanup_and_leaves_plain_takes(monkeypatch, tmp_path):
+    (text, _, raw), seen = _finish_with(
+        monkeypatch, tmp_path, "check the sha 256", cleanup="off", vocabulary=["sha256"],
+    )
+    assert text == raw == "check the sha256" and seen == []
+    (text, _, _), _ = _finish_with(monkeypatch, tmp_path, TRANSCRIPT, cleanup="off")
+    assert text == TRANSCRIPT
+
+
+def test_listen_wav_applies_the_vocabulary(monkeypatch, tmp_path):
+    wav = write_wav(tmp_path / "take.wav")
+    monkeypatch.setattr(dictate, "transcribe", lambda path, s: "the kokoro voice")
+    assert dictate.transcribe_wav(wav, stt(vocabulary=["Kokoro"])) == "the Kokoro voice"

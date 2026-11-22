@@ -16,6 +16,8 @@ from __future__ import annotations
 import platform
 from pathlib import Path
 
+from . import locks
+
 REPO = "mlx-community/parakeet-tdt-0.6b-v2"
 # Pinned to the commit the repo pointed at when the hashes were taken: the
 # moving `main` branch is not an acceptable source.
@@ -39,11 +41,25 @@ FILES = [
     },
 ]
 
-# Pinned exactly, binary wheels only (`--no-build` in every uv call): the
-# worker runs under uv's own Python, and an unpinned `--with` would change
-# the runtime under the user's feet.
+# Pinned exactly, and its whole tree with it: see LOCK_FILE below.
 RUNTIME_PACKAGE = "parakeet-mlx==0.5.2"
 PYTHON_VERSION = "3.12"
+
+# The engine's whole dependency tree, pinned by version and sha256
+# (locks/__init__.py). RUNTIME_PACKAGE above is what the lock was compiled
+# from and is kept as the runtime's name; it is never handed to uv.
+ENGINE = "parakeet"
+LOCK_FILE = locks.lock_file("parakeet.txt")
+
+
+def lock_file() -> Path:
+    """The lock this machine installs from."""
+    return LOCK_FILE
+
+
+def runtime_python() -> Path:
+    """The locked environment's interpreter, created by `local install`."""
+    return locks.env_python(ENGINE, lock_file())
 
 STAMP_NAME = ".verified"
 MANIFEST_VERSION = 1
@@ -66,16 +82,15 @@ def runtime_argv(model_dir: Path | None = None) -> list[str]:
     base = MODEL_DIR if model_dir is None else model_dir
     return [
         "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
-        "--python", PYTHON_VERSION,
-        "--with", RUNTIME_PACKAGE,
+        "--python", str(runtime_python()),
         str(worker_path()),
         "--model", str(base),
     ]
 
 
 def selftest_argv(model_dir: Path | None = None, **_unused) -> list[str]:
-    """What `local install` runs to warm the runtime: loads the model and
-    transcribes half a second of generated tone (pays the one-time
-    compile, so the first dictation does not)."""
-    return [arg for arg in runtime_argv(model_dir)
-            if arg not in {"--offline", "--no-python-downloads"}] + ["--selftest"]
+    """What `local install` runs, once the locked environment exists, to
+    warm the runtime: loads the model and transcribes half a second of
+    generated tone (pays the one-time compile, so the first dictation
+    does not). Offline too: there is nothing left to fetch."""
+    return [*runtime_argv(model_dir), "--selftest"]

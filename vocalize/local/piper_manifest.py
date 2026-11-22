@@ -92,14 +92,17 @@ def uv_argv(voice: str, out: Path, length_scale: float = 1.0, model_dir: Path | 
     """Everything after `uv` for one synthesis. The text goes to stdin.
 
     --no-project is load-bearing, same as Kokoro's: without it `uv run`
-    started inside a project directory would adopt that project.
+    started inside a project directory would adopt that project. `-P`
+    keeps the working folder (the temporary folder the provider runs in)
+    off the import path, so no `piper.py` there can stand in for the
+    engine; PYTHON_VERSION has it (3.11 and later).
     """
     model, config = file_paths(voice, model_dir)
     return [
         "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
         "--python", PYTHON_VERSION,
         "--with", RUNTIME_PACKAGE,
-        "python", "-m", "piper",
+        "python", "-P", "-m", "piper",
         "-m", str(model), "-c", str(config),
         "-f", str(out),
         "--length-scale", f"{length_scale:.3f}",
@@ -113,5 +116,5 @@ def selftest_argv(model_dir: Path | None = None, voice: str = DEFAULT_VOICE) -> 
         "run", "--no-project", "--no-build",
         "--python", PYTHON_VERSION,
         "--with", RUNTIME_PACKAGE,
-        "python", "-m", "piper", "--help",
+        "python", "-P", "-m", "piper", "--help",
     ]

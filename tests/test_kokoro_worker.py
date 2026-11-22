@@ -21,7 +21,7 @@ WORKER_SOURCE = WORKER_PATH.read_text(encoding="utf-8")
 TREE = ast.parse(WORKER_SOURCE)
 
 # Everything the module body is allowed to pull in.
-STDLIB_AT_MODULE_LEVEL = {"__future__", "argparse", "json", "signal", "sys", "wave"}
+STDLIB_AT_MODULE_LEVEL = {"__future__", "argparse", "json", "logging", "os", "signal", "sys", "wave"}
 
 
 def module_level_imports():
@@ -88,9 +88,10 @@ def load_worker():
 class StubKokoro:
     """Stands in for kokoro_onnx.Kokoro. Records what it was asked to say."""
 
-    def __init__(self, model, voices):
+    def __init__(self, model, voices, espeak_config=None):
         self.model = model
         self.voices = voices
+        self.espeak_config = espeak_config
         self.calls = []
 
     def create(self, text, voice=None, speed=None, lang=None):
@@ -116,8 +117,18 @@ def stdlib_write_wav(samples, path, sample_rate=manifest.SAMPLE_RATE):
 def worker(monkeypatch):
     module = load_worker()
     monkeypatch.setattr(module, "_kokoro_class", lambda: StubKokoro)
+    monkeypatch.setattr(module, "_espeak_config", lambda: "bundled-espeak")
     monkeypatch.setattr(module, "write_wav", stdlib_write_wav)
     return module
+
+
+@pytest.fixture
+def files(tmp_path):
+    """Absolute, existing model and voices files: anything else is refused."""
+    model, voices = tmp_path / "kokoro-v1.0.onnx", tmp_path / "voices-v1.0.bin"
+    model.write_bytes(b"onnx")
+    voices.write_bytes(b"voices")
+    return ["--model", str(model), "--voices", str(voices)]
 
 
 def serve(worker, args_list, lines):
@@ -174,7 +185,7 @@ def test_a_failed_request_answers_with_one_line_and_the_session_goes_on(worker, 
     assert code == 0
     assert replies[0]["id"] == 7 and replies[0]["ok"] is False
     assert "\n" not in replies[0]["error"]
-    assert replies[0]["error"] == "espeak fell over mid-sentence"
+    assert replies[0]["error"] == "synthesis failed"  # fixed: engine words can quote the text
     assert replies[1] == {"id": 8, "ok": True}  # one bad request is not fatal
 
 
@@ -214,22 +225,22 @@ def test_eof_ends_the_session(worker, tmp_path):
 # --- the one-shot modes -----------------------------------------------
 
 
-def test_list_voices_prints_them_sorted(worker, tmp_path, capsys):
-    code = worker.main(["--model", "m", "--voices", "v", "--list-voices"])
+def test_list_voices_prints_them_sorted(worker, files, tmp_path, capsys):
+    code = worker.main([*files, "--list-voices"])
 
     assert code == 0
     assert capsys.readouterr().out.split() == ["af_heart", "am_adam", "bm_george"]
 
 
-def test_selftest_says_ok(worker, capsys):
-    code = worker.main(["--model", "m", "--voices", "v", "--selftest"])
+def test_selftest_says_ok(worker, files, capsys):
+    code = worker.main([*files, "--selftest"])
 
     assert code == 0
     assert capsys.readouterr().out.strip() == "ok"
 
 
 def test_a_model_that_will_not_load_exits_one_with_a_single_stderr_line(
-    worker, monkeypatch, capsys
+    worker, files, monkeypatch, capsys
 ):
     class Broken:
         def __init__(self, *args):
@@ -237,7 +248,7 @@ def test_a_model_that_will_not_load_exits_one_with_a_single_stderr_line(
 
     monkeypatch.setattr(worker, "_kokoro_class", lambda: Broken)
 
-    code = worker.main(["--model", "m", "--voices", "v", "--selftest"])
+    code = worker.main([*files, "--selftest"])
 
     err = capsys.readouterr().err
     assert code == 1
@@ -245,14 +256,14 @@ def test_a_model_that_will_not_load_exits_one_with_a_single_stderr_line(
     assert "could not load the model" in err
 
 
-def test_a_failing_selftest_exits_one(worker, monkeypatch, capsys):
+def test_a_failing_selftest_exits_one(worker, files, monkeypatch, capsys):
     class Broken(StubKokoro):
         def create(self, *args, **kwargs):
             raise RuntimeError("espeak-ng data is missing")
 
     monkeypatch.setattr(worker, "_kokoro_class", lambda: Broken)
 
-    code = worker.main(["--model", "m", "--voices", "v", "--selftest"])
+    code = worker.main([*files, "--selftest"])
 
     assert code == 1
     assert "selftest failed" in capsys.readouterr().err

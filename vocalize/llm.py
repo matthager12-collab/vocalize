@@ -203,49 +203,43 @@ def _complete(system: str, text: str, *, feature: str, backend: str) -> str | No
 
 _WARM_CLEANUP_CAP = 60
 _LOCAL_REAP_TIMEOUT = 5
-# speak_options is also a standalone script, so it repeats this private name.
-_SUMMARY_GROUP_OWNER = "_VOCALIZE_SUMMARY_GROUP_OWNER"
+_LLM_INSTALL_HINT = "vocalize local install --llm"
+_offline_noticed = False
 
 
-def _summary_owns_group() -> bool:
-    """Only the helper's direct, isolated CLI may share its cleanup group.
+def _offline_skipped() -> None:
+    """One fixed line, once per process: the runtime is not cached offline.
 
-    The marker names the helper, not a public option to disable cleanup. It is
-    not forwarded to workers. Both leader checks exclude inherited markers in
-    ordinary shells and subprocesses.
+    The worker's diagnostics were only matched; none of them, and none of
+    the transcript, is in the line.
     """
-    return (
-        os.environ.get(_SUMMARY_GROUP_OWNER) == str(os.getppid())
-        and os.getpgrp() == os.getpid()
-        and os.getsid(0) == os.getpid()
-    )
+    global _offline_noticed
+    if _offline_noticed:
+        return
+    _offline_noticed = True
+    from .local import runtime
+
+    _skipped("cleanup", runtime.reinstall_hint(_LLM_INSTALL_HINT))
 
 
 def _run_local_worker(argv, *, input, timeout, env, cwd, **_run_options):
-    """Run one uv worker, owning its descendants unless Quick Action does.
+    """Run one uv worker in its own process group, and own its descendants.
 
     A successful launcher can still leave a worker behind. Always close the
-    owned group, including on interruption, without draining child-held pipes.
+    group, including on interruption, without draining child-held pipes.
     """
-    managed = _summary_owns_group()
     process = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, cwd=cwd, start_new_session=not managed,
+        text=True, env=env, cwd=cwd, start_new_session=True,
     )
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
     finally:
-        if managed:
-            # The outer helper kills this CLI's entire group before returning
-            # or starting fallback speech. Do not detach from that group or
-            # kill our own CLI here, which would defeat its failure handling.
-            process.kill()
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=_LOCAL_REAP_TIMEOUT)
         finally:
@@ -258,6 +252,16 @@ def _run_local_worker(argv, *, input, timeout, env, cwd, **_run_options):
 
 # The seam the tests swap for the local backend.
 LOCAL_RUN_SEAM = _run_local_worker
+
+
+def warm_identity(selected) -> str:
+    """What the warm cleanup server's fingerprint carries: the explicit
+    runtime's identity, or the lock's sha256, so a changed lock never
+    reuses a server started from the old environment. dictate's warm
+    spec starts the server with this same value."""
+    from .local import llm_manifest, locks
+
+    return selected.identity if selected else locks.identity(llm_manifest.lock_file())
 
 
 def _local(system: str, text: str, timeout: float, max_tokens: int, *,
@@ -282,7 +286,7 @@ def _local(system: str, text: str, timeout: float, max_tokens: int, *,
             fingerprint = warm_protocol.fingerprint(
                 llm_manifest.worker_path(), llm_manifest.RUNTIME_PACKAGE,
                 llm_manifest.MODEL_DIR / "model.safetensors",
-                runtime_identity=selected.identity if selected else None,
+                runtime_identity=warm_identity(selected),
             )
             reply = warm.request("llm", {
                 "op": "complete", "system": system, "text": text,
@@ -318,6 +322,8 @@ def _local(system: str, text: str, timeout: float, max_tokens: int, *,
         return None
 
     if result.returncode != 0:
+        if runtime.offline_failure(result.stderr):
+            _offline_skipped()
         return None
 
     try:

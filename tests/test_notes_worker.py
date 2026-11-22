@@ -170,3 +170,31 @@ def test_executable_payload_is_not_evaluated(worker, tmp_path):
     with pytest.raises(notes.NotesError):
         worker(f"print({payload!r})")
     assert not marker.exists()
+
+
+UV_OFFLINE_STDERR = (
+    "  hint: Packages were unavailable because the network was disabled.\n"
+)
+
+
+@pytest.mark.parametrize("flood", [0, 200000])
+def test_offline_start_failure_says_install_again_privately(worker, capsys, flood):
+    script = (
+        "import sys; "
+        f"sys.stderr.write('SECRET_CANARY ' * {flood}); "
+        f"sys.stderr.write('SECRET_CANARY\\n' + {UV_OFFLINE_STDERR!r}); sys.exit(2)"
+    )
+    with pytest.raises(notes.NotesError) as exc:
+        worker(script)
+    message = str(exc.value)
+    assert "could not start offline" in message
+    assert "run `vocalize local install --stt --engine whisper` again" in message
+    assert "SECRET_CANARY" not in message + str(capsys.readouterr())
+    assert "network was disabled" not in message
+
+
+def test_other_worker_exit_is_not_called_offline(worker, capsys):
+    with pytest.raises(notes.NotesError) as exc:
+        worker('import sys; sys.stderr.write("Traceback: SECRET_CANARY"); sys.exit(1)')
+    assert str(exc.value) == "Transcription worker failed"
+    assert "SECRET_CANARY" not in str(capsys.readouterr())

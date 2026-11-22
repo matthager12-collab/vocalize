@@ -2477,3 +2477,277 @@ def test_cloud_engine_is_rejected_before_speech(monkeypatch, provider):
 def test_cleanup_flag_always_selects_local(monkeypatch):
     monkeypatch.setattr(cli_module, "load_config_file", lambda: {"stt": {"cleanup": "off"}})
     assert cli_module._stt_options(True, False, None)["cleanup"] == "local"
+
+
+# --- phase 1 review fixes (H1, M1, L4, transcribe help) ---------------------
+
+
+def test_settings_loads_a_015_anthropic_table_and_an_unknown_table(monkeypatch, tmp_path):
+    """The menu-bar app runs `vocalize settings`: it must not fail on either."""
+    from vocalize import config
+
+    monkeypatch.setattr(config, "_warned", set())
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text(
+        '[providers.anthropic]\nmonthly_chars = 1000\n\n[providers.nonesuch]\nvoice = "x"\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(main, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "chain=kokoro,say" in result.stdout
+    notices = result.stderr.splitlines()
+    assert len(notices) == 2
+    assert "[providers.anthropic]" in notices[0] and "1000" not in notices[0]
+    assert "[providers.nonesuch]" in notices[1]
+    assert "vocalize:" not in result.stdout
+
+
+def test_chain_says_when_it_kept_a_backup_of_a_commented_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('# mine\nchain = ["say"]\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "piper", "say"])
+
+    assert result.exit_code == 0, result.output
+    backup = cfg_path.with_name("config.toml.bak")
+    assert backup.read_text() == '# mine\nchain = ["say"]\n'
+    assert str(backup) in result.output
+    assert f"wrote {cfg_path}" in result.output
+
+    again = CliRunner().invoke(main, ["chain", "say"])
+    assert again.exit_code == 0, again.output
+    assert str(backup) not in again.output
+
+
+def test_transcribe_help_names_the_transcripts_folder():
+    result = CliRunner().invoke(main, ["transcribe", "--help"])
+
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())  # help text wraps
+    assert "notes folder" not in text
+    assert text.count("transcripts folder") == 2
+
+
+# --- `local status` judges speech-to-text by the engine dictation uses ---
+
+
+def _stt_installs(monkeypatch, *, parakeet: bool, whisper: bool, engine: str | None):
+    """Parakeet supported; each engine installed or not; uv present."""
+    from vocalize import local as local_module
+    from vocalize.local import install as install_module
+    from vocalize.local import parakeet_manifest, whisper_manifest
+
+    def installed(manifest, model_dir=None, files=None, install_hint="vocalize local install"):
+        if manifest is parakeet_manifest:
+            ok = parakeet
+        elif manifest is whisper_manifest:
+            ok = whisper and files == [whisper_manifest.file_for(whisper_manifest.DEFAULT_MODEL)]
+        else:
+            ok = False
+        return (True, "") if ok else (False, f"not installed — run: {install_hint}")
+
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: True)
+    monkeypatch.setattr(install_module, "installed", installed)
+    monkeypatch.setattr(local_module, "uv_path", lambda: "/fake/uv")
+    if engine is not None:
+        cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "vocalize" / "config.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(f'[stt]\nengine = "{engine}"\n', encoding="utf-8")
+
+
+def _stt_verdict(output: str) -> str:
+    return next(line for line in output.splitlines() if line.startswith("STT:"))
+
+
+@pytest.mark.parametrize("engine", ["parakeet", None])
+def test_local_status_is_ready_when_parakeet_dictates(monkeypatch, engine):
+    """F3 (m2): Parakeet configured and ready read as 'STT: not ready'."""
+    _stt_installs(monkeypatch, parakeet=True, whisper=False, engine=engine)
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert _stt_verdict(result.output) == "STT: ready (parakeet)"
+
+
+def test_local_status_names_the_parakeet_install_when_parakeet_is_chosen_and_missing(monkeypatch):
+    _stt_installs(monkeypatch, parakeet=False, whisper=True, engine="parakeet")
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    verdict = _stt_verdict(result.output)
+    assert verdict.startswith("STT: not ready")
+    assert verdict.endswith("vocalize local install --stt --engine parakeet")
+
+
+def test_local_status_never_offers_parakeet_as_the_repair_for_a_ready_whisper(monkeypatch):
+    """m1: with Whisper ready, `local install --stt` would install Parakeet,
+    which repairs nothing."""
+    _stt_installs(monkeypatch, parakeet=False, whisper=True, engine=None)
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert _stt_verdict(result.output).startswith("STT: ready")
+    parakeet_block = result.output.split("Parakeet (speech-to-text")[1].split("\n\n")[0]
+    assert not parakeet_block.rstrip().endswith("run: vocalize local install --stt")
+    assert "vocalize local install --stt --engine parakeet" in parakeet_block
+    assert "Whisper" in parakeet_block  # says which engine dictation uses
+
+
+def test_local_status_names_the_whisper_install_when_whisper_is_chosen_and_missing(monkeypatch):
+    _stt_installs(monkeypatch, parakeet=True, whisper=False, engine="whisper")
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    verdict = _stt_verdict(result.output)
+    assert verdict.startswith("STT: not ready")
+    assert verdict.endswith("vocalize local install --stt --engine whisper")
+
+
+def test_local_install_stt_help_names_parakeet_as_the_apple_silicon_default():
+    result = CliRunner().invoke(main, ["local", "install", "--help"])
+
+    text = " ".join(result.output.split())
+    assert "Parakeet on Apple Silicon" in text
+    assert "runtime (whisper.cpp) instead" not in text
+
+
+# --- `vocalize local stop` (W5-B) ------------------------------------------
+
+
+@pytest.mark.parametrize("stopped, lines", [
+    ({"whisper": True, "llm": False},
+     ["Whisper warm server: stopped.", "Cleanup model warm server: none was running."]),
+    ({"whisper": False, "llm": False},
+     ["Whisper warm server: none was running.", "Cleanup model warm server: none was running."]),
+    ({"whisper": True, "llm": True},
+     ["Whisper warm server: stopped.", "Cleanup model warm server: stopped."]),
+])
+def test_local_stop_reports_each_kind_and_exits_zero(monkeypatch, stopped, lines):
+    from vocalize.local import warm
+
+    calls = []
+    monkeypatch.setattr(warm, "stop_all", lambda: calls.append("all") or dict(stopped))
+
+    result = CliRunner().invoke(main, ["local", "stop"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == lines
+    assert calls == ["all"]
+
+
+def test_local_stop_with_nothing_running_touches_nothing():
+    result = CliRunner().invoke(main, ["local", "stop"])
+    assert result.exit_code == 0, result.output
+    assert "none was running" in result.output
+
+
+def test_local_help_lists_stop():
+    result = CliRunner().invoke(main, ["local", "--help"])
+    assert result.exit_code == 0
+    assert any(line.split()[:1] == ["stop"] for line in result.output.splitlines())
+
+
+def test_no_help_text_is_left_over_from_the_cloud_version():
+    """`settings` once said 'no API call, no key needed' (W5-B)."""
+    import click
+
+    def walk(command, path):
+        yield path, command
+        for name, sub in getattr(command, "commands", {}).items():
+            yield from walk(sub, [*path, name])
+
+    for path, command in walk(main, ["vocalize"]):
+        texts = [command.help or "", command.short_help or ""]
+        texts += [p.help or "" for p in command.params if isinstance(p, click.Option)]
+        for text in texts:
+            lowered = text.lower()
+            for word in ("api call", "api key", "no key", "cloud", "credentials", "budget",
+                         "usage summary"):
+                assert word not in lowered, (path, word, text)
+
+
+def test_settings_help_says_what_it_prints():
+    text = " ".join((main.commands["settings"].help or "").split())
+    assert "one per line" in text and "menu-bar app" in text
+
+
+def test_the_output_option_names_only_the_formats_local_engines_write():
+    """mp3 came only from the retired hosted engines."""
+    import click
+
+    for name in ("speak", "speak-file", "clip"):
+        option = next(p for p in main.commands[name].params
+                      if isinstance(p, click.Option) and p.name == "output_path")
+        assert "mp3" not in (option.help or "")
+        assert "wav" in (option.help or "")
+
+
+# --- settings no engine read are gone from the command line (review M2) -----
+
+
+@pytest.mark.parametrize("command", [["speak", "hi"], ["speak-file", "-"], ["clip"]])
+def test_the_speaking_commands_have_no_model_option(command):
+    assert "--model" not in CliRunner().invoke(main, [command[0], "--help"]).output
+    result = CliRunner().invoke(main, [*command, "--model", "x"], input="hi")
+    assert result.exit_code == 2
+    assert "No such option '--model'" in result.output
+
+
+def test_vocalize_model_is_ignored_when_speaking(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("VOCALIZE_MODEL", "something")
+    calls = []
+    _patch_tts(monkeypatch, calls=calls)
+
+    result = CliRunner().invoke(
+        main, ["speak", "hello", "--no-play", "--output", str(tmp_path / "out.mp3")])
+
+    assert result.exit_code == 0, result.output
+    assert "model_id" not in calls[0]["overrides"]
+
+
+def test_settings_prints_no_model_line(monkeypatch, tmp_path):
+    _isolate_config(monkeypatch, tmp_path)
+    lines = CliRunner().invoke(main, ["settings"]).output.splitlines()
+    assert not any(line.startswith("model=") for line in lines)
+    assert not any(".model=" in line and line.startswith("providers.") for line in lines)
+
+
+# --- the writer's notices reach the terminal (review L5) ----------------------
+
+
+def test_chain_keeps_an_unknown_table_and_names_it(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('[meetings]\nroom = "B"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert "[meetings]" in result.output and "does not use it" in result.output
+    assert '[meetings]\nroom = "B"' in cfg_path.read_text()
+
+
+def test_chain_says_the_backup_still_holds_a_retired_setting(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    cfg_path = tmp_path / "vocalize" / "config.toml"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text('api_key = "SECRET_CANARY"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["chain", "say"])
+
+    assert result.exit_code == 0, result.output
+    assert "SECRET_CANARY" not in cfg_path.read_text() + result.output
+    assert "config.toml.bak" in result.output
+    assert "still holds the retired settings" in result.output

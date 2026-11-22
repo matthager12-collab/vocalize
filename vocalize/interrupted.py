@@ -45,7 +45,7 @@ from typing import NamedTuple
 from . import audio as audio_module
 from .auth import PROVIDER_NAMES
 
-# Same directory as the playback lock, the ledger and the dictation
+# Same directory as the playback lock and the dictation
 # session. Spelled out so tests can point the module at a temporary one.
 CACHE_DIR = Path.home() / ".cache" / "vocalize"
 

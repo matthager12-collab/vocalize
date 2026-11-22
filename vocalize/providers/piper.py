@@ -94,7 +94,9 @@ def synthesize(text: str, settings: Settings) -> bytes:
             result = RUN_SEAM(
                 argv, input=line + "\n", capture_output=True, text=True,
                 timeout=_REQUEST_TIMEOUT, check=False,
-                cwd=tempfile.gettempdir(),  # never the caller's project dir
+                # Never the caller's project dir; the manifest's `-P` keeps
+                # this folder off the engine's import path.
+                cwd=tempfile.gettempdir(),
                 env=runtime.environment(),  # allowlisted, offline, no credentials
             )
         except subprocess.TimeoutExpired:

@@ -13,8 +13,8 @@ downloader in `vocalize/local/install.py`; the only other sockets are Unix
 sockets for the warm servers (`vocalize/local/warm.py`,
 `vocalize/local/warm_protocol.py`).
 
-What that tree still has and this design removes: a meeting module
-(`vocalize/meetings.py`, a `meetings` command group), summaries
+What that tree still has and this design removes: a call-capture module
+and its command group, summaries
 (`llm.summarize`, `summarize-text`, the notes templates, the summary depths
 in `vocalize/speak_options.py`) and the URL gate for the `/speak` skill's
 web mode (`hooks/speak_url_gate.py`).
@@ -36,7 +36,7 @@ Three facts shape everything else:
 
 ## Approach
 
-- **Remove** meetings and summaries (DEC-002). Keep transcript cleanup as an
+- **Remove** call capture and summaries (DEC-002). Keep transcript cleanup as an
   optional stage of dictation, run by the pinned on-device worker (DEC-003).
 - **Keep** one pinned worker per engine (DEC-004) and start every one
   offline.
@@ -48,12 +48,15 @@ Three facts shape everything else:
   applies: it writes ordinary settings and installs models. The owner's Mac
   Studio gets the largest profile.
 - **Adopt open-source projects where one does the job better**, each after
-  an intake review (DEC-009): Parakeet for dictation (in the base),
-  `tomlkit` for a config writer that keeps comments, `pytest-socket` to
-  prove the suite needs no network, and larger speech models for big
-  machines if they pass measurement. Research found the hand-built
-  downloader, settings page server and Swift helpers better suited to a
-  local-only tool than the alternatives; they stay.
+  an intake review (DEC-009): Parakeet for dictation (in the base), and
+  larger speech models for big machines if they pass measurement. Two
+  packages were considered and not adopted: neither `tomlkit` nor
+  `pytest-socket` is a dependency. The test suite has its own network
+  guard, and the config writer does not keep comments; instead it keeps
+  one backup copy of a file before the first save that would lose them.
+  Research found the hand-built downloader, settings page server and Swift
+  helpers better suited to a local-only tool than the alternatives; they
+  stay.
 
 ## Structure
 
@@ -140,16 +143,24 @@ written with mode 0600. Files already processed are skipped.
 3. Workers receive an allow-listed environment that sets
    `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and passes no credential
    variables.
-4. Downloads go only to hosts named in a manifest, over HTTPS, to a pinned
-   revision, and every file is checked against a pinned sha256 and size.
+4. Model files are downloaded from an address pinned in a manifest to one
+   release or revision, over HTTPS; a redirect is followed only to another
+   HTTPS address. Every model file is checked against a pinned sha256 and
+   size before it is used. Each engine's packages are installed into the
+   engine's own environment from a hash-locked list
+   (`vocalize/local/locks/`, `uv pip sync --require-hashes --only-binary
+   :all:`), with no builds from source. Piper is the exception: its
+   packages are pinned by version only, not yet by hash.
 5. The test suite runs with network sockets disabled.
 6. When a worker cannot start offline, the error says to run
    `vocalize local install` again. It never falls back to the network.
 
 Nothing here can stop an engine package from misbehaving once trusted; that
 is what the intake review is for. Running workers under a deny-network
-sandbox is measured in Phase 3 and adopted only if it works on current
-macOS with Metal.
+sandbox was measured in Phase 3: Kokoro, Whisper and Parakeet all worked
+under `sandbox-exec` with `(deny network*)`, Metal included, but that
+profile also blocks the Unix sockets of the warm servers. It is not
+adopted in 1.0; see [measurements.md](./measurements.md).
 
 ### Commands the menu-bar app depends on
 
@@ -225,17 +236,30 @@ A candidate that does not pass in time is left out and listed as deferred.
 ### Machine profiles
 
 A profile is chosen from installed memory and can be overridden in the
-settings page. Values are provisional until measured in Phase 3.
+settings page.
 
-| Profile | Memory | Dictation | Whisper model | Models kept loaded | Cleanup |
-|---|---|---|---|---|---|
-| small | under 16 GB | Whisper | large-v3-turbo-q5_0 | not kept | off |
-| standard | 16 to 31 GB | Parakeet | large-v3-turbo-q5_0 | 15 minutes | off |
-| large | 32 to 63 GB | Parakeet | large-v3-turbo-q8_0 | 60 minutes | off |
-| studio | 64 GB and up | Parakeet | large-v3-turbo-q8_0, 8 beams | 240 minutes | local |
+As built (`vocalize/profiles.py`), every profile sets the same five keys,
+so applying a smaller profile after a larger one puts each value back.
+Applying a profile installs nothing; it names the installs it recommends.
+The settings page shows the profile `profiles.detect()` picks from this
+Mac's memory and applies one through the `apply_profile` action.
+
+| Profile | Memory | `stt.engine` | `stt.model` | `stt.beam_size` | `stt.warm_minutes` | `stt.cleanup` | Recommended installs |
+|---|---|---|---|---|---|---|---|
+| small | under 16 GB | `auto` | large-v3-turbo-q5_0 | 5 | 0 | off | Kokoro, Whisper |
+| standard | 16 to 31 GB | `parakeet` | large-v3-turbo-q5_0 | 5 | 0 | off | Kokoro, Parakeet, Whisper |
+| large | 32 to 63 GB | `parakeet` | large-v3-turbo-q8_0 | 5 | 0 | off | Kokoro, Parakeet, Whisper |
+| studio | 64 GB and up | `parakeet` | large-v3-turbo-q8_0 | 5 | 240 | local | Kokoro, Parakeet, cleanup model, and the large-v3-turbo-q8_0 Whisper model for use if the engine is switched to Whisper |
 
 Package defaults stay at the small profile so a first install on any Mac
-is safe.
+is safe. Two consequences of the values, worth knowing when they are
+revisited: `stt.warm_minutes` keeps only Whisper and the cleanup model
+loaded (Parakeet runs one-shot), so in the standard and large profiles it
+has no effect while Parakeet is the engine; and `stt.model` and
+`stt.beam_size` apply only when Whisper runs, which under these profiles
+is when the user switches the engine. The measurements
+([measurements.md](./measurements.md)) were taken only on the 128 GB
+Mac Studio, so the small, standard and large values remain provisional.
 
 ## Decision summary
 

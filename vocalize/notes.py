@@ -1,7 +1,7 @@
-"""Transcription: turn audio or text sources into timestamped transcript notes.
+"""Transcription: turn audio or text sources into timestamped transcripts.
 
 Runs per-source transcription only; no summary is generated.
-The notes folder acts as the ledger: .md files in the folder are scanned
+The transcripts folder acts as the ledger: .md files in the folder are scanned
 for (source_sha256, source) pairs to determine if a file is already processed.
 """
 
@@ -25,7 +25,7 @@ import wave
 from collections.abc import Callable
 from pathlib import Path
 
-from . import __version__, config, dictate
+from . import __version__, config, dictate, vocabulary
 from .exceptions import VocalizeError
 
 ALLOWLISTED_SUFFIXES = {".m4a", ".mp3", ".wav", ".aif", ".aiff", ".caf", ".txt"}
@@ -37,6 +37,18 @@ _MAX_WORKER_LINE_BYTES = 32 * 1024 * 1024
 _MAX_WORKER_OUTPUT_BYTES = 64 * 1024 * 1024
 _MAX_WORKER_SEGMENTS = 100_000
 _MAX_WORKER_SECONDS = 7 * 24 * 3600.0
+# Enough of the worker's stderr tail to recognise uv's offline refusal.
+_MAX_WORKER_STDERR_TAIL = 16 * 1024
+_WHISPER_INSTALL_HINT = "vocalize local install --stt --engine whisper"
+# How much of a note `_done` reads looking for the end of its frontmatter.
+_FRONTMATTER_MAX_BYTES = 64 * 1024
+# The whole transcript of a recording with no sound: Whisper invents words
+# ("Thank you.") for digital silence, so the worker is never run on one.
+SILENT_TRANSCRIPT = "This recording is silent: it has no words."
+_UV_MISSING = (
+    "uv is not installed, and transcription runs under it. "
+    "Install it from https://docs.astral.sh/uv/"
+)
 
 
 class NotesError(VocalizeError):
@@ -79,8 +91,36 @@ def _sweep_stale_notes_dirs() -> None:
             continue
 
 
+def _frontmatter_lines(path: Path) -> list[str]:
+    """The lines of a note's frontmatter block, between its two `---` lines.
+
+    Read line by line up to the closing line, never past
+    `_FRONTMATTER_MAX_BYTES`: a long title (JSON escapes a non-ASCII
+    letter as six characters) used to push `source:` out of a fixed-size
+    head. A block that does not close within the bound, or a file that
+    does not start with one, has no provenance.
+    """
+    lines: list[str] = []
+    read = 0
+    with open(path, "rb") as f:
+        first = f.readline(_FRONTMATTER_MAX_BYTES)
+        if first.strip() != b"---":
+            return []
+        read += len(first)
+        while read < _FRONTMATTER_MAX_BYTES:
+            raw = f.readline(_FRONTMATTER_MAX_BYTES - read)
+            if not raw:
+                return []
+            read += len(raw)
+            line = raw.decode("utf-8", errors="replace")
+            if line.strip() == "---":
+                return lines
+            lines.append(line)
+    return []
+
+
 def _done(folder: Path) -> tuple[dict[tuple[str, str], Path], dict[str, Path]]:
-    """Scan folder/*.md, read the first 1KB of each.
+    """Scan folder/*.md, read the frontmatter block of each.
 
     Returns (done_ledger, source_to_note):
     - done_ledger: {(source_sha256, source): path}
@@ -94,13 +134,12 @@ def _done(folder: Path) -> tuple[dict[tuple[str, str], Path], dict[str, Path]]:
         if path.name.startswith("."):
             continue
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                head = f.read(1024)
+            head = _frontmatter_lines(path)
         except OSError:
             continue
         src_sha = None
         src_path = None
-        for line in head.splitlines():
+        for line in head:
             line_str = line.strip()
             if line_str.startswith("source:"):
                 val = line_str.partition(":")[2].strip()
@@ -169,13 +208,18 @@ def _render_frontmatter(
 
 
 def _transcribe_long(
-    cmd: list[str], duration: float | None, *, env: dict[str, str] | None = None
+    cmd: list[str], duration: float | None, *, env: dict[str, str] | None = None,
+    install_hint: str | None = None,
 ) -> tuple[str, list[dict]]:
     """Read bounded worker frames without blocking on partial lines or stderr.
 
     Only complete, advancing progress resets the inactivity timer. Raw worker
-    diagnostics may contain transcript content, so stderr is discarded.
+    diagnostics may contain transcript content, so only a bounded tail of
+    stderr is held in memory, to recognise an offline start failure; it is
+    never shown or stored.
     """
+    from .local import runtime
+
     final_reply = None
     next_threshold_pct = 10
     last_progress = -1.0
@@ -234,19 +278,40 @@ def _transcribe_long(
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
         cwd=tempfile.gettempdir(),
         env=env,
     )
-    try:
-        assert proc.stdout is not None
-        fileno = proc.stdout.fileno()
-        os.set_blocking(fileno, False)
+    stderr_tail = bytearray()
+
+    def drain_stderr() -> bool:
+        """Keep only the newest bytes; False once stderr is closed."""
         while True:
-            readable, _, _ = select.select([fileno], [], [], remaining())
+            try:
+                chunk = os.read(err_fileno, 65536)
+            except BlockingIOError:
+                return True
+            if not chunk:
+                return False
+            stderr_tail.extend(chunk)
+            del stderr_tail[:-_MAX_WORKER_STDERR_TAIL]
+
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        fileno = proc.stdout.fileno()
+        err_fileno = proc.stderr.fileno()
+        os.set_blocking(fileno, False)
+        os.set_blocking(err_fileno, False)
+        watched = [fileno, err_fileno]
+        while True:
+            readable, _, _ = select.select(watched, [], [], remaining())
             if not readable:
                 raise NotesError("transcription timed out")
+            if err_fileno in readable and not drain_stderr():
+                watched.remove(err_fileno)
+            if fileno not in readable:
+                continue
             try:
                 chunk = os.read(fileno, 65536)
             except BlockingIOError:
@@ -270,6 +335,15 @@ def _transcribe_long(
         except subprocess.TimeoutExpired:
             raise NotesError("transcription timed out") from None
         if proc.returncode != 0:
+            if err_fileno in watched:
+                drain_stderr()
+            offline = runtime.offline_failure(stderr_tail.decode("utf-8", "replace"))
+            stderr_tail.clear()
+            if offline:
+                raise NotesError(
+                    "Transcription worker could not start offline: "
+                    f"{runtime.reinstall_hint(install_hint or _WHISPER_INSTALL_HINT)}"
+                )
             raise NotesError("Transcription worker failed")
         if final_reply is None:
             raise NotesError("Transcription worker produced no output")
@@ -277,8 +351,10 @@ def _transcribe_long(
         if proc.poll() is None:
             proc.kill()
         proc.wait()
-        if proc.stdout is not None:
-            proc.stdout.close()
+        stderr_tail.clear()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
 
     raw_segments = final_reply.get("segments", [])
     if not isinstance(raw_segments, list) or len(raw_segments) > _MAX_WORKER_SEGMENTS:
@@ -337,6 +413,79 @@ def _write_note_atomic(folder: Path, target_path: Path, content: str | bytes) ->
         raise
 
 
+def _whisper_worker(take_wav: Path, model_name: str, stt: dict) -> tuple[list[str], dict[str, str]]:
+    """(command, environment) for Whisper's segment mode."""
+    from .local import install, runtime, uv_path
+    from .local import whisper_manifest as w_manifest
+
+    ready, reason = install.installed(
+        w_manifest,
+        files=[w_manifest.file_for(model_name)],
+        install_hint=_WHISPER_INSTALL_HINT,
+    )
+    if not ready:
+        raise NotesError(f"Speech-to-text model {model_name}: {reason}")
+    try:
+        selected = runtime.selection(w_manifest.RUNTIME_PACKAGE)
+    except runtime.RuntimeSelectionError as exc:
+        raise NotesError(str(exc)) from exc
+    uv = "" if selected else uv_path()
+    if not selected and uv is None:
+        raise NotesError(_UV_MISSING)
+    worker_cmd = runtime.command(
+        w_manifest, dictate.worker_argv(uv, take_wav, stt) + ["--segments"], selected,
+    )
+    return worker_cmd, runtime.environment(selected)
+
+
+def _file_engine(stt: dict, model_name: str) -> str:
+    """"whisper" or "parakeet" for file transcription.
+
+    A chosen engine is returned as it is, so one that cannot run is its
+    own error. "auto" keeps Whisper whenever its model is installed, else
+    takes a Parakeet that is installed and can run here.
+    """
+    from .local import install, parakeet_manifest
+    from .local import whisper_manifest as w_manifest
+
+    engine = stt.get("engine", "auto")
+    if engine != "auto":
+        return engine
+    if install.installed(w_manifest, files=[w_manifest.file_for(model_name)])[0]:
+        return "whisper"
+    if parakeet_manifest.supported() and install.installed(
+        parakeet_manifest, install_hint=dictate.PARAKEET_INSTALL_HINT,
+    )[0]:
+        return "parakeet"
+    raise NotesError(
+        "No speech-to-text model is installed. Install one with: "
+        f"{_WHISPER_INSTALL_HINT} (or, on an Apple Silicon Mac: {dictate.PARAKEET_INSTALL_HINT})"
+    )
+
+
+def _parakeet_worker(take_wav: Path) -> tuple[list[str], dict[str, str], str, str]:
+    """(command, environment, transcribed_by, install hint) for Parakeet's
+    chunked segment mode. Reached when `[stt] engine` is "parakeet", or
+    "auto" with no Whisper model installed; a Parakeet that cannot run
+    here is an error, never a silent Whisper."""
+    from .local import install, runtime, uv_path
+    from .local import parakeet_manifest as p_manifest
+
+    if not p_manifest.supported():
+        raise NotesError(
+            'Parakeet needs an Apple Silicon Mac. Use [stt] engine = "whisper" to transcribe files here.'
+        )
+    ready, reason = install.installed(p_manifest, install_hint=dictate.PARAKEET_INSTALL_HINT)
+    if not ready:
+        raise NotesError(f"Speech-to-text model parakeet: {reason}")
+    uv = uv_path()
+    if uv is None:
+        raise NotesError(_UV_MISSING)
+    worker_cmd = [uv, *p_manifest.runtime_argv(), "--transcribe", str(take_wav), "--segments"]
+    model = p_manifest.REPO.rsplit("/", 1)[-1]
+    return worker_cmd, runtime.environment(), f"parakeet:{model}", dictate.PARAKEET_INSTALL_HINT
+
+
 class RunLock:
     """Machine-local run lock on <folder>/.vocalize.lock."""
 
@@ -352,7 +501,7 @@ class RunLock:
         except (BlockingIOError, OSError):
             os.close(self.fd)
             self.fd = None
-            print("vocalize: another notes run is in progress", file=sys.stderr)
+            print("vocalize: another transcription run is in progress", file=sys.stderr)
             sys.exit(1)
         return self
 
@@ -376,12 +525,12 @@ def process_sources(
     transcript_checkpoint: Callable[[str], None] | None = None,
     offline: bool = False,
 ) -> list[Path]:
-    """Transcribe files or directories into transcript notes.
+    """Transcribe files or directories into transcripts.
 
-    Returns the list of created or updated note file paths.
+    Returns the list of created or updated transcript file paths.
     All processing is local; ``offline`` is retained for caller compatibility.
     """
-    notes_cfg = config.resolve_notes(config_dict)
+    notes_cfg = config.resolve_transcribe(config_dict)
     folder_str = notes_cfg["folder"]
     folder = Path(folder_str).expanduser().resolve()
 
@@ -391,7 +540,7 @@ def process_sources(
             folder.mkdir(parents=True, mode=0o700)
     except PermissionError as exc:
         raise NotesError(
-            f"Permission denied accessing notes folder {folder}. "
+            f"Permission denied accessing transcripts folder {folder}. "
             f"Check System Settings › Privacy & Security › Files and Folders."
         ) from exc
 
@@ -436,7 +585,7 @@ def process_sources(
 
             # Self-ingestion guard
             if resolved_src == folder or _is_under(resolved_src, folder):
-                print(f"Skipping {src.name}: inside notes folder (self-ingestion guard)")
+                print(f"Skipping {src.name}: inside transcripts folder (self-ingestion guard)")
                 continue
 
             src_sha = _sha256_file(resolved_src)
@@ -510,35 +659,25 @@ def process_sources(
                     except (OSError, wave.Error):
                         duration_seconds = 0.0
 
-                    from .local import install
-                    from .local import whisper_manifest as w_manifest
-                    ready, reason = install.installed(
-                        w_manifest,
-                        files=[w_manifest.file_for(model_name)],
-                        install_hint="vocalize local install --stt",
-                    )
-                    if not ready:
-                        raise NotesError(f"Speech-to-text model {model_name}: {reason}")
-
-                    from .local import runtime, uv_path
-                    try:
-                        selected = runtime.selection(w_manifest.RUNTIME_PACKAGE)
-                    except runtime.RuntimeSelectionError as exc:
-                        raise NotesError(str(exc)) from exc
-                    uv = "" if selected else uv_path()
-                    if not selected and uv is None:
-                        raise NotesError(
-                            "uv is not installed, and transcription runs under it. "
-                            "Install it from https://docs.astral.sh/uv/"
+                    if _file_engine(stt_cfg, model_name) == "parakeet":
+                        worker_cmd, worker_env, transcribed_by, hint = _parakeet_worker(take_wav)
+                        extra = {"install_hint": hint}
+                    else:
+                        worker_cmd, worker_env = _whisper_worker(take_wav, model_name, stt_for_worker)
+                        transcribed_by = f"whisper:{model_name}"
+                        extra = {}
+                    if dictate._is_silent(take_wav):
+                        # The same guard as dictation and `listen --wav`.
+                        transcript = SILENT_TRANSCRIPT
+                    else:
+                        transcript, segments = _transcribe_long(
+                            worker_cmd, duration_seconds, env=worker_env, **extra,
                         )
-                    worker_cmd = runtime.command(
-                        w_manifest,
-                        dictate.worker_argv(uv, take_wav, stt_for_worker) + ["--segments"], selected,
-                    )
-                    transcript, segments = _transcribe_long(
-                        worker_cmd, duration_seconds, env=runtime.environment(selected),
-                    )
-                    transcribed_by = f"whisper:{model_name}"
+                        # After either engine: Parakeet never saw the vocabulary.
+                        terms = stt_cfg.get("vocabulary") or []
+                        transcript = vocabulary.correct(transcript, terms)
+                        for seg in segments:
+                            seg["text"] = vocabulary.correct(seg["text"], terms)
 
                     if keep_audio_flag and take_wav.is_file():
                         dest_wav = target_note.with_suffix(".wav")
@@ -578,6 +717,6 @@ def process_sources(
             _write_note_atomic(folder, target_note, note_body)
             done_map[(src_sha, resolved_src_str)] = target_note
             created_notes.append(target_note)
-            print(f"Wrote note: {target_note.name}")
+            print(f"Wrote transcript: {target_note.name}")
 
     return created_notes

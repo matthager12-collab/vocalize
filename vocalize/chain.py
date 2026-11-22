@@ -7,15 +7,16 @@ failure never restarts the read on another provider.
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
 from . import audio as audio_module
-from . import cache, ledger, providers
+from . import cache, providers
 from .config import (
     _validate_chain,
     config_path,
-    reject_retired_settings,
+    migrate_retired_settings,
     resolve_provider_settings,
 )
 from .exceptions import (
@@ -36,13 +37,6 @@ _MAX_RESPLIT_PASSES = 12
 
 # Errors that mean "this provider can't do it, ask the next one".
 _SKIPPABLE = (ProviderUnavailableError, ProviderTransientError)
-
-
-def _count(text: str, provider) -> int:
-    """Count synthesized input units for local usage statistics."""
-    if getattr(provider, "COUNT_UNIT", "chars") == "bytes":
-        return len(text.encode("utf-8"))
-    return len(text)
 
 
 def _reason(exc: ProviderError, name: str) -> str:
@@ -71,9 +65,57 @@ def _fit_bytes(chunks: list[str], max_bytes: int) -> list[str]:
     return out
 
 
-def _chunks_for(provider, text: str, chunk_chars: int | None) -> list[str]:
+def _cap(provider, chunk_chars: int | None) -> int | None:
     limits = [x for x in (getattr(provider, "MAX_CHARS", None), chunk_chars) if x]
-    chunks = split_for_synthesis(text, min(limits)) if limits else [text]
+    return min(limits) if limits else None
+
+
+# The first piece of a streamed read is what the listener waits through
+# in silence: ~390 characters took 2.4-4.9 s to render with Kokoro's model
+# already loaded, one short sentence 0.32 s. So it is the first sentence,
+# or — past this length — the sentence's first clause(s). Only that one
+# boundary moves; every later chunk is cut exactly as before.
+_FIRST_CHUNK_CHARS = 120
+_FIRST_BREAK_RE = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
+_CLAUSE_BREAK_RE = re.compile(r"[,;:](?=\s)")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _first_cut(sentence: str) -> int | None:
+    """Where to end the first piece of an over-long sentence, or None.
+
+    The last clause break that keeps it within _FIRST_CHUNK_CHARS, else the
+    first clause break at all, else the last space within the limit. Always
+    between words: a cut is after punctuation or at whitespace.
+    """
+    clauses = [m.end() for m in _CLAUSE_BREAK_RE.finditer(sentence)]
+    within = [cut for cut in clauses if cut <= _FIRST_CHUNK_CHARS]
+    if within:
+        return within[-1]
+    if clauses:
+        return clauses[0]
+    spaces = [m.start() for m in _SPACE_RE.finditer(sentence, 0, _FIRST_CHUNK_CHARS + 1)]
+    return spaces[-1] if spaces else None
+
+
+def _short_first(chunk: str) -> list[str]:
+    """`chunk` as [first sentence or clause, the rest]; the same words."""
+    text = chunk.strip()
+    end = _FIRST_BREAK_RE.search(text)
+    cut = end.start() if end else len(text)
+    if cut > _FIRST_CHUNK_CHARS:
+        cut = _first_cut(text[:cut]) or cut
+    head, rest = text[:cut].rstrip(), text[cut:].strip()
+    return [head, rest] if head and rest else [chunk]
+
+
+def _chunks_for(provider, text: str, chunk_chars: int | None) -> list[str]:
+    cap = _cap(provider, chunk_chars)
+    chunks = split_for_synthesis(text, cap) if cap else [text]
+    if getattr(provider, "STREAMING", False) and chunks:
+        # Streamed or not, the same boundaries: the audio cache is keyed
+        # by chunk text, so a saved read and a played one share entries.
+        chunks = [*_short_first(chunks[0]), *chunks[1:]]
     max_bytes = getattr(provider, "MAX_BYTES", None)
     if max_bytes:
         chunks = _fit_bytes(chunks, max_bytes)
@@ -130,7 +172,8 @@ def _speak(
     ext = provider.AUDIO_EXT
     chunks = _chunks_for(provider, text, chunk_chars)
     total = len(chunks)
-    if total > 1:
+    cap = _cap(provider, chunk_chars)
+    if total > 1 and cap is not None and len(text) > cap:
         echo(f"Long input: splitting into {total} chunks.")
 
     streaming = on_chunk is not None and getattr(provider, "STREAMING", False)
@@ -155,8 +198,6 @@ def _speak(
                         )
                     audio = provider.synthesize(chunk, settings, **call_kwargs)
                     cache.put(chunk, settings, audio, cache_dir, ext)
-                    # Count synthesized characters, excluding cache hits.
-                    ledger.record(name, _count(chunk, provider))
             except ProviderError as exc:
                 if started:
                     raise TTSRequestError(
@@ -207,7 +248,8 @@ def run(
     overrides = dict(overrides or {})
     overrides = {k: v for k, v in overrides.items() if v is not None}
     _validate_chain(chain, config_path())
-    reject_retired_settings(file_config)
+    # Retired keys are dropped (with their notice) before any provider sees them.
+    file_config = migrate_retired_settings(file_config)
     if "api_key" in overrides:
         raise ConfigError("Hosted inference credentials are unsupported; --api-key was removed")
 

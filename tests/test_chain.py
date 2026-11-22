@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from vocalize import audio as audio_module
-from vocalize import cache, chain, ledger
+from vocalize import cache, chain
 from vocalize.config import Settings
 from vocalize.exceptions import (
     AudioPlaybackError,
@@ -25,6 +25,7 @@ from vocalize.exceptions import (
     ProviderUnavailableError,
     TTSRequestError,
 )
+from vocalize.preprocess import split_for_synthesis
 
 
 def _wav(text: str) -> bytes:
@@ -60,7 +61,6 @@ class FakeProvider:
         error=None,
         check_error=None,
         streaming=False,
-        count_unit=None,
         max_bytes=None,
     ):
         self.NAME = name
@@ -68,8 +68,6 @@ class FakeProvider:
         self.MAX_CHARS = max_chars
         self.DEFAULTS = {"voice": f"{name}-voice"}
         self.STREAMING = streaming
-        if count_unit is not None:
-            self.COUNT_UNIT = count_unit
         if max_bytes is not None:
             self.MAX_BYTES = max_bytes
         self._audio = audio
@@ -106,6 +104,10 @@ class _Registry(dict):
     resolved: list
     cache_dir = None
 
+    def __init__(self):
+        super().__init__()
+        self.file_configs = []
+
 
 @pytest.fixture
 def registry(monkeypatch, tmp_path):
@@ -121,6 +123,7 @@ def registry(monkeypatch, tmp_path):
 
     def fake_resolve(name, file_config=None, *, primary=True, **overrides):
         resolved.append({"name": name, "primary": primary, **overrides})
+        modules.file_configs.append(file_config)
         return Settings(voice_id=f"{name}-voice", provider=name)
 
     monkeypatch.setattr("vocalize.providers.get", fake_get)
@@ -337,36 +340,19 @@ def test_no_local_fallback_hint_when_say_is_already_in_the_chain(registry):
     assert "no local fallback" not in str(excinfo.value)
 
 
-# --- budgets and the ledger --------------------------------------------------
+# --- no usage is written (review L1) ---------------------------------------
 
 
-
-
-
-
-
-
-def test_characters_are_recorded_for_every_chunk_that_were_synthesized(registry):
+def test_speaking_writes_no_usage_file(registry, tmp_path, monkeypatch):
     registry["piper"] = FakeProvider("piper", max_chars=20)
-    text = "one two three four five six seven eight"
+    monkeypatch.setattr(chain, "DEFAULT_CACHE_DIR", tmp_path)
 
-    _run(registry, text=text, chain=["piper"])
+    _run(registry, text="one two three four five six seven eight", chain=["piper"])
 
-    chunks = registry["piper"].calls
-    assert len(chunks) > 1
-    assert ledger.status("piper")[0] == sum(len(c) for c in chunks)
-
-
-def test_a_bytes_counting_provider_records_utf8_bytes(registry):
-    registry["piper"] = FakeProvider("piper", count_unit="bytes")
-    text = "ünïcödé — mit Umlauten"
-
-    _run(registry, text=text)
-
-    assert len(text.encode("utf-8")) > len(text)
-    assert ledger.status("piper") == (len(text.encode("utf-8")), False)
-
-
+    assert len(registry["piper"].calls) > 1
+    assert not (tmp_path / "usage.json").exists()
+    assert not (Path(registry.cache_dir) / "usage.json").exists()
+    assert not hasattr(chain, "ledger")
 
 
 # --- the cache ---------------------------------------------------------------
@@ -381,7 +367,6 @@ def test_a_cache_hit_costs_neither_a_request_nor_a_character(registry, tmp_path)
 
     assert (audio, name) == (b"cached-audio", "piper")
     assert registry["piper"].calls == []
-    assert ledger.status("piper") == (0, False)
 
 
 def test_a_fresh_chunk_is_written_to_the_cache(registry, tmp_path):
@@ -432,7 +417,7 @@ def test_a_provider_without_a_cap_gets_the_whole_text_in_one_call(registry):
 
 
 def test_a_byte_cap_resplits_a_chunk_that_is_short_but_fat(registry):
-    registry["piper"] = FakeProvider("piper", max_chars=40, max_bytes=30, count_unit="bytes")
+    registry["piper"] = FakeProvider("piper", max_chars=40, max_bytes=30)
     text = "ü" * 39 + " " + "ö" * 39
 
     _run(registry, text=text)
@@ -693,3 +678,157 @@ def test_entire_chain_rejected_before_any_local_side_effect(registry, retired):
         _run(registry, chain=["say", retired])
     assert registry["say"].checked == []
     assert registry["say"].calls == []
+
+
+def test_providers_never_see_a_retired_setting(registry, capsys):
+    registry["say"] = FakeProvider("say")
+    file_config = {
+        "chain": ["elevenlabs", "say"],
+        "providers": {
+            "elevenlabs": {"api_key": "SECRET_CANARY"},
+            "say": {"voice": "Samantha", "api_key": "SECRET_CANARY", "monthly_chars": 10},
+        },
+    }
+
+    assert _run(registry, chain=["say"], file_config=file_config)[1] == "say"
+
+    seen = registry.file_configs
+    assert seen and all("SECRET_CANARY" not in repr(cfg) for cfg in seen)
+    assert seen[0]["providers"] == {"say": {"voice": "Samantha"}}
+    assert seen[0]["chain"] == ["say"]
+    assert file_config["providers"]["say"]["api_key"] == "SECRET_CANARY"  # input untouched
+    assert "SECRET_CANARY" not in capsys.readouterr().err
+
+
+# --- a short first chunk, so sound starts soon (Mac Studio run, F4) ------
+#
+# With Kokoro's model loaded, a ~390-character first chunk took 2.4-4.9 s
+# before any sound; one short sentence took 0.32 s. The first chunk of a
+# streamed read is now the first sentence — or, for a sentence longer than
+# about 120 characters, its first clause(s) — and every later boundary is
+# exactly where it was.
+
+_PARAGRAPH = (
+    "The installer downloads the weights and checks each file. "
+    "A file whose checksum does not match is deleted rather than kept, "
+    "and the install stops with a message naming the command to run again. "
+    "The verified models are stored under the cache directory. "
+    "A small stamp file records which hashes were accepted, so a later "
+    "status check can say whether the files on disk are the ones that "
+    "were verified. If the checksum step fails, run the install command "
+    "again with a stable network connection, then confirm the status "
+    "output reports every engine as ready before you continue with the "
+    "rest of the setup, which covers the recorder and the cleanup model."
+)
+
+_LONG_FIRST = (
+    "When the model is already loaded and the text is long, the first piece "
+    "of audio used to wait for the whole first chunk, which on this machine "
+    "meant several seconds of silence; now it does not. Then the rest follows."
+)
+
+
+def _streaming(max_chars=400):
+    return FakeProvider("kokoro", ext="wav", max_chars=max_chars, streaming=True)
+
+
+def _words(chunks):
+    return " ".join(chunks).split()
+
+
+def test_the_first_chunk_of_a_streamed_read_is_its_first_sentence():
+    chunks = chain._chunks_for(_streaming(), _PARAGRAPH, None)
+
+    assert chunks[0] == "The installer downloads the weights and checks each file."
+    assert _words(chunks) == _PARAGRAPH.split()  # the same words, in order
+
+
+def test_only_the_first_boundary_moves():
+    before = split_for_synthesis(_PARAGRAPH, 400)
+    chunks = chain._chunks_for(_streaming(), _PARAGRAPH, None)
+
+    assert len(before) > 1
+    assert chunks[2:] == before[1:]  # later chunks keep today's size and text
+    assert " ".join(chunks[:2]) == before[0]
+
+
+def test_text_under_the_cap_is_still_split_after_its_first_sentence():
+    text = "Hello there. This is the second sentence, which is a little longer."
+
+    assert chain._chunks_for(_streaming(), text, None) == [
+        "Hello there.", "This is the second sentence, which is a little longer.",
+    ]
+
+
+def test_a_long_first_sentence_is_cut_at_a_clause_never_inside_a_word():
+    chunks = chain._chunks_for(_streaming(), _LONG_FIRST, None)
+
+    assert len(chunks[0]) <= 120
+    assert chunks[0][-1] in ",;:"
+    assert _LONG_FIRST.startswith(chunks[0] + " ")
+    assert _words(chunks) == _LONG_FIRST.split()
+
+
+def test_a_long_first_sentence_without_a_clause_is_cut_between_words():
+    text = " ".join(["word"] * 60) + ". Next."
+
+    chunks = chain._chunks_for(_streaming(), text, None)
+
+    assert len(chunks[0]) <= 120
+    assert set(chunks[0].split()) == {"word"}
+    assert _words(chunks) == text.split()
+
+
+@pytest.mark.parametrize("text", [
+    "One sentence only.",
+    "  Leading space. And\nnewlines inside.\n\nA new paragraph here.  ",
+    "Heading without a stop\n\nBody text follows here.",
+    "a" * 450,
+    "Decimal 12.5% and 3.45 p.m. stay whole. Then more.",
+])
+def test_the_spoken_words_never_change(text):
+    before = split_for_synthesis(text, 400)
+    chunks = chain._chunks_for(_streaming(), text, None)
+
+    assert _words(chunks) == _words(before)
+    assert all(chunk.strip() for chunk in chunks)
+    assert all(len(chunk) <= 400 for chunk in chunks)
+
+
+def test_a_provider_that_does_not_stream_keeps_its_chunks():
+    provider = FakeProvider("piper", ext="wav", max_chars=400, streaming=False)
+
+    assert chain._chunks_for(provider, _PARAGRAPH, None) == split_for_synthesis(_PARAGRAPH, 400)
+
+
+def test_a_short_streamed_text_is_not_called_long_input(registry):
+    registry["kokoro"] = _streaming()
+    lines, echo = _echoes()
+
+    _run(registry, text="Hello there. And again.", echo=echo)
+
+    assert registry["kokoro"].calls == ["Hello there.", "And again."]
+    assert not any(line.startswith("Long input") for line in lines)
+
+
+def test_the_cache_answers_every_chunk_of_a_repeated_streamed_read(registry):
+    registry["kokoro"] = _streaming()
+
+    first, _, _ = _run(registry, text=_PARAGRAPH)
+    rendered = list(registry["kokoro"].calls)
+    again, _, _ = _run(registry, text=_PARAGRAPH)
+
+    assert registry["kokoro"].calls == rendered  # nothing rendered twice
+    assert again == first
+
+
+def test_a_stop_after_the_short_first_chunk_resumes_with_every_unheard_word(registry):
+    registry["kokoro"] = _streaming()
+    chunks = chain._chunks_for(registry["kokoro"], _PARAGRAPH, None)
+    _seen, on_chunk = _collect(results=[True, False])
+
+    with pytest.raises(PlaybackStopped) as excinfo:
+        _run(registry, text=_PARAGRAPH, on_chunk=on_chunk)
+
+    assert excinfo.value.remaining_text == " ".join(chunks[1:])
+    assert (chunks[0] + " " + excinfo.value.remaining_text).split() == _PARAGRAPH.split()

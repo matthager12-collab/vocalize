@@ -25,12 +25,22 @@ FRONTMATTER_KEYS = (
 )
 
 
-def _write_wav(path: Path, seconds: float = 2.0) -> None:
+def _write_wav(path: Path, seconds: float = 2.0, *, silent: bool = False) -> None:
+    """16 kHz mono 16-bit; audible (+1000, -1000 pairs) unless `silent`."""
+    frames = int(16000 * seconds)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(16000)
-        w.writeframes(b"\x00\x00" * int(16000 * seconds))
+        w.writeframes(b"\x00\x00" * frames if silent else b"\xe8\x03\x18\xfc" * (frames // 2))
+
+
+def _is_silent_wav(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as w:
+            return not any(w.readframes(w.getnframes()))
+    except (OSError, wave.Error, EOFError):
+        return False
 
 
 def _frontmatter(text: str) -> dict[str, str]:
@@ -57,7 +67,7 @@ def env(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kw):
         assert cmd[0] == "afconvert", cmd
-        _write_wav(Path(cmd[-1]))
+        _write_wav(Path(cmd[-1]), silent=_is_silent_wav(Path(cmd[-2])))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -194,3 +204,18 @@ def test_text_source_is_transcribed_by_file(env, tmp_path):
     text = note.read_text(encoding="utf-8")
     assert _frontmatter(text)["transcribed_by"] == '"file"'
     assert text.endswith("\n## Transcript\n\nPlain synthetic words\n")
+
+
+def test_a_silent_recording_exits_0_with_a_silent_note_and_is_skipped_next_time(env, tmp_path):
+    silence = tmp_path / "Silence.m4a"
+    _write_wav(silence, 10.0, silent=True)
+    result = CliRunner().invoke(main, ["transcribe", str(silence)])
+    assert result.exit_code == 0, result.output
+    assert env["calls"] == []  # the worker never ran
+    [note] = env["folder"].glob("*.md")
+    text = note.read_text(encoding="utf-8")
+    assert set(_frontmatter(text)) == set(FRONTMATTER_KEYS)
+    assert text.endswith("\n## Transcript\n\n" + notes.SILENT_TRANSCRIPT + "\n")
+    again = CliRunner().invoke(main, ["transcribe", str(silence)])
+    assert again.exit_code == 0 and "already processed" in again.output
+    assert env["calls"] == [] and list(env["folder"].glob("*.md")) == [note]

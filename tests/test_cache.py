@@ -9,10 +9,26 @@ from vocalize.config import Settings
 
 
 def test_local_key_preserves_existing_provider_namespace():
-    settings = Settings(voice_id="af_heart", model_id="m", output_format="wav", provider="kokoro")
-    expected = hashlib.sha256(b"af_heart|m|wav|hello|provider=kokoro").hexdigest()
+    # The second field held a model name no engine read; it is always empty
+    # now, so an entry saved with the default (empty) model still hits.
+    settings = Settings(voice_id="af_heart", output_format="wav", provider="kokoro")
+    expected = hashlib.sha256(b"af_heart||wav|hello|provider=kokoro").hexdigest()
     assert cache.cache_key("hello", settings) == expected
     assert cache.cache_key("hello", Settings(voice_id="af_heart", provider="piper")) != expected
+
+
+def test_the_key_changes_with_voice_speed_engine_and_text_only():
+    base = Settings(voice_id="af_heart", provider="kokoro")
+    key = cache.cache_key("hello", base)
+    assert cache.cache_key("hello", Settings(voice_id="af_heart", provider="kokoro")) == key
+    for other in (
+        Settings(voice_id="af_bella", provider="kokoro"),
+        Settings(voice_id="af_heart", provider="kokoro", speed=0.9),
+        Settings(voice_id="af_heart", provider="say"),
+    ):
+        assert cache.cache_key("hello", other) != key
+    assert cache.cache_key("hello!", base) != key
+    assert "model_id" not in Settings.__dataclass_fields__
 
 
 def test_speed_and_language_separate_entries():
@@ -112,3 +128,53 @@ def test_none_or_unwritable_cache_is_nonfatal(tmp_path, monkeypatch):
 def test_cache_extension_cannot_be_a_path(tmp_path):
     with pytest.raises(ValueError):
         cache.cache_path("fixture", Settings(), tmp_path, "../../outside")
+
+
+def _cache_tree(tmp_path):
+    root = tmp_path / "vocalize"
+    root.mkdir(mode=0o700)
+    settings = Settings(provider="kokoro")
+    cache.put("one", settings, b"1234", root, "wav")
+    cache.put("two", settings, b"12", root, "mp3")
+    (root / ".audio-leftover").write_bytes(b"1")
+    keep = [root / "app.log", root / "models" / "kokoro" / ("a" * 64 + ".wav"),
+            root / "envs" / "kokoro-x" / "bin" / "python", root / ("a" * 63 + ".wav")]
+    for path in keep:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"keep")
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"keep")
+    (root / ("b" * 64 + ".wav")).symlink_to(outside)
+    return root, keep, outside
+
+
+def test_usage_counts_only_audio_cache_files(tmp_path):
+    root, _keep, _outside = _cache_tree(tmp_path)
+    assert cache.usage(root) == (3, 7)
+
+
+def test_clear_removes_only_audio_cache_files(tmp_path):
+    root, keep, outside = _cache_tree(tmp_path)
+    assert cache.clear(root) == (3, 7)
+    assert cache.usage(root) == (0, 0)
+    assert all(path.read_bytes() == b"keep" for path in keep)
+    assert outside.read_bytes() == b"keep"
+    assert (root / ("b" * 64 + ".wav")).is_symlink()
+
+
+def test_missing_cache_is_empty(tmp_path):
+    assert cache.usage(tmp_path / "absent") == (0, 0)
+    assert cache.clear(tmp_path / "absent") == (0, 0)
+
+
+def test_a_redirected_cache_is_never_cleared(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    victim = real / ("a" * 64 + ".wav")
+    victim.write_bytes(b"keep")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    assert cache.usage(link) == (0, 0)
+    with pytest.raises(OSError):
+        cache.clear(link)
+    assert victim.read_bytes() == b"keep"

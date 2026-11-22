@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from . import locks
+
 # The Hugging Face repo and the exact commit hash pinned from a verified
 # download.  The moving branch itself ("main") is not an acceptable
 # source: a later push would change what a pinned sha256 silently stops
@@ -74,12 +76,26 @@ FILES = [
 # The model type the spike confirmed (spike-notes.md § LLM).
 MODEL_TYPE = "qwen3_5"
 
-# Pinned exactly: the worker runs under uv's own Python, and an unpinned
-# ``--with`` would silently change the runtime.  Recorded in the
-# ``.verified`` stamp so a mismatch reports "installed by an older
-# vocalize — run: vocalize local install --llm".
+# Pinned exactly, and its whole tree with it: see LOCK_FILE below.  The
+# lock targets macOS 14 or later, the oldest macOS mlx publishes wheels for.
 RUNTIME_PACKAGE = "mlx-lm==0.31.3"
 PYTHON_VERSION = "3.12"
+
+# The engine's whole dependency tree, pinned by version and sha256
+# (locks/__init__.py). RUNTIME_PACKAGE above is what the lock was compiled
+# from and is kept as the runtime's name; it is never handed to uv.
+ENGINE = "llm"
+LOCK_FILE = locks.lock_file("llm.txt")
+
+
+def lock_file() -> Path:
+    """The lock this machine installs from."""
+    return LOCK_FILE
+
+
+def runtime_python() -> Path:
+    """The locked environment's interpreter, created by `local install`."""
+    return locks.env_python(ENGINE, lock_file())
 
 # 12 GiB: the spike measured ~1.1 GB peak RSS for the model itself, but
 # the machine also needs room for the OS, the STT model, and the rest of
@@ -168,39 +184,31 @@ def worker_path() -> Path:
     return Path(__file__).resolve().parent / "llm_worker.py"
 
 
-def selftest_argv(model_dir: Path | None = None) -> list[str]:
-    """The argv ``local install --llm`` runs (after the ``uv`` executable)
-    to warm the runtime.
-
-    This is the **online** version: uv may populate its cache on the
-    first run.  Every later ``_local`` call uses ``runtime_argv`` which
-    carries ``--offline``.  A test asserts the two differ in exactly
-    the offline flags.
-    """
-    base = MODEL_DIR if model_dir is None else model_dir
+def _argv(base: Path) -> list[str]:
     return [
-        "run", "--no-project",
-        "--python", PYTHON_VERSION,
-        "--with", RUNTIME_PACKAGE,
+        "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
+        "--python", str(runtime_python()),
         str(worker_path()),
         "--model-dir", str(base),
-        "--selftest",
     ]
+
+
+def selftest_argv(model_dir: Path | None = None) -> list[str]:
+    """The argv ``local install --llm`` runs (after the ``uv`` executable)
+    to warm the runtime, once the locked environment exists.
+
+    Offline like every other call: the environment was built from the
+    lock before this runs, so there is nothing left to fetch.  It differs
+    from ``runtime_argv`` only in ``--selftest`` for ``--once``.
+    """
+    base = MODEL_DIR if model_dir is None else model_dir
+    return [*_argv(base), "--selftest"]
 
 
 def runtime_argv(model_dir: Path | None = None) -> list[str]:
-    """The argv every runtime call uses — identical to ``selftest_argv``
-    but with offline/no-Python-download flags and ``--once`` instead of ``--selftest``.
-
-    ``--offline`` tells uv to refuse network access; the install selftest
-    already populated the cache.
+    """The argv every runtime call uses: the locked environment's
+    interpreter, ``--offline``, no ``--with`` — uv resolves and fetches
+    nothing — and ``--once``.
     """
     base = MODEL_DIR if model_dir is None else model_dir
-    return [
-        "run", "--no-project", "--offline", "--no-python-downloads",
-        "--python", PYTHON_VERSION,
-        "--with", RUNTIME_PACKAGE,
-        str(worker_path()),
-        "--model-dir", str(base),
-        "--once",
-    ]
+    return [*_argv(base), "--once"]

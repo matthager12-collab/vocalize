@@ -72,6 +72,30 @@ def test_runs_outside_the_callers_project(fake):
     assert fake.calls[0][1]["cwd"] != "."
 
 
+def _python_flags(argv):
+    """What sits between `python` and `-m piper`."""
+    start = argv.index("python") + 1
+    end = argv.index("piper") - 1
+    assert argv[end] == "-m"
+    return argv[start:end]
+
+
+def test_the_working_folder_is_not_on_the_engines_import_path(fake):
+    """L4: `python -m piper` run from the temporary folder put that folder
+    first on `sys.path`, so a `piper.py` there would run instead of the
+    engine. `-P` (Python 3.11 and later) keeps it off."""
+    piper.synthesize("hello", settings())
+    argv, kwargs = fake.calls[0]
+    assert kwargs["cwd"]  # still never the caller's project folder
+    assert "-P" in _python_flags(argv)
+    assert tuple(int(p) for p in manifest.PYTHON_VERSION.split(".")) >= (3, 11)
+
+
+def test_the_install_selftest_keeps_the_working_folder_off_the_import_path():
+    assert "-P" in _python_flags(manifest.selftest_argv())
+    assert "-P" in _python_flags(manifest.uv_argv("lessac", manifest.MODEL_DIR / "x.wav"))
+
+
 def test_multiline_text_is_flattened_to_one_utterance(fake):
     piper.synthesize("one\n\ntwo   three", settings())
     assert fake.calls[0][1]["input"] == "one two three\n"

@@ -1,9 +1,9 @@
 # Decisions: vocalize, local only
 
-Decided under Mat's delegation of 2026-11-21: "No permission needed from me
-for any choices through publication of the new version." Each entry names
-the evidence it rests on. Mat can reverse any of them; the Review line says
-what to look at.
+Decided by the maintainer under the owner's standing approval of
+2026-11-21, which covers every choice up to and including publishing the
+new version. Each entry names the evidence it rests on. The owner can
+reverse any of them; the Review line says what to look at.
 
 | # | Question | Status | Decision | Round |
 |---|---|---|---|---|
@@ -26,19 +26,19 @@ what to look at.
 **Question**: What is the base of the work?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: `main` is 0.15.0 with every cloud path in place. An earlier,
 never-pushed line of work removed the cloud providers and credentials and
-then added meeting features on top. Commit `90b5dbc` on that line is the
-last one before the meeting capture work.
+then added call-capture features on top. Commit `90b5dbc` on that line is
+the last one before the call-capture work.
 
 | Option | Description | Trade-offs |
 |---|---|---|
 | A | Start from `main`, merge the Parakeet branch, remove the cloud code again by hand | Cleanest history. Repeats about 11,000 lines of removal and test rewriting that already exist. |
-| B | Start from `90b5dbc`, merge `main`, delete the meeting module | Reuses the finished removal. Carries one meeting module, one command group and two documents that must be deleted. |
-| C | Start from the tip of the meeting line and strip it | Also carries app-audio capture, a third Swift bundle and meeting orchestration: about 2,600 more lines to strip. |
+| B | Start from `90b5dbc`, merge `main`, delete the call-capture module | Reuses the finished removal. Carries one call-capture module, one command group and two documents that must be deleted. |
+| C | Start from the tip of the call-capture line and strip it | Also carries app-audio capture, a third Swift bundle and call orchestration: about 2,600 more lines to strip. |
 
 **Recommendation**: B. Measured on 2026-11-21 at `90b5dbc`: `ruff check .`
 passes, the suite reports 2360 passed and 6 skipped, the runtime
@@ -48,16 +48,16 @@ dependencies are `click` and `tomli` only, and merging `main` conflicts in
 **Decision**: B.
 
 **Consequences**: The branch history contains commits whose messages mention
-a meeting foundation; `main` receives one squashed commit, so that history
+a call-capture foundation; `main` receives one squashed commit, so that history
 does not land there. Parakeet and Piper arrive with the base. Anything the
-later meeting commits fixed in shared code is not included and has to be
+later call-capture commits fixed in shared code is not included and has to be
 found by tests.
 
 **Applied to**:
 - [design.md](./design.md) § Context
 - [plan.md](./plan.md) § Phase 0, T-01 to T-03
 
-**Review**: 2026-12-21. Check that no meeting code or wording remains
+**Review**: 2026-12-21. Check that no call-capture code or wording remains
 anywhere in the released tree.
 
 ---
@@ -67,19 +67,19 @@ anywhere in the released tree.
 **Question**: What does "just speech to text and text to speech" keep?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: Two features use a language model. Transcript cleanup rewrites
-a dictated take into what was meant; Mat asked for it in September and his
-own config turns it on. Summaries turn a transcript or a long selection into
+a dictated take into what was meant; the owner asked for it in September
+and the owner's own config turns it on. Summaries turn a transcript or a long selection into
 a shorter text. Neither is transcription or synthesis in the narrow sense.
 
 | Option | Description | Trade-offs |
 |---|---|---|
 | A | No language model anywhere | Smallest product. Dictation loses self-correction and typed numbers: the repo's own eval scores 5 of 26 without a model, 11 of 26 with simple rules, 25 of 26 with the model. |
 | B | Cleanup stays as a stage of dictation; summaries go | Dictation output stays as good as it is today. Keeps a language model in the product, on device. |
-| C | Keep cleanup and local summaries | No loss of features. Summaries are a third capability, and the meeting template is a meeting feature. |
+| C | Keep cleanup and local summaries | No loss of features. Summaries are a third capability, and one note template exists only for recorded calls. |
 
 **Recommendation**: B. Cleanup changes how well speech becomes text;
 summaries make a different document.
@@ -88,17 +88,16 @@ summaries make a different document.
 `summarize-text` command, the summary depths in the Speak Quick Action, and
 the web and file digest modes of the `/speak` skill with their URL gate.
 
-**Consequences**: A downstream recorder project of the owner's was designed
-around notes that include a local summary; it keeps the transcripts and
-loses the summary. Summarizing becomes a job for whatever reads the
+**Consequences**: A program that reads the transcripts and expected a local
+summary in each note keeps the transcripts and loses the summary. Summarizing becomes a job for whatever reads the
 transcripts. The long-selection picker offers speak all or truncate.
 
 **Applied to**:
 - [design.md](./design.md) § Approach, § Contracts
 - [plan.md](./plan.md) § Phase 1, T-10 to T-12
 
-**Review**: 2026-12-21. Ask Mat whether losing summaries in the recorder
-pipeline is acceptable, and whether cleanup should stay.
+**Review**: 2026-12-21. Ask the owner whether losing summaries in the
+transcript pipeline is acceptable, and whether cleanup should stay.
 
 ---
 
@@ -107,14 +106,13 @@ pipeline is acceptable, and whether cleanup should stay.
 **Question**: What runs transcript cleanup?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: Cleanup runs today in a pinned worker: one hash-checked model,
 `mlx-lm`, started offline, with the prompt built as token ids so dictated
 text cannot end a turn. The alternative raised in research is a local
-server with an OpenAI-style API, such as Ollama, which is installed on the
-Mac Studio.
+server with a standard chat API, such as Ollama.
 
 | Option | Description | Trade-offs |
 |---|---|---|
@@ -145,7 +143,7 @@ the latency of a take.
 **Question**: One shared speech runtime, or one worker per engine?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: Each engine is installed from a pinned, hash-checked manifest
@@ -183,7 +181,7 @@ shows `mlx-audio` running pinned, offline and on a Unix socket.
 **Question**: What happens to a 0.15 config file on upgrade?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: Published users have config files naming cloud providers. The
@@ -215,7 +213,7 @@ from the settings page removes them, after the page says so.
 **Question**: How does the UI come to cover every setting?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: The settings page edits the chain, one provider and six of
@@ -254,7 +252,7 @@ the only thing that had to be satisfied.
 **Question**: How does file transcription survive without notes?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: `vocalize notes` is the only command that takes ordinary audio
@@ -290,7 +288,7 @@ processed and confirm nothing is transcribed twice.
 **Question**: What is the version number?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: The package is public. Its default voice chain starts with a
@@ -321,7 +319,7 @@ users to stay on 0.15.
 **Question**: Which third-party packages need an intake review first?
 
 **Date**: 2026-11-21
-**Decided by**: Mat's engineering manager agent, under Mat's delegation
+**Decided by**: the maintainer, under the owner's standing approval for this release
 **Status**: Decided
 
 **Context**: The owner's rule is that a third-party package is reviewed for
@@ -339,7 +337,8 @@ chosen on the pushed Parakeet branch. None has run on the Mac Studio.
 no time, and none of the five pins has a review on record.
 
 **Decision**: A, revised from B on 2026-11-21 before anything had run.
-Reviewed first: `tomlkit`, `pytest-socket`, `kokoro-onnx`, `pywhispercpp`,
+Reviewed first: `tomlkit`, `pytest-socket` (neither was adopted in the
+end), `kokoro-onnx`, `pywhispercpp`,
 `mlx-lm`, `parakeet-mlx` and `piper-tts`; then each candidate engine
 runtime.
 

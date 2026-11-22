@@ -152,7 +152,7 @@ def _no_real_home(monkeypatch, tmp_path):
 def _no_real_playback_lock(monkeypatch, tmp_path):
     """Keep every test off the real playback lock at ~/.cache/vocalize.
 
-    Autouse for the same reason as the ledger fixture: a real lock held by
+    Autouse to isolate application state: a real lock held by
     an actual read on the developer's machine would otherwise make any
     play() test block until the audio finished — a hang with no error.
     """
@@ -170,21 +170,10 @@ def _no_real_playback_lock(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_ledger(monkeypatch, tmp_path):
-    """Keep every test off the real usage ledger at ~/.cache/vocalize.
-
-    Autouse to isolate application state: a real usage.json on the
-    developer's machine could satisfy or skew a status()/record() call and
-    quietly turn a test green (or exhausted) for the wrong reason.
-    """
-    monkeypatch.setattr("vocalize.ledger.DEFAULT_CACHE_DIR", tmp_path)
-
-
-@pytest.fixture(autouse=True)
 def _no_real_model_cache(monkeypatch, tmp_path, request):
     """Keep every test off the real model caches at ~/.cache/vocalize/models.
 
-    Autouse for the same reason as the ledger and playback-lock fixtures:
+    Autouse for the same reason as the playback-lock fixture:
     a test that forgets to override a manifest's MODEL_DIR (or does not
     need to, like a `local status` test focused on the other manifest)
     would otherwise stat — or worse, delete — the developer's real Kokoro,
@@ -219,12 +208,16 @@ def _no_real_model_cache(monkeypatch, tmp_path, request):
 @pytest.fixture(autouse=True)
 def _no_real_warm_workers(monkeypatch, tmp_path):
     """Keep model requests and stop markers off the user's warm workers."""
-    from vocalize.local import warm_protocol
+    from vocalize.local import warm, warm_protocol
 
     monkeypatch.setattr(
         warm_protocol, "warm_dir",
         lambda base=None: Path(base) if base is not None else tmp_path / "warm",
     )
+    # tmp_path is often too long for a Unix socket. The short fallback
+    # folder lives in a shared temporary directory, so it is off unless a
+    # test turns it on: a too-long path keeps meaning "no warm server".
+    monkeypatch.setattr(warm, "_fallback_parents", list)
 
 
 @pytest.fixture(autouse=True)
@@ -245,7 +238,7 @@ def _no_real_recorder_bin(monkeypatch, tmp_path):
 def _no_real_audio_cache(monkeypatch, tmp_path):
     """Keep the portal's previews out of the real audio cache.
 
-    Autouse for the same reason as the ledger fixture, and sharper: a
+    Autouse for the same reason as the playback-lock fixture, and sharper: a
     preview writes a *fake* provider's bytes into `~/.cache/vocalize`
     under the cache key of a real voice's settings, and the developer's
     next real `vocalize speak` of that sentence would play them back.

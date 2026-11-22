@@ -41,7 +41,7 @@ import sys
 from pathlib import Path
 
 # Keep spoken responses short by default — a Stop hook fires after every
-# turn, and a long response would eat the ElevenLabs free-tier quota fast.
+# turn, and reading a long response aloud each time would take minutes.
 # Passed as vocalize's --default-max-chars, which sits BELOW the user's own
 # settings: a --max-chars flag, VOCALIZE_MAX_CHARS in the environment, or
 # max_chars in the config file all override it (vocalize resolves those

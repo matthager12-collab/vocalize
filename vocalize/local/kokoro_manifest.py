@@ -11,7 +11,10 @@ nothing downloaded here is ever executed or unpickled.
 
 from __future__ import annotations
 
+import platform
 from pathlib import Path
+
+from . import locks
 
 # The GitHub release the two files are pinned to.
 RELEASE_TAG = "model-files-v1.1"
@@ -39,14 +42,32 @@ FILES = [
 MODEL_FILE = FILES[0]["name"]
 VOICES_FILE = FILES[1]["name"]
 
-# Pinned exactly: the worker runs under uv's own Python, and an unpinned
-# `--with` would silently change the runtime under the user's feet.
+# Pinned exactly, and its whole tree with it: see LOCK_FILE below.
 RUNTIME_PACKAGE = "kokoro-onnx==0.6.1"
 # kokoro-onnx pins <3.14, so it cannot run in vocalize's own 3.14 venv.
 PYTHON_VERSION = "3.12"
 
 # Written only after both files verify. Its presence is what `check()`
 # trusts, so a half-finished install never looks installed.
+# The engine's whole dependency tree, pinned by version and sha256
+# (locks/__init__.py). RUNTIME_PACKAGE above is what the locks were compiled
+# from and is kept as the runtime's name; it is never handed to uv. Kokoro
+# also runs on Intel Macs, whose wheels differ, so each arch has a lock.
+ENGINE = "kokoro"
+LOCK_FILE = locks.lock_file("kokoro.txt")
+LOCK_FILE_X86_64 = locks.lock_file("kokoro-x86_64.txt")
+
+
+def lock_file() -> Path:
+    """The lock this machine installs from."""
+    return LOCK_FILE_X86_64 if platform.machine() == "x86_64" else LOCK_FILE
+
+
+def runtime_python() -> Path:
+    """The locked environment's interpreter, created by `local install`."""
+    return locks.env_python(ENGINE, lock_file())
+
+
 STAMP_NAME = ".verified"
 MANIFEST_VERSION = 1
 
@@ -90,18 +111,27 @@ def file_paths(model_dir: Path | None = None) -> tuple[Path, Path]:
     return base / MODEL_FILE, base / VOICES_FILE
 
 
+def runtime_prefix() -> list[str]:
+    """Everything after `uv` up to the worker's own arguments: the locked
+    environment's interpreter, offline, and no `--with` — nothing is
+    resolved or fetched when a worker starts."""
+    return [
+        "run", "--no-project", "--no-build", "--offline", "--no-python-downloads",
+        "--python", str(runtime_python()),
+        str(worker_path()),
+    ]
+
+
 def selftest_argv(model_dir: Path | None = None) -> list[str]:
-    """The argv `local install` runs (after `uv run --no-project ...`) to
-    warm the runtime. Owned here, not by install.py, so install.py never
-    has to know what a voice or a language is — only Whisper's manifest
-    differs (it needs a `model=` kwarg; Kokoro needs none).
+    """The argv `local install` runs (after `uv`, once the locked
+    environment exists) to warm the runtime. Owned here, not by
+    install.py, so install.py never has to know what a voice or a
+    language is — only Whisper's manifest differs (it needs a `model=`
+    kwarg; Kokoro needs none).
     """
     model, voices = file_paths(model_dir)
     return [
-        "run", "--no-project",
-        "--python", PYTHON_VERSION,
-        "--with", RUNTIME_PACKAGE,
-        str(worker_path()),
+        *runtime_prefix(),
         "--model", str(model),
         "--voices", str(voices),
         "--voice", DEFAULT_VOICE,

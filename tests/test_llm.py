@@ -109,25 +109,35 @@ def test_verbatim_keyword_and_flag_select_prompt(local):
     assert llm.VERBATIM_PROMPT in json.loads(local[-1][1]["input"])["system"]
 
 
-@pytest.mark.parametrize("marker,parent,group,session,expected", [
-    (None, 100, 200, 200, False),
-    ("99", 100, 200, 200, False),
-    ("100", 100, 100, 200, False),
-    ("100", 100, 200, 100, False),
-    ("100", 100, 200, 200, True),
-])
-def test_only_summary_helper_direct_session_leader_inherits_group(
-    monkeypatch, marker, parent, group, session, expected,
-):
-    if marker is None:
-        monkeypatch.delenv(llm._SUMMARY_GROUP_OWNER, raising=False)
-    else:
-        monkeypatch.setenv(llm._SUMMARY_GROUP_OWNER, marker)
-    monkeypatch.setattr(llm.os, "getpid", lambda: 200)
-    monkeypatch.setattr(llm.os, "getppid", lambda: parent)
-    monkeypatch.setattr(llm.os, "getpgrp", lambda: group)
-    monkeypatch.setattr(llm.os, "getsid", lambda pid: session)
-    assert llm._summary_owns_group() is expected
+def test_summary_process_group_marker_is_gone():
+    assert not hasattr(llm, "_SUMMARY_GROUP_OWNER")
+    assert not hasattr(llm, "_summary_owns_group")
+
+
+UV_OFFLINE_STDERR = "  hint: Packages were unavailable because the network was disabled.\n"
+OFFLINE_LINE = (
+    "vocalize: cleanup skipped (its runtime is not cached for offline use; "
+    "run `vocalize local install --llm` again)"
+)
+
+
+def test_offline_start_failure_keeps_text_and_says_install_once(local, monkeypatch, capsys):
+    monkeypatch.setattr(llm, "_offline_noticed", False, raising=False)
+    monkeypatch.setattr(llm, "LOCAL_RUN_SEAM", lambda argv, **k: subprocess.CompletedProcess(
+        argv, 2, "", UV_OFFLINE_STDERR + "SECRET_CANARY " + TEXT))
+    assert llm.cleanup_transcript(TEXT, "local") == (TEXT, False)
+    assert llm.cleanup_transcript(TEXT, "local") == (TEXT, False)
+    err = capsys.readouterr().err
+    assert err.splitlines() == [OFFLINE_LINE]
+    assert TEXT not in err and "SECRET_CANARY" not in err
+
+
+def test_other_worker_failure_prints_no_install_line(local, monkeypatch, capsys):
+    monkeypatch.setattr(llm, "_offline_noticed", False, raising=False)
+    monkeypatch.setattr(llm, "LOCAL_RUN_SEAM", lambda argv, **k: subprocess.CompletedProcess(
+        argv, 1, "", "Traceback: SECRET_CANARY"))
+    assert llm.cleanup_transcript(TEXT, "local") == (TEXT, False)
+    assert "local install" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "success", "cancel"])
@@ -201,3 +211,41 @@ def test_direct_local_inference_stops_worker_descendants(monkeypatch, tmp_path, 
         for process in processes:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_warm_cleanup_fingerprint_carries_the_lock_identity(local, monkeypatch):
+    from vocalize.local import llm_manifest, locks, warm, warm_protocol
+
+    seen = []
+    monkeypatch.setattr(warm, "request", lambda kind, payload, fingerprint, **kw: seen.append(fingerprint))
+    monkeypatch.delenv("VOCALIZE_LLM_PYTHON", raising=False)
+    llm.cleanup_transcript(TEXT, "local")
+    assert seen[0]["runtime_identity"] == locks.identity(llm_manifest.lock_file())
+    assert seen[0] == warm_protocol.fingerprint(
+        llm_manifest.worker_path(), llm_manifest.RUNTIME_PACKAGE,
+        llm_manifest.MODEL_DIR / "model.safetensors",
+        runtime_identity=locks.identity(llm_manifest.lock_file()),
+    )
+
+
+def test_a_changed_lock_changes_the_warm_cleanup_fingerprint(tmp_path, monkeypatch):
+    from vocalize.local import llm_manifest
+
+    lock = tmp_path / "llm.txt"
+    lock.write_text("mlx-lm==0.31.3 --hash=sha256:aaa\n")
+    monkeypatch.setattr(llm_manifest, "lock_file", lambda: lock)
+    before = llm.warm_identity(None)
+    lock.write_text("mlx-lm==0.31.3 --hash=sha256:bbb\n")
+    assert llm.warm_identity(None) != before
+
+
+def test_an_explicit_interpreter_keeps_its_own_identity(tmp_path, monkeypatch):
+    import sys
+
+    from vocalize.local import runtime
+
+    interpreter = tmp_path / "python"
+    interpreter.symlink_to(sys.executable)
+    monkeypatch.setenv("VOCALIZE_LLM_PYTHON", str(interpreter))
+    selected = runtime.selection("mlx-lm==0.31.3")
+    assert llm.warm_identity(selected) == selected.identity

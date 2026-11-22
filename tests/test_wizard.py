@@ -5,7 +5,7 @@ import time
 import pytest
 from click.testing import CliRunner
 
-from vocalize import wizard
+from vocalize import config, wizard
 from vocalize.cli import main
 from vocalize.config import load_config_file
 from vocalize.exceptions import (
@@ -158,7 +158,7 @@ def test_every_table_and_every_key_survives_a_save(monkeypatch, tmp_path):
         "engine": "whisper", "model": "small.en", "language": "en",
         "input_device": "Studio Mic", "cleanup": "local", "paste": True,
         "max_seconds": 30, "sounds": False, "cues": "both", "beam_size": 3,
-        "verbatim": True, "max_take_seconds": 600, "vocabulary": ["Hermes", "Mat Hager"],
+        "verbatim": True, "max_take_seconds": 600, "vocabulary": ["Kokoro", "repository root"],
         "warm_minutes": 15,
     }
     speech = {
@@ -174,9 +174,9 @@ def test_every_table_and_every_key_survives_a_save(monkeypatch, tmp_path):
         "overflow": "never",
         "chain": ["piper", "kokoro", "say"],
         "providers": {
-            "kokoro": {"voice": "af_bella", "model": "kokoro-v1.0", "language": "en-us", "speed": 0.9},
-            "piper": {"voice": "en_US-amy-medium", "model": "amy", "language": "en_US", "speed": 1.1},
-            "say": {"voice": "Samantha", "model": "system", "language": "en_US", "speed": 1.0},
+            "kokoro": {"voice": "af_bella", "language": "en-us", "speed": 0.9},
+            "piper": {"voice": "en_US-amy-medium", "speed": 1.1},
+            "say": {"voice": "Samantha", "speed": 1.0},
         },
         "stt": stt,
         "transcribe": {"folder": "~/Transcripts", "keep_audio": True, "model": "base.en"},
@@ -192,7 +192,8 @@ def test_every_table_and_every_key_survives_a_save(monkeypatch, tmp_path):
     assert set(speech) == set(config.KNOWN_SPEECH_KEYS)
     assert set(data["transcribe"]) == set(config.KNOWN_TRANSCRIBE_KEYS)
     assert set(data["app"]) == set(config.KNOWN_APP_KEYS)
-    assert all(set(t) == set(config.KNOWN_PROVIDER_KEYS) for t in data["providers"].values())
+    assert all(set(t) == set(config.KNOWN_PROVIDER_KEYS[name])
+               for name, t in data["providers"].items())
 
     path = config.config_path()
     wizard.write_config_if_unchanged(path, data, wizard.ABSENT_CONFIG)
@@ -530,3 +531,209 @@ def test_an_app_config_round_trips_through_the_renderer(monkeypatch, tmp_path):
     assert "[app]" in once
     assert load_config_file()["app"] == {"dictate": "ctrl+cmd+d", "dictate_mode": "hold"}
     assert wizard._render_config_text(load_config_file()) == once
+
+
+# --- a save that would drop comments keeps a backup first (L4) ---------------
+
+
+COMMENTED = '# my voices\nchain = ["say"]\n\n[stt]\n  # tuned by hand\nmax_seconds = 30\n'
+
+
+def test_the_first_save_over_a_commented_file_backs_it_up_at_0600(tmp_path):
+    import stat as stat_module
+
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+
+    backup = tmp_path / "config.toml.bak"
+    assert result.backup == backup
+    assert backup.read_text() == COMMENTED
+    assert stat_module.S_IMODE(backup.stat().st_mode) == 0o600
+    text, fingerprint = result  # callers that unpack two values keep working
+    assert path.read_text() == text == 'chain = ["kokoro"]\n'
+    assert fingerprint == wizard.fingerprint_config(path)
+
+
+def test_an_existing_backup_is_never_overwritten(tmp_path):
+    path = tmp_path / "config.toml"
+    backup = tmp_path / "config.toml.bak"
+    backup.write_text("older backup\n")
+    path.write_text(COMMENTED)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+
+    assert result.backup is None
+    assert backup.read_text() == "older backup\n"
+    assert path.read_text() == 'chain = ["kokoro"]\n'
+
+
+def test_a_second_save_makes_no_second_backup(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED)
+    first = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+    path.write_text("# a new comment\n" + path.read_text())
+
+    second = wizard.write_config_if_unchanged(path, {"chain": ["say"]}, wizard.fingerprint_config(path))
+
+    assert first.backup is not None and second.backup is None
+    assert (tmp_path / "config.toml.bak").read_text() == COMMENTED
+
+
+@pytest.mark.parametrize("before", [None, 'chain = ["say"]\nvoice_label = "a # b"\n'])
+def test_no_backup_without_a_comment_line(tmp_path, before):
+    path = tmp_path / "config.toml"
+    if before is not None:
+        path.write_text(before)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path)
+    )
+
+    assert result.backup is None
+    assert not (tmp_path / "config.toml.bak").exists()
+
+
+def test_a_backup_that_cannot_be_written_stops_the_save(tmp_path, monkeypatch):
+    import os
+
+    path = tmp_path / "config.toml"
+    path.write_text(COMMENTED)
+    real_open = os.open
+
+    def refuse_backup(name, flags, *args, **kwargs):
+        if str(name).endswith(".bak"):
+            raise PermissionError(13, "denied")
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse_backup)
+    with pytest.raises(ConfigError, match="back up"):
+        wizard.write_config_if_unchanged(path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path))
+    assert path.read_text() == COMMENTED
+
+
+# --- a table vocalize does not use never blocks a save (review L5) -----------
+
+
+def _parse(text):
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        import tomli as tomllib
+    return tomllib.loads(text)
+
+
+UNKNOWN_TABLES = (
+    'chain = ["say"]\n\n[meetings]\ntitle = "Weekly \\"sync\\""\nminutes = 30\nratio = 0.5\n'
+    'on = true\nnames = ["a", "b", [1, 2]]\nrows = [{x = 1}, {x = 2}]\n\n'
+    '[meetings.room]\nfloor = 3\n\n[meetings.room.desk]\nlamp = false\n\n'
+    '[later_feature]\n"odd key" = "kept"\n'
+)
+
+
+def test_an_unknown_table_is_kept_as_it_was_with_one_notice(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(UNKNOWN_TABLES)
+    data = _parse(UNKNOWN_TABLES)
+
+    result = wizard.write_config_if_unchanged(
+        path, {**data, "chain": ["kokoro"]}, wizard.fingerprint_config(path))
+
+    reread = _parse(path.read_text())
+    assert reread == {**data, "chain": ["kokoro"]}
+    assert len(result.notices) == 2
+    assert "[meetings]" in result.notices[0] and "does not use it" in result.notices[0]
+    assert "[later_feature]" in result.notices[1]
+    assert all("Weekly" not in notice and "odd key" not in notice for notice in result.notices)
+    assert result.backup is None  # nothing was lost
+
+
+def test_an_array_of_tables_vocalize_does_not_use_is_kept(tmp_path):
+    body = 'chain = ["say"]\n\n[[later]]\nname = "one"\n\n[[later]]\nname = "two"\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+
+    result = wizard.write_config_if_unchanged(path, _parse(body), wizard.fingerprint_config(path))
+
+    assert _parse(path.read_text()) == _parse(body)
+    assert len(result.notices) == 1 and "[later]" in result.notices[0]
+
+
+def test_an_unknown_table_that_cannot_be_copied_is_dropped_after_a_backup(tmp_path):
+    body = 'chain = ["say"]\n\n[meetings]\nwhen = 1979-05-27\nkept = "x"\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+
+    result = wizard.write_config_if_unchanged(path, _parse(body), wizard.fingerprint_config(path))
+
+    assert _parse(path.read_text()) == {"chain": ["say"]}
+    assert result.backup == tmp_path / "config.toml.bak"
+    assert result.backup.read_text() == body
+    (notice,) = result.notices
+    assert "[meetings]" in notice and "1979" not in notice
+    assert result.backup_has_retired is False
+
+
+def test_a_trailing_comment_alone_is_backed_up(tmp_path):
+    body = 'chain = ["say"]  # the quiet voice\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path))
+
+    assert result.backup == tmp_path / "config.toml.bak"
+    assert result.backup.read_bytes() == body.encode()
+
+
+@pytest.mark.parametrize("body", [
+    'chain = ["say"]\nlabel = "a # b"\n',
+    "chain = [\"say\"]\nlabel = 'a # b'\n",
+    'chain = ["say"]\nlabel = """\nline # not a comment\n"""\n',
+    'chain = ["say"]\nlabel = "quote \\" # still inside"\n',
+])
+def test_a_hash_inside_a_string_is_not_a_comment(tmp_path, body):
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    _parse(body)  # a real TOML file
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["kokoro"]}, wizard.fingerprint_config(path))
+
+    assert result.backup is None
+
+
+def test_a_save_that_drops_a_retired_setting_is_backed_up_and_says_so(tmp_path):
+    body = 'chain = ["say"]\n\n[providers.kokoro]\nvoice = "af_bella"\nmodel = "x"\n' \
+           '\n[providers.openai]\napi_key = "SECRET_CANARY"\n'
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    data = config.without_retired_settings(_parse(body))  # what the loader hands on
+
+    result = wizard.write_config_if_unchanged(path, data, wizard.fingerprint_config(path))
+
+    assert "SECRET_CANARY" not in path.read_text() and "model" not in path.read_text()
+    assert result.backup == tmp_path / "config.toml.bak"
+    assert result.backup.read_bytes() == body.encode()  # byte for byte, key included
+    assert result.backup_has_retired is True
+    text, fingerprint = result
+    assert text == path.read_text() and fingerprint == wizard.fingerprint_config(path)
+
+
+def test_no_retired_flag_without_a_backup(tmp_path):
+    path = tmp_path / "config.toml"
+    (tmp_path / "config.toml.bak").write_text("older\n")
+    path.write_text('api_key = "SECRET_CANARY"\nchain = ["say"]\n')
+
+    result = wizard.write_config_if_unchanged(
+        path, {"chain": ["say"]}, wizard.fingerprint_config(path))
+
+    assert result.backup is None and result.backup_has_retired is False
+    assert (tmp_path / "config.toml.bak").read_text() == "older\n"

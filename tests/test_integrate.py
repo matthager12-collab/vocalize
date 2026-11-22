@@ -105,3 +105,44 @@ def test_quick_action_install_output_and_bundles_name_no_retired_feature(install
             assert b"summar" not in body
             assert b"speak_url_gate" not in body
             assert b"digest" not in body
+
+
+@pytest.fixture
+def skill(monkeypatch, tmp_path):
+    dest = tmp_path / 'claude' / 'skills' / 'speak' / 'SKILL.md'
+    monkeypatch.setattr(integrate, 'SKILL_DEST', dest)
+    return dest
+
+
+def test_remove_claude_removes_exactly_what_was_installed(installer, skill, tmp_path):
+    services, _binary = installer
+    unrelated = services / 'My Own.workflow'
+    unrelated.mkdir(parents=True)
+    assert integrate._install_skill(force=False) == 'installed'
+    assert integrate.main() == 0
+    assert len(integrate.installed_paths()) == 6
+
+    removed, kept = integrate.remove_claude()
+
+    assert len(removed) == 6 and kept == []
+    assert not any((services / name).exists() for name in integrate.BUNDLE_NAMES)
+    assert not skill.exists() and not skill.parent.exists()
+    assert unrelated.is_dir()
+    assert integrate.installed_paths() == []
+
+
+def test_remove_claude_keeps_a_users_own_skill_and_symlinks(installer, skill, tmp_path):
+    services, _binary = installer
+    skill.parent.mkdir(parents=True)
+    skill.write_text('my own skill\n')
+    services.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / 'elsewhere'
+    target.mkdir()
+    (services / integrate.BUNDLE_NAMES[0]).symlink_to(target, target_is_directory=True)
+
+    removed, kept = integrate.remove_claude()
+
+    assert removed == []
+    assert skill.read_text() == 'my own skill\n'
+    assert target.is_dir()
+    assert set(kept) == {skill, services / integrate.BUNDLE_NAMES[0]}

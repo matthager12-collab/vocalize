@@ -1,4 +1,5 @@
-"""Download, verify and stamp Kokoro's model files.
+"""Download, verify and stamp the engines' model files; build each locked
+engine's environment.
 
 Kept apart from the CLI so the command stays a thin shell around it, and
 so the tests can drive a download with a fake `opener` and never touch
@@ -6,7 +7,9 @@ the network.
 
 The rules that make a 326 MB download from GitHub acceptable:
 
-* HTTPS only, at a URL pinned to one release tag.
+* HTTPS only, starting at a URL pinned to one release tag or revision.
+  Redirects are followed only to another https:// URL, on any host: what
+  is pinned is the bytes (below), not the host they are served from.
 * The bytes are hashed while they stream, and both the size and the
   sha256 must match the manifest before anything is renamed into place.
 * A failed file is deleted, not left half-written under its real name —
@@ -33,6 +36,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..audio import ensure_private_dir
 from . import kokoro_manifest as manifest
+from . import locks, runtime
 
 # Big enough that a 326 MB file isn't a million iterations, small enough
 # to keep progress reporting responsive.
@@ -40,10 +44,32 @@ _BLOCK = 1024 * 1024
 
 _DOWNLOAD_TIMEOUT = 60
 _SELFTEST_TIMEOUT = 900
+_RUNTIME_TIMEOUT = 1800
 
 
 class InstallError(Exception):
     """Something went wrong installing the local runtime."""
+
+
+#: Every variable the install's network steps — `uv venv` (which may fetch
+#: the pinned Python) and `uv pip sync` from the lock — inherit, and no
+#: other: where uv keeps its caches and Pythons, and what a proxy or a
+#: corporate certificate needs (review M4). Never a credential, never
+#: PYTHONPATH, and never an index override such as UV_INDEX_URL,
+#: UV_EXTRA_INDEX_URL or PIP_INDEX_URL: the lock's hashes are the check,
+#: but the index stays the one uv defaults to.
+_NETWORK_ENV = (
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
+    "UV_CACHE_DIR", "XDG_CACHE_HOME", "UV_PYTHON_INSTALL_DIR",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+    "https_proxy", "http_proxy", "no_proxy", "all_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
+
+
+def network_environment() -> dict[str, str]:
+    """The environment for the install steps that must reach the network."""
+    return {name: os.environ[name] for name in _NETWORK_ENV if name in os.environ}
 
 
 class _HttpsOnlyRedirects(HTTPRedirectHandler):
@@ -268,27 +294,112 @@ def installed(
         if (seen.get("sha256"), seen.get("size")) != (entry["sha256"], entry["size"]):
             return False, f"{entry['name']} does not match this release — run: {install_hint}"
 
+    if not runtime_installed(manifest):
+        return False, (
+            f"its locked runtime is missing or out of date — run `{install_hint}` again"
+        )
+
     return True, ""
+
+
+def locked(manifest) -> bool:
+    """Whether `manifest` names a hash-locked dependency tree (Piper, not
+    yet reviewed, does not)."""
+    return callable(getattr(manifest, "lock_file", None))
+
+
+def runtime_installed(manifest) -> bool:
+    """Whether the environment built from `manifest`'s current lock is
+    complete. A changed lock names a different environment, so this is
+    False until `local install` runs again. A manifest with no lock has
+    nothing to check here."""
+    if not locked(manifest):
+        return True
+    return locks.env_ready(manifest.ENGINE, manifest.lock_file())
+
+
+def _run_uv(argv: list[str], runner, what: str) -> None:
+    try:
+        result = runner(
+            argv, capture_output=True, text=True, timeout=_RUNTIME_TIMEOUT, check=False,
+            cwd=tempfile.gettempdir(),  # never the caller's project dir
+            env=network_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallError(f"Could not {what}: {exc}") from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip().splitlines()
+        detail = stderr[-1] if stderr else "uv failed"
+        raise InstallError(f"Could not {what}: {detail}")
+
+
+def install_runtime(uv: str, manifest, runner=subprocess.run) -> Path:
+    """Build the engine's environment from its lock, once per lock.
+
+    `uv pip sync --require-hashes --only-binary :all:` installs exactly
+    the packages the lock names, refuses any whose sha256 differs, and
+    never builds from source. The marker that `runtime_installed()`
+    trusts is written only after that succeeded. Returns the
+    environment's interpreter.
+    """
+    engine, lock = manifest.ENGINE, manifest.lock_file()
+    if not lock.is_file():
+        raise InstallError(
+            f"This install of vocalize is missing {lock.name}; reinstall vocalize to get it back."
+        )
+    python = locks.env_python(engine, lock)
+    if locks.env_ready(engine, lock):
+        return python
+    try:
+        ensure_private_dir(locks.envs_dir())
+    except OSError as exc:
+        raise InstallError(f"Could not create {locks.envs_dir()}: {exc}") from exc
+    _run_uv([uv, *locks.venv_argv(engine, lock, manifest.PYTHON_VERSION)], runner,
+            f"create the {engine} environment")
+    _run_uv([uv, *locks.sync_argv(engine, lock)], runner,
+            f"install the {engine} runtime from {lock.name}")
+    if not python.is_file():
+        raise InstallError(f"uv did not create the {engine} environment at {python.parent.parent}")
+    try:
+        locks.write_marker(engine, lock)
+    except OSError as exc:
+        raise InstallError(f"Could not record the {engine} environment: {exc}") from exc
+    return python
 
 
 def selftest(
     uv: str, manifest=manifest, model_dir: Path | None = None, runner=subprocess.run,
     **manifest_kwargs,
 ) -> str:
-    """Warm the uv environment by loading the model and saying one word.
+    """Build the locked environment, then warm it by loading the model and
+    saying one word.
 
     The argv is the manifest's own business (a voice and a language mean
     nothing here, and Whisper's selftest needs to know which model was
     selected) — `manifest.selftest_argv(model_dir, **manifest_kwargs)`
     returns everything after the `uv` executable, and this function only
     runs it: always `--no-project`, never the caller's own directory.
+
+    A locked engine's selftest is offline and gets exactly the workers'
+    environment, `runtime.environment()`. Piper, not yet locked, still has
+    uv fetch its package here, so it gets the network allow-list with the
+    model hubs switched off — never the caller's full environment.
     """
     base = _model_dir(model_dir, manifest)
+    if locked(manifest):
+        install_runtime(uv, manifest, runner)
+        env = runtime.environment()
+    else:
+        env = {
+            **network_environment(),
+            "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
+        }
     argv = [uv, *manifest.selftest_argv(base, **manifest_kwargs)]
     try:
         result = runner(
             argv, capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT, check=False,
             cwd=tempfile.gettempdir(),  # never the caller's project dir
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise InstallError(f"Could not run the runtime: {exc}") from exc

@@ -1,7 +1,9 @@
 """Exercise client deadlines and retirement against actual Unix listeners."""
 
+import os
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -394,3 +396,160 @@ def test_giving_up_on_an_unbound_spawn_tells_it_to_stand_down(monkeypatch):
         note = (base / "whisper.lock").read_text(encoding="ascii")
         assert note.startswith("stand-down ")
         assert not warm._spawn_pending(base / "whisper.sock")
+
+
+# --- a socket path past the AF_UNIX limit (Mac Studio run, F3) ---------
+
+
+def _long_base(root: Path) -> Path:
+    base = root / ("d" * 60) / ("e" * 60)
+    assert len(str(base / "whisper.sock")) > 100
+    return base
+
+
+def test_a_too_long_socket_path_moves_to_a_short_private_folder(monkeypatch):
+    with short_dir() as root:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [str(root)])
+        base = _long_base(root)
+
+        path = warm.socket_path("whisper", base)
+
+        assert len(str(path)) <= 100 and path.name == "whisper.sock"
+        assert path.parent.parent == root
+        assert path.parent.name.startswith(f"vocalize-{os.getuid()}-")
+        # Both kinds share one folder; the same input always gives the same path.
+        assert warm.socket_path("llm", base).parent == path.parent
+        assert warm.socket_path("whisper", base) == path
+        # A different usual folder (another HOME) never shares a server.
+        assert warm.socket_path("whisper", base / "other").parent != path.parent
+        assert warm.socket_problem("whisper", base) is None
+
+
+def test_a_short_socket_path_is_left_where_it_was(monkeypatch):
+    with short_dir() as base:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: ["/should-not-be-used"])
+        assert warm.socket_path("whisper", base) == base / "whisper.sock"
+
+
+def test_the_fallback_folder_is_created_private_and_a_server_is_spawned(monkeypatch):
+    with short_dir() as root:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [str(root)])
+        base = _long_base(root)
+        calls = []
+
+        warm.ensure_warm("whisper", ["/fake/argv"], {"test": 1}, None, base,
+                         spawn=lambda argv, **kw: calls.append(argv))
+
+        assert calls == [["/fake/argv"]]
+        folder = warm.socket_path("whisper", base).parent
+        assert stat.S_IMODE(folder.lstat().st_mode) == 0o700
+        assert not base.exists()  # the too-long folder was never needed
+
+
+def test_an_unsafe_fallback_folder_is_refused_and_reported(monkeypatch):
+    with short_dir() as root:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [str(root)])
+        base = _long_base(root)
+        folder = warm.socket_path("whisper", base).parent
+        folder.mkdir(mode=0o755)
+        folder.chmod(0o755)
+        calls = []
+
+        warm.ensure_warm("whisper", ["/fake/argv"], {"test": 1}, None, base,
+                         spawn=lambda argv, **kw: calls.append(argv))
+
+        assert calls == []
+        assert "not a private folder" in warm.socket_problem("whisper", base)
+
+
+def test_no_short_folder_at_all_is_reported_not_silent(monkeypatch):
+    with short_dir() as root:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [str(_long_base(root))])
+        base = _long_base(root)
+
+        assert len(str(warm.socket_path("whisper", base))) > 100
+        assert "too long" in warm.socket_problem("whisper", base)
+
+
+# --- stopping a warm server on request (`vocalize local stop`) ----------
+
+
+def test_stop_shuts_down_a_running_server_and_says_so():
+    with Harness() as h:
+        assert warm.is_running("whisper", h.base)
+        assert warm.stop("whisper", h.base) is True
+        h.thread.join(1)
+        assert not h.thread.is_alive()
+        assert not h.path.exists()
+        assert warm.is_running("whisper", h.base) is False
+        # Nothing is left to stop the second time.
+        assert warm.stop("whisper", h.base) is False
+
+
+def test_stop_with_nothing_running_creates_nothing_and_says_none():
+    with short_dir() as root:
+        base = root / "never-made"
+        assert warm.stop("whisper", base) is False
+        assert warm.is_running("llm", base) is False
+        assert not base.exists()  # a stop never makes the folder it looks in
+
+
+def test_a_stale_socket_is_not_reported_as_a_stopped_server():
+    with short_dir() as base:
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(base / "whisper.sock"))
+        stale.close()  # bound, never listening: nobody owns a model there
+        assert warm.stop("whisper", base) is False
+
+
+def test_stop_finds_a_server_in_the_short_fallback_folder(monkeypatch):
+    with short_dir() as root:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [str(root)])
+        base = _long_base(root)
+        path = warm.socket_path("llm", base)
+        p.ensure_private_dir(path.parent)
+        stopped = []
+        monkeypatch.setattr(p, "check_socket_path", lambda candidate: candidate == path)
+        monkeypatch.setattr(warm, "_hello", lambda candidate, deadline: {"ok": True})
+        monkeypatch.setattr(warm, "_stop", lambda candidate, ident, deadline:
+                            stopped.append((candidate, ident)))
+
+        assert warm.stop("llm", base) is True
+        assert stopped == [(path, None)]
+        assert not base.exists()
+
+
+def test_stop_refuses_a_socket_folder_that_is_not_private(monkeypatch):
+    with short_dir() as root:
+        monkeypatch.setattr(warm, "_fallback_parents", lambda: [str(root)])
+        base = _long_base(root)
+        path = warm.socket_path("whisper", base)
+        path.parent.mkdir(mode=0o755)
+        path.parent.chmod(0o755)
+        monkeypatch.setattr(p, "check_socket_path", lambda candidate: True)
+        monkeypatch.setattr(warm, "_hello", lambda *a: {"ok": True})
+        monkeypatch.setattr(warm, "_stop", lambda *a: pytest.fail("connected to an unsafe folder"))
+
+        assert warm.stop("whisper", base) is False
+        assert warm.is_running("whisper", base) is False
+
+
+def test_stop_all_reports_every_kind_and_never_raises(monkeypatch):
+    asked = []
+
+    def stop(kind, base=None):
+        asked.append(kind)
+        if kind == "whisper":
+            raise RuntimeError("private")
+        return True
+
+    monkeypatch.setattr(warm, "stop", stop)
+    assert warm.stop_all() == {"whisper": False, "llm": True}
+    assert asked == ["whisper", "llm"]
+
+
+def test_stop_names_only_the_known_kinds():
+    with pytest.raises(ValueError):
+        warm.stop("../elsewhere")
+    with pytest.raises(ValueError):
+        warm.is_running("parakeet")

@@ -1,0 +1,50 @@
+name: Release
+
+# Uploads the package to PyPI when a GitHub release is published.
+#
+# It uses PyPI Trusted Publishing: no token is stored anywhere. For it to
+# work, the PyPI project must list this repository, this workflow file
+# (release.yml) and the environment name `pypi` as a trusted publisher.
+# Until that is set up on pypi.org, the publish job fails and uploads
+# nothing; it can be re-run afterwards.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - name: The built version must match the release tag
+        if: github.event_name == 'release'
+        run: |
+          version="$(python -c "import pathlib, re; print(re.search(r'__version__ = \"(.+?)\"', pathlib.Path('vocalize/__init__.py').read_text()).group(1))")"
+          test "v$version" = "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1

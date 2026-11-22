@@ -49,10 +49,9 @@ def _isolate_config(monkeypatch, tmp_path):
 def test_say_row_is_always_ok():
     rows = readiness({"chain": ["say"]})
     say = [r for r in rows if r.name == "say"]
-    assert say == [Row("say", "ok", "local, no credentials needed", "")]
-    # The llm model row is now always present.
-    llm = [r for r in rows if r.name == "llm model"]
-    assert len(llm) == 1
+    assert say == [Row("say", "ok", "built into macOS, nothing to install", "")]
+    # No cleanup was ever opted into, so there is no llm model row.
+    assert [r for r in rows if r.name == "llm model"] == []
 
 
 def test_kokoro_row_ok_when_installed(monkeypatch):
@@ -70,6 +69,31 @@ def test_kokoro_row_warn_when_not_installed(monkeypatch):
     row = rows[0]
     assert row.state == "warn"
     assert row.action == "vocalize local install"
+
+
+@pytest.mark.parametrize("reason", [
+    "not installed — run: vocalize local install",
+    "kokoro-v1.0.onnx is the wrong size — reinstall with: vocalize local install",
+    "its locked runtime is missing or out of date — run `vocalize local install` again",
+])
+def test_kokoro_row_names_its_fix_once(monkeypatch, reason):
+    """Mac Studio run: 'run: vocalize local install — vocalize local install'."""
+    monkeypatch.setattr("vocalize.providers.kokoro.installed", lambda model_dir=None: (False, reason))
+    row = readiness({"chain": ["kokoro"]})[0]
+
+    rendered = f"{row.detail} — {row.action}" if row.action else row.detail
+    assert rendered.count("vocalize local install") == 1
+    assert row.state == "warn"
+
+
+def test_kokoro_row_keeps_the_command_as_its_action(monkeypatch):
+    monkeypatch.setattr(
+        "vocalize.providers.kokoro.installed",
+        lambda model_dir=None: (False, "not installed — run: vocalize local install"),
+    )
+    row = readiness({"chain": ["kokoro"]})[0]
+
+    assert row == Row("kokoro", "warn", "not installed", "vocalize local install")
 
 
 def test_raising_probe_yields_warn_row():
@@ -183,6 +207,36 @@ def test_process_exits_promptly_with_a_probe_still_blocked():
     assert result.returncode == 0, result.stderr
 
 
+LOCAL_CLEANUP = {"chain": ["say"], "stt": {"cleanup": "local"}}
+
+
+@pytest.mark.parametrize("file_config", [
+    {"chain": ["say"]},
+    {"chain": ["say"], "stt": {"cleanup": "off"}},
+    {"chain": ["say"], "stt": {"cleanup": "claude-cli"}},  # 0.15: becomes off
+    {"chain": ["say"], "stt": {"cleanup": "nonsense"}},  # never raises
+])
+def test_the_llm_model_row_is_absent_unless_cleanup_is_local(file_config):
+    assert "llm model" not in [row.name for row in readiness(file_config)]
+
+
+def test_the_llm_model_row_appears_with_local_cleanup_and_goes_again():
+    assert _row(readiness(LOCAL_CLEANUP), "llm model").state == "warn"
+    assert "llm model" not in [row.name for row in readiness({"chain": ["say"]})]
+
+
+def test_status_exits_0_on_a_machine_that_never_opted_into_cleanup(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("VOCALIZE_CHAIN", raising=False)
+    (tmp_path / "vocalize").mkdir()
+    (tmp_path / "vocalize" / "config.toml").write_text('chain = ["say"]\n', encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "llm model" not in result.output
+
+
 def test_llm_model_row_when_installed(monkeypatch):
     from vocalize.local import install as install_module
     from vocalize.local import llm_manifest
@@ -192,7 +246,7 @@ def test_llm_model_row_when_installed(monkeypatch):
             return (True, "")
         return _original(manifest, **kw)
     monkeypatch.setattr(install_module, "installed", _fake_installed)
-    row = _row(readiness({"chain": ["say"]}), "llm model")
+    row = _row(readiness(LOCAL_CLEANUP), "llm model")
     assert row.state == "ok"
     assert row.detail == "installed and ready"
 
@@ -202,7 +256,7 @@ def test_llm_model_row_ram_gate_names_measured_and_required(monkeypatch):
     from vocalize.local import install as install_module
     monkeypatch.setattr(install_module, "installed", lambda m, **kw: (False, "not installed"))
     monkeypatch.setattr(local_module, "physical_ram_bytes", lambda: 8 * 1024**3)
-    row = _row(readiness({"chain": ["say"]}), "llm model")
+    row = _row(readiness(LOCAL_CLEANUP), "llm model")
     assert row.state == "warn"
     assert "8.0 GB RAM, needs 12.0 GB" in row.detail
     assert "disable cleanup until a compatible local model is installed" in row.detail
@@ -243,14 +297,14 @@ def _row(rows, name):
 def test_stt_rows_are_absent_on_a_machine_that_never_opted_in():
     rows = readiness({"chain": ["say"]})
 
-    assert [row.name for row in rows if row.name != "llm model"] == ["say"]
+    assert [row.name for row in rows] == ["say"]
 
 
 def test_stt_rows_appear_once_dictation_is_set_up(stt_machine):
     rows = readiness({"chain": ["say"]})
 
-    assert [row.name for row in rows if row.name not in ("say", "llm model")] == list(readiness_module.STT_ROW_NAMES)
-    assert all(row.state == "ok" for row in rows if row.name != "llm model")
+    assert [row.name for row in rows if row.name != "say"] == list(readiness_module.STT_ROW_NAMES)
+    assert all(row.state == "ok" for row in rows)
 
 
 def test_stt_rows_appear_from_the_config_table_alone(monkeypatch):
@@ -270,7 +324,7 @@ def test_stt_rows_disappear_again_when_the_table_is_removed(stt_machine, monkeyp
 
     rows = readiness({"chain": ["say"]})
 
-    assert [row.name for row in rows if row.name != "llm model"] == ["say"]
+    assert [row.name for row in rows] == ["say"]
 
 
 def test_the_stt_model_row_names_what_is_on_disk(stt_machine):
@@ -278,6 +332,154 @@ def test_the_stt_model_row_names_what_is_on_disk(stt_machine):
 
     assert row.state == "ok"
     assert "small.en" in row.detail
+
+
+def _engines(monkeypatch, *, parakeet, whisper, supported=True):
+    from vocalize.local import install as install_module
+    from vocalize.local import parakeet_manifest, whisper_manifest
+
+    def installed(manifest, **kw):
+        return (parakeet if manifest is parakeet_manifest else whisper), ""
+
+    monkeypatch.setattr(install_module, "installed", installed)
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: supported)
+    assert whisper_manifest.MODELS
+
+
+def test_the_stt_model_row_names_both_engines(stt_machine, monkeypatch):
+    _engines(monkeypatch, parakeet=True, whisper=True)
+    row = _row(readiness({"chain": ["say"]}), "stt model")
+    assert row.state == "ok"
+    assert row.detail.startswith("Parakeet on disk; Whisper ")
+
+
+def test_the_stt_model_row_says_parakeet_is_missing(stt_machine, monkeypatch):
+    _engines(monkeypatch, parakeet=False, whisper=True)
+    row = _row(readiness({"chain": ["say"]}), "stt model")
+    assert row.state == "ok"
+    assert "Parakeet not installed" in row.detail and "Whisper" in row.detail
+
+
+def test_the_stt_model_row_omits_parakeet_where_it_cannot_run(stt_machine, monkeypatch):
+    _engines(monkeypatch, parakeet=False, whisper=True, supported=False)
+    row = _row(readiness({"chain": ["say"]}), "stt model")
+    assert row.state == "ok"
+    assert "Parakeet" not in row.detail
+
+
+def test_the_stt_model_row_is_ok_with_parakeet_alone_under_auto(stt_machine, monkeypatch):
+    # With auto, `vocalize transcribe` falls back to Parakeet, so a machine
+    # with only Parakeet can dictate and transcribe.
+    _engines(monkeypatch, parakeet=True, whisper=False)
+    row = _row(readiness({"chain": ["say"]}), "stt model")
+    assert row.state == "ok"
+    assert "Parakeet on disk" in row.detail and "transcribe cannot run" not in row.detail
+
+
+def test_the_stt_model_row_follows_a_parakeet_engine(stt_machine, monkeypatch):
+    _engines(monkeypatch, parakeet=True, whisper=False)
+    row = _row(readiness({"chain": ["say"], "stt": {"engine": "parakeet"}}), "stt model")
+    assert row == readiness_module.Row("stt model", "ok", "Parakeet ready", "")
+
+
+def test_the_stt_model_row_follows_a_whisper_engine(stt_machine, monkeypatch):
+    _engines(monkeypatch, parakeet=True, whisper=False)
+    row = _row(readiness({"chain": ["say"], "stt": {"engine": "whisper"}}), "stt model")
+    assert row.state == "fail"
+    assert row.detail == "no Whisper model installed"
+    assert row.action == "vocalize local install --stt --engine whisper"
+
+
+_RUNTIME_REASON = "its locked runtime is missing or out of date — run `x` again"
+
+
+def _upgraded(monkeypatch, *, ready=(), waiting=(), supported=True):
+    """Manifests in `waiting` have verified files but no locked runtime (0.15)."""
+    from vocalize.local import install as install_module
+    from vocalize.local import (
+        kokoro_manifest,
+        llm_manifest,
+        parakeet_manifest,
+        whisper_manifest,
+    )
+
+    names = {kokoro_manifest: "kokoro", llm_manifest: "llm",
+             parakeet_manifest: "parakeet", whisper_manifest: "whisper"}
+
+    def installed(manifest, files=None, **kw):
+        name = names.get(manifest)
+        if name == "whisper" and files is not None:
+            entry = files[0]["name"]
+            hit = [m for m in (*ready, *waiting) if m.startswith("whisper:")
+                   and whisper_manifest.file_for(m.split(":", 1)[1])["name"] == entry]
+            name = hit[0] if hit else "whisper:none"
+        if name in ready:
+            return True, ""
+        if name in waiting:
+            return False, _RUNTIME_REASON
+        return False, "not installed — run: x"
+
+    monkeypatch.setattr(install_module, "installed", installed)
+    monkeypatch.setattr(install_module, "runtime_installed", lambda manifest: False)
+    monkeypatch.setattr(parakeet_manifest, "supported", lambda: supported)
+
+
+def test_an_upgraded_parakeet_says_the_model_is_installed_and_names_the_command(
+        stt_machine, monkeypatch):
+    _upgraded(monkeypatch, waiting=("parakeet",))
+    for stt in ({}, {"engine": "parakeet"}):
+        row = _row(readiness({"chain": ["say"], "stt": stt}), "stt model")
+        assert "no speech-to-text model installed" not in row.detail
+        assert row.detail == "Parakeet model installed; its runtime must be installed once"
+        assert row.action == "vocalize local install --stt --engine parakeet"
+
+
+def test_an_upgraded_whisper_names_its_model_and_the_command(stt_machine, monkeypatch):
+    _upgraded(monkeypatch, waiting=("whisper:small.en",), supported=False)
+    row = _row(readiness({"chain": ["say"]}), "stt model")
+    assert row.detail == "Whisper model small.en installed; its runtime must be installed once"
+    assert row.action == "vocalize local install --stt --engine whisper --model small.en"
+
+
+def test_nothing_on_disk_still_says_no_model_installed(stt_machine, monkeypatch):
+    _upgraded(monkeypatch)
+    row = _row(readiness({"chain": ["say"]}), "stt model")
+    assert row.detail == "no speech-to-text model installed"
+
+
+def test_upgrade_commands_name_each_engine_waiting_for_its_runtime(monkeypatch):
+    _upgraded(monkeypatch, waiting=("kokoro", "parakeet", "whisper:large-v3-turbo-q5_0", "llm"))
+    assert readiness_module.upgrade_commands() == [
+        "vocalize local install",
+        "vocalize local install --stt --engine parakeet",
+        "vocalize local install --stt --engine whisper",
+        "vocalize local install --llm",
+    ]
+    line = readiness_module.upgrade_line(readiness_module.upgrade_commands())
+    assert line.startswith("After upgrading from an older version, run once: ")
+    assert line.endswith("Model files already on disk are checked and not downloaded again.")
+
+
+def test_upgrade_commands_are_empty_on_a_fresh_or_current_machine(monkeypatch):
+    _upgraded(monkeypatch)
+    assert readiness_module.upgrade_commands() == []
+    _upgraded(monkeypatch, ready=("kokoro", "parakeet"))
+    assert readiness_module.upgrade_commands() == []
+
+
+def test_status_ends_with_the_upgrade_line(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from vocalize.cli import main
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("VOCALIZE_CHAIN", "say")
+    _upgraded(monkeypatch, waiting=("kokoro",))
+    result = CliRunner().invoke(main, ["status"])
+    assert result.output.rstrip().splitlines()[-1] == readiness_module.upgrade_line(
+        ["vocalize local install"])
+    json_result = CliRunner().invoke(main, ["status", "--json"])
+    assert "After upgrading" not in json_result.output
 
 
 def test_the_stt_model_row_fails_with_nothing_installed(stt_machine, monkeypatch):
@@ -628,16 +830,16 @@ def test_hostile_app_status_word_never_reaches_a_row_detail_unchanged(monkeypatc
 
 _DOCTOR_ONLY_NAMES = (
     "cli path", "uv", "swiftc", "shebang", "hammerspoon",
-    "services shortcut", "cli start-up", "app bundle", "notes folder",
+    "services shortcut", "cli start-up", "app bundle", "transcripts folder",
 )
 
 
 @pytest.fixture
 def _no_real_tools(monkeypatch, tmp_path):
     """Keep the doctor_rows() composition tests off whatever toolchain
-    (and notes folder) happens to exist on the machine running the suite:
+    (and transcripts folder) happens to exist on the machine running the suite:
     no real `which`, `xcrun` or `vocalize` subprocess, and HOME pointed at
-    tmp_path so the default notes folder is never the developer's real
+    tmp_path so the default transcripts folder is never the developer's real
     ~/Documents. Only the composition (names, order) is under test here —
     the state each probe reports for a real machine is covered
     probe-by-probe above with an explicit fake.
@@ -685,7 +887,7 @@ def test_doctor_never_raises_when_a_probe_blows_up(monkeypatch, tmp_path, _no_re
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     rows = readiness_module.doctor_rows({})
-    row = _row(rows, "notes folder")
+    row = _row(rows, "transcripts folder")
     assert row.state == "warn"
     assert "boom" not in row.detail  # exception message never leaks (see run_probes)
 
@@ -887,25 +1089,32 @@ def test_app_bundle_row_mirrors_the_app_row(monkeypatch, bundle, expected_state)
     assert row.state == expected_state
 
 
-def test_notes_folder_row_reports_not_created_yet(tmp_path, monkeypatch):
+def test_transcripts_folder_row_reports_not_created_yet(tmp_path, monkeypatch):
     folder = tmp_path / "Vocalize Notes"
-    row = readiness_module._notes_folder_row({"notes": {"folder": str(folder)}})
-    assert row == Row("notes folder", "ok", "not created yet", "")
+    row = readiness_module._transcripts_folder_row({"notes": {"folder": str(folder)}})
+    assert row == Row("transcripts folder", "ok", "not created yet", "")
 
 
-def test_notes_folder_row_reports_size_on_disk(tmp_path):
+def test_transcripts_folder_row_reads_the_transcribe_table(tmp_path):
+    folder = tmp_path / "Transcripts"
+    folder.mkdir()
+    row = readiness_module._transcripts_folder_row({"transcribe": {"folder": str(folder)}})
+    assert row == Row("transcripts folder", "ok", "0.0 MB on disk", "")
+
+
+def test_transcripts_folder_row_reports_size_on_disk(tmp_path):
     folder = tmp_path / "Vocalize Notes"
     folder.mkdir()
     (folder / "one.md").write_bytes(b"x" * 1024 * 1024)
     (folder / "one.m4a").write_bytes(b"y" * 1024 * 1024)  # kept audio counts too
-    row = readiness_module._notes_folder_row({"notes": {"folder": str(folder)}})
+    row = readiness_module._transcripts_folder_row({"notes": {"folder": str(folder)}})
     assert row.state == "ok"
     assert row.detail == "2.0 MB on disk"
 
 
-def test_notes_folder_row_warns_under_icloud_mobile_documents(monkeypatch, tmp_path):
+def test_transcripts_folder_row_warns_under_icloud_mobile_documents(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     folder = tmp_path / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "Vocalize Notes"
-    row = readiness_module._notes_folder_row({"notes": {"folder": str(folder)}})
+    row = readiness_module._transcripts_folder_row({"notes": {"folder": str(folder)}})
     assert row.state == "warn"
     assert "iCloud" in row.detail

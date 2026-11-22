@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import types
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -22,6 +23,7 @@ from vocalize import local as local_pkg
 from vocalize.cli import _human_readable_size, main
 from vocalize.local import install as install_module
 from vocalize.local import kokoro_manifest as manifest
+from vocalize.local import locks
 from vocalize.local import whisper_manifest as stt_manifest
 from vocalize.providers import kokoro as provider
 
@@ -60,6 +62,12 @@ def opener_for(payloads: dict):
 
     opener.calls = calls
     return opener
+
+
+@pytest.fixture(autouse=True)
+def _private_envs(tmp_path, monkeypatch):
+    """Locked environments land under tmp_path, never the real cache."""
+    monkeypatch.setattr(locks, "ENVS_DIR", tmp_path / "envs")
 
 
 @pytest.fixture
@@ -521,26 +529,106 @@ def test_installed_treats_a_list_valued_files_stamp_as_nothing_recorded(tmp_path
 # --- selftest ---------------------------------------------------------
 
 
-def test_the_selftest_runs_the_worker_through_uv(tmp_path, tiny_manifest):
+def _make_venv(argv):
+    """What a real `uv venv <dir>` leaves behind that the install checks."""
+    if argv[1:2] == ["venv"]:
+        python = Path(argv[-1]) / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_bytes(b"")
+
+
+def test_the_selftest_builds_the_locked_environment_then_runs_the_worker(tmp_path, tiny_manifest):
     calls = []
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
+        _make_venv(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
 
     assert install_module.selftest("/usr/local/bin/uv", runner=runner) == "ok"
 
-    argv, kwargs = calls[0]
+    lock = manifest.lock_file()
+    env = locks.env_dir("kokoro", lock)
+    assert env.parent == tmp_path / "envs"
+    assert env.name == f"kokoro-{hashlib.sha256(lock.read_bytes()).hexdigest()}"
+    assert [argv for argv, _ in calls[:2]] == [
+        ["/usr/local/bin/uv", "venv", "--clear", "--no-project",
+         "--python", manifest.PYTHON_VERSION, str(env)],
+        ["/usr/local/bin/uv", "pip", "sync", "--python", str(env / "bin" / "python"),
+         "--require-hashes", "--only-binary", ":all:", str(lock)],
+    ]
+    argv = calls[2][0]
     # --no-project + a neutral cwd: uv must never mistake the caller's
     # directory for a project and rebuild that project's .venv.
-    assert argv[:7] == [
-        "/usr/local/bin/uv", "run", "--no-project",
-        "--python", manifest.PYTHON_VERSION,
-        "--with", manifest.RUNTIME_PACKAGE,
+    assert argv[:8] == [
+        "/usr/local/bin/uv", "run", "--no-project", "--no-build",
+        "--offline", "--no-python-downloads",
+        "--python", str(env / "bin" / "python"),
     ]
-    assert argv[7] == str(manifest.worker_path())
+    assert "--with" not in argv
+    assert argv[8] == str(manifest.worker_path())
     assert argv[-1] == "--selftest"
-    assert kwargs["cwd"] == tempfile.gettempdir()
+    assert all(kw["cwd"] == tempfile.gettempdir() for _, kw in calls)
+
+
+def test_a_failed_hash_locked_install_leaves_the_runtime_not_installed(tmp_path, tiny_manifest):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[1:3] == ["pip", "sync"]:
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="error: Hash mismatch for `numpy==2.5.4`\n")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with pytest.raises(install_module.InstallError, match="Hash mismatch"):
+        install_module.selftest("uv", runner=runner)
+
+    assert len(calls) == 2  # the worker never ran
+    assert not install_module.runtime_installed(manifest)
+
+
+def test_an_installed_locked_environment_is_not_rebuilt(tmp_path, tiny_manifest):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        _make_venv(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    install_module.selftest("uv", runner=runner)
+    assert install_module.runtime_installed(manifest)
+    calls.clear()
+
+    install_module.selftest("uv", runner=runner)
+
+    assert [argv[1] for argv in calls] == ["run"]
+
+
+def test_a_changed_lock_needs_install_again(tmp_path, monkeypatch, tiny_manifest):
+    lock = tmp_path / "kokoro.txt"
+    lock.write_text("kokoro-onnx==0.6.1 \\\n    --hash=sha256:" + "a" * 64 + "\n")
+    monkeypatch.setattr(manifest, "LOCK_FILE", lock)
+    monkeypatch.setattr(manifest, "LOCK_FILE_X86_64", lock)
+    python = locks.env_python("kokoro", lock)
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    locks.write_marker("kokoro", lock)
+    assert install_module.runtime_installed(manifest)
+
+    lock.write_text(lock.read_text() + "numpy==2.5.4 \\\n    --hash=sha256:" + "b" * 64 + "\n")
+
+    assert not install_module.runtime_installed(manifest)
+    for entry in tiny_manifest:
+        path = manifest.MODEL_DIR / entry["name"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(MODEL_PAYLOAD if entry["name"] == manifest.MODEL_FILE else VOICES_PAYLOAD)
+    install_module.write_stamp()
+    ready, reason = install_module.installed(manifest)
+    assert not ready
+    assert reason == (
+        "its locked runtime is missing or out of date — run `vocalize local install` again"
+    )
 
 
 def test_the_selftest_forwards_manifest_kwargs_to_a_second_manifests_argv(tmp_path):
@@ -554,6 +642,7 @@ def test_the_selftest_forwards_manifest_kwargs_to_a_second_manifests_argv(tmp_pa
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
+        _make_venv(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
 
     result = install_module.selftest(
@@ -561,7 +650,7 @@ def test_the_selftest_forwards_manifest_kwargs_to_a_second_manifests_argv(tmp_pa
     )
 
     assert result == "ok"
-    argv, kwargs = calls[0]
+    argv, kwargs = calls[-1]
     assert argv == ["/uv", *stt_manifest.selftest_argv(tmp_path, model="base.en")]
     assert "--no-project" in argv
     assert "base.en" in " ".join(argv)
@@ -582,6 +671,19 @@ def test_a_failing_selftest_reports_the_last_stderr_line(tiny_manifest):
 # --- the CLI ----------------------------------------------------------
 
 
+def _locked_selftest(record, *manifests):
+    """A passing selftest that leaves what the real one does: an
+    environment built from each manifest's current lock."""
+    def selftest(uv, **kw):
+        for m in manifests if not kw.get("manifest") else (kw["manifest"],):
+            python = locks.env_python(m.ENGINE, m.lock_file())
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_bytes(b"")
+            locks.write_marker(m.ENGINE, m.lock_file())
+        return record(uv, kw) or "ok"
+    return selftest
+
+
 @pytest.fixture
 def fake_install(monkeypatch, payloads, tiny_manifest):
     """Wire the command to the fake opener and a selftest that passes."""
@@ -595,7 +697,8 @@ def fake_install(monkeypatch, payloads, tiny_manifest):
 
     selftests = []
     monkeypatch.setattr(install_module, "download_file", download)
-    monkeypatch.setattr(install_module, "selftest", lambda uv, **kw: selftests.append(uv) or "ok")
+    monkeypatch.setattr(install_module, "selftest",
+                        _locked_selftest(lambda uv, kw: selftests.append(uv), manifest))
     # `local install` (Kokoro) resolves uv through the re-exported
     # provider.uv_path(); `local status` resolves it through
     # vocalize.local.uv_path() directly (see local_status()'s comment) —
@@ -799,7 +902,7 @@ def fake_stt_install(monkeypatch, stt_payloads, tiny_stt_manifest):
     monkeypatch.setattr(install_module, "download_file", download)
     monkeypatch.setattr(
         install_module, "selftest",
-        lambda uv, **kw: selftests.append((uv, kw)) or "ok",
+        _locked_selftest(lambda uv, kw: selftests.append((uv, kw)), stt_manifest),
     )
     # The recorder build has its own suite (test_recorder_build.py) driving
     # the real function through a fake compiler; here it only has to not
@@ -1093,7 +1196,8 @@ def test_uninstall_whisper_removes_the_model_dir_the_recorder_bundle_and_its_sta
     leftover.mkdir()
 
     plan = CliRunner().invoke(main, ["local", "uninstall", "--stt"], input="n\n")
-    assert str(stt_manifest.MODEL_DIR) in plan.output
+    assert f"Whisper {stt_manifest.DEFAULT_MODEL}" in plan.output
+    assert "Parakeet" in plan.output
     assert str(bundle) in plan.output
     assert str(stamp) in plan.output
     assert str(leftover) in plan.output
@@ -1109,10 +1213,10 @@ def test_uninstall_whisper_removes_the_model_dir_the_recorder_bundle_and_its_sta
     assert neighbour.is_dir() and (bin_dir / ".else").is_file()
 
 
-def test_uninstall_whisper_reports_a_symlinked_target_instead_of_crashing(fake_stt_install):
-    # shutil.rmtree() raises OSError on a symlink; a user who pointed the
-    # model dir at an external disk must get a clean message, not a
-    # traceback, and nothing should be deleted.
+def test_uninstall_through_a_symlinked_model_folder_removes_only_model_files(fake_stt_install):
+    # A user who pointed the model folder at an external disk: the files go
+    # by manifest name, as the settings page's button removes them, and
+    # nothing else in that folder (nor the folder or the link) is touched.
     real_target = stt_manifest.MODEL_DIR.parent / "elsewhere"
     real_target.mkdir(parents=True)
     (real_target / "keep.bin").write_text("x")
@@ -1121,16 +1225,123 @@ def test_uninstall_whisper_reports_a_symlinked_target_instead_of_crashing(fake_s
 
     result = CliRunner().invoke(main, ["local", "uninstall", "--stt", "--yes"])
 
-    assert result.exit_code == 0
-    assert "remove it yourself" in result.output
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "Nothing to remove."
     assert (real_target / "keep.bin").exists()
+    assert stt_manifest.MODEL_DIR.is_symlink()
 
 
-def test_uninstall_without_stt_flag_is_rejected():
+def test_uninstall_without_a_flag_removes_kokoro_and_its_environment(fake_install):
+    CliRunner().invoke(main, ["local", "install", "--yes"])
+    envs = list(locks.envs_dir().glob("kokoro-*"))
+    assert envs and all((manifest.MODEL_DIR / e["name"]).exists() for e in manifest.FILES)
+
+    declined = CliRunner().invoke(main, ["local", "uninstall"], input="n\n")
+    assert declined.exit_code == 1 and "Kokoro" in declined.output
+    assert all((manifest.MODEL_DIR / e["name"]).exists() for e in manifest.FILES)
+
     result = CliRunner().invoke(main, ["local", "uninstall", "--yes"])
 
+    assert result.exit_code == 0, result.output
+    assert "Kokoro is removed." in result.output
+    assert not any((manifest.MODEL_DIR / e["name"]).exists() for e in manifest.FILES)
+    assert not any(path.exists() for path in envs)
+    again = CliRunner().invoke(main, ["local", "uninstall", "--yes"])
+    assert again.output.strip() == "Nothing to remove."
+
+
+def _action_calls(monkeypatch):
+    from vocalize import actions
+
+    calls = []
+
+    def run(action_id, params, progress=None):
+        calls.append((action_id, dict(params)))
+        return f"ran {action_id}"
+
+    monkeypatch.setattr(actions, "run", run)
+    return calls
+
+
+@pytest.mark.parametrize("args, expected", [
+    ([], [("uninstall_kokoro", {})]),
+    (["--piper"], [("uninstall_piper", {})]),
+    (["--llm"], [("uninstall_cleanup", {})]),
+    (["--stt", "--engine", "parakeet"], [("uninstall_parakeet", {})]),
+    (["--stt", "--model", "small.en"], [("uninstall_whisper", {"model": "small.en"})]),
+    (["--stt", "--engine", "whisper", "--model", "base.en"],
+     [("uninstall_whisper", {"model": "base.en"})]),
+])
+def test_each_uninstall_choice_runs_the_settings_page_action(monkeypatch, tmp_path, args, expected):
+    calls = _action_calls(monkeypatch)
+    monkeypatch.setattr("vocalize.cli._anything_to_uninstall", lambda steps: True)
+
+    result = CliRunner().invoke(main, ["local", "uninstall", *args, "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == expected
+    for action_id, _ in expected:
+        assert f"ran {action_id}" in result.output
+
+
+def test_uninstall_stt_alone_removes_both_engines_every_whisper_model_and_the_recorder(
+        fake_stt_install, monkeypatch):
+    for model in ("base.en", "small.en"):
+        entry = stt_manifest.file_for(model)
+        stt_manifest.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        (stt_manifest.MODEL_DIR / entry["name"]).write_bytes(b"x")
+    calls = _action_calls(monkeypatch)
+
+    result = CliRunner().invoke(main, ["local", "uninstall", "--stt", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("uninstall_parakeet", {}), ("uninstall_whisper", {"model": "base.en"}),
+                     ("uninstall_whisper", {"model": "small.en"})]
+    assert "Speech-to-text uninstalled." in result.output
+
+
+def test_an_engine_choice_keeps_the_recorder(fake_stt_install, monkeypatch):
+    bin_dir = stt_manifest.MODEL_DIR.parent.parent / "bin"
+    monkeypatch.setattr(install_module, "BIN_DIR", bin_dir)
+    bundle = install_module.recorder_bundle()
+    bundle.mkdir(parents=True)
+    _action_calls(monkeypatch)
+    monkeypatch.setattr("vocalize.cli._anything_to_uninstall", lambda steps: True)
+
+    result = CliRunner().invoke(main, ["local", "uninstall", "--stt", "--engine", "whisper", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert bundle.is_dir()
+
+
+@pytest.mark.parametrize("args, message", [
+    (["--stt", "--llm"], "mutually exclusive"),
+    (["--piper", "--stt"], "mutually exclusive"),
+    (["--engine", "whisper"], "only apply together with --stt"),
+    (["--model", "base.en"], "only apply together with --stt"),
+    (["--stt", "--engine", "parakeet", "--model", "base.en"], "--engine whisper"),
+    (["--stt", "--model", "../../etc"], "Unknown Whisper model"),
+])
+def test_uninstall_refuses_a_choice_that_does_not_fit(monkeypatch, args, message):
+    calls = _action_calls(monkeypatch)
+    result = CliRunner().invoke(main, ["local", "uninstall", *args, "--yes"])
     assert result.exit_code != 0
-    assert "--stt" in result.output
+    assert message in result.output
+    assert calls == []
+
+
+def test_an_action_error_is_a_clean_message(monkeypatch):
+    from vocalize import actions
+
+    def refuse(action_id, params, progress=None):
+        raise actions.ActionError("Could not remove a file: denied")
+
+    monkeypatch.setattr(actions, "run", refuse)
+    monkeypatch.setattr("vocalize.cli._anything_to_uninstall", lambda steps: True)
+    result = CliRunner().invoke(main, ["local", "uninstall", "--piper", "--yes"])
+    assert result.exit_code != 0
+    assert "Could not remove a file: denied" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_a_directory_that_cannot_be_created_is_an_install_error(monkeypatch, tmp_path):
@@ -1219,7 +1430,8 @@ def test_local_install_llm_and_uninstall_lifecycle(monkeypatch, tmp_path):
             f.truncate(size)
 
     monkeypatch.setattr(install_module, "download_file", _fake_download)
-    monkeypatch.setattr(install_module, "selftest", lambda *a, **kw: None)
+    monkeypatch.setattr(install_module, "selftest",
+                        _locked_selftest(lambda uv, kw: None, llm_manifest))
 
     # Install
     res = CliRunner().invoke(main, ["local", "install", "--llm", "--yes"])
@@ -1235,3 +1447,165 @@ def test_local_install_llm_and_uninstall_lifecycle(monkeypatch, tmp_path):
     assert res_un.exit_code == 0
     assert "Language model uninstalled." in res_un.output
     assert not model_dir.exists()
+
+
+# --- what the install and status screens claim (M2, M3) ---------------------
+
+
+def test_the_install_plan_does_not_overstate_what_is_checked(fake_install, tiny_manifest):
+    result = CliRunner().invoke(main, ["local", "install"], input="n\n")
+
+    assert "from PyPI" not in result.output
+    assert "pinned address" in result.output
+    assert "redirect must stay on HTTPS" in result.output
+    assert "every model file is checked against its sha256 and size" in result.output
+    assert f"hash-locked list {manifest.lock_file().name}" in result.output
+
+
+def test_the_piper_plan_says_its_packages_are_not_hash_locked(monkeypatch):
+    from vocalize.local import piper_manifest
+
+    monkeypatch.setattr(local_pkg, "uv_path", lambda: "/usr/local/bin/uv")
+    result = CliRunner().invoke(main, ["local", "install", "--piper"], input="n\n")
+
+    assert result.exit_code == 1
+    assert "from PyPI" not in result.output
+    assert "hash-locked list" not in result.output
+    assert f"{piper_manifest.RUNTIME_PACKAGE}, pinned by version only" in result.output
+    assert "every model file is checked against its sha256 and size" in result.output
+
+
+def test_status_says_a_missing_locked_runtime_is_not_installed(tiny_stt_manifest):
+    from vocalize.local import llm_manifest
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert "via uv" not in result.output
+    assert "installed from the hash-locked list" not in result.output
+    assert (f"not installed yet (hash-locked list {llm_manifest.lock_file().name}) — run: "
+            "vocalize local install --llm") in result.output
+    assert f"not installed yet (hash-locked list {stt_manifest.lock_file().name})" in result.output
+
+
+def test_status_names_the_hash_locked_list_once_it_is_installed(tiny_stt_manifest):
+    from vocalize.local import llm_manifest
+
+    for m in (stt_manifest, llm_manifest):
+        python = locks.env_python(m.ENGINE, m.lock_file())
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_bytes(b"")
+        locks.write_marker(m.ENGINE, m.lock_file())
+
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert f"installed from the hash-locked list {stt_manifest.lock_file().name}" in result.output
+    assert f"installed from the hash-locked list {llm_manifest.lock_file().name}" in result.output
+    assert "not installed yet" not in result.output
+
+
+def test_local_status_ends_with_the_upgrade_line(tiny_stt_manifest, monkeypatch):
+    from vocalize import readiness
+
+    monkeypatch.setattr("vocalize.cli.upgrade_commands",
+                        lambda: ["vocalize local install", "vocalize local install --llm"])
+    result = CliRunner().invoke(main, ["local", "status"])
+
+    assert result.output.rstrip().splitlines()[-1] == readiness.upgrade_line(
+        ["vocalize local install", "vocalize local install --llm"])
+    monkeypatch.setattr("vocalize.cli.upgrade_commands", list)
+    assert "After upgrading" not in CliRunner().invoke(main, ["local", "status"]).output
+
+
+def test_an_upgraded_kokoro_is_named_in_the_upgrade_line(fake_install, monkeypatch):
+    """What 0.15 leaves: verified model files and stamp, no locked environment."""
+    from vocalize import readiness
+
+    CliRunner().invoke(main, ["local", "install", "--yes"])
+    for path in locks.envs_dir().glob("kokoro-*"):
+        import shutil
+        shutil.rmtree(path)
+
+    assert "vocalize local install" in readiness.upgrade_commands()
+    result = CliRunner().invoke(main, ["local", "status"])
+    last = result.output.rstrip().splitlines()[-1]
+    assert last.startswith("After upgrading from an older version, run once: vocalize local install")
+
+
+# --- the install's own commands get an allow-listed environment (M4) ---------
+
+NETWORK_ENV_NAMES = {
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "UV_CACHE_DIR", "XDG_CACHE_HOME",
+    "UV_PYTHON_INSTALL_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+    "https_proxy", "http_proxy", "no_proxy", "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
+}
+INSTALL_CANARIES = (
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HF_TOKEN", "GITHUB_TOKEN", "AWS_SECRET",
+    "CLIENT_SECRET", "DB_PASSWORD", "PYTHONPATH", "PYTHONSTARTUP", "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL", "PIP_INDEX_URL", "VIRTUAL_ENV", "HF_ENDPOINT",
+)
+
+
+@pytest.fixture
+def install_canaries(monkeypatch):
+    for name in INSTALL_CANARIES:
+        monkeypatch.setenv(name, "CREDENTIAL_CANARY")
+    for name in ("HTTPS_PROXY", "no_proxy", "SSL_CERT_FILE", "UV_PYTHON_INSTALL_DIR"):
+        monkeypatch.setenv(name, f"/kept/{name}")
+
+
+def _assert_network_env(env):
+    assert env is not None, "an install command must never inherit the caller's environment"
+    assert set(env) <= NETWORK_ENV_NAMES
+    assert "CREDENTIAL_CANARY" not in env.values()
+    for name in ("HTTPS_PROXY", "no_proxy", "SSL_CERT_FILE", "UV_PYTHON_INSTALL_DIR"):
+        assert env[name] == f"/kept/{name}"
+
+
+def test_the_network_steps_get_only_the_allow_listed_variables(install_canaries, tiny_manifest):
+    from vocalize.local import runtime
+
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        _make_venv(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    install_module.selftest("/usr/local/bin/uv", runner=runner)
+
+    (venv, venv_kw), (sync, sync_kw), (run, run_kw) = calls
+    assert venv[1] == "venv" and sync[1:3] == ["pip", "sync"] and run[1] == "run"
+    _assert_network_env(venv_kw.get("env"))
+    _assert_network_env(sync_kw.get("env"))
+    # The selftest itself is offline: exactly the workers' environment.
+    assert run_kw.get("env") == runtime.environment()
+    assert "CREDENTIAL_CANARY" not in run_kw["env"].values()
+
+
+def test_the_unlocked_piper_selftest_gets_the_network_list_with_the_hub_off(
+    install_canaries, tmp_path,
+):
+    from vocalize.local import piper_manifest
+
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    install_module.selftest("/uv", manifest=piper_manifest, model_dir=tmp_path, runner=runner)
+
+    ((_, kwargs),) = calls
+    env = dict(kwargs.get("env"))
+    assert env.pop("HF_HUB_OFFLINE") == env.pop("TRANSFORMERS_OFFLINE") == "1"
+    assert env.pop("HF_HUB_DISABLE_TELEMETRY") == "1"
+    _assert_network_env(env)
+
+
+def test_the_network_environment_is_exactly_the_allow_list(monkeypatch):
+    for name in NETWORK_ENV_NAMES:
+        monkeypatch.setenv(name, "v")
+    for name in INSTALL_CANARIES:
+        monkeypatch.setenv(name, "CREDENTIAL_CANARY")
+
+    assert set(install_module.network_environment()) == NETWORK_ENV_NAMES

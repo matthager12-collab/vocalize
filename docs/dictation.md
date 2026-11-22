@@ -20,11 +20,22 @@ Two speech-to-text engines are available:
 
 | Engine | Runtime | When to use it |
 |---|---|---|
-| Parakeet | `parakeet-mlx` | The default on Apple Silicon. English |
-| Whisper | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via [`pywhispercpp`](https://github.com/absadiki/pywhispercpp) | Other languages, the `[stt] vocabulary` list, smaller Macs, and `vocalize transcribe` |
+| Parakeet | `parakeet-mlx` | The default on Apple Silicon when installed. English only. 2.3 GB download |
+| Whisper | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) via [`pywhispercpp`](https://github.com/absadiki/pywhispercpp) | Any Mac, other languages, and `vocalize transcribe` under the default `auto` setting when a Whisper model is installed. 547 MB for the default model |
 
 `[stt] engine` chooses between them: `auto` (the default) uses Parakeet when
-it is installed and Whisper otherwise.
+it is installed and Whisper otherwise. The [vocabulary](#vocabulary)
+corrections apply after either engine.
+
+Measured on a Mac Studio (Apple M5 Max, 128 GB) from saved files, not from
+a live microphone: Parakeet transcribed an 18 to 23 second recording in 0.6
+to 0.7 s, using 1.2 to 1.6 GB of memory; Whisper (`large-v3-turbo-q5_0`)
+transcribed a 45 to 55 second one in 1.1 to 1.2 s, using about 0.87 GB.
+With Whisper kept loaded (see [warm servers](#keeping-models-loaded-warm-servers)),
+a 22.9 second file took 0.45 to 0.48 s, against 0.76 to 0.77 s without.
+The time from the end of a live take to text on the clipboard was not
+measured. Details are in
+[measurements.md](plans/2026-11-local-only/measurements.md).
 
 Two things had to be true for this to work at all, and they shape
 everything else in this doc:
@@ -69,7 +80,7 @@ Whisper model choices, by `--model`:
 | `base.en` | ~141 MB | fastest, least accurate |
 | `small.en` | ~465 MB | the lighter choice for a slow Mac; mishears more jargon |
 | `large-v3-turbo-q5_0` (default) | ~547 MB | the most accurate at this size and the first model to keep "the merge" as two words in testing ([#4](https://github.com/matthager12-collab/vocalize/issues/4)); no slower than `small.en` on an M4 |
-| `large-v3-turbo-q8_0` | ~834 MB | the same turbo model with 8-bit weights: the least-lossy turbo, for machines with 16 GB or more |
+| `large-v3-turbo-q8_0` | ~834 MB | the same turbo model with 8-bit weights. On technical text spoken by Kokoro it gave a 2.3 percent raw word error rate against 6.8 percent for q5_0, using about 1.2 GB of memory against 0.87 GB. The large and studio machine profiles choose it |
 
 ```bash
 vocalize local install --stt --model base.en
@@ -270,11 +281,17 @@ Error: Speech-to-text needs a 16 kHz mono 16-bit WAV recording. Convert it
 with: afconvert -f WAVE -d LEI16@16000 -c 1 <in> <out>
 ```
 
-`--wav` skips the silence guard and `--cleanup` — it's a literal
-transcription primitive, not a stand-in for a live dictation.
+`--wav` runs the same steps as a live take after recording: the silence
+guard, the engine, the vocabulary corrections and, when it is on, cleanup.
+It honours `[stt] warm_minutes` as a live take does (see
+[Keeping models loaded](#keeping-models-loaded-warm-servers)).
+A silent file prints "The recording is silent: there are no words to
+transcribe." instead of a transcript. (Before this guard applied to files,
+Whisper wrote "Thank you." for a silent file in testing; Parakeet returned
+nothing.)
 
-**`--cleanup`** applies only to a live recording (`--toggle`/`dictate`, or
-plain `listen`). It passes the transcript — never the audio — to the
+**`--cleanup`** applies to a live recording (`--toggle`/`dictate`, or
+plain `listen`) and to a file given with `--wav`. It passes the transcript — never the audio — to the
 on-device cleanup model (see [Local cleanup model](#local-cleanup-model))
 with a fixed prompt telling the model the text is data to clean, not
 instructions to follow (dictated text that happens to read like a command
@@ -295,8 +312,7 @@ model = "large-v3-turbo-q5_0"
 language = "en"
 input_device = ""
 cleanup = "off"      # "off" | "local"
-warm_minutes = 0     # 0 loads nothing ahead; 1-240 keeps models loaded that long after each take
-                    # holds about 1 GB for Whisper, plus 3.3 GB with local cleanup
+warm_minutes = 0     # 0 loads nothing ahead; 1-240 keeps Whisper and the cleanup model loaded that long after each take
 verbatim = false     # keep every word: punctuation and casing only, no dropped restatements
 paste = false        # paste after copying — see Auto-paste
 max_seconds = 120
@@ -308,7 +324,7 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 
 | Key | Type / allowlist | Default | Notes |
 |---|---|---|---|
-| `engine` | `auto`, `parakeet`, `whisper` | `auto` | `auto` uses Parakeet when it is installed, otherwise Whisper |
+| `engine` | `auto`, `parakeet`, `whisper` | `auto` | `auto` uses Parakeet when it is installed, otherwise Whisper. For `vocalize transcribe`, `auto` uses Whisper when a Whisper model is installed, otherwise Parakeet |
 | `model` | `base.en`, `small.en`, `large-v3-turbo-q5_0`, `large-v3-turbo-q8_0` | `large-v3-turbo-q5_0` | must already be installed (`vocalize local install --stt --model …`) |
 | `language` | a whisper.cpp language code (`en`, `es`, `fr`, `de`, …) | `en` | an `.en` model (both `base.en` and `small.en`) is English-only regardless of this setting — pairing one with a non-`en` language is a `ConfigError` |
 | `input_device` | `""` (system default) or an exact name from `vocalize listen --list-devices`; ≤ 128 characters, printable only, can't start with `-` | `""` | see [The input-device gotcha](#the-input-device-gotcha) |
@@ -317,8 +333,8 @@ beam_size = 5    # 1 = greedy (the 0.10.x decoder); 2-8 = beam search with that 
 | `paste` | `true` / `false` | `false` | paste into the app you dictated in, after copying — see [Auto-paste](#auto-paste) |
 | `max_seconds` | integer, 1–600 | `120` | the recorder self-stops here; `dictate` backstops it a few seconds later in case the recorder doesn't |
 | `max_take_seconds` | integer, 60–7200 | `1800` | caps the entire paused-and-resumed take; `max_seconds` stays per segment |
-| `warm_minutes` | integer, 0–240 | `0` | Minutes to keep the models loaded after each take, so the next take skips loading them (about 1.7 s faster with local cleanup on the reference Mac). `0`, the default, loads nothing ahead of time. The first take after a pause runs at normal speed. While loaded they hold about 1 GB for Whisper and about 3.5 GB for cleanup. |
-| `vocabulary` | a list of short terms | `[]` | words Whisper should expect, such as names and jargon; letters, digits, spaces and `_ . - + / @ # :` only |
+| `warm_minutes` | integer, 0–240 | `0` | Minutes to keep Whisper and the cleanup model loaded after each take, so the next take skips loading them. Parakeet is not kept loaded; it starts fresh for each take. `0`, the default, loads nothing ahead of time. The first take after a pause runs at normal speed. While working, Whisper used about 0.87 GB (q5_0) and the cleanup model about 3 GB on the Mac Studio |
+| `vocabulary` | a list of up to 50 short terms | `[]` | names and jargon to spell right after either engine; Whisper also gets them as a hint. Letters, digits, spaces and `_ . - + / @ # :` only. See [Vocabulary](#vocabulary) |
 | `sounds` | `true` / `false` | `true` | the Tink/Pop/Glass feedback; `false` silences all three (words included) |
 | `beam_size` | integer, 1–8 | `5` | the whisper.cpp decoder: `1` is greedy, the 0.10.x behaviour that ran words together on fast speech ("toget" for "to get", [#4](https://github.com/matthager12-collab/vocalize/issues/4)); `5` is whisper.cpp's own beam-search default and the fix. Lower it if a take is slow to land on your machine |
 | `cues` | `sounds`, `words`, `both` | `sounds` | `"words"` speaks "Start.", "Stopped.", "Ready." instead of the system sounds; `"both"` speaks the word and then plays the sound — for the start cue, the word before the microphone opens and the Tink once it has. Has no effect while `sounds = false`. |
@@ -329,6 +345,36 @@ checked against its allowlist or shape before that can happen, on the way
 into the config file and again every time it's read. An unrecognized key
 in `[stt]` warns on stderr; a bad value for a known key is a `ConfigError`
 naming the file, the key, and what was expected.
+
+### Keeping models loaded: warm servers
+
+With `warm_minutes` above 0, Vocalize keeps a model loaded after a take in
+a *warm server*: a worker process that holds the model and answers only
+over a private socket in `~/.cache/vocalize/warm/` (or a short private
+folder under the temporary directory when that path is too long for a
+socket). Two engines have one:
+
+- **Whisper**, when Whisper is the dictation engine;
+- **the cleanup model**, when `cleanup = "local"`.
+
+**Parakeet has no warm server**: it loads afresh for every take. So with
+Parakeet as the engine, `warm_minutes` keeps only the cleanup model loaded
+when cleanup is on, and does nothing when cleanup is off.
+
+A file take behaves like a live one here: `vocalize listen --wav FILE`
+uses a warm server that is already running and, when `warm_minutes` is
+above 0, starts one after the take, exactly as `vocalize listen` does.
+With `warm_minutes = 0` nothing is started.
+
+To let go of the loaded models before the window runs out:
+
+```bash
+vocalize local stop     # stop every warm server; the next dictation loads again
+```
+
+It prints one line per model, saying whether a warm server was stopped or
+none was running, and exits 0 either way. The settings page has the same
+button, "Unload the dictation models", in the Dictation section.
 
 `vocalize settings` prints the resolved dictation settings alongside
 everything else:
@@ -343,7 +389,44 @@ stt.max_seconds=120
 stt.max_take_seconds=1800
 stt.cues=sounds
 stt.paste=false
+stt.engine=auto
+stt.warm_minutes=0
 ```
+
+(Among other lines; `vocalize settings` prints every setting.)
+
+## Vocabulary
+
+Speech engines often get names and technical words wrong. List them under
+`[stt] vocabulary`, or in the Dictation section of the settings page:
+
+```toml
+[stt]
+vocabulary = ["pyproject", "sha256", "Kokoro", "DuckDB"]
+```
+
+After either engine, Vocalize looks for a run of one to four heard words
+whose letters and digits, ignoring case, spell a term's letters and digits.
+It replaces that run with the term exactly as you wrote it: "py project"
+becomes "pyproject" and "duck db" becomes "DuckDB". This is the same for
+dictation and for `vocalize transcribe`, and it runs before the optional
+cleanup.
+
+It is deliberately cautious:
+
+- There is no matching by sound. A term heard as a different word ("pie
+  project") is not corrected.
+- A term with fewer than three letters or digits is never matched.
+- The correction step leaves text with no term in it unchanged.
+
+Whisper also receives the list as a hint before it starts. Parakeet does
+not take hints, so for Parakeet the correction above is the whole effect.
+The hint can change what Whisper hears, even in text with no term in it.
+On the Mac Studio, a technical take's word error rate fell from 7.7 to 1.5
+percent with the list, on both engines. On two plain prose takes, the hint
+moved Whisper's word error rate from 2.54 to 3.94 percent on one (it
+dropped a clause) and from 0.84 to 0.28 percent on the other. A term heard
+as different words, such as a command with dashes, was not corrected.
 
 ## Pause and resume
 
@@ -484,9 +567,14 @@ No transcript ever leaves the machine.
 vocalize local install --llm
 ```
 
-This downloads ~2.5 GB of model weights (Qwen 3.5 4B, 4-bit quantised
-for Apple Silicon via MLX) plus a Python runtime managed by uv. The
-installer gates on 12 GB of RAM by default — use `--force` to override.
+This downloads 2.8 GB of model files (Qwen3.5-4B, 4-bit, for Apple Silicon
+via MLX) and builds a 371 MB environment for it with uv. The installer
+refuses on a Mac with less than 12 GB of memory — use `--force` to
+override.
+
+On the Mac Studio, one cleanup took about 1.9 s and used about 3 GB of
+memory. Its evaluation passed 25 of 26 everyday cases and 10 of 10
+adversarial cases (see [local-model-evaluation.md](local-model-evaluation.md)).
 
 Once installed, set the backend:
 
@@ -500,7 +588,8 @@ bare `--cleanup` selects the local model.
 
 ```bash
 vocalize local status      # check whether the model is installed
-vocalize local uninstall --llm   # remove the model files
+vocalize local stop        # unload it now if warm_minutes keeps it loaded
+vocalize local uninstall --llm   # remove the model and its environment
 ```
 
 ## Uninstalling
@@ -511,9 +600,13 @@ vocalize local uninstall --llm   # remove the model files
 vocalize local uninstall --stt
 ```
 
-Removes the speech-to-text model files under `~/.cache/vocalize/models/` and
-the recorder bundle under `~/.cache/vocalize/bin/`. It asks first (skip
-with `--yes`) and does nothing if there's nothing to remove. **The
+`vocalize local uninstall` removes the same things the settings page's
+remove buttons remove: an engine, one Whisper model, or the cleanup model,
+each together with its engine environment. Run
+`vocalize local uninstall --help` for the choices. It asks first (skip with
+`--yes`) and does nothing if there's nothing to remove. On the settings
+page, the Engines section has **Remove Parakeet** and **Remove a Whisper
+model**, and the Dictation section has **Remove the cleanup model**. **The
 microphone permission grant is not touched** — it lives in System
 Settings, not in anything this command can see, so remove it yourself
 under Privacy & Security › Microphone if you want it gone too.

@@ -1,6 +1,8 @@
-/* The config portal page: the session exchange, one fetch helper, the state
- * cache with its config fingerprint, the readiness sidebar, and one place
- * that shows an error. The five tab panels are filled in from `renderers`.
+/* The vocalize settings page: the session exchange, one request helper,
+ * the state cache with its config fingerprint, and a page drawn entirely
+ * from the schema the server sends. Nothing about any one setting is
+ * written here: a setting added to the registry appears on this page with
+ * no change to this file, drawn by the renderer its `control` names.
  *
  * Two rules run through the whole file:
  *
@@ -13,6 +15,10 @@
  *   2. The session token travels in the `X-Vocalize-Token` header and
  *      nowhere else. A token in a query string is refused by the server
  *      before it routes, deliberately.
+ *
+ * Everything shown is put in as text (`textContent`, `.value`), never as
+ * markup: labels, help, values and messages all come from a config file,
+ * the registry or the server, and a hand-edited file is somebody's text.
  */
 
 "use strict";
@@ -27,16 +33,16 @@ var STALE =
   "This page's session is over. Run `vocalize portal` again to get a fresh link.";
 
 /* Ping every 30 s. The server closes itself after 900 s with no
- * token-authenticated request, so 30 s is a thirtieth of the budget and
- * keeps an open page alive with room to spare; it is also how long the page
- * can take to notice the CLI stopping, which is short enough to feel
- * immediate. `/api/state` is NOT polled on a timer: it costs up to two 2 s
- * local probe batches. It is fetched on load,
- * after every successful write, and when the user asks. */
+ * token-authenticated request, so 30 s keeps an open page alive with room
+ * to spare. `/api/state` is NOT polled on a timer: it is fetched on load,
+ * after every write and finished action, and when the user asks. */
 var PING_MS = 30000;
+/* How often a running job is asked about. */
+var JOB_POLL_MS = 1000;
 
 var token = null;
 var dead = false;
+var schema = null; // the /api/schema payload: groups, settings, actions
 var state = null; // the last /api/state payload
 var fingerprint = null; // the config file's fingerprint from that payload
 var pingTimer = null;
@@ -46,11 +52,6 @@ var polling = null; // the in-flight refresh, so polls never stack
  * read predates a write that has since landed, and the page already holds
  * that write's fingerprint from the write's own answer. */
 var generation = 0;
-
-/** Tab panel renderers, filled in by the tab code: `renderers.chain =
- *  function (panel, state) {...}`. Called for the visible tab on every
- *  refresh and on every tab switch. */
-var renderers = {};
 
 // --- elements ---------------------------------------------------------
 
@@ -65,10 +66,16 @@ function el(tag, className, text) {
   return node;
 }
 
+/** Say something through the polite live region. Every status change the
+ *  page makes — saved, refused, started, finished — is announced here. */
+function announce(text) {
+  $("status").textContent = text;
+}
+
 // --- the one place an error is shown ----------------------------------
 
-/** Show one line of trouble. Every tab calls this rather than inventing
- *  its own banner. `fatal` marks the page unusable and stops the polling. */
+/** Show one line of trouble. `fatal` marks the page unusable and stops
+ *  the polling. */
 function showError(message, fatal) {
   var box = $("alert");
   // Shown first, then filled: it is a live region, and a change made while
@@ -103,17 +110,16 @@ function banner(id, heading, message, mild) {
   box.hidden = false;
 }
 
-// --- the fetch helper -------------------------------------------------
+// --- the request helper -----------------------------------------------
 
 /* Status to result kind. 403 is "your session is over" — a wrong token, a
  * refused Host or a refused Origin all land here and all mean this page can
- * do nothing more. 409 is the compare-and-swap refusal: the file moved
- * under us. 400/404/413 are refusals of what was sent. 503 is either the
- * lockout (the whole server is going away) or a preview already running,
- * told apart by the message below. */
+ * do nothing more. 409 is a refusal because something moved: the config
+ * file changed on disk, or another action is running. 400/404/413 are
+ * refusals of what was sent. 503 is either the lockout (the whole server
+ * is going away) or the server being busy, told apart by the message. */
 var KINDS = {
   400: "invalid",
-  402: "budget",
   403: "auth",
   404: "missing",
   409: "conflict",
@@ -125,16 +131,13 @@ var KINDS = {
 
 /**
  * One request. Returns `{ok: true, data}` or `{ok: false, kind, status,
- * message}` with `kind` one of: auth (session over — the page is dead),
- * gone (the portal is not there at all), conflict (409, reload before
- * writing again), invalid (the request was refused), budget, missing, busy,
- * error.
- *
- * `raw` asks for the response body as a Blob instead of JSON — the preview
- * route answers with audio bytes, not JSON.
+ * message, body}` with `kind` one of: auth (session over — the page is
+ * dead), gone (the portal is not there at all), conflict (409), invalid
+ * (the request was refused), missing, busy, error. `body` is the parsed
+ * refusal, so a caller can read `errors`, `fingerprint` or `values`.
  */
-async function api(method, path, body, raw) {
-  if (dead) return { ok: false, kind: "gone", status: 0, message: GONE };
+async function api(method, path, body) {
+  if (dead) return { ok: false, kind: "gone", status: 0, message: GONE, body: null };
   var headers = { "X-Vocalize-Token": token };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   var response;
@@ -148,26 +151,18 @@ async function api(method, path, body, raw) {
     // The socket is gone: idle timeout, Ctrl-C, or the process exited.
     // Never an invitation to re-exchange the one-time code.
     showError(GONE, true);
-    return { ok: false, kind: "gone", status: 0, message: GONE };
+    return { ok: false, kind: "gone", status: 0, message: GONE, body: null };
   }
 
-  if (response.ok) {
-    if (raw) {
-      return {
-        ok: true,
-        data: await response.blob(),
-        type: response.headers.get("Content-Type") || ""
-      };
-    }
-    return { ok: true, data: await response.json() };
-  }
+  if (response.ok) return { ok: true, data: await response.json() };
 
-  var message = "";
+  var refused = null;
   try {
-    message = (await response.json()).error || "";
+    refused = await response.json();
   } catch (err) {
-    message = "";
+    refused = null;
   }
+  var message = refused && typeof refused.error === "string" ? refused.error : "";
   var kind = KINDS[response.status] || "error";
   if (response.status === 503 && message.indexOf("was shut down") !== -1) {
     kind = "gone"; // the lockout message: the server is closing its socket
@@ -178,11 +173,28 @@ async function api(method, path, body, raw) {
     ok: false,
     kind: kind,
     status: response.status,
-    message: message || "The portal refused that (" + response.status + ")."
+    message: message || "The portal refused that (" + response.status + ").",
+    body: refused
   };
 }
 
-// --- state, and the fingerprint the writes need ------------------------
+// --- schema, state, and the fingerprint the writes need ----------------
+
+/** After the session exists: the schema once, then the state. */
+async function start() {
+  var result = await api("GET", "/api/schema");
+  if (!result.ok) {
+    if (result.kind !== "gone" && result.kind !== "auth") {
+      showError("The list of settings could not be loaded: " + result.message, false);
+    }
+    return result;
+  }
+  schema = result.data || {};
+  schema.groups = Array.isArray(schema.groups) ? schema.groups : [];
+  schema.settings = Array.isArray(schema.settings) ? schema.settings : [];
+  schema.actions = Array.isArray(schema.actions) ? schema.actions : [];
+  return refresh();
+}
 
 /** Fetch `/api/state`, cache it, redraw. Polls never stack: a second call
  *  while one is in flight waits for that one. */
@@ -214,10 +226,9 @@ async function load() {
     return result;
   }
   state = result.data;
-  // `fingerprint` is taken by the server before it parses the file, and a
-  // write hands it straight back. null means the path could not be read at
-  // all: nothing can be written until a later poll returns one.
-  fingerprint = state.fingerprint;
+  // null means the path could not be read at all: nothing can be written
+  // until a later poll returns one.
+  fingerprint = state.fingerprint === undefined ? null : state.fingerprint;
   render();
   return result;
 }
@@ -227,84 +238,373 @@ function canWrite() {
   return !dead && fingerprint !== null;
 }
 
+// --- the edits held on the page ----------------------------------------
+//
+// Nothing writes until Save is pressed: no save-on-blur, no autosave. An
+// edit lives in `drafts` (key to the value to save) or `resets` (key to
+// true: send null, so the default applies). A redraw — every poll — keeps
+// both, so a reload after a 409 discards nothing.
+
+var drafts = {};
+var resets = {};
+var fieldErrors = {}; // the server's 400, key to message
+var localErrors = {}; // what the page itself refuses to send, key to message
+var restartNotes = {}; // key to what must restart, after a save
+var UNSET = "__vocalize_unset__"; // the option that means "no value: the default"
+
+function has(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function same(a, b) {
+  return JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+}
+
+function copyOf(value) {
+  return Array.isArray(value) ? value.slice() : value;
+}
+
+function settingOf(key) {
+  var found = null;
+  (schema ? schema.settings : []).forEach(function (setting) {
+    if (setting.key === key) found = setting;
+  });
+  return found;
+}
+
+/** What the file holds now, or the default when the state says nothing. */
+function saved(setting) {
+  var values = (state && state.values) || {};
+  return has(values, setting.key) ? values[setting.key] : setting.default;
+}
+
+/** What the page shows: the edit if there is one, else the saved value. */
+function current(setting) {
+  if (resets[setting.key]) return copyOf(setting.default);
+  if (has(drafts, setting.key)) return copyOf(drafts[setting.key]);
+  return copyOf(saved(setting));
+}
+
+function setDraft(setting, value) {
+  delete resets[setting.key];
+  delete fieldErrors[setting.key];
+  delete restartNotes[setting.key];
+  if (same(value, saved(setting))) delete drafts[setting.key];
+  else drafts[setting.key] = copyOf(value);
+  updateBar();
+}
+
+/** Stage a reset: on save the key is sent as null and the default applies. */
+function resetTo(setting) {
+  delete drafts[setting.key];
+  delete localErrors[setting.key];
+  delete fieldErrors[setting.key];
+  resets[setting.key] = true;
+  updateBar();
+}
+
+/** Only the keys that changed: every reset, and every edit that differs
+ *  from what the file holds. */
+function collect() {
+  var changes = {};
+  Object.keys(resets).forEach(function (key) {
+    changes[key] = null;
+  });
+  Object.keys(drafts).forEach(function (key) {
+    var setting = settingOf(key);
+    if (setting && !same(drafts[key], saved(setting))) changes[key] = copyOf(drafts[key]);
+  });
+  return changes;
+}
+
+function updateBar() {
+  var count = Object.keys(collect()).length;
+  var save = $("save");
+  save.textContent = count === 0 ? "Save changes" : "Save " + count + (count === 1 ? " change" : " changes");
+  save.disabled = count === 0 || !canWrite();
+  $("discard").disabled = count === 0;
+}
+
+function discardEdits() {
+  drafts = {};
+  resets = {};
+  localErrors = {};
+  fieldErrors = {};
+  render();
+  announce("Your unsaved edits were undone. The page shows what the file holds.");
+}
+
+function labelOf(key) {
+  var setting = settingOf(key);
+  return setting ? setting.label : key;
+}
+
+/* A setting's `restart` field, in words: "app" and "warm" are the two the
+ * registry uses; anything newer is shown as it is. */
+var RESTART_WORDS = {
+  app: "The menu-bar app must be restarted before this change takes effect.",
+  warm: "This applies once the dictation model loaded now is let go; until then dictation keeps using it."
+};
+var APP_RESTART = "app_restart"; // the action that restarts the menu-bar app
+
+function restartWords(restart) {
+  return has(RESTART_WORDS, restart) ? RESTART_WORDS[restart] : "Still to restart: " + restart + ".";
+}
+
+/** Focus `node` if it can take it; true when it did. */
+function focusOn(node) {
+  if (!node || !node.focus || node.disabled) return false;
+  node.focus();
+  return document.activeElement === node;
+}
+
+/** What `render()` puts the keyboard on next, when a handler knows better
+ *  than "where it was": the item that moved, the next one after a removal. */
+var focusNext = null;
+
+/** Put focus back where it was after a redraw. A control that is gone or
+ *  now disabled hands it to its card, so it never falls to the page body. */
+function restoreFocus(id, home) {
+  if (!id) return;
+  var again = document.getElementById(id);
+  if (focusOn(again)) return;
+  var owner = again && again.getAttribute ? again.getAttribute("data-home") : null;
+  focusOn(document.getElementById(owner || home || ""));
+}
+
+/** The save's own message: what was saved, what must restart (with the
+ *  app's restart button when it can run), and the backup the save made.
+ *  It takes the focus, because the Save button it came from is now off. */
+function showSaved(lines, restart) {
+  var box = $("save-note");
+  box.className = "banner mild";
+  box.hidden = false;
+  box.replaceChildren(el("strong", null, "Saved"));
+  lines.forEach(function (line) {
+    box.appendChild(el("p", null, line));
+  });
+  var action = actionById(APP_RESTART);
+  if (restart.indexOf("app") !== -1 && action && actionState(action).available) {
+    var row = el("div", "row");
+    var button = el("button", null, action.label || action.id);
+    button.type = "button";
+    button.id = "save-note-restart";
+    button.addEventListener("click", function () {
+      runAction(action, {});
+    });
+    row.appendChild(button);
+    box.appendChild(row);
+  }
+  focusOn(box);
+}
+
 /**
- * Write to a config route (`/api/chain`, `/api/provider/<name>`,
- * `/api/stt`), carrying the fingerprint the page was given and taking the
- * next one from the answer, so consecutive writes need no poll in between.
+ * Write the changed keys with the fingerprint the page was given, and take
+ * the next fingerprint from the answer, so consecutive saves need no poll
+ * in between.
  *
- * On 409 the file moved under us: the page reloads the state and the caller
- * must let the user look at the new values and confirm again. It never
- * re-sends the same write with the fresh fingerprint — that would overwrite
- * a change nobody saw, which is the whole point of the refusal.
+ * On 409 the file moved under the page: nothing was saved, the user is told
+ * and offered a reload, and the edits stay. It never re-sends the same
+ * write with the fresh fingerprint by itself — that would overwrite a
+ * change nobody saw, which is the whole point of the refusal.
  */
-async function save(path, body) {
+async function saveSettings() {
+  var changes = collect();
+  var keys = Object.keys(changes);
+  if (keys.length === 0) {
+    announce("Nothing to save: no setting was changed.");
+    return null;
+  }
+  var stuck = keys.filter(function (key) {
+    return has(localErrors, key);
+  });
+  if (stuck.length) {
+    focusNext = domId("set", stuck[0]);
+    render();
+    announce(
+      "Nothing was saved. Fix " +
+        stuck
+          .map(function (key) {
+            return labelOf(key) + " (" + localErrors[key] + ")";
+          })
+          .join(", ") +
+        " first."
+    );
+    return null;
+  }
   if (!canWrite()) {
     var why = dead ? GONE : "The config file could not be read, so nothing can be saved yet.";
     showError(why, dead);
-    return { ok: false, kind: "invalid", status: 0, message: why };
+    return null;
   }
-  var payload = Object.assign({}, body, { fingerprint: fingerprint });
-  var result = await api("POST", path, payload);
+  $("save-note").hidden = true;
+  announce("Saving…");
+  var result = await api("POST", "/api/settings", { changes: changes, fingerprint: fingerprint });
   if (result.ok) {
     clearError();
+    $("conflict").hidden = true;
+    var data = result.data || {};
     // From the write's own answer, and nothing older may replace it: a
     // poll already in flight read the file before this write landed.
     generation += 1;
-    fingerprint = result.data.fingerprint;
-    await poll(); // the sidebar is the point of the page: redraw it now
+    fingerprint = data.fingerprint === undefined ? fingerprint : data.fingerprint;
+    if (state) {
+      if (data.values) state.values = data.values;
+      state.fingerprint = fingerprint;
+      if (data.notices) state.notices = data.notices;
+    }
+    fieldErrors = {};
+    restartNotes = {};
+    keys.forEach(function (key) {
+      delete drafts[key];
+      delete resets[key];
+      var setting = settingOf(key);
+      if (setting && setting.restart) restartNotes[key] = "Saved. " + restartWords(setting.restart);
+    });
+    var restart = Array.isArray(data.restart) ? data.restart.map(String) : [];
+    var lines = ["Saved " + keys.length + (keys.length === 1 ? " setting: " : " settings: ") + keys.map(labelOf).join(", ") + "."];
+    restart.forEach(function (need) {
+      lines.push(restartWords(need));
+    });
+    if (typeof data.backup === "string" && data.backup) {
+      lines.push("A copy of your old config file, with its comments, was kept at " + data.backup + ".");
+      if (data.backup_has_retired === true) {
+        lines.push(
+          "The copy still holds the old settings that were removed, which can include a service key from an older version, so delete the copy once it is no longer needed."
+        );
+      }
+    }
+    render();
+    showSaved(lines, restart);
+    announce(lines.join(" "));
+    await poll(); // the readiness list and the actions may have changed
+    return result;
+  }
+  if (result.kind === "invalid" && result.body && result.body.errors) {
+    fieldErrors = {};
+    var elsewhere = [];
+    Object.keys(result.body.errors).forEach(function (key) {
+      fieldErrors[key] = String(result.body.errors[key]);
+      if (!settingOf(key)) elsewhere.push(key + ": " + fieldErrors[key]);
+    });
+    var bad = Object.keys(fieldErrors);
+    var placed = bad.filter(function (key) {
+      return settingOf(key) !== null;
+    });
+    if (placed.length) focusNext = domId("set", placed[0]);
+    render();
+    if (elsewhere.length) showError(elsewhere.join(" "), false);
+    announce(
+      "Nothing was saved. " + bad.length + (bad.length === 1 ? " setting needs" : " settings need") +
+        " a change: " +
+        bad
+          .map(function (key) {
+            return labelOf(key) + ": " + fieldErrors[key];
+          })
+          .join(" ") +
+        " Your edits are still here."
+    );
     return result;
   }
   if (result.kind === "conflict") {
-    await poll();
-    showError(
-      "The config file changed on disk while you were editing, so nothing was saved. " +
-        "The page has reloaded it — check the values and try again.",
-      false
-    );
-  } else if (result.kind !== "gone" && result.kind !== "auth") {
-    showError(result.message, false);
+    showConflict();
+    return result;
   }
+  if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
   return result;
 }
 
-// --- rendering --------------------------------------------------------
+/** The file changed on disk since the page loaded it. Say so, keep every
+ *  edit, and let the user reload the file underneath them. */
+function showConflict() {
+  var box = $("conflict");
+  box.className = "banner";
+  box.hidden = false;
+  box.replaceChildren(el("strong", null, "The config file changed on disk, so nothing was saved"));
+  box.appendChild(
+    el(
+      "p",
+      null,
+      "Something else wrote the file after this page loaded it. Your unsaved edits are still on this page. " +
+        "Reload the file to see what it holds now; your edits are kept and marked Unsaved, and nothing is written until you press Save again."
+    )
+  );
+  var row = el("div", "row");
+  var reload = el("button", "primary", "Reload the file, keep my edits");
+  reload.type = "button";
+  reload.id = "conflict-reload";
+  reload.addEventListener("click", reloadAfterConflict);
+  row.appendChild(reload);
+  box.appendChild(row);
+  announce("Nothing was saved: the config file changed on disk. Reload it to continue; your edits are kept.");
+}
 
-var CHAIN_SOURCES = ["default", "config file", "environment", "flag"];
+async function reloadAfterConflict() {
+  $("conflict").hidden = true;
+  await poll();
+  var count = Object.keys(collect()).length;
+  announce(
+    "The file was reloaded. " +
+      (count ? count + (count === 1 ? " unsaved edit is" : " unsaved edits are") + " kept; check them and press Save." : "No edits were waiting.")
+  );
+}
+
+// --- the page ---------------------------------------------------------
 
 function render() {
-  $("config-path").textContent = state.config_path;
+  if (!state) return;
+  var active = document.activeElement;
+  var focused = focusNext || (active && active.id ? active.id : null);
+  var home = active && active.getAttribute ? active.getAttribute("data-home") : null;
+  focusNext = null;
+  $("config-path").textContent = state.config_path || "—";
 
-  // A config_error means the whole file was discarded and every other value
-  // on this page is a default, not the user's setting. It outranks
-  // everything else here.
+  // A config_error means the whole file was discarded and every value on
+  // this page is a default, not the user's setting.
   banner(
     "config-alert",
     "The config file did not load — every value below is a default",
     state.config_error ? state.config_error + " Fix the file at " + state.config_path + "." : ""
   );
-
-  // chain_source is overloaded: either a provenance word or an error about
-  // VOCALIZE_CHAIN. Tested by membership, never by matching the text.
-  var envError = CHAIN_SOURCES.indexOf(state.chain_source) === -1 ? state.chain_source : "";
-  banner("chain-alert", "VOCALIZE_CHAIN in the environment is not usable", envError, true);
-
+  renderNotices();
   renderRows();
-  renderPanel(currentTab());
+  if (schema) {
+    renderProfile();
+    renderGroups();
+  }
+  updateBar();
+  restoreFocus(focused, home);
 }
 
-/** One readiness row, as the sidebar's `<li>` — shared with the Setup tab,
- *  which shows the same rows again grouped by wizard step instead of by
- *  provider chain. */
+function renderNotices() {
+  var notices = (state && Array.isArray(state.notices) && state.notices) || [];
+  var box = $("notices");
+  if (!notices.length) {
+    box.hidden = true;
+    return;
+  }
+  box.className = "banner mild";
+  box.replaceChildren(el("strong", null, "Your config file holds settings vocalize no longer uses"));
+  var list = el("ul");
+  notices.forEach(function (text) {
+    list.appendChild(el("li", null, String(text)));
+  });
+  box.appendChild(list);
+  box.appendChild(el("p", null, "The next save removes these retired settings from the file. Nothing else in it is touched."));
+  box.hidden = false;
+}
+
+/** One readiness row: its name, its state in words, its detail, and its
+ *  suggested command as a `<code>` node's text. */
 function rowItem(row) {
   var known = row.state === "ok" || row.state === "warn" || row.state === "fail";
   var item = el("li", known ? row.state : "warn");
   var head = el("div", "row-head");
-  head.appendChild(el("span", "dot"));
   head.appendChild(el("span", "row-name", row.name));
   head.appendChild(el("span", "row-state", row.state));
   item.appendChild(head);
   if (row.detail) item.appendChild(el("p", "row-detail", row.detail));
-  if (row.action) item.appendChild(rowAction(row));
+  if (row.action) item.appendChild(el("code", "row-action", row.action));
   return item;
 }
 
@@ -315,7 +615,6 @@ function renderRows() {
   rows.forEach(function (row) {
     list.appendChild(rowItem(row));
   });
-
   var note = "";
   if (!rows.length) note = "Nothing to check yet.";
   else if (fingerprint === null) note = "Saving is off: the config file could not be read.";
@@ -324,46 +623,1103 @@ function renderRows() {
   $("rows-note").hidden = note === "";
 }
 
-/* One line of good news, waiting for the panel that earned it. A save
- * redraws its panel from the fresh state, so a handler cannot leave a
- * message on a node it is holding — the node is gone by then. `showError`
- * stays the only place trouble is shown; this is only the other half. */
-var flash = null;
-
-function setFlash(panel, text) {
-  flash = { panel: panel, text: text };
+function domId(prefix, key) {
+  return prefix + "-" + String(key).replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
-function renderPanel(name) {
-  var panel = $("panel-" + name);
-  if (!panel) return;
-  if (!state) return;
-  var draw = renderers[name];
-  if (!draw) {
-    panel.replaceChildren(el("p", "empty", "Nothing here yet."));
+/** The words for a value, as the page shows it beside a control. */
+function shown(value) {
+  if (value === null || value === undefined) return "not set";
+  if (value === true) return "on";
+  if (value === false) return "off";
+  if (Array.isArray(value)) return value.length ? value.join(", ") : "an empty list";
+  if (value === "") return "empty";
+  return String(value);
+}
+
+function sortedGroups() {
+  return schema.groups.slice().sort(function (a, b) {
+    return (a.order || 0) - (b.order || 0);
+  });
+}
+
+var OTHER = { id: "__other__", label: "Other", help: "Settings and actions this page could not place in a group." };
+
+function renderGroups() {
+  var holder = $("groups");
+  var toc = $("toc");
+  holder.replaceChildren();
+  var links = el("ul");
+  var groups = sortedGroups();
+  var known = {};
+  groups.forEach(function (group) {
+    known[group.id] = true;
+  });
+  var straySettings = schema.settings.filter(function (s) {
+    return !has(known, s.group);
+  });
+  var strayActions = schema.actions.filter(function (a) {
+    return !has(known, a.group) && !isProfileAction(a);
+  });
+  var all = groups.slice();
+  if (straySettings.length || strayActions.length) all.push(OTHER);
+  all.forEach(function (group) {
+    var settings =
+      group === OTHER
+        ? straySettings
+        : schema.settings.filter(function (s) {
+            return s.group === group.id;
+          });
+    var actions =
+      group === OTHER
+        ? strayActions
+        : schema.actions.filter(function (a) {
+            return a.group === group.id && !isProfileAction(a);
+          });
+    holder.appendChild(groupSection(group, settings, actions));
+    var item = el("li");
+    var link = el("a", null, group.label);
+    link.href = "#" + domId("g", group.id);
+    item.appendChild(link);
+    links.appendChild(item);
+  });
+  toc.replaceChildren(links);
+}
+
+function groupSection(group, settings, actions) {
+  var section = el("section", "group");
+  section.id = domId("g", group.id);
+  section.setAttribute("data-group", group.id);
+  var heading = el("h2", null, group.label);
+  heading.id = domId("gh", group.id);
+  section.setAttribute("aria-labelledby", heading.id);
+  section.appendChild(heading);
+  if (group.help) section.appendChild(el("p", "hint", group.help));
+  settings.forEach(function (setting) {
+    section.appendChild(settingCard(setting));
+  });
+  if (actions.length) {
+    section.appendChild(el("h3", null, group.label + ": actions"));
+    actions.forEach(function (action) {
+      section.appendChild(actionCard(action));
+    });
+  }
+  return section;
+}
+
+// --- one setting ------------------------------------------------------
+
+/** Whether a setting's `applies_when` holds, and the words when it does not. */
+function applies(setting) {
+  var when = setting.applies_when;
+  if (!Array.isArray(when) || when.length !== 2) return { ok: true };
+  var other = settingOf(when[0]);
+  var now = other ? current(other) : undefined;
+  if (same(now, when[1])) return { ok: true };
+  var name = "“" + (other ? other.label : when[0]) + "”";
+  var words =
+    when[1] === true ? name + " is on" : when[1] === false ? name + " is off" : name + " is set to " + shown(when[1]);
+  return { ok: false, note: "Applies only when " + words + ". Change that setting to use this one." };
+}
+
+/** Register an interactive part of a control: disabled with the card when
+ *  the setting does not apply, and described by its help and error. */
+function part(ctx, node) {
+  node.disabled = ctx.off || node.disabled === true;
+  if (ctx.home) node.setAttribute("data-home", ctx.home);
+  ctx.parts.push(node);
+  return node;
+}
+
+/** Why a source is empty and what to do about it, from the state. */
+function sourceNote(source) {
+  var notes = (state && state.source_notes) || {};
+  return source && typeof notes[source] === "string" ? notes[source] : "";
+}
+
+function labelFor(ctx, node, text) {
+  var tag = el("label", null, text === undefined ? ctx.setting.label : text);
+  tag.htmlFor = node.id;
+  return tag;
+}
+
+/** The environment variable that overrides `key` in the server's own
+ *  environment, by name only (the server never sends its value). */
+function overrideOf(key) {
+  var map = state && state.overrides;
+  if (!map || typeof map !== "object" || !has(map, key)) return "";
+  var name = map[key];
+  return typeof name === "string" && /^VOCALIZE_[A-Z_]{1,40}$/.test(name) ? name : "";
+}
+
+function settingCard(setting) {
+  var key = setting.key;
+  var card = el("div", "setting");
+  card.id = domId("card", key);
+  card.setAttribute("data-setting", key);
+  card.setAttribute("tabindex", "-1"); // where focus goes when its control cannot hold it
+  var rule = applies(setting);
+  var ctx = { setting: setting, value: current(setting), off: !rule.ok, parts: [], id: domId("set", key), home: card.id };
+  var draw = has(RENDERERS, setting.control) ? RENDERERS[setting.control] : renderUnknown;
+  var control = draw(ctx, card);
+  control.setAttribute("data-control", key);
+  control.setAttribute("data-home", card.id);
+
+  var described = [];
+  var why = sourceNote(setting.choices_from);
+  if (why) {
+    var empty = el("p", "note", why);
+    empty.id = domId("src", key);
+    card.appendChild(empty);
+    described.push(empty.id);
+  }
+  if (setting.help) {
+    var help = el("p", "hint", setting.help);
+    help.id = domId("help", key);
+    card.appendChild(help);
+    described.push(help.id);
+  }
+  var variable = overrideOf(key);
+  if (variable) {
+    var env = el("p", "note", variable + " overrides this value for commands run from a shell where it is set. This page edits the config file.");
+    env.id = domId("env", key);
+    card.appendChild(env);
+    described.push(env.id);
+  }
+  if (!rule.ok) {
+    card.className += " off";
+    var off = el("p", "note", rule.note);
+    off.id = domId("off", key);
+    card.appendChild(off);
+    described.push(off.id);
+  }
+  var error = has(localErrors, key) ? localErrors[key] : has(fieldErrors, key) ? fieldErrors[key] : "";
+  if (error) {
+    card.className += " has-error";
+    var bad = el("p", "bad", error);
+    bad.id = domId("err", key);
+    card.appendChild(bad);
+    described.push(bad.id);
+  }
+  ctx.parts.forEach(function (node) {
+    if (described.length) node.setAttribute("aria-describedby", described.join(" "));
+    if (error) node.setAttribute("aria-invalid", "true");
+  });
+  if (has(restartNotes, key)) card.appendChild(el("p", "restart", restartNotes[key]));
+
+  var badges = el("p", "badges");
+  var isDefault = same(ctx.value, setting.default);
+  badges.appendChild(
+    el("span", "badge", isDefault ? "Default value" : "Changed from the default (" + shown(setting.default) + ")")
+  );
+  if (resets[key]) {
+    card.className += " unsaved";
+    badges.appendChild(el("span", "badge unsaved", "Unsaved: will return to the default"));
+  } else if (has(drafts, key)) {
+    card.className += " unsaved";
+    badges.appendChild(el("span", "badge unsaved", "Unsaved edit (saved: " + shown(saved(setting)) + ")"));
+  }
+  if (setting.restart) badges.appendChild(el("span", "badge", restartWords(setting.restart)));
+  card.appendChild(badges);
+
+  var row = el("div", "row");
+  var reset = el("button", null, "Reset to default");
+  reset.type = "button";
+  reset.id = domId("reset", key);
+  reset.setAttribute("data-reset", key);
+  reset.setAttribute("aria-label", "Reset " + setting.label + " to its default");
+  reset.setAttribute("data-home", card.id);
+  reset.disabled = resets[key] === true;
+  reset.addEventListener("click", function () {
+    resetTo(setting);
+    render();
+    announce(setting.label + " will return to its default, " + shown(setting.default) + ", when you save.");
+  });
+  row.appendChild(reset);
+  card.appendChild(row);
+  return card;
+}
+
+/** Change from a control, then redraw: other settings may depend on it. */
+function commit(setting, value) {
+  setDraft(setting, value);
+  render();
+}
+
+/** Typed text for a key whose default is null: empty means "not set". */
+function textValue(setting, text) {
+  if (text === "" && setting.default === null) return null;
+  return text;
+}
+
+/** Store typed text: null (empty, for a key with no default) is a reset. */
+function typed(setting, text, redraw) {
+  var value = textValue(setting, text);
+  if (value === null) resetTo(setting);
+  else setDraft(setting, value);
+  if (redraw) render();
+}
+
+function textInput(ctx, value) {
+  var box = el("input");
+  box.type = "text";
+  box.id = ctx.id;
+  box.value = value === null || value === undefined ? "" : String(value);
+  box.autocomplete = "off";
+  box.spellcheck = false;
+  if (ctx.setting.max_length) box.maxLength = ctx.setting.max_length;
+  return part(ctx, box);
+}
+
+function option(value, text, selected) {
+  var item = el("option");
+  item.value = value;
+  item.textContent = text;
+  item.selected = selected;
+  return item;
+}
+
+/** The named source from the state as `{value, label}` entries, or null. */
+function sourceEntries(source) {
+  var sources = (state && state.sources) || {};
+  if (!source || !Array.isArray(sources[source])) return null;
+  return sources[source].map(function (entry) {
+    if (entry !== null && typeof entry === "object") {
+      return { value: entry.value, label: entry.label === undefined ? String(entry.value) : String(entry.label) };
+    }
+    return { value: entry, label: String(entry) };
+  });
+}
+
+/** The options a setting or a param offers, each `{value, label}`. With
+ *  `choices`, those are the allowed values in their order, and the source
+ *  only lends labels to the values it knows; an empty choice it does not
+ *  label is called `emptyLabel` (the setting's help). With no `choices`,
+ *  the source's own list. */
+function optionsFrom(choices, source, emptyLabel) {
+  var listed = sourceEntries(source);
+  if (!Array.isArray(choices)) return listed || [];
+  var labels = {};
+  (listed || []).forEach(function (entry) {
+    labels["v:" + String(entry.value)] = entry.label;
+  });
+  return choices.map(function (choice) {
+    var key = "v:" + String(choice);
+    var label = has(labels, key) && labels[key] !== "" ? labels[key] : choice === "" ? emptyLabel || "None" : String(choice);
+    return { value: choice, label: label };
+  });
+}
+
+/** A `<select>` over `options`, `value` selected. A value the list does not
+ *  hold is offered first as itself, so nothing changes under the user; a
+ *  null value is the "not set" option when `unsetLabel` names one. */
+function dropDown(ctx, options, value, unsetLabel, onPick) {
+  var list = options.slice();
+  var known = list.some(function (entry) {
+    return same(entry.value, value);
+  });
+  if (unsetLabel) list.unshift({ value: UNSET, label: unsetLabel });
+  if (!known && !(value === null && unsetLabel)) {
+    list.unshift({ value: value, label: shown(value) + " (not in the list)" });
+  }
+  var pick = el("select");
+  pick.id = ctx.id;
+  list.forEach(function (entry) {
+    var mine = entry.value === UNSET ? value === null : same(entry.value, value);
+    pick.appendChild(option(entry.value === null ? UNSET : String(entry.value), entry.label, mine));
+  });
+  pick.value = value === null ? UNSET : String(value);
+  pick.addEventListener("change", function () {
+    if (pick.value === UNSET) return onPick(null, true);
+    var chosen = null;
+    list.forEach(function (entry) {
+      if (entry.value !== UNSET && String(entry.value) === pick.value) chosen = entry;
+    });
+    return onPick(chosen ? chosen.value : pick.value, false);
+  });
+  return part(ctx, pick);
+}
+
+function pickInto(setting) {
+  return function (value, unset) {
+    if (unset) {
+      resetTo(setting);
+      render();
+    } else commit(setting, value);
+  };
+}
+
+// --- the renderers, one per control kind --------------------------------
+
+/* chord: vocalize's spelling of a key combination. Modifiers in the order
+ * `config.CHORD_MODIFIERS` gives them, then one key: a-z, 0-9 or f1-f12. */
+var CHORD_ORDER = [
+  ["ctrlKey", "ctrl"],
+  ["altKey", "alt"],
+  ["metaKey", "cmd"],
+  ["shiftKey", "shift"]
+];
+
+function chordKey(event) {
+  var code = String(event.code || "");
+  var match = /^Key([A-Z])$/.exec(code) || /^Digit([0-9])$/.exec(code);
+  if (match) return match[1].toLowerCase();
+  match = /^F([1-9]|1[0-2])$/.exec(code);
+  if (match) return "f" + match[1];
+  var key = String(event.key || "").toLowerCase();
+  return /^[a-z0-9]$/.test(key) || /^f([1-9]|1[0-2])$/.test(key) ? key : null;
+}
+
+/** The chord a key press spells, or null when it is not one (no ctrl, alt
+ *  or cmd held, or no key vocalize knows). Plain typing is left alone, so
+ *  the same field takes a chord typed by hand. */
+function chordOf(event) {
+  if (!event.ctrlKey && !event.altKey && !event.metaKey) return null;
+  var key = chordKey(event);
+  if (key === null) return null;
+  var parts = [];
+  CHORD_ORDER.forEach(function (pair) {
+    if (event[pair[0]]) parts.push(pair[1]);
+  });
+  parts.push(key);
+  return parts.join("+");
+}
+
+var RENDERERS = {
+  toggle: function (ctx, card) {
+    var box = el("input");
+    box.type = "checkbox";
+    box.id = ctx.id;
+    box.checked = ctx.value === true;
+    part(ctx, box);
+    box.addEventListener("change", function () {
+      commit(ctx.setting, box.checked === true);
+    });
+    var line = el("div", "check");
+    line.appendChild(box);
+    line.appendChild(labelFor(ctx, box));
+    card.appendChild(line);
+    return box;
+  },
+
+  select: function (ctx, card) {
+    var options = optionsFrom(ctx.setting.choices, ctx.setting.choices_from, ctx.setting.help);
+    var unset = ctx.value === null || ctx.setting.default === null ? "Not set (the default)" : null;
+    var pick = dropDown(ctx, options, ctx.value, unset, pickInto(ctx.setting));
+    card.appendChild(labelFor(ctx, pick));
+    card.appendChild(pick);
+    return pick;
+  },
+
+  number: function (ctx, card) {
+    var setting = ctx.setting;
+    var box = el("input");
+    box.type = "number";
+    box.id = ctx.id;
+    box.inputMode = setting.type === "int" ? "numeric" : "decimal";
+    if (setting.minimum !== null && setting.minimum !== undefined) box.min = String(setting.minimum);
+    if (setting.maximum !== null && setting.maximum !== undefined) box.max = String(setting.maximum);
+    box.step = setting.step !== null && setting.step !== undefined ? String(setting.step) : setting.type === "int" ? "1" : "any";
+    box.value = ctx.value === null || ctx.value === undefined ? "" : String(ctx.value);
+    part(ctx, box);
+    function take() {
+      var text = String(box.value).trim();
+      delete localErrors[setting.key];
+      if (text === "") {
+        resetTo(setting); // empty: not set, so the default applies
+        return;
+      }
+      var number = Number(text);
+      if (!isFinite(number)) localErrors[setting.key] = "Enter a number.";
+      else if (setting.type === "int" && !Number.isInteger(number)) localErrors[setting.key] = "Enter a whole number.";
+      else if (setting.minimum !== null && setting.minimum !== undefined && number < setting.minimum) {
+        localErrors[setting.key] = "Enter " + setting.minimum + " or more.";
+      } else if (setting.maximum !== null && setting.maximum !== undefined && number > setting.maximum) {
+        localErrors[setting.key] = "Enter " + setting.maximum + " or less.";
+      }
+      setDraft(setting, number);
+    }
+    box.addEventListener("input", take);
+    box.addEventListener("change", function () {
+      take();
+      render();
+      if (has(localErrors, setting.key)) announce(setting.label + ": " + localErrors[setting.key]);
+    });
+    card.appendChild(labelFor(ctx, box));
+    card.appendChild(box);
+    card.appendChild(el("p", "hint", "Leave it empty to use the default."));
+    return box;
+  },
+
+  text: function (ctx, card) {
+    var box = textInput(ctx, ctx.value);
+    box.addEventListener("input", function () {
+      typed(ctx.setting, box.value, false);
+    });
+    box.addEventListener("change", function () {
+      typed(ctx.setting, box.value, true);
+    });
+    card.appendChild(labelFor(ctx, box));
+    card.appendChild(box);
+    return box;
+  },
+
+  chord: function (ctx, card) {
+    var box = textInput(ctx, ctx.value);
+    box.placeholder = "ctrl+alt+cmd+d";
+    box.addEventListener("keydown", function (event) {
+      var chord = chordOf(event);
+      if (chord === null) return; // plain typing, Tab and the rest: left alone
+      event.preventDefault();
+      box.value = chord;
+      setDraft(ctx.setting, chord);
+      announce(ctx.setting.label + " set to " + chord + ". Press Save to keep it.");
+    });
+    box.addEventListener("input", function () {
+      setDraft(ctx.setting, String(box.value).trim().toLowerCase());
+    });
+    box.addEventListener("change", function () {
+      commit(ctx.setting, String(box.value).trim().toLowerCase());
+    });
+    card.appendChild(labelFor(ctx, box));
+    card.appendChild(box);
+    card.appendChild(
+      el(
+        "p",
+        "hint",
+        "Click the field and press the combination, or type it, for example ctrl+alt+cmd+d. Empty turns the shortcut off."
+      )
+    );
+    var row = el("div", "row");
+    var clear = el("button", null, "Turn this shortcut off");
+    clear.type = "button";
+    clear.id = domId("off-btn", ctx.setting.key);
+    part(ctx, clear);
+    clear.addEventListener("click", function () {
+      commit(ctx.setting, "");
+      announce(ctx.setting.label + " will be turned off when you save.");
+    });
+    row.appendChild(clear);
+    card.appendChild(row);
+    return box;
+  },
+
+  device: function (ctx, card) {
+    var source = ctx.setting.choices_from || "input_devices";
+    var devices = optionsFrom(null, source);
+    var options = [{ value: "", label: "The system default microphone" }].concat(devices);
+    var value = ctx.value === null ? "" : ctx.value;
+    var pick = dropDown(ctx, options, value, null, function (chosen) {
+      commit(ctx.setting, chosen === null ? "" : String(chosen));
+    });
+    card.appendChild(labelFor(ctx, pick));
+    card.appendChild(pick);
+    if (!devices.length && !sourceNote(source)) {
+      card.appendChild(el("p", "note", "No microphones are listed right now, so only the system default is offered."));
+    }
+    return pick;
+  },
+
+  list: function (ctx, card) {
+    var setting = ctx.setting;
+    var items = Array.isArray(ctx.value) ? ctx.value.map(String) : [];
+    var group = el("fieldset");
+    group.id = ctx.id;
+    group.appendChild(el("legend", null, setting.label));
+    var list = el("ol", "items");
+    list.setAttribute("role", "list");
+    items.forEach(function (item, index) {
+      var row = el("li");
+      var box = el("input");
+      box.type = "text";
+      box.id = domId("item", setting.key) + "-" + index;
+      box.value = item;
+      box.autocomplete = "off";
+      if (setting.max_length) box.maxLength = setting.max_length;
+      part(ctx, box);
+      function edited() {
+        var next = items.slice();
+        next[index] = box.value;
+        return next;
+      }
+      box.addEventListener("input", function () {
+        setDraft(setting, edited());
+      });
+      box.addEventListener("change", function () {
+        commit(setting, edited());
+      });
+      row.appendChild(labelFor(ctx, box, "Item " + (index + 1)));
+      row.appendChild(box);
+      var remove = el("button", null, "Remove");
+      remove.type = "button";
+      remove.id = domId("remove", setting.key) + "-" + index;
+      remove.setAttribute("aria-label", "Remove “" + item + "” from " + setting.label);
+      part(ctx, remove);
+      remove.addEventListener("click", function () {
+        var next = items.slice();
+        next.splice(index, 1);
+        // The item that took its place, else the one before, else the adder.
+        focusNext = next.length
+          ? domId("remove", setting.key) + "-" + Math.min(index, next.length - 1)
+          : domId("add", setting.key);
+        commit(setting, next);
+        announce("Removed “" + item + "” from " + setting.label + ".");
+      });
+      row.appendChild(remove);
+      list.appendChild(row);
+    });
+    group.appendChild(list);
+    if (!items.length) group.appendChild(el("p", "hint", "The list is empty."));
+
+    var full = setting.max_items !== null && setting.max_items !== undefined && items.length >= setting.max_items;
+    var add = el("input");
+    add.type = "text";
+    add.id = domId("add", setting.key);
+    add.autocomplete = "off";
+    if (setting.max_length) add.maxLength = setting.max_length;
+    var addButton = el("button", null, "Add");
+    addButton.type = "button";
+    addButton.id = domId("add-btn", setting.key);
+    addButton.setAttribute("aria-label", "Add to " + setting.label);
+    add.disabled = full;
+    addButton.disabled = full;
+    part(ctx, add);
+    part(ctx, addButton);
+    function addOne() {
+      var text = String(add.value).trim();
+      if (text === "") {
+        announce("Type something to add first.");
+        return;
+      }
+      commit(setting, items.concat([text]));
+      announce("Added “" + text + "” to " + setting.label + ". Press Save to keep it.");
+    }
+    addButton.addEventListener("click", addOne);
+    add.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        addOne();
+      }
+    });
+    group.appendChild(labelFor(ctx, add, "New item for " + setting.label));
+    var adder = el("div", "row");
+    adder.appendChild(add);
+    adder.appendChild(addButton);
+    group.appendChild(adder);
+    if (full) group.appendChild(el("p", "note", "The list is full: it holds at most " + setting.max_items + " items."));
+    card.appendChild(group);
+    return group;
+  },
+
+  voice: function (ctx, card) {
+    var setting = ctx.setting;
+    var options = optionsFrom(setting.choices, setting.choices_from, setting.help);
+    var unset = ctx.value === null || setting.default === null ? "The engine's own default voice" : null;
+    var pick = dropDown(ctx, options, ctx.value, unset, pickInto(setting));
+    card.appendChild(labelFor(ctx, pick));
+    card.appendChild(pick);
+    if (!options.length) card.appendChild(el("p", "note", "No voices are listed for this engine right now: is it installed?"));
+
+    var parts = String(setting.key).split(".");
+    var engine = parts.length === 3 ? parts[1] : "";
+    var preview = actionById("preview_voice");
+    var status = preview ? actionState(preview) : { available: false, reason: "this vocalize offers no preview" };
+    var row = el("div", "row");
+    var button = el("button", null, "Preview");
+    button.type = "button";
+    button.id = domId("preview", setting.key);
+    button.setAttribute("aria-label", "Preview " + setting.label);
+    button.disabled = !status.available;
+    part(ctx, button);
+    button.addEventListener("click", function () {
+      runAction(preview, previewParams(preview, engine, current(setting)));
+    });
+    row.appendChild(button);
+    card.appendChild(row);
+    if (!status.available) {
+      card.appendChild(el("p", "note", "Preview is not available: " + (status.reason || "no reason given") + "."));
+    } else {
+      var job = jobFor(preview.id);
+      if (job) card.appendChild(el("p", "note", jobWords(job)));
+    }
+    return pick;
+  },
+
+  folder: function (ctx, card) {
+    var box = textInput(ctx, ctx.value);
+    box.addEventListener("input", function () {
+      typed(ctx.setting, box.value, false);
+    });
+    box.addEventListener("change", function () {
+      typed(ctx.setting, box.value, true);
+    });
+    card.appendChild(labelFor(ctx, box));
+    card.appendChild(box);
+    card.appendChild(el("p", "hint", "A folder path on this Mac; ~ stands for your home folder."));
+    return box;
+  },
+
+  chain: function (ctx, card) {
+    var setting = ctx.setting;
+    var order = Array.isArray(ctx.value) ? ctx.value.map(String) : [];
+    var engines = optionsFrom(setting.choices, setting.choices_from || "tts_engines", setting.help);
+    function nameOf(value) {
+      var label = value;
+      engines.forEach(function (entry) {
+        if (String(entry.value) === value) label = entry.label;
+      });
+      return label;
+    }
+    var group = el("fieldset");
+    group.id = ctx.id;
+    group.appendChild(el("legend", null, setting.label));
+    var list = el("ol", "items");
+    list.setAttribute("role", "list");
+    order.forEach(function (name, index) {
+      var row = el("li");
+      row.appendChild(el("span", "item-name", index + 1 + ". " + nameOf(name)));
+      [
+        ["up", "Move up", index === 0, -1],
+        ["down", "Move down", index === order.length - 1, 1]
+      ].forEach(function (spec) {
+        var move = el("button", null, spec[1]);
+        move.type = "button";
+        move.id = domId(spec[0], setting.key) + "-" + index;
+        move.setAttribute("aria-label", spec[1] + ": " + nameOf(name));
+        move.disabled = spec[2];
+        part(ctx, move);
+        move.addEventListener("click", function () {
+          var next = order.slice();
+          var to = index + spec[3];
+          next.splice(index, 1);
+          next.splice(to, 0, name);
+          // Follow the engine that moved; at an end, its other button.
+          var edge = spec[0] === "up" ? to === 0 : to === next.length - 1;
+          focusNext = domId(edge ? (spec[0] === "up" ? "down" : "up") : spec[0], setting.key) + "-" + to;
+          commit(setting, next);
+          announce(nameOf(name) + " is now number " + (index + spec[3] + 1) + " of " + next.length + ".");
+        });
+        row.appendChild(move);
+      });
+      var remove = el("button", null, "Remove");
+      remove.type = "button";
+      remove.id = domId("remove", setting.key) + "-" + index;
+      remove.setAttribute("aria-label", "Remove " + nameOf(name) + " from " + setting.label);
+      remove.disabled = order.length <= 1;
+      part(ctx, remove);
+      remove.addEventListener("click", function () {
+        var next = order.slice();
+        next.splice(index, 1);
+        focusNext = domId("remove", setting.key) + "-" + Math.min(index, next.length - 1);
+        commit(setting, next);
+        announce("Removed " + nameOf(name) + ".");
+      });
+      row.appendChild(remove);
+      list.appendChild(row);
+    });
+    group.appendChild(list);
+    if (order.length === 1) group.appendChild(el("p", "hint", "At least one engine must stay in the list."));
+
+    var left = engines.filter(function (entry) {
+      return order.indexOf(String(entry.value)) === -1;
+    });
+    var full = setting.max_items !== null && setting.max_items !== undefined && order.length >= setting.max_items;
+    if (left.length && !full) {
+      var pickCtx = { setting: setting, off: ctx.off, parts: ctx.parts, id: domId("add", setting.key), home: ctx.home };
+      var chosen = { value: left[0].value };
+      var pick = dropDown(pickCtx, left, left[0].value, null, function (value) {
+        chosen.value = value;
+      });
+      group.appendChild(labelFor(pickCtx, pick, "Add an engine to the end"));
+      var adder = el("div", "row");
+      adder.appendChild(pick);
+      var add = el("button", null, "Add");
+      add.type = "button";
+      add.id = domId("add-btn", setting.key);
+      add.setAttribute("aria-label", "Add the chosen engine to " + setting.label);
+      part(ctx, add);
+      add.addEventListener("click", function () {
+        var value = String(chosen.value);
+        commit(setting, order.concat([value]));
+        announce("Added " + nameOf(value) + " at the end.");
+      });
+      adder.appendChild(add);
+      group.appendChild(adder);
+    } else {
+      group.appendChild(el("p", "hint", "Every engine is already in the list."));
+    }
+    card.appendChild(group);
+    return group;
+  }
+};
+
+/** A control kind this page does not know: a plain text field over the
+ *  value, read back by the setting's type, with a note saying so. Never
+ *  dropped — the setting still has a control. */
+function renderUnknown(ctx, card) {
+  var setting = ctx.setting;
+  var value = ctx.value;
+  var text = Array.isArray(value) ? value.join(", ") : value === null || value === undefined ? "" : String(value);
+  var box = textInput(ctx, text);
+  function read() {
+    var raw = String(box.value).trim();
+    delete localErrors[setting.key];
+    if (raw === "") return setting.type === "str" ? "" : null;
+    if (setting.type === "bool") {
+      if (raw === "true" || raw === "false") return raw === "true";
+      localErrors[setting.key] = "Type true or false.";
+      return raw;
+    }
+    if (setting.type === "int" || setting.type === "float") {
+      var number = Number(raw);
+      if (!isFinite(number)) localErrors[setting.key] = "Enter a number.";
+      return number;
+    }
+    if (setting.type === "list") {
+      return raw
+        .split(",")
+        .map(function (item) {
+          return item.trim();
+        })
+        .filter(Boolean);
+    }
+    return box.value;
+  }
+  function store(redraw) {
+    var next = read();
+    if (next === null) resetTo(setting);
+    else setDraft(setting, next);
+    if (redraw) render();
+  }
+  box.addEventListener("input", function () {
+    store(false);
+  });
+  box.addEventListener("change", function () {
+    store(true);
+    if (has(localErrors, setting.key)) announce(setting.label + ": " + localErrors[setting.key]);
+  });
+  card.appendChild(labelFor(ctx, box));
+  card.appendChild(box);
+  card.appendChild(
+    el(
+      "p",
+      "note",
+      "This page does not know the control “" + setting.control + "”, so it is shown as plain text" +
+        (setting.type === "list" ? " (items separated by commas)." : ".")
+    )
+  );
+  return box;
+}
+
+// --- actions ----------------------------------------------------------
+
+var jobs = {}; // job id to the last {id, action, state, progress, message}
+var actionNotes = {}; // action id to {text, bad}
+var paramDrafts = {}; // action id to {param name: value}
+var jobTimer = null;
+var ACTION_KINDS = { job: true, instant: true };
+
+function actionById(id) {
+  var found = null;
+  (schema ? schema.actions : []).forEach(function (action) {
+    if (action.id === id) found = action;
+  });
+  return found;
+}
+
+function actionState(action) {
+  var all = (state && state.actions) || {};
+  var mine = has(all, action.id) ? all[action.id] : null;
+  if (!mine) return { available: true, reason: "", status: "" };
+  return {
+    available: mine.available !== false,
+    reason: mine.reason ? String(mine.reason) : "",
+    status: mine.status ? String(mine.status) : ""
+  };
+}
+
+function isProfileAction(action) {
+  return action.id === "apply_profile";
+}
+
+function jobFor(actionId) {
+  var found = null;
+  Object.keys(jobs).forEach(function (id) {
+    if (jobs[id].action === actionId && (found === null || jobs[id].state === "running")) found = jobs[id];
+  });
+  return found;
+}
+
+function anyRunning() {
+  return Object.keys(jobs).some(function (id) {
+    return jobs[id].state === "running";
+  });
+}
+
+function jobWords(job) {
+  var action = actionById(job.action);
+  var label = action ? action.label || action.id : job.action;
+  var message = job.message ? ": " + job.message : "";
+  if (job.state === "done") return label + " finished" + message;
+  if (job.state === "failed") return label + " failed" + message;
+  var percent = typeof job.progress === "number" ? " (" + Math.round(job.progress * 100) + "% done)" : "";
+  return label + " is running" + percent + message;
+}
+
+/** The params a voice preview needs: the engine named by the setting's key
+ *  and the voice shown in its drop-down. Matched by param name. */
+function previewParams(action, engine, voice) {
+  var params = {};
+  ((action && action.params) || []).forEach(function (param) {
+    if (param.name === "engine" || param.name === "provider" || param.choices_from === "tts_engines") {
+      params[param.name] = engine;
+    } else if (param.name === "voice" && voice !== null && voice !== undefined) {
+      params[param.name] = String(voice);
+    }
+  });
+  return params;
+}
+
+function paramOptions(param) {
+  var sources = (state && state.sources) || {};
+  if (Array.isArray(param.choices) || (param.choices_from && Array.isArray(sources[param.choices_from]))) {
+    return optionsFrom(param.choices, param.choices_from, param.label || param.name);
+  }
+  if (param.choices_from === "profiles" || param.name === "profile") {
+    var names = (state && state.profile && state.profile.names) || [];
+    return names.map(function (name) {
+      return { value: name, label: String(name) };
+    });
+  }
+  return [];
+}
+
+function paramValue(action, param, options) {
+  var mine = paramDrafts[action.id] || {};
+  if (has(mine, param.name)) return mine[param.name];
+  var detected = state && state.profile ? state.profile.detected : null;
+  var offersDetected = options.some(function (entry) {
+    return entry.value === detected;
+  });
+  if (detected && offersDetected) return detected;
+  if (param.type === "enum" && options.length) return options[0].value;
+  return "";
+}
+
+function paramControl(action, param) {
+  var wrap = el("div", "param");
+  var name = param.label || param.name;
+  var ctx = {
+    setting: { label: name },
+    off: false,
+    parts: [],
+    id: domId("param", action.id + "-" + param.name),
+    home: domId("action", action.id)
+  };
+  var mine = (paramDrafts[action.id] = paramDrafts[action.id] || {});
+  var control;
+  if (param.type === "enum") {
+    var options = paramOptions(param);
+    var value = paramValue(action, param, options);
+    mine[param.name] = value;
+    control = dropDown(ctx, options, value, null, function (chosen) {
+      mine[param.name] = chosen;
+    });
+  } else {
+    control = textInput(ctx, paramValue(action, param, []));
+    mine[param.name] = control.value;
+    control.addEventListener("input", function () {
+      mine[param.name] = control.value;
+    });
+  }
+  wrap.appendChild(labelFor(ctx, control, name + (param.required ? " (required)" : "")));
+  wrap.appendChild(control);
+  var why = sourceNote(param.choices_from);
+  if (why) {
+    var empty = el("p", "note", why);
+    empty.id = ctx.id + "-src";
+    control.setAttribute("aria-describedby", empty.id);
+    wrap.appendChild(empty);
+  }
+  if (param.type !== "enum" && param.type !== "str") {
+    wrap.appendChild(el("p", "note", "This page does not know the field type “" + param.type + "”, so it is plain text."));
+  }
+  return wrap;
+}
+
+function actionCard(action) {
+  var card = el("div", "action-card");
+  card.id = domId("action", action.id);
+  card.setAttribute("data-action", action.id);
+  card.setAttribute("tabindex", "-1"); // where focus goes when its button is turned off
+  var status = actionState(action);
+  (action.params || []).forEach(function (param) {
+    card.appendChild(paramControl(action, param));
+  });
+  var row = el("div", "row");
+  var button = el("button", action.danger ? "danger" : null, action.label || action.id);
+  button.type = "button";
+  button.id = domId("run", action.id);
+  button.setAttribute("data-run", action.id);
+  button.setAttribute("data-home", card.id);
+  button.disabled = !status.available;
+  button.addEventListener("click", function () {
+    runAction(action, Object.assign({}, paramDrafts[action.id] || {}));
+  });
+  row.appendChild(button);
+  if (action.danger) row.appendChild(el("span", "badge", "Cannot be undone"));
+  if (action.confirm || action.danger) row.appendChild(el("span", "badge", "Asks first"));
+  card.appendChild(row);
+  var described = [];
+  if (action.help) {
+    var help = el("p", "hint", action.help);
+    help.id = domId("ahelp", action.id);
+    card.appendChild(help);
+    described.push(help.id);
+  }
+  if (!has(ACTION_KINDS, action.kind)) {
+    card.appendChild(
+      el("p", "note", "This page does not know the action kind “" + action.kind + "”; the button runs it and shows the answer.")
+    );
+  }
+  if (status.status) {
+    var said = el("p", "note", "Now: " + status.status);
+    said.id = domId("astatus", action.id);
+    card.appendChild(said);
+    described.push(said.id);
+  }
+  if (!status.available) {
+    var why = el("p", "note", "Not available: " + (status.reason || "no reason given") + ".");
+    why.id = domId("awhy", action.id);
+    card.appendChild(why);
+    described.push(why.id);
+  }
+  var job = jobFor(action.id);
+  if (job) {
+    if (job.state === "running") {
+      var bar = el("progress");
+      bar.max = 1;
+      if (typeof job.progress === "number") bar.value = job.progress;
+      bar.setAttribute("aria-label", (action.label || action.id) + " progress");
+      card.appendChild(bar);
+    }
+    var said2 = el("p", job.state === "failed" ? "bad" : "note", jobWords(job));
+    said2.id = domId("ajob", action.id);
+    card.appendChild(said2);
+    described.push(said2.id);
+  }
+  if (has(actionNotes, action.id)) {
+    var told = el("p", actionNotes[action.id].bad ? "bad" : "note", actionNotes[action.id].text);
+    told.id = domId("anote", action.id);
+    card.appendChild(told);
+    described.push(told.id);
+    if (actionNotes[action.id].bad) button.setAttribute("aria-invalid", "true");
+  }
+  if (described.length) button.setAttribute("aria-describedby", described.join(" "));
+  return card;
+}
+
+function renderProfile() {
+  var box = $("profile");
+  var action = actionById("apply_profile");
+  var profile = state.profile || null;
+  if (!action && !profile) {
+    box.replaceChildren();
     return;
   }
-  draw(panel, state);
-  if (flash !== null && flash.panel === name) {
-    panel.appendChild(el("p", "flash", flash.text));
-    flash = null; // said once, on the panel it belongs to
+  var section = el("section", "profile");
+  var heading = el("h2", null, "Machine profile");
+  heading.id = "profile-heading";
+  section.setAttribute("aria-labelledby", heading.id);
+  section.appendChild(heading);
+  var detected = profile && profile.detected ? String(profile.detected) : "";
+  section.appendChild(
+    el("p", null, detected ? "This Mac was detected as: " + detected + "." : "No profile was detected for this Mac.")
+  );
+  if (profile && Array.isArray(profile.names) && profile.names.length) {
+    section.appendChild(el("p", "hint", "Profiles: " + profile.names.join(", ") + "."));
   }
+  if (action) section.appendChild(actionCard(action));
+  box.replaceChildren(section);
 }
 
-// --- tabs -------------------------------------------------------------
-
-function currentTab() {
-  var selected = document.querySelector('[role="tab"][aria-selected="true"]');
-  return selected ? selected.id.slice(4) : "chain";
-}
-
-function selectTab(name) {
-  document.querySelectorAll('[role="tab"]').forEach(function (tab) {
-    var mine = tab.id === "tab-" + name;
-    tab.setAttribute("aria-selected", mine ? "true" : "false");
-    $(tab.getAttribute("aria-controls")).hidden = !mine;
+/** Run one action. Asks first when the schema says to; a job is followed
+ *  by polling until it is done or failed, and then the state is fetched. */
+async function runAction(action, params) {
+  if (!action) return null;
+  var label = action.label || action.id;
+  if (action.confirm || action.danger) {
+    var question =
+      "Run “" + label + "” now?" +
+      (action.help ? "\n\n" + action.help : "") +
+      (action.danger ? "\n\n“" + label + "” cannot be undone." : "");
+    if (!window.confirm(question)) {
+      announce(label + " was not run.");
+      return null;
+    }
+  }
+  var missing = (action.params || []).filter(function (param) {
+    var value = params[param.name];
+    return param.required && (value === undefined || value === null || value === "");
   });
-  renderPanel(name);
+  if (missing.length) {
+    var names = missing.map(function (param) {
+      return param.label || param.name;
+    });
+    actionNotes[action.id] = { text: "Fill in " + names.join(", ") + " first.", bad: true };
+    render();
+    announce(actionNotes[action.id].text);
+    return null;
+  }
+  delete actionNotes[action.id];
+  announce("Starting " + label + "…");
+  var result = await api("POST", "/api/action/" + encodeURIComponent(action.id), { params: params });
+  if (result.ok) {
+    var data = result.data || {};
+    if (data.job) {
+      jobs[data.job] = { id: data.job, action: action.id, state: "running", progress: null, message: data.message || "" };
+      render();
+      announce(label + " started" + (data.message ? ": " + data.message : "."));
+      pollJobs();
+    } else {
+      actionNotes[action.id] = { text: data.message || label + " is done.", bad: false };
+      announce(actionNotes[action.id].text);
+      await poll();
+    }
+    return result;
+  }
+  if (result.kind === "gone" || result.kind === "auth") return result;
+  var text = result.status === 409 ? "Another action is running. Try again when it finishes." : result.message;
+  actionNotes[action.id] = { text: text, bad: true };
+  render();
+  announce(label + " did not run: " + text);
+  return result;
+}
+
+/** Ask how the jobs are doing; again in a moment while any runs. When one
+ *  ends the state is fetched, because what it did shows there. */
+async function pollJobs() {
+  if (!anyRunning()) return null;
+  var result = await api("GET", "/api/action/status");
+  if (!result.ok) return result;
+  var ended = [];
+  ((result.data && result.data.jobs) || []).forEach(function (job) {
+    var before = jobs[job.id];
+    jobs[job.id] = job;
+    if (before && before.state === "running" && job.state !== "running") ended.push(job);
+  });
+  render();
+  ended.forEach(function (job) {
+    announce(jobWords(job));
+  });
+  if (anyRunning() && jobTimer === null) {
+    jobTimer = setTimeout(function () {
+      jobTimer = null;
+      pollJobs();
+    }, JOB_POLL_MS);
+  }
+  if (ended.length) await poll();
+  return result;
 }
 
 // --- boot: the one-time exchange, once --------------------------------
@@ -431,15 +1787,10 @@ async function exchange(code) {
 }
 
 async function boot() {
-  $("machine").textContent = window.location.host;
+  $("page-address").textContent = window.location.host;
   $("recheck").addEventListener("click", function () {
     clearError();
     refresh();
-  });
-  document.querySelectorAll('[role="tab"]').forEach(function (tab) {
-    tab.addEventListener("click", function () {
-      selectTab(tab.id.slice(4));
-    });
   });
 
   var code = takeCode();
@@ -461,7 +1812,7 @@ async function boot() {
     }
   }
 
-  await refresh();
+  await start();
   if (!dead) pingTimer = setInterval(ping, PING_MS);
 }
 
@@ -471,973 +1822,28 @@ function ping() {
   api("GET", "/api/ping");
 }
 
-/** What the tab code uses. One fetch helper, one error surface, one cache. */
+/* The save bar is in the document before this script runs (the script tag
+ * is the body's last child), so it is wired here, once. */
+$("save").addEventListener("click", saveSettings);
+$("discard").addEventListener("click", discardEdits);
+
+/** What a test drives. The page itself goes through the same functions. */
 window.portal = {
   api: api,
-  save: save,
+  start: start,
   refresh: refresh,
   canWrite: canWrite,
+  saveSettings: saveSettings,
+  collect: collect,
+  pollJobs: pollJobs,
+  runAction: runAction,
+  chordOf: chordOf,
   showError: showError,
   clearError: clearError,
-  renderers: renderers,
-  selectTab: selectTab,
+  renderers: RENDERERS,
   state: function () {
     return state;
   }
 };
 
 document.addEventListener("DOMContentLoaded", boot);
-
-// ======================================================================
-// The five tab panels.
-//
-// Everything here goes through the plumbing above: `api` for a request,
-// `save` for a config write (it carries the fingerprint and refuses to
-// re-send after a 409), `showError` for anything that failed. A panel is
-// rebuilt from scratch on every refresh and every tab switch, so nothing
-// is remembered in the DOM — the one exception is the chain's draft order,
-// which is held here and thrown away the moment the saved chain changes.
-//
-// Nothing on this page writes until a button is pressed. There is no
-// save-on-blur and no autosave: a config file is somebody's setup.
-// ======================================================================
-
-/** What a provider costs, in words. The chain is the one screen where the
- *  difference between "free and offline" and "billed per character"
- *  decides the order, so it is said there rather than implied. */
-var COST = {
-  say: "Free. The voice built into macOS. Works with no network.",
-  kokoro: "Free. Runs on this Mac once installed. Works with no network."
-};
-
-/** The speech-to-text models, allowlisted by the server too. */
-// `config.STT_CLEANUP_BACKENDS`, in its order.
-var STT_CLEANUP = ["off", "local"];
-
-var STT_MODELS = ["base.en", "small.en", "large-v3-turbo-q5_0", "large-v3-turbo-q8_0"];
-
-
-var uid = 0;
-
-function field(text, control, hint, extra) {
-  uid += 1;
-  control.id = "f" + uid;
-  // A refusal quoting what was typed should not outlive the correction.
-  control.addEventListener("input", clearError);
-  var wrap = el("div", "field");
-  var tag = el("label", null, text);
-  tag.htmlFor = control.id;
-  wrap.appendChild(tag);
-  wrap.appendChild(control);
-  if (extra) wrap.appendChild(extra);
-  if (hint) wrap.appendChild(el("p", "hint", hint));
-  return wrap;
-}
-
-/** The config value as the text a box shows: null and undefined are empty.
- *  A hand-edited file can hold a number where a name belongs, and it
- *  arrives here as that number. */
-function asText(value) {
-  return value === null || value === undefined ? "" : String(value);
-}
-
-function textBox(value) {
-  var box = el("input");
-  box.type = "text";
-  box.value = asText(value);
-  box.autocomplete = "off";
-  box.spellcheck = false;
-  return box;
-}
-
-function textArea(value) {
-  var box = el("textarea");
-  box.value = asText(value);
-  box.autocomplete = "off";
-  box.spellcheck = false;
-  return box;
-}
-
-function option(value, text, selected) {
-  var item = el("option");
-  item.value = value;
-  item.textContent = text;
-  item.selected = selected;
-  return item;
-}
-
-/** Put a voice list into a `<select>`, `current` selected. Every voice came
- *  from a third-party API, so each goes in through `.value` and
- *  `.textContent` — properties on a created node, never markup and never
- *  an attribute string. A `current` the list does not know is prepended as
- *  its own option, so the box never shows a voice the file does not hold.
- *  Returns the closing "Type a voice id…" option. */
-function offer(pick, voices, current) {
-  pick.replaceChildren();
-  var known = voices.some(function (voice) {
-    return String(voice.id) === current;
-  });
-  if (!known) {
-    pick.appendChild(
-      option(current, current === "" ? "vocalize's default" : current + " (not in this list)", true)
-    );
-  }
-  voices.forEach(function (voice) {
-    var id = String(voice.id);
-    pick.appendChild(option(id, voice.name ? String(voice.name) : id, id === current));
-  });
-  var typeOne = option("", "Type a voice id…", false);
-  pick.appendChild(typeOne);
-  return typeOne;
-}
-
-/** The voice control: a text box for an id, and a `<select>` that takes
- *  its place once a list arrives. Choosing in the select only sets the
- *  box — nothing is fetched and nothing is saved until Save is pressed.
- *  The last option brings the box back for an id the list does not know. */
-function voicePicker(name, label, current) {
-  var box = textBox(current);
-  var typed = field("Voice id", box, null);
-  var pick = el("select");
-  var picked = field("Voice", pick, null);
-  picked.hidden = true;
-  var note = el("p", "hint", "Any voice id this provider knows. Empty means vocalize's default.");
-  var typeOne = null;
-
-  pick.addEventListener("change", function () {
-    if (typeOne !== null && typeOne.selected) {
-      typed.hidden = false;
-      box.focus();
-      return;
-    }
-    box.value = pick.value;
-    typed.hidden = true;
-  });
-
-  function show(voices) {
-    // The box's text at this moment, not the value the card was drawn
-    // with: a keystroke may have landed while the list was on its way.
-    typeOne = offer(pick, voices, box.value);
-    picked.hidden = false;
-    typed.hidden = true;
-    if (document.activeElement === box) pick.focus(); // the field he clicked is now the select
-  }
-  var ask = function () {
-    offerVoices(name, label, show, note);
-  };
-  box.addEventListener("focus", ask);
-  if (voiceLists[name]) ask(); // a rebuilt card is filled from memory
-
-  var wrap = el("div");
-  wrap.appendChild(picked);
-  wrap.appendChild(typed);
-  wrap.appendChild(note);
-  return { node: wrap, box: box };
-}
-
-function numberBox(value, min, max, step) {
-  var box = el("input");
-  box.type = "number";
-  box.min = String(min);
-  if (max !== null) box.max = String(max);
-  box.step = step;
-  box.value = asText(value);
-  return box;
-}
-
-function selectBox(values, current) {
-  var box = el("select");
-  values.forEach(function (value) {
-    var option = el("option", null, value);
-    option.value = value;
-    if (value === current) option.selected = true;
-    box.appendChild(option);
-  });
-  return box;
-}
-
-function button(text, onClick) {
-  var node = el("button", "action", text);
-  node.type = "button";
-  node.addEventListener("click", onClick);
-  return node;
-}
-
-function card(title, badge) {
-  var box = el("section", "card");
-  var head = el("div", "card-head");
-  head.appendChild(el("h3", null, title));
-  if (badge) head.appendChild(el("span", "badge", badge));
-  box.appendChild(head);
-  return box;
-}
-
-function number(value) {
-  return typeof value === "number" ? value.toLocaleString() : asText(value);
-}
-
-/** Collect the changed fields of a settings form.
- *
- *  Only what the user actually touched is sent: the payload the server
- *  returns has every default filled in, so saving the lot would write
- *  vocalize's defaults into the file as if they were choices. An emptied
- *  box sends null, which is how a key is deleted.
- *
- *  Returns null when a number box holds something that is not a number —
- *  `JSON.stringify(NaN)` is `null`, which would silently delete the key.
- */
-function changed(fields, status) {
-  var settings = {};
-  var bad = false;
-  fields.forEach(function (entry) {
-    if (entry.list) {
-      var values = entry.box.value.split("\n").map(function (line) {
-        return line.trim();
-      }).filter(function (line) {
-        return line !== "";
-      });
-      var listNow = values.join("\n");
-      if (listNow === entry.initial) return;
-      settings[entry.key] = values.length ? values : null;
-      return;
-    }
-    var now = entry.box.value.trim();
-    if (now === entry.initial) return;
-    if (now === "") {
-      settings[entry.key] = null;
-      return;
-    }
-    if (entry.number) {
-      var value = Number(now);
-      if (!isFinite(value)) {
-        status.textContent = "The " + entry.key + " has to be a number.";
-        bad = true;
-        return;
-      }
-      settings[entry.key] = value;
-      return;
-    }
-    settings[entry.key] = now;
-  });
-  if (bad) return null;
-  if (Object.keys(settings).length === 0) {
-    status.textContent = "Nothing changed.";
-    return null;
-  }
-  return settings;
-}
-
-
-/** Write, and if it lands say so on the panel it came from.
- *
- *  `save` refreshes the state on its way out, which rebuilds the panel and
- *  detaches whatever status node the handler was holding — so the good news
- *  is parked in `flash` and painted by the redraw instead of set on a node
- *  nobody can see any more.
- */
-async function saveFrom(name, path, body, done) {
-  var result = await save(path, body);
-  if (result.ok) {
-    setFlash(name, done);
-    renderPanel(name);
-  }
-  return result;
-}
-
-// --- Chain ------------------------------------------------------------
-
-/* The order being edited, and the saved order it was taken from. When the
- * saved chain changes — someone else wrote the file, or this page just
- * saved — the draft is dropped rather than replayed over the new value. */
-var chainDraft = null;
-var chainDraftOf = null;
-
-function chainKey(order) {
-  return order.join(" ");
-}
-
-function chainOrder(saved) {
-  if (chainDraftOf !== chainKey(saved)) {
-    chainDraft = saved.slice();
-    chainDraftOf = chainKey(saved);
-  }
-  return chainDraft;
-}
-
-function providerLabel(data, name) {
-  var entry = data.providers[name];
-  return entry ? entry.label : name;
-}
-
-function chainSourceWords(data) {
-  if (data.chain_source === "config file") return "the config file";
-  if (data.chain_source === "environment") return "the VOCALIZE_CHAIN environment variable";
-  if (data.chain_source === "default") return "vocalize's built-in default";
-  if (data.chain_source === "flag") return "a command-line flag";
-  return "VOCALIZE_CHAIN, which vocalize could not use";
-}
-
-renderers.chain = function (panel, data) {
-  var order = chainOrder(data.chain);
-  var saved = chainKey(order) === chainKey(data.chain);
-
-  panel.replaceChildren(el("h2", null, "Fallback chain"));
-  panel.appendChild(
-    el(
-      "p",
-      "hint",
-      "vocalize speaks with the first provider that works and falls down the " +
-        "list from there. This order comes from " + chainSourceWords(data) + "."
-    )
-  );
-
-  var list = el("ol", "chain");
-  list.setAttribute("role", "list"); // `list-style: none` drops the role in Safari
-  order.forEach(function (name, index) {
-    var item = el("li");
-    var head = el("div", "row-head");
-    head.appendChild(el("span", "row-name", String(index + 1) + ". " + providerLabel(data, name)));
-
-    var controls = el("div", "controls");
-    controls.appendChild(chainMove(data, name, index, -1, index === 0));
-    controls.appendChild(chainMove(data, name, index, 1, index === order.length - 1));
-    var drop = button("Remove", function () {
-      order.splice(index, 1);
-      renderPanel("chain");
-    });
-    drop.setAttribute("aria-label", "Remove " + providerLabel(data, name) + " from the chain");
-    drop.disabled = order.length === 1;
-    controls.appendChild(drop);
-    head.appendChild(controls);
-
-    item.appendChild(head);
-    item.appendChild(el("p", "hint", COST[name] || ""));
-    list.appendChild(item);
-  });
-  panel.appendChild(list);
-  if (order.length === 1) {
-    panel.appendChild(el("p", "hint", "A chain needs at least one provider."));
-  }
-
-  var spare = Object.keys(data.providers).filter(function (name) {
-    return order.indexOf(name) === -1;
-  });
-  if (spare.length) {
-    panel.appendChild(el("h3", null, "Not in the chain"));
-    var rest = el("ul", "plain");
-    rest.setAttribute("role", "list");
-    spare.forEach(function (name) {
-      var item = el("li");
-      item.appendChild(el("span", "row-name", providerLabel(data, name)));
-      item.appendChild(el("span", "hint", COST[name] || ""));
-      var add = button("Add", function () {
-        order.push(name);
-        renderPanel("chain");
-      });
-      add.setAttribute("aria-label", "Add " + providerLabel(data, name) + " to the end of the chain");
-      var controls = el("div", "controls");
-      controls.appendChild(add);
-      item.appendChild(controls);
-      rest.appendChild(item);
-    });
-    panel.appendChild(rest);
-  }
-
-  var actions = el("div", "actions");
-  var status = el("p", "status", saved ? "" : "Not saved yet.");
-  var keep = button("Save this order", async function () {
-    keep.disabled = true;
-    status.textContent = "Saving…";
-    var result = await saveFrom(
-      "chain",
-      "/api/chain",
-      { order: order.slice() },
-      "Saved the new order."
-    );
-    if (!result.ok) {
-      keep.disabled = false;
-      status.textContent = "";
-    }
-  });
-  keep.disabled = !canWrite() || saved;
-  actions.appendChild(keep);
-  if (!canWrite()) {
-    actions.appendChild(el("span", "hint", "The config file cannot be written yet."));
-  }
-  panel.appendChild(actions);
-  panel.appendChild(status);
-
-  if (CHAIN_SOURCES.indexOf(data.chain_source) === -1 || data.chain_source === "environment") {
-    panel.appendChild(
-      el(
-        "p",
-        "hint",
-        "VOCALIZE_CHAIN in the environment beats the config file, so a saved " +
-          "order here has no effect until that variable is unset."
-      )
-    );
-  }
-};
-
-function chainMove(data, name, index, step, atEnd) {
-  var word = step < 0 ? "Up" : "Down";
-  var move = button(word, function () {
-    var order = chainDraft;
-    var other = order[index + step];
-    order[index + step] = order[index];
-    order[index] = other;
-    renderPanel("chain");
-  });
-  move.setAttribute("aria-label", "Move " + providerLabel(data, name) + " " + word.toLowerCase());
-  move.disabled = atEnd;
-  return move;
-}
-
-// --- Providers --------------------------------------------------------
-
-var previewUrl = null;
-
-/* One voice list per provider per page load, asked for on the first focus
- * of that provider's voice field and remembered here, because the card is
- * rebuilt on every refresh and every tab switch. Only a good list is kept:
- * a 502 or an "unavailable" answer is forgotten as it lands, so the next
- * focus asks again — the usual reason is a key not stored yet, and a
- * reload cannot be the refresh (the one-time code is spent). Neither
- * raises the error banner: the field is free text either way. Storing a
- * key asks for that provider's list again at once. The list itself lives
- * on the server, which holds the keys; this page never fetches one from a
- * provider. */
-var voiceLists = {};
-
-function askVoices(name) {
-  var asked = api("GET", "/api/voices/" + name);
-  voiceLists[name] = asked;
-  asked.then(function (result) {
-    if ((!result.ok || result.data.source === "unavailable") && voiceLists[name] === asked) {
-      delete voiceLists[name];
-    }
-  });
-  return asked;
-}
-
-function voiceWords(source, label) {
-  if (source === "live") return "The list is live from " + label + ". Pick one, or type any id it knows.";
-  if (source === "cached") {
-    return "The list is from " + label + ", fetched earlier by this portal. Pick one, or type any id.";
-  }
-  return "The list is built in. Pick one, or type any id it knows.";
-}
-
-function offerVoices(name, label, show, note) {
-  (voiceLists[name] || askVoices(name)).then(function (result) {
-    if (!result.ok) {
-      note.textContent = "Couldn't fetch the list — type a voice id.";
-      return;
-    }
-    if (result.data.source === "unavailable") {
-      note.textContent = "No list: " + result.data.reason + " You can still type a voice id.";
-      return;
-    }
-    show(result.data.voices);
-    note.textContent = voiceWords(result.data.source, label);
-  });
-}
-
-renderers.providers = function (panel, data) {
-  panel.replaceChildren(el("h2", null, "Provider settings"));
-  panel.appendChild(
-    el(
-      "p",
-      "hint",
-      "vocalize checks the speed when you save. It does not check a voice or " +
-        "model name — a wrong one fails when the provider next speaks, not here."
-    )
-  );
-  Object.keys(data.providers).forEach(function (name) {
-    panel.appendChild(providerCard(data, name, data.providers[name]));
-  });
-};
-
-function providerCard(data, name, entry) {
-  var box = card(entry.label, entry.in_chain ? "in the chain" : null);
-  var status = el("p", "status");
-  var fields = [];
-
-
-  // This provider's own trouble, in the CLI's words. `settings: null` is
-  // the shape that comes with it — there is nothing to edit until it is
-  // fixed in the file.
-  if (entry.error) box.appendChild(el("p", "bad", entry.error));
-
-  if (entry.settings === null) {
-    box.appendChild(
-      el(
-        "p",
-        "hint",
-        "vocalize could not resolve this provider's settings, so the voice, " +
-          "model and speed cannot be edited here. Fix it in " + data.config_path + "."
-      )
-    );
-  } else {
-    var voice = voicePicker(name, entry.label, entry.settings.voice);
-    box.appendChild(voice.node);
-    fields.push({ key: "voice", box: voice.box, initial: asText(entry.settings.voice) });
-
-    var model = textBox(entry.settings.model);
-    box.appendChild(field("Model", model, "Empty means vocalize's default."));
-    fields.push({ key: "model", box: model, initial: asText(entry.settings.model) });
-
-    var speed = numberBox(entry.settings.speed, 0.7, 1.2, "0.05");
-    box.appendChild(field("Speed", speed, "Between 0.7 and 1.2. Empty means normal."));
-    fields.push({ key: "speed", box: speed, initial: asText(entry.settings.speed), number: true });
-  }
-
-  var actions = el("div", "actions");
-  var keep = button("Save " + entry.label, async function () {
-    var settings = changed(fields, status);
-    if (settings === null) return;
-    keep.disabled = true;
-    status.textContent = "Saving…";
-    var result = await saveFrom(
-      "providers",
-      "/api/provider/" + name,
-      { settings: settings },
-      "Saved " + entry.label + "."
-    );
-    keep.disabled = false;
-    status.textContent = "";
-    return result;
-  });
-  keep.disabled = !canWrite();
-  actions.appendChild(keep);
-
-  var audio = el("audio");
-  audio.controls = true;
-  audio.hidden = true;
-  var listen = button("Preview", async function () {
-    // One click, one local synthesis. The server holds a lock for
-    // 30 seconds before refusing a second request, so the
-    // button stays disabled for the whole request rather than queueing.
-    listen.disabled = true;
-    status.textContent = "Speaking the preview sentence…";
-    var result = await api("POST", "/api/voices/" + name + "/preview", undefined, true);
-    listen.disabled = false;
-    if (!result.ok) {
-      status.textContent = "";
-      if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
-      return;
-    }
-    if (previewUrl !== null) URL.revokeObjectURL(previewUrl);
-    previewUrl = URL.createObjectURL(result.data);
-    audio.src = previewUrl;
-    audio.hidden = false;
-    status.textContent = "Playing the preview.";
-    var playing = audio.play();
-    if (playing && playing.catch) {
-      playing.catch(function () {
-        status.textContent = "Ready — press play.";
-      });
-    }
-  });
-  listen.setAttribute("aria-label", "Preview " + entry.label);
-  actions.appendChild(listen);
-  actions.appendChild(el("span", "hint", "Speaks one short sentence, with what is saved."));
-
-  box.appendChild(actions);
-  box.appendChild(audio);
-  box.appendChild(status);
-  return box;
-}
-
-// --- Keys -------------------------------------------------------------
-
-// --- Local ------------------------------------------------------------
-
-/* The install runs in the CLI, on its own thread, and outlives this page.
- * `installProgress` is the last status seen; `installMine` records that
- * this page started the run, because the status dict is never reset to
- * idle — `done: true` sits there until the next install claims the slot. */
-var installProgress = null;
-var installTimer = null;
-var installPolling = false;
-var installMine = false;
-/* The speech-to-text model picked on the Local tab. Held here so the
- * sidebar's Install button installs what the tab shows, and so the choice
- * survives the tab being rebuilt. */
-var sttChoice = "large-v3-turbo-q5_0";
-
-function megabytes(bytes) {
-  return (bytes / 1048576).toFixed(1) + " MB";
-}
-
-async function watchInstall() {
-  if (installPolling) return;
-  installPolling = true;
-  installTimer = null;
-  var result = await api("GET", "/api/local/install/status");
-  installPolling = false;
-  if (!result.ok) return; // a closed portal is already on screen
-  installProgress = result.data;
-  paintInstall();
-  if (installProgress.running) {
-    installTimer = setTimeout(watchInstall, 1000);
-  } else if (installMine) {
-    installMine = false;
-    refresh(); // the sidebar has a row for what just landed
-  }
-}
-
-function pollInstall() {
-  if (installTimer === null && !installPolling) installTimer = setTimeout(watchInstall, 0);
-}
-
-/* The node install progress is painted into. Both the Local tab and the
- * Setup tab can start an install, so whichever panel rendered last owns
- * it — a stale copy behind a hidden panel is simply never repainted. */
-var installBox = null;
-
-function progressBox() {
-  installBox = el("div");
-  return installBox;
-}
-
-var TARGET_LABELS = { stt: "Speech to text", kokoro: "Kokoro", app: "The app" };
-
-function paintInstall() {
-  var node = installBox;
-  if (!node) return; // no panel that shows progress is up; the install carries on
-  node.replaceChildren();
-  var progress = installProgress;
-  if (progress === null) {
-    node.appendChild(el("p", "hint", "Checking…"));
-    return;
-  }
-  if (progress.step === "idle") {
-    node.appendChild(el("p", "hint", "Nothing downloading."));
-    return;
-  }
-
-  var what = TARGET_LABELS[progress.target] || progress.target;
-  node.appendChild(el("p", "row-name", what + ": " + progress.step));
-  if (progress.total > 0) {
-    var bar = el("progress");
-    bar.max = progress.total;
-    bar.value = progress.downloaded;
-    bar.setAttribute("aria-label", what + " download");
-    node.appendChild(bar);
-    node.appendChild(
-      el("p", "hint", megabytes(progress.downloaded) + " of " + megabytes(progress.total))
-    );
-  } else if (progress.downloaded > 0) {
-    node.appendChild(el("p", "hint", megabytes(progress.downloaded) + " so far"));
-  }
-  if (progress.error) node.appendChild(el("p", "bad", progress.error));
-  else if (progress.done) node.appendChild(el("p", "status", "Finished."));
-  if (progress.note) node.appendChild(el("p", "note-strong", progress.note));
-}
-
-renderers.local = function (panel, data) {
-  panel.replaceChildren(el("h2", null, "On this Mac"));
-
-  var installs = card("Downloads");
-  installs.appendChild(
-    el(
-      "p",
-      "hint",
-      "Kokoro is the offline voice; the speech-to-text model is what " +
-        "`vocalize listen` transcribes with. Each is a few hundred megabytes " +
-        "and takes minutes. The CLI does the downloading — closing this page " +
-        "does not stop it, and neither does moving to another tab."
-    )
-  );
-
-  var running = installProgress !== null && installProgress.running;
-  var kokoro = button("Install Kokoro", function () {
-    startInstall({ target: "kokoro" }, kokoro);
-  });
-  kokoro.disabled = running || dead;
-  var kokoroRow = el("div", "actions");
-  kokoroRow.appendChild(kokoro);
-  installs.appendChild(kokoroRow);
-
-  var model = selectBox(STT_MODELS, sttChoice);
-  model.addEventListener("change", function () {
-    sttChoice = model.value;
-  });
-  installs.appendChild(
-    field(
-      "Speech-to-text model to install",
-      model,
-      "base.en is the smallest and quickest; the large-v3-turbo models are the most accurate, q8_0 the least lossy for 16 GB machines."
-    )
-  );
-  var stt = button("Install speech to text", function () {
-    startInstall({ target: "stt", model: sttChoice }, stt);
-  });
-  stt.disabled = running || dead;
-  var sttRow = el("div", "actions");
-  sttRow.appendChild(stt);
-  installs.appendChild(sttRow);
-
-  installs.appendChild(progressBox());
-  panel.appendChild(installs);
-
-  panel.appendChild(sttCard(data));
-
-  paintInstall();
-  pollInstall();
-};
-
-async function startInstall(body, pressed) {
-  pressed.disabled = true;
-  var result = await api("POST", "/api/local/install/start", body);
-  if (!result.ok) {
-    pressed.disabled = false;
-    if (result.kind !== "gone" && result.kind !== "auth") showError(result.message, false);
-    return;
-  }
-  installMine = true;
-  installProgress = result.data;
-  paintInstall();
-  pollInstall();
-}
-
-// --- the sidebar's buttons --------------------------------------------
-
-function installStt(pressed) {
-  selectTab("local");
-  startInstall({ target: "stt", model: sttChoice }, pressed);
-}
-
-var ROW_ACTIONS = {
-  kokoro: {
-    label: "Install Kokoro",
-    run: function (pressed) {
-      selectTab("local");
-      startInstall({ target: "kokoro" }, pressed);
-    }
-  },
-  "stt model": { label: "Install speech to text", run: installStt },
-  recorder: { label: "Install speech to text", run: installStt },
-  "input device": { state: "warn", label: "Install speech to text", run: installStt },
-  microphone: {
-    why: "This page cannot ask macOS for the microphone. Run it in a terminal, or use System Settings."
-  }
-};
-
-function rowAction(row) {
-  var entry = Object.prototype.hasOwnProperty.call(ROW_ACTIONS, row.name) ? ROW_ACTIONS[row.name] : null;
-  var wrap = el("div", "row-do");
-  if (entry && entry.run && (!entry.state || entry.state === row.state)) {
-    var go = button(entry.label, function () {
-      entry.run(go);
-    });
-    go.disabled = dead || (installProgress !== null && installProgress.running);
-    wrap.appendChild(go);
-    return wrap;
-  }
-  wrap.appendChild(el("code", "row-action", row.action));
-  if (entry && entry.why) wrap.appendChild(el("p", "hint", entry.why));
-  return wrap;
-}
-
-function sttCard(data) {
-  var box = card("Dictation settings");
-  var status = el("p", "status");
-  var fields = [];
-
-  var model = selectBox(STT_MODELS, data.stt.model);
-  box.appendChild(
-    field(
-      "Model",
-      model,
-      "The model `vocalize listen` transcribes with. It has to be installed above."
-    )
-  );
-  fields.push({ key: "model", box: model, initial: asText(data.stt.model) });
-
-  var language = textBox(data.stt.language);
-  box.appendChild(
-    field(
-      "Language",
-      language,
-      "A whisper.cpp language code such as en, fr or de. An English-only " +
-        "model (base.en, small.en) has to stay on en."
-    )
-  );
-  fields.push({ key: "language", box: language, initial: asText(data.stt.language) });
-
-  var cleanup = selectBox(STT_CLEANUP, data.stt.cleanup);
-  box.appendChild(
-    field(
-      "Cleanup",
-      cleanup,
-      "What tidies a dictated take after transcription. off keeps the words " +
-        "as spoken; local cleans it up using the installed model on this Mac."
-    )
-  );
-  fields.push({ key: "cleanup", box: cleanup, initial: asText(data.stt.cleanup) });
-
-  var warmMinutes = textBox(data.stt.warm_minutes);
-  warmMinutes.type = "number";
-  warmMinutes.min = "0";
-  warmMinutes.max = "240";
-  warmMinutes.step = "1";
-  box.appendChild(
-    field(
-      "Keep models loaded, minutes",
-      warmMinutes,
-      "Minutes to keep the models loaded after each take, so the next take " +
-        "skips loading them. 0 loads nothing ahead of time. While loaded they " +
-        "hold about 1 GB for Whisper and, with local cleanup, about 3.5 GB more."
-    )
-  );
-  fields.push({ key: "warm_minutes", box: warmMinutes, initial: asText(data.stt.warm_minutes), number: true });
-
-  var device = textBox(data.stt.input_device);
-  box.appendChild(
-    field(
-      "Input device",
-      device,
-      "Empty means the system default. Run `vocalize listen --list-devices` " +
-        "in a terminal to see the names on this Mac."
-    )
-  );
-  fields.push({ key: "input_device", box: device, initial: asText(data.stt.input_device) });
-
-  var vocabulary = textArea((data.stt.vocabulary || []).join("\n"));
-  box.appendChild(
-    field(
-      "Vocabulary",
-      vocabulary,
-      "One word or short phrase per line. Helps Whisper expect jargon; this list is visible to other programs while Whisper runs."
-    )
-  );
-  fields.push({ key: "vocabulary", box: vocabulary, initial: (data.stt.vocabulary || []).join("\n"), list: true });
-
-  var actions = el("div", "actions");
-  var keep = button("Save dictation settings", async function () {
-    var settings = changed(fields, status);
-    if (settings === null) return;
-    keep.disabled = true;
-    status.textContent = "Saving…";
-    await saveFrom("local", "/api/stt", { settings: settings }, "Saved the dictation settings.");
-    keep.disabled = false;
-    status.textContent = "";
-  });
-  keep.disabled = !canWrite();
-  actions.appendChild(keep);
-  box.appendChild(actions);
-  box.appendChild(status);
-  return box;
-}
-
-// --- Setup --------------------------------------------------------------
-
-/* The nine wizard steps of the analysis doc, over rows and routes this
- * page already has: nothing here is a new probe or a new route. Each step
- * looks up the readiness rows it cares about by name and shows them with
- * the same `rowItem`/`rowAction` the sidebar uses — so a hostile row action
- * still lands only in a `<code>` node's text, never as markup. A name this
- * poll never reports (most machines never populate "uv" or "swiftc" here —
- * those are `vocalize doctor`'s own rows, not readiness') falls back to
- * fixed text naming the command that does. */
-
-renderers.setup = function (panel, data) {
-  panel.replaceChildren(el("h2", null, "Setup"));
-
-  var rows = data.rows || [];
-  function findRow(name) {
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].name === name) return rows[i];
-    }
-    return null;
-  }
-
-  function stepCard(title, names, fallback) {
-    var box = card(title);
-    var list = el("ul", "setup-rows");
-    list.setAttribute("role", "list");
-    var any = false;
-    names.forEach(function (name) {
-      var row = findRow(name);
-      if (row) {
-        list.appendChild(rowItem(row));
-        any = true;
-      }
-    });
-    if (any) box.appendChild(list);
-    if (fallback) box.appendChild(el("p", "hint", fallback));
-    return box;
-  }
-
-  panel.appendChild(stepCard("1. Toolchain", ["uv", "swiftc"], "run: vocalize doctor"));
-
-  var running = installProgress !== null && installProgress.running;
-  var build = stepCard("2. Build both bundles", ["recorder", "app"], null);
-  var buildActions = el("div", "actions");
-  var dictate = button("Install dictation", function () {
-    startInstall({ target: "stt", model: sttChoice }, dictate);
-  });
-  dictate.disabled = running || dead;
-  var installApp = button("Install the app", function () {
-    startInstall({ target: "app" }, installApp);
-  });
-  installApp.disabled = running || dead;
-  buildActions.appendChild(dictate);
-  buildActions.appendChild(installApp);
-  build.appendChild(buildActions);
-  build.appendChild(progressBox());
-  panel.appendChild(build);
-
-  panel.appendChild(
-    stepCard("3. Login item", ["app agent"], "Install the app above to load it at login.")
-  );
-
-  var chords = card("4. Chords");
-  var appInfo = data.app || {};
-  chords.appendChild(
-    el(
-      "p",
-      "hint",
-      "Hotkeys: " + asText(appInfo.hotkeys) + " (backend: " + asText(appInfo.hotkey_backend) + ")"
-    )
-  );
-  chords.appendChild(el("p", "hint", "Edit [app] in the config file to change them."));
-  panel.appendChild(chords);
-
-  var download = stepCard("5. Model download", ["stt model"], null);
-  var getModel = button("Install speech to text", function () {
-    startInstall({ target: "stt", model: sttChoice }, getModel);
-  });
-  getModel.disabled = running || dead;
-  var downloadActions = el("div", "actions");
-  downloadActions.appendChild(getModel);
-  download.appendChild(downloadActions);
-  panel.appendChild(download);
-
-  panel.appendChild(stepCard("6. Microphone", ["microphone"], "run: vocalize listen --check"));
-
-  var speak = card("7. The /speak skill and Quick Actions");
-  speak.appendChild(el("code", "row-action", "vocalize integrate claude"));
-  panel.appendChild(speak);
-
-  panel.appendChild(
-    stepCard(
-      "8. Accessibility",
-      ["accessibility"],
-      "Grant Accessibility to Vocalize in System Settings › Privacy & Security › Accessibility."
-    )
-  );
-
-  var failing = rows.filter(function (row) {
-    return row.state === "fail";
-  }).length;
-  var selftest = card("9. Self-test");
-  selftest.appendChild(el("code", "row-action", "vocalize doctor"));
-  selftest.appendChild(el("p", "hint", failing + (failing === 1 ? " failing row." : " failing rows.")));
-  panel.appendChild(selftest);
-
-  paintInstall();
-  pollInstall();
-};

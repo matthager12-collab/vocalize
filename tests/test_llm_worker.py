@@ -194,17 +194,21 @@ def test_generate_receives_the_prompt_ids_never_a_decoded_string(worker):
 # --- Selftest argv vs runtime argv (from manifest) ---------------------
 
 
-def test_selftest_and_runtime_argv_differ_only_by_offline_and_mode():
+def test_selftest_and_runtime_argv_differ_only_by_mode_and_both_stay_offline():
     """Already tested in test_llm_manifest.py, but repeated here at the
-    worker level to pin the contract the worker depends on."""
+    worker level to pin the contract the worker depends on.  The install
+    step builds the hash-locked environment first, so its selftest runs
+    offline inside it like every runtime call."""
     from vocalize.local import llm_manifest as manifest
 
-    selftest = set(manifest.selftest_argv(Path("/fake")))
-    runtime = set(manifest.runtime_argv(Path("/fake")))
-    only_selftest = selftest - runtime
-    only_runtime = runtime - selftest
-    assert only_selftest == {"--selftest"}
-    assert only_runtime == {"--offline", "--no-python-downloads", "--once"}
+    selftest = manifest.selftest_argv(Path("/fake"))
+    runtime = manifest.runtime_argv(Path("/fake"))
+    assert set(selftest) - set(runtime) == {"--selftest"}
+    assert set(runtime) - set(selftest) == {"--once"}
+    assert selftest[:-1] == runtime[:-1]
+    for argv in (selftest, runtime):
+        assert {"--offline", "--no-python-downloads"} <= set(argv)
+        assert argv[argv.index("--model-dir") + 1] == str(Path("/fake"))
 
 
 # --- check_config gate --------------------------------------------------
